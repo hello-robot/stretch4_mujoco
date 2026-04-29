@@ -1,0 +1,281 @@
+<mujoco model="stretch">
+
+  <asset>
+    <mesh name="base_link_collision" file="./meshes/base_link_collision.STL" />
+    <mesh name="link_wheel_0_collision" file="./meshes/link_wheel_0_collision.STL" />
+    <mesh name="link_wheel_1_collision" file="./meshes/link_wheel_1_collision.STL" />
+    <mesh name="link_wheel_2_collision" file="./meshes/link_wheel_2_collision.STL" />
+    <mesh name="link_mast_collision" file="./meshes/link_mast_collision.STL" />
+    <mesh name="link_lift_collision" file="./meshes/link_lift_collision.STL" />
+    <mesh name="link_arm_l4_collision" file="./meshes/link_arm_l4_collision.STL" />
+    <mesh name="link_arm_l3_collision" file="./meshes/link_arm_l3_collision.STL" />
+    <mesh name="link_arm_l2_collision" file="./meshes/link_arm_l2_collision.STL" />
+    <mesh name="link_arm_l1_collision" file="./meshes/link_arm_l1_collision.STL" />
+    <mesh name="link_arm_l0_collision" file="./meshes/link_arm_l0_collision.STL" />
+
+    <mesh name="base_link" file="./meshes/base_link.STL" />
+    <mesh name="link_wheel_0" file="./meshes/link_wheel_0.STL" />
+    <mesh name="link_wheel_1" file="./meshes/link_wheel_1.STL" />
+    <mesh name="link_wheel_2" file="./meshes/link_wheel_2.STL" />
+    <mesh name="link_mast" file="./meshes/link_mast.STL" />
+    <mesh name="link_lift" file="./meshes/link_lift.STL" />
+    <mesh name="link_arm_l4" file="./meshes/link_arm_l4.STL" />
+    <mesh name="link_arm_l3" file="./meshes/link_arm_l3.STL" />
+    <mesh name="link_arm_l2" file="./meshes/link_arm_l2.STL" />
+    <mesh name="link_arm_l1" file="./meshes/link_arm_l1.STL" />
+    <mesh name="link_arm_l0" file="./meshes/link_arm_l0.STL" />
+
+    <mesh name="link_wrist" file="./meshes/link_wrist.STL" />
+    <mesh name="link_wrist_yaw" file="./meshes/link_wrist_yaw.STL" />
+    <mesh name="link_wrist_pitch" file="./meshes/link_wrist_pitch.STL" />
+    <mesh name="link_wrist_roll" file="./meshes/link_wrist_roll.STL" />
+    <mesh name="gripper_camera_link" file="./meshes/gripper_camera_link.STL" />
+    <mesh name="link_tool_attachment_site" file="./meshes/link_tool_attachment_site.STL" />
+    <mesh name="link_head_collision" file="./meshes/link_head_collision.STL" />
+    <mesh name="link_head" file="./meshes/link_head.STL" />
+    <mesh name="link_hesai_left_collision" file="./meshes/link_hesai_left_collision.STL" />
+    <mesh name="link_hesai_left" file="./meshes/link_hesai_left.STL" />
+    <mesh name="link_hesai_right_collision" file="./meshes/link_hesai_right_collision.STL" />
+    <mesh name="link_hesai_right" file="./meshes/link_hesai_right.STL" />
+    <mesh name="link_camera_right" file="./meshes/link_camera_right.STL" />
+    <mesh name="link_camera_left" file="./meshes/link_camera_left.STL" />
+    <mesh name="link_camera_center" file="./meshes/link_camera_center.STL" />
+    <mesh name="link_gripper_s4_body" file="./meshes/link_gripper_s4_body.STL" />
+    <mesh name="link_gripper_finger_right" file="./meshes/link_gripper_finger_right.STL" />
+    <mesh name="link_gripper_fingertip_right" file="./meshes/link_gripper_fingertip_right.STL" />
+    <mesh name="link_gripper_finger_left" file="./meshes/link_gripper_finger_left.STL" />
+    <mesh name="link_gripper_fingertip_left" file="./meshes/link_gripper_fingertip_left.STL" />
+
+  </asset>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 0.12740222089719128" quat="1 0 0 0">
+      <freejoint />
+
+      <site name="imu" size="0.01" pos="0 0 0" />
+
+      <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="base_link"
+        density="0" group="1" class="visualgeom" />
+      <geom name="base_link" mass="26.8" type="cylinder" size="0.2150 0.0876" pos="0.0000 0.0011 0.0876" rgba="0.752941 0.752941 0.752941 1" class="collision" />
+
+
+      <body name="link_mast" pos="-0.093 -0.098 0.0062">
+        <geom type="mesh"
+          mesh="link_mast" class="visualgeom" />
+        <geom type="cylinder" size="0.0400 0.7360" pos="0.0000 -0.0014 0.8159" class="collision" mass="4.25" />
+      </body>
+
+
+      <geom pos="-0.093 -0.0979713 1.5646" quat="1 0 0 0" type="mesh"
+        rgba="0.752941 0.752941 0.752941 1" mesh="link_head"
+        density="0" group="1" class="visualgeom" />
+      <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_head_collision"
+        pos="-0.093 -0.0979713 1.5646" quat="1 0 0 0" class="collision" />
+
+
+      <body name="link_lidar_right" pos="0.0387442 -0.124414 1.50375"
+        quat="-0.339444 -0.353553 -0.853553 0.176704">
+        <geom type="mesh" rgba="0.298039 0.298039 0.298039 1" mesh="link_hesai_right"
+          density="0" group="1" class="visualgeom" />
+        <!-- <geom type="mesh" rgba="0.298039 0.298039 0.298039 1" mesh="link_hesai_right_collision"
+        class="collision" /> -->
+        <include file="hemisphere_lidar_cameras_right.xml" />
+      </body>
+
+
+      <body name="link_lidar_left" pos="0.0387442 0.124414 1.50375"
+        quat="0.176704 -0.853553 -0.353553 -0.339444">
+        <geom type="mesh" rgba="0.298039 0.298039 0.298039 1" mesh="link_hesai_left"
+          density="0" group="1" class="visualgeom" />
+        <!-- <geom type="mesh" rgba="0.298039 0.298039 0.298039 1" mesh="link_hesai_left_collision"
+        class="collision" /> -->
+        <include file="hemisphere_lidar_cameras_left.xml" />
+      </body>
+
+
+      <body name="link_camera_right" pos="0.0736423 -0.075 1.54612" quat="0.446198 0 0.894934 0">
+        <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link_camera_right"
+          density="0" group="1" class="visualgeom" />
+        <!-- <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link_camera_right"  /> -->
+        <camera name="link_camera_right" pos="0 0 0.015" euler="0 3.14 0" />
+      </body>
+
+      <body name="laser" pos="0.0 0.0 0.2" quat="0 0 0 1">
+        <replicate count="360" euler="0 0 0.0174533">
+            <site name="lidar" zaxis="1 0 0"/>
+        </replicate>
+      </body>
+
+      <body name="link_camera_left" pos="0.0736423 0.075 1.54612" quat="0 0.894934 0 0.446198">
+        <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link_camera_left"
+          density="0" group="1" class="visualgeom" />
+        <!-- <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link_camera_left"  /> -->
+        <camera name="link_camera_left" pos="0 0 0.015" euler="0 3.14 0" />
+      </body>
+
+      <body name="link_camera_center" pos="0.0800039 0 1.53817" quat="0 0.809017 0 0.587785">
+        <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link_camera_center"
+          density="0" group="1" class="visualgeom" />
+        <!-- <geom type="mesh" rgba="0.792157 0.819608 0.933333 1" mesh="link_camera_center"/> -->
+        <camera name="link_camera_center" pos="0 0 0.015" euler="0 3.14 0" />
+      </body>
+
+      <include file="omniwheels.xml" />
+
+      <body name="link_lift" pos="-0.093 -0.0994 0.2362" gravcomp="1">
+        <inertial pos="-0.010177 0.0738112 0.0111377" quat="0.489497 0.511231 0.490398 0.508473"
+          mass="2.05763" diaginertia="0.00324532 0.00286011 0.00207173" />
+        <joint name="joint_lift" class="lift_stretch4" />
+        <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_lift"
+          density="0" group="1" class="visualgeom" />
+        <geom type="cylinder" size="0.0922 0.1370" pos="0.0433 0.0543 0.0302" euler="0 1.5708 0" class="collision" />
+
+        <body name="link_arm_l4" gravcomp="1">
+          <geom pos="-0.0295 0.0994 -0.0128595" quat="0.707107 0 0.707107 0" type="mesh"
+            rgba="0.752941 0.752941 0.752941 1" mesh="link_arm_l4"
+            density="0" group="1" class="visualgeom" />
+          <geom type="cylinder" size="0.0922 0.1370" pos="-0.0295 0.0994 -0.0128595" quat="0.707107 0 0.707107 0" mass="0.1" class="collision" />
+          <body name="link_arm_l3" pos="-0.028 0.0994 -0.0128595" quat="0.707107 0 0.707107 0"
+            gravcomp="1">
+            <inertial pos="-0.00169666 1.23403e-09 0.11307" quat="1 0 -0.000396465 0"
+              mass="0.253486"
+              diaginertia="0.000737537 0.000702212 0.000254621" />
+            <joint name="joint_arm_l3" class="telescope" />
+            <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_arm_l3"
+              density="0" group="1" class="visualgeom" />
+            <geom type="cylinder" size="0.0446 0.1119" pos="0.0000 0.0000 0.1119" class="collision" />
+            <body name="link_arm_l2" pos="0 0 0.0135" gravcomp="1">
+              <inertial pos="-0.00200863 -2.37709e-07 0.115753" quat="1 0 -0.000385675 0"
+                mass="0.230201" diaginertia="0.000676932 0.000645972 0.000198378" />
+              <joint name="joint_arm_l2" class="telescope" />
+              <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_arm_l2"
+                density="0" group="1" class="visualgeom" />
+              <geom type="cylinder" size="0.0421 0.1129" pos="0.0000 0.0000 0.1129" class="collision" />
+              <body name="link_arm_l1" pos="0 0 0.0135" gravcomp="1">
+                <inertial pos="-0.00206878 4.64136e-08 0.117804" quat="1 0 -0.000426271 0"
+                  mass="0.209448" diaginertia="0.000618754 0.000592847 0.000152502" />
+                <joint name="joint_arm_l1" class="telescope" />
+                <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_arm_l1"
+                  density="0" group="1" class="visualgeom" />
+                <geom type="cylinder" size="0.0396 0.1139" pos="0.0000 0.0000 0.1139" class="collision" />
+                <body name="link_arm_l0" pos="0 0 0.01375" gravcomp="1">
+                  <inertial pos="0.000157238 5.01583e-05 0.143402"
+                    quat="0.999988 0.00035173 0.00488351 -0.000582197" mass="0.447727"
+                    diaginertia="0.0011253 0.00106748 0.000219509" />
+                  <joint name="joint_arm_l0" class="telescope" />
+                  <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_arm_l0"
+                    density="0" group="1" class="visualgeom" />
+                  <geom type="cylinder" size="0.0344 0.1396" pos="0.0033 0.0000 0.1396" class="collision" />
+                  <geom pos="0.03672 0 0.25115" quat="0.5 -0.5 0.5 -0.5" type="mesh"
+                    rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist"
+                    density="0" group="1" class="visualgeom" />
+                  <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist"
+                    pos="0.03672 0 0.25115" quat="0.5 -0.5 0.5 -0.5" />
+                  <body name="link_wrist_yaw" pos="0.03672 0 0.25115" quat="-0.707107 0 0.707107 0"
+                    gravcomp="1">
+                    <inertial pos="2.72652e-06 -0.0110706 -0.0376073"
+                      quat="0.684565 -0.1768 0.176882 0.684708" mass="0.0650873"
+                      diaginertia="5.1519e-05 4.11764e-05 2.74308e-05" />
+                    <joint name="joint_wrist_yaw" class="wrist_yaw_stretch4" />
+                    <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist_yaw"
+                      density="0" group="1" class="visualgeom" />
+                    <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist_yaw" />
+                    <body name="link_wrist_pitch" pos="0 -0.04222 -0.0452"
+                      quat="0 0 0.707107 0.707107" gravcomp="1">
+                      <inertial pos="-0.0110705 -2.76972e-06 -0.0376073"
+                        quat="0.968223 6.73543e-05 0.250087 0.000103455" mass="0.0650877"
+                        diaginertia="5.15193e-05 4.11759e-05 2.74305e-05" />
+                      <joint name="joint_wrist_pitch" class="wrist_pitch_stretch4" />
+                      <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist_pitch"
+                        density="0" group="1" class="visualgeom" />
+                      <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist_pitch" />
+                      <body name="link_wrist_roll" pos="-0.04222 0 -0.0452"
+                        quat="0.707107 0 0.707107 0" gravcomp="1">
+                        <inertial pos="-0.000270708 0.00991374 -0.0364928"
+                          quat="0.952263 -0.18227 -0.0461335 -0.240507" mass="0.317043"
+                          diaginertia="0.000435861 0.000432722 0.000158805" />
+                        <joint name="joint_wrist_roll" class="wrist_roll_stretch4" />
+                        <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist_roll"
+                          density="0" group="1" class="visualgeom" />
+                        <geom type="mesh" rgba="0.752941 0.752941 0.752941 1" mesh="link_wrist_roll" />
+                        <geom pos="0 0.0660509 -0.0253083" quat="0.5 0.5 0.5 -0.5" type="mesh"
+                          rgba="0.792157 0.819608 0.933333 1" mesh="gripper_camera_link"
+                          density="0" group="1" class="visualgeom" />
+                        <body name="d405_camera_mount" pos="0 0.0660509 -0.0253083" quat="0.5 0.5 0.5 -0.5">
+                            <include file="d405_cameras.xml"/>
+                        </body>
+                        <geom type="mesh" rgba="0.792157 0.819608 0.933333 1"
+                          mesh="gripper_camera_link" pos="0 0.0660509 -0.0253083"
+                          quat="0.5 0.5 0.5 -0.5" />
+                        <geom pos="0 0 -0.0186" quat="0 -0.707107 -0.707107 0" type="mesh"
+                          rgba="0.752941 0.752941 0.752941 1" mesh="link_tool_attachment_site"
+                          density="0" group="1" class="visualgeom" />
+                        <geom type="mesh" rgba="0.752941 0.752941 0.752941 1"
+                          mesh="link_tool_attachment_site" pos="0 0 -0.0186"
+                          quat="0 -0.707107 -0.707107 0" />
+                        <geom pos="0 0 -0.0186" quat="0 -0.000398163 -1 0" type="mesh"
+                          rgba="0.752941 0.752941 0.752941 1" mesh="link_gripper_s4_body"
+                          density="0" group="1" class="visualgeom" />
+                        <geom type="mesh" rgba="0.752941 0.752941 0.752941 1"
+                          mesh="link_gripper_s4_body" pos="0 0 -0.0186" quat="0 -0.000398163 -1 0" />
+
+                        <body name="link_gripper_s4_body" euler="0 0 0" pos="0 0 0" gravcomp="1">
+
+                          <body name="link_gripper_slider" euler="0 0 0" pos="0 0 0" gravcomp="1">
+                            <!-- <joint name="joint_gripper_slide" class="finger_slide" /> -->
+                            <geom type="box" size=".03 .005 .005" mass=".05" class="visualgeom"
+                              rgba="0 0 0 0" />
+                            <body name="link_gripper_finger_right"
+                              pos="0.02226 -1.77262e-05 -0.055991"
+                              quat="1 3.6732e-06 -1.47603e-09 -0.000401837" gravcomp="1">
+                              <inertial pos="0.0404064 -2.42526e-06 -0.118186"
+                                quat="0.694062 -0.134115 -0.134032 0.694497" mass="0.0249257"
+                                diaginertia="0.00010004 9.41556e-05 7.11563e-06" />
+                              <joint name="joint_gripper_finger_right" class="gripper_right_finger" />
+                              <geom type="mesh" rgba="1 0.94902 0.909804 1"
+                                mesh="link_gripper_finger_right"
+                                density="0" group="1" class="visualgeom" />
+                              <geom type="mesh" rgba="1 0.94902 0.909804 1"
+                                mesh="link_gripper_finger_right" class="rubber" />
+                              <geom pos="0.0732141 0 -0.177807" quat="0.382683 0 -0.92388 0"
+                                type="mesh" rgba="0.698039 0.698039 0.698039 1"
+                                mesh="link_gripper_fingertip_right"
+                                density="0" group="1" class="visualgeom" />
+                              <geom type="mesh" rgba="0.698039 0.698039 0.698039 1"
+                                mesh="link_gripper_fingertip_right" pos="0.0732141 0 -0.177807"
+                                quat="0.382683 0 -0.92388 0" class="rubber" />
+                            </body>
+                            <body name="link_gripper_finger_left"
+                              pos="-0.02226 1.77262e-05 -0.055991"
+                              quat="1 3.6732e-06 -1.47603e-09 -0.000401837" gravcomp="1">
+                              <inertial pos="-0.0403668 2.42547e-06 -0.118165"
+                                quat="0.694051 0.134174 0.134091 0.694486" mass="0.0249235"
+                                diaginertia="0.000100075 9.41908e-05 7.11601e-06" />
+                              <joint name="joint_gripper_finger_left" class="gripper_left_finger" />
+                              <geom type="mesh" rgba="1 0.94902 0.909804 1"
+                                mesh="link_gripper_finger_left"
+                                density="0" group="1" class="visualgeom" />
+                              <geom type="mesh" rgba="1 0.94902 0.909804 1"
+                                mesh="link_gripper_finger_left" class="rubber" />
+                              <geom pos="-0.0732141 0 -0.177807" quat="0.382683 0 0.92388 0"
+                                type="mesh" rgba="0.698039 0.698039 0.698039 1"
+                                mesh="link_gripper_fingertip_left"
+                                density="0" group="1" class="visualgeom" />
+                              <geom type="mesh" rgba="0.698039 0.698039 0.698039 1"
+                                mesh="link_gripper_fingertip_left" pos="-0.0732141 0 -0.177807"
+                                quat="0.382683 0 0.92388 0" class="rubber" />
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

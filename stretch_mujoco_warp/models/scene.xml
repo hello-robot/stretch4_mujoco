@@ -1,0 +1,7 @@
+<mujoco model="stretch scene">
+  <include file="open_world_scene.xml"/>
+  <include file="stretch_3/stretch.xml"/>
+
+  <!-- <include file="room_scene/room_scene.xml"/> -->
+  <!-- <include file="table.xml"/> -->
+</mujoco>

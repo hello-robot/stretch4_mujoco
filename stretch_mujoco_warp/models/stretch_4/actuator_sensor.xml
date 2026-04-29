@@ -1,0 +1,22 @@
+<mujoco model="stretch actuator_sensor">
+    <actuator>
+      <position name="back_wheel_vel" joint="joint_back_wheel" class="wheel"/>
+      <position name="right_wheel_vel" joint="joint_right_wheel" class="wheel"/>
+      <position name="left_wheel_vel" joint="joint_left_wheel" class="wheel"/>
+
+      <position name="lift" joint="joint_lift" class="lift_stretch4" />
+      <position name="arm" tendon="extend" class="telescope" />
+      <position name="wrist_yaw" joint="joint_wrist_yaw" class="wrist_yaw_stretch4" />
+      <position name="wrist_pitch" joint="joint_wrist_pitch" class="wrist_pitch_stretch4" />
+      <position name="wrist_roll" joint="joint_wrist_roll" class="wrist_roll_stretch4" />
+      <position name="gripper_right_finger" joint="joint_gripper_finger_right" class="gripper_right_finger"/>
+      <position name="gripper_left_finger" joint="joint_gripper_finger_left" class="gripper_left_finger"/>
+    </actuator>
+
+  <sensor>
+    <gyro name="base_gyro" site="imu" />
+    <accelerometer name="base_accel" site="imu" />
+    <rangefinder name="base_lidar" site="lidar" cutoff="10.0"/>
+  </sensor>
+
+</mujoco>

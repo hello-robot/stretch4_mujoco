@@ -1,0 +1,32 @@
+<mujoco model="stretch scene">
+  <statistic center="0 0 .75" extent="1.2" meansize="0.05"/>
+
+  <visual>
+    <quality shadowsize="4096" offsamples="4"/>
+    <headlight ambient=".25 .25 .25" diffuse="0.250 0.250 0.250" specular="0.250 0.250 0.250"/>
+  </visual>
+
+  <asset>
+    <material name="floor" rgba="0.937 0.886 0.816 1" reflectance="0.01" />
+    <mesh name="rooms" file="some_rooms.stl" scale="0.05 0.05 0.05"/>
+  </asset>
+
+  <compiler angle="radian"/>
+
+  <default>
+    <default class="scene">
+      <geom contype="0" conaffinity="0"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="rooms" pos="-2.0 -2.0 0.0" childclass="scene">
+      <light directional="false" diffuse="0.8 0.8 0.8" specular="0.03 0.03 0.03" pos="4 6 30.0" />
+
+      <geom name="rooms" type="mesh" mesh="rooms" rgba="0.8 0.8 0.9 1.0" />
+      <geom name="floor" pos="3.9133275 6.3406725 0.0" size="3.9133275 6.3406725 .1" conaffinity="1" contype="4" type="plane" material="floor"/>
+    </body>
+  </worldbody>
+
+  <include file="stretch_4/stretch_4.xml"/>
+</mujoco>
