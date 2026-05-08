@@ -1,4 +1,0 @@
-<mujoco model="d405_wrist_cameras">
-<camera name="d405_rgb" pos="0 0 0" euler="1.57 -1.57 0"/>
-<camera name="d405_depth" pos="0 0 0" euler="1.57 -1.57 0"/>
-</mujoco>

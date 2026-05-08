@@ -1,8 +1,0 @@
-<mujoco model="keyframes">
-    <keyframe>
-      <!-- <key name="home" ctrl="0 0 0.6 0.1 0 0 0 0 0 0"/>
-      <key name="stow" ctrl="0 0 0.23 0 3.14 -0.4 0 0 0 0"/> -->
-      <key name="home" ctrl="0 0 0 0.6 0.1 0 0 0 0 0" />
-      <key name="stow" ctrl="0 0 0 0.23 0 3.14 -0.4 0 0 0" />
-    </keyframe>
-</mujoco>
