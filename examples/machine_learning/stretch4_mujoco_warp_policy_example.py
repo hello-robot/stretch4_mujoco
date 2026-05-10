@@ -18,6 +18,69 @@ try:
 except ImportError:
     pass  # Allow import to fail if mujoco_warp is not installed, it will error later if needed.
 
+def patch_robocasa():
+    """
+    Patches Robocasa to remove strict mujoco and numpy version checks
+    so it can be used with newer versions compatible with mujoco_warp.
+    """
+    import os
+    
+    robocasa_init_path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), 
+        "../../third_party/robocasa/robocasa/__init__.py"
+    ))
+    
+    if not os.path.exists(robocasa_init_path):
+        try:
+            import importlib.util
+            spec = importlib.util.find_spec("robocasa")
+            if spec is not None and spec.origin is not None:
+                robocasa_init_path = spec.origin
+            else:
+                return
+        except Exception:
+            return
+
+    with open(robocasa_init_path, 'r') as f:
+        lines = f.readlines()
+
+    modified = False
+    in_mujoco_assert = False
+    in_numpy_assert = False
+
+    for i in range(len(lines)):
+        line = lines[i]
+        
+        # Check for un-commented asserts
+        if line.strip() == 'assert (' and i + 1 < len(lines) and 'mujoco.__version__' in lines[i+1] and not line.startswith('#'):
+            in_mujoco_assert = True
+            
+        if line.startswith('assert numpy.__version__ in ['):
+            in_numpy_assert = True
+            
+        if in_mujoco_assert:
+            lines[i] = '# ' + line
+            modified = True
+            if 'MuJoCo version must be' in line:
+                in_mujoco_assert = False
+                
+        if in_numpy_assert:
+            lines[i] = '# ' + line
+            modified = True
+            if 'numpy version must be' in line:
+                in_numpy_assert = False
+
+    if modified:
+        try:
+            with open(robocasa_init_path, 'w') as f:
+                f.writelines(lines)
+            print("Successfully patched robocasa version checks.")
+        except Exception as e:
+            print(f"Failed to write patch for robocasa: {e}")
+
+# Run the patch before importing robocasa
+patch_robocasa()
+
 from stretch_mujoco.robocasa_gen import model_generation_wizard
 from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
