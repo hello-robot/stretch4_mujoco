@@ -18,6 +18,30 @@ try:
 except ImportError:
     pass  # Allow import to fail if mujoco_warp is not installed, it will error later if needed.
 
+def get_default_config() -> Dict[str, Any]:
+    config = {
+        "NWORLD": 16,
+        "num_iterations": 20,
+        "rollout_length": 48,
+        "minibatch_size": 4096,
+        "NJMAX": 513,
+        "NCONMAX": 1024,
+        "render_during_training": True,
+        "render_freq": 2
+    }
+    # config = {
+    #     "NWORLD": 1024,
+    #     "num_iterations": 2000,
+    #     "rollout_length": 128,
+    #     "minibatch_size": 4096,
+    #     "NJMAX": 513,
+    #     "NCONMAX": 1024,
+    #     "render_during_training": True,
+    #     "render_freq": 2
+    # }
+    config["batch_size"] = config["NWORLD"] * config["rollout_length"]
+    return config
+
 def patch_robocasa():
     """
     Patches Robocasa to remove strict mujoco and numpy version checks
@@ -114,18 +138,6 @@ def setup_environment():
     wp.config.quiet = True
     wp.init()
 
-def get_default_config() -> Dict[str, Any]:
-    return {
-        "NWORLD": 16,
-        "num_iterations": 20,
-        "rollout_length": 48,
-        "batch_size": 16 * 48,
-        "minibatch_size": 4096,
-        "NJMAX": 513,
-        "NCONMAX": 1024,
-        "render_during_training": True,
-        "render_freq": 2
-    }
 
 def generate_robocasa_model(target_category: str = "apple") -> Tuple[mujoco.MjModel, str]:
     robot_xml_path = Stretch4MujocoSimulator.get_robot_xml_path()
@@ -250,7 +262,8 @@ class PPOTrainer:
             returns = advantages + values
             return advantages, returns
 
-        @jax.jit
+        import functools
+        @functools.partial(jax.jit, static_argnames=['tx'])
         def update_ppo(params, opt_state, tx, obs, actions, log_probs_old, returns, advantages):
             def loss_fn(p):
                 mean, log_std, value = ActorCritic(nu).apply(p, obs)
@@ -436,7 +449,7 @@ def run_training(trainer: PPOTrainer):
             print(f"Iteration {i}, Mean Reward: {all_rewards.mean():.4f}, Loss: {loss:.4f}")
             
     print("Training finished!")
-    return params
+    return params, training_frames
 
 def save_params(params, filename_prefix="trained_ppo_params"):
     bytes_output = serialization.to_bytes(params)
@@ -514,14 +527,32 @@ if __name__ == "__main__":
     setup_environment()
     config = get_default_config()
     mj_model, target_object_body_name = generate_robocasa_model()
+
+    # sim = Stretch4MujocoSimulator(
+    #     model=mj_model,
+    #     scene_xml_path=None,
+    #     cameras_to_use=[],
+    #     camera_hz=10.00,
+    # )
+
+    # sim.start(headless=False)
+
+    # while sim.is_running():
+    #     time.sleep(0.1)
+
     warp_model, warp_data = load_mujoco_warp_model(mj_model, config)
     
     trainer = PPOTrainer(mj_model, warp_model, warp_data, target_object_body_name, config)
     
-    # Run training
-    params = run_training(trainer)
+    # # Run training
+    params, training_frames = run_training(trainer)
     
-    # Save the trained parameters
+    # # Save the trained parameters
     filename = save_params(params)
     print(f"Training complete. Parameters saved to {filename}")
+
+    if training_frames:
+        video_filename = f"training_video_{int(time.time())}.mp4"
+        media.write_video(video_filename, training_frames, fps=15)
+        print(f"Saved training video to {video_filename}")
 
