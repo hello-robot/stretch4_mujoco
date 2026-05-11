@@ -1,0 +1,25 @@
+<mujoco model="table">
+
+  <asset>
+    <texture type="2d" name="wood" file="./assets/wood.png"/>
+    <material name="wood" texture="wood"/>
+    <mesh name="cup" file="./assets/cup/cup_0.obj" scale="0.05 0.05 0.05"/>
+    <material name="SphereObjectColor" rgba="1 1 0 1"/>
+    <material name="TableColor" rgba="1 1 1 1"/>
+  </asset>
+
+    <worldbody>
+      <body name="table" pos="0 -1 .24">
+        <geom type="box" size=".6 .5 .24" mass="1" material="TableColor"/>
+      </body>
+      <body name="cup" pos="-.02 -0.55 .6" euler="1.57 3.14 0">
+        <freejoint/>
+        <geom type="mesh" mesh="cup" mass=".2" rgba="0.9 0.9 0.9 1"/>
+      </body>
+      <body name="tennis_ball" pos=".1 -0.55 .6">
+        <freejoint/>
+        <geom type="sphere" size=".035" mass=".058" material="SphereObjectColor"/>
+      </body>
+    </worldbody>
+
+  </mujoco>

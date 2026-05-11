@@ -1,0 +1,4 @@
+<mujoco model="gripper_wrist_cameras">
+<camera name="gripper_rgb" pos="-0.04 -0.01 0" euler="1.57 1.57 3.14"/>
+<camera name="gripper_depth" pos="-0.04 0 0" euler="1.57 1.57 3.14"/>
+</mujoco>

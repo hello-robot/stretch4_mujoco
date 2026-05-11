@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Vim files
+*.swp
+*.swo
+*.swn
+
+# Other
+.mypy_cache/
+.vscode/
+.idea/
+MUJOCO_LOG.TXT
+
+# Temp runtime XML
+stretch_temp_abs.xml
+.DS_Store

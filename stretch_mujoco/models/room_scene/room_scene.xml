@@ -1,0 +1,38 @@
+<mujoco model="room_scene">
+<!-- Acknowledgement Vikash Kumar (vikashplus@gmail.com) https://github.com/vikashplus/scene_sim Apache License 2.0 -->
+
+  <asset>
+    <texture name="texplane" type="2d" height="1" width="1" file="../models/room_scene/oak_floorboard.png"/>
+    <material name="MatPlane" reflectance="0.01" texture="texplane" texrepeat="4 4" texuniform="true"/>
+    <mesh name="room" file="../models/room_scene/simpleroom1.stl" scale="1 1 1"/>
+    <material name="MatWall" rgba="1 1 1 1"/>
+  </asset>
+
+  <compiler angle="radian"/>
+
+
+  <visual>
+    <quality shadowsize="4096" offsamples="4"/>
+  </visual>
+
+  <default>
+    <default class='scene'>
+      <geom contype="0" conaffinity="0"/>
+    </default>
+  </default>
+
+  <worldbody>
+
+    <body name="room" pos="0 0 0" childclass="scene">
+      <!-- indoor lights -->
+      <!-- <light directional='false' diffuse='.8 .8 .8' specular='0.03 0.03 0.03' pos='0 0 3.0' dir='0 0 -3'/> -->
+
+      <geom name="room" pos="0 0 0" type="mesh" mesh="room" rgba="1 1 1 1" euler="-.0 0 3.14" material="MatWall"/>
+      <geom name="floor" pos="0 0 0.001" size="3 2.5 .1" conaffinity="1" contype="4" type="plane" material="MatPlane"/>
+      <geom name="lamp" pos="2.604 2.1 1.65" type="cylinder" size=".3 .2" rgba="2 1.6 0 .6" group="1"/>
+      <light directional='false' diffuse='1 0.8 0' specular='1 1 1' pos='2.604 2.1 1.5' dir='1 1 1' exponent="1" castshadow="false"/>
+
+    </body>
+  </worldbody>
+
+</mujoco>

@@ -1,0 +1,7 @@
+<mujoco model="stretch scene">
+  <statistic center="0 0 .75" extent="1.2" meansize="0.05"/>
+
+  <include file="room_scene/room_scene.xml"/>
+  <include file="stretch_4/stretch_4_dynamic.xml"/>
+  <include file="table.xml"/>
+</mujoco>
