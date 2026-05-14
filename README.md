@@ -2,6 +2,12 @@
 
 This repo provides a simulation stack for Stretch 4, built on [MuJoCo](https://github.com/google-deepmind/mujoco). The simulation for Stretch 3 can be found in the [stretch_mujoco](https://github.com/hello-robot/stretch_mujoco) repo. The simulation includes position control for the arm and gripper joints, velocity control for mobile base, calibrated camera RGB + depth imagery, 3D lidar clouds, and more. There is a visualizer that supports user interaction, or a more efficient headless mode. There is a [ROS2 package](https://github.com/hello-robot/stretch4_ros2/tree/jazzy/stretch_simulation), built on this library, that works with Nav2 and more. There is 100s of permutations of Robocasa-provided kitchen environments that Stretch can spawn into. The MuJoCo API can be used for features like deformables, procedural model generation, SDF collisions, cloth simulation, and more.
 
+
+
+https://github.com/user-attachments/assets/ea683561-998b-44d3-9d45-41ab1b1664ab
+
+
+
 ## Getting Started
 
 First, install [`uv`](https://docs.astral.sh/uv/#getting-started). Uv is a package manager that we'll use to run this project.
