@@ -37,31 +37,32 @@ class Actuators(Enum):
         Opposite mapping to get_actuator_by_joint_names_in_mjcf()
         """
         if self == Actuators.left_wheel_vel:
-            return ["joint_left_wheel"]
+            return ["joint_left_wheel", "left_wheel_joint"]
         if self == Actuators.right_wheel_vel:
-            return ["joint_right_wheel"]
+            return ["joint_right_wheel", "right_wheel_joint"]
         if self == Actuators.back_wheel_vel:
-            return ["joint_back_wheel"]
+            return ["joint_back_wheel", "back_wheel_joint"]
         if self == Actuators.lift:
-            return ["joint_lift"]
+            return ["joint_lift", "lift_joint"]
         if self == Actuators.arm:
-            return ["joint_arm_l0", "joint_arm_l1", "joint_arm_l2", "joint_arm_l3"]
+            return ["joint_arm_l0", "joint_arm_l1", "joint_arm_l2", "joint_arm_l3",
+                    "arm_l4_joint", "arm_l3_joint", "arm_l2_joint", "arm_l1_joint"]
         if self == Actuators.wrist_yaw:
-            return ["joint_wrist_yaw"]
+            return ["joint_wrist_yaw", "wrist_yaw_joint"]
         if self == Actuators.wrist_pitch:
-            return ["joint_wrist_pitch"]
+            return ["joint_wrist_pitch", "wrist_pitch_joint"]
         if self == Actuators.wrist_roll:
-            return ["joint_wrist_roll"]
+            return ["joint_wrist_roll", "wrist_roll_joint"]
         if self == Actuators.gripper:
-            return ["joint_gripper_slide"]
+            return ["joint_gripper_slide", "gripper_slide_joint"]
         if self == Actuators.gripper_left_finger:
-            return ["joint_gripper_finger_left"]
+            return ["joint_gripper_finger_left", "gripper_finger_left_joint"]
         if self == Actuators.gripper_right_finger:
-            return ["joint_gripper_finger_right"]
+            return ["joint_gripper_finger_right", "gripper_finger_right_joint"]
         if self == Actuators.head_pan:
-            return ["joint_head_pan"]
+            return ["joint_head_pan", "head_pan_joint"]
         if self == Actuators.head_tilt:
-            return ["joint_head_tilt"]
+            return ["joint_head_tilt", "head_tilt_joint"]
 
         raise NotImplementedError(f"Joint names for {self} are not defined.")
 
@@ -73,36 +74,36 @@ class Actuators(Enum):
 
         Opposite mapping to get_joint_names_in_mjcf()
         """
-        if joint_name == "joint_left_wheel":
+        if joint_name in ("joint_left_wheel", "left_wheel_joint"):
             return Actuators.left_wheel_vel
-        if joint_name == "joint_right_wheel":
+        if joint_name in ("joint_right_wheel", "right_wheel_joint"):
             return Actuators.right_wheel_vel
-        if joint_name == "joint_back_wheel":
+        if joint_name in ("joint_back_wheel", "back_wheel_joint"):
             return Actuators.back_wheel_vel
         if joint_name == 'translate_mobile_base' or joint_name == 'position':
             return Actuators.base_translate
         if joint_name == 'rotate_mobile_base':
             return Actuators.base_rotate
 
-        if joint_name == "joint_lift":
+        if joint_name in ("joint_lift", "lift_joint"):
             return Actuators.lift
-        if "joint_arm" in joint_name:
+        if "joint_arm" in joint_name or "arm_l" in joint_name:
             return Actuators.arm
-        if joint_name == "joint_wrist_yaw":
+        if joint_name in ("joint_wrist_yaw", "wrist_yaw_joint"):
             return Actuators.wrist_yaw
-        if joint_name == "joint_wrist_pitch":
+        if joint_name in ("joint_wrist_pitch", "wrist_pitch_joint"):
             return Actuators.wrist_pitch
-        if joint_name == "joint_wrist_roll":
+        if joint_name in ("joint_wrist_roll", "wrist_roll_joint"):
             return Actuators.wrist_roll
-        if joint_name == "joint_gripper_slide" or joint_name == "gripper_aperture":
+        if joint_name in ("joint_gripper_slide", "gripper_slide_joint", "gripper_aperture"):
             return Actuators.gripper
-        if "joint_gripper_finger_left" in joint_name:
+        if "joint_gripper_finger_left" in joint_name or "gripper_finger_left" in joint_name:
             return Actuators.gripper_left_finger
-        if "joint_gripper_finger_right" in joint_name:
+        if "joint_gripper_finger_right" in joint_name or "gripper_finger_right" in joint_name:
             return Actuators.gripper_right_finger
-        if joint_name == "joint_head_pan":
+        if joint_name in ("joint_head_pan", "head_pan_joint"):
             return Actuators.head_pan
-        if joint_name == "joint_head_tilt":
+        if joint_name in ("joint_head_tilt", "head_tilt_joint"):
             return Actuators.head_tilt
 
         raise NotImplementedError(f"Actuator for {joint_name} is not defined.")

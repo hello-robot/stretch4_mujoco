@@ -160,9 +160,9 @@ class KeyboardController:
         elif key == "k":
             self.sim.move_by(Actuators.arm, 0.05)
         elif key == "o":
-            self.sim.move_by(Actuators.wrist_yaw, 0.2)
-        elif key == "p":
             self.sim.move_by(Actuators.wrist_yaw, -0.2)
+        elif key == "p":
+            self.sim.move_by(Actuators.wrist_yaw, 0.2)
         elif key == "c":
             self.sim.move_by(Actuators.wrist_pitch, 0.2)
         elif key == "v":

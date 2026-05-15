@@ -438,7 +438,11 @@ class MujocoServer:
 
         self.mjdata = MjData(self.mjmodel)
 
-        self.use_diff_drive = mujoco.mj_name2id(self.mjmodel, mujoco.mjtObj.mjOBJ_JOINT, Actuators.back_wheel_vel.get_joint_names_in_mjcf()[0]) == -1 # Check if back wheel does not exist.
+        self.use_diff_drive = True
+        for b_name in Actuators.back_wheel_vel.get_joint_names_in_mjcf():
+            if mujoco.mj_name2id(self.mjmodel, mujoco.mjtObj.mjOBJ_JOINT, b_name) != -1:
+                self.use_diff_drive = False
+                break
 
         self._base_in_pos_motion = False
 
@@ -752,7 +756,7 @@ class MujocoServer:
             
             def is_robot_geom(g_name):
                 if not g_name: return False
-                return "link_" in g_name or "stretch" in g_name or "base_" in g_name
+                return "link_" in g_name or "_link" in g_name or "stretch" in g_name or "base_" in g_name
                 
             if is_robot_geom(geom1_name) and is_robot_geom(geom2_name):
                 # A lot of geoms might technically intersect by design depending on limits, but ncon tracks active contacts.

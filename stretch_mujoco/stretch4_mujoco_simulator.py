@@ -1,18 +1,18 @@
+import tempfile
 import time
 
 import click
 import numpy as np
 from mujoco._structs import MjModel
+from stretch4_urdf import get_urdf
 
+import stretch_mujoco.utils as utils
+from stretch_mujoco.datamodels.status_command import CommandBaseVelocity
 from stretch_mujoco.enums.actuators import Actuators
 from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.datamodels.status_command import (
-    CommandBaseVelocity,
-)
 from stretch_mujoco.pointcloud_utils import get_pointcloud_from_camera_status
 from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
-import stretch_mujoco.utils as utils
-from stretch_mujoco.utils import require_connection, block_until_check_succeeds
+from stretch_mujoco.utils import block_until_check_succeeds, require_connection
 
 
 class Stretch4MujocoSimulator(StretchMujocoSimulator):
@@ -99,30 +99,16 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             Stretch4MujocoSimulator.get_default_model_batch_tool_names()
         )
 
-        try:
-            from stretch4_urdf.urdf_utils_generate_from_base_xacro import get_urdf
-            import tempfile
-
-            out_dir = tempfile.mkdtemp()
-            generated_urdf_path = get_urdf(
-                model_name=model_name,
-                batch_name=batch_name,
-                tool_name=tool_name,
-                output_dir=out_dir,
-                description="mujoco_stretch_4",
-            )
-            print(f"Generated URDF path: {generated_urdf_path}")
-            return generated_urdf_path
-        except Exception as e:
-            import click
-
-            click.secho(
-                f"Warning: Failed to generate URDF dynamically. Falling back to pre-built URDF file. Error: {e}",
-                fg="yellow",
-            )
-            pkg_path = utils.get_urdf_package_path("stretch4_urdf")
-            file_name = utils.get_urdf_file_name(model_name, tool_name)
-            return str(pkg_path / f"{model_name}_{batch_name}" / file_name)
+        out_dir = tempfile.mkdtemp()
+        generated_urdf_path = get_urdf(
+            model_name=model_name,
+            batch_name=batch_name,
+            tool_name=tool_name,
+            output_dir=out_dir,
+            description="mujoco_stretch_4",
+        )
+        print(f"Generated URDF path: {generated_urdf_path}")
+        return generated_urdf_path
 
     @staticmethod
     def get_all_cameras() -> list[StretchCameras]:

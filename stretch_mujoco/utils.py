@@ -258,6 +258,18 @@ class URDFmodel:
             "joint_gripper_finger_left",
             "joint_head_pan",
             "joint_head_tilt",
+            
+            "wrist_yaw_joint",
+            "wrist_pitch_joint",
+            "wrist_roll_joint",
+            "lift_joint",
+            "arm_l4_joint",
+            "arm_l3_joint",
+            "arm_l2_joint",
+            "arm_l1_joint",
+            "gripper_finger_left_joint",
+            "head_pan_joint",
+            "head_tilt_joint",
         ]:
             if joint_name in self.urdf.joint_map:
                 self.joint_names.append(joint_name)
@@ -275,16 +287,34 @@ class URDFmodel:
             "joint_arm_l1": cfg["arm"] / 4,
             "joint_arm_l2": cfg["arm"] / 4,
             "joint_arm_l3": cfg["arm"] / 4,
+            
+            "wrist_yaw_joint": cfg["wrist_yaw"],
+            "wrist_pitch_joint": cfg["wrist_pitch"],
+            "wrist_roll_joint": cfg["wrist_roll"],
+            "lift_joint": cfg["lift"],
+            "arm_l4_joint": cfg["arm"] / 4,
+            "arm_l3_joint": cfg["arm"] / 4,
+            "arm_l2_joint": cfg["arm"] / 4,
+            "arm_l1_joint": cfg["arm"] / 4,
         }
         if (
             "joint_head_pan" in cfg.keys()
         ):  # Assumes is pan is available, joint_head_tilt is also available.
             lk_cfg["joint_head_pan"] = cfg["head_pan"]
             lk_cfg["joint_head_tilt"] = cfg["head_tilt"]
+        if "head_pan_joint" in cfg.keys():
+            lk_cfg["head_pan_joint"] = cfg["head_pan"]
+            lk_cfg["head_tilt_joint"] = cfg["head_tilt"]
+        
         if "gripper" in cfg.keys():
             lk_cfg["joint_gripper_finger_left"] = cfg["gripper"]
             lk_cfg["joint_gripper_finger_right"] = cfg["gripper"]
-        return self.urdf.link_fk(lk_cfg, link=link_name)  # type: ignore
+            lk_cfg["gripper_finger_left_joint"] = cfg["gripper"]
+            lk_cfg["gripper_finger_right_joint"] = cfg["gripper"]
+            
+        # Filter lk_cfg to only include joints that exist in this specific urdf
+        valid_lk_cfg = {k: v for k, v in lk_cfg.items() if k in self.urdf.joint_map}
+        return self.urdf.link_fk(valid_lk_cfg, link=link_name)  # type: ignore
 
 
 def replace_xml_tag_value(xml_str: str, tag: str, attribute: str, pattern: str, value: str) -> str:

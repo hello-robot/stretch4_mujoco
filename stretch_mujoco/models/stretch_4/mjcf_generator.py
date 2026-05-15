@@ -1,28 +1,46 @@
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from urdf2mjcf.convert import convert_urdf_to_mjcf
+from urdf2mjcf.model import ConversionMetadata
 
 
-def generate_mjcf(urdf_path: str, out_mjcf_path: str):
+def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     """
     Generates a Stretch 4 MJCF from the provided URDF using urdf2mjcf and programmatic DOM manipulations.
     Note, this function only works for stretch 4 urdf -> mjcf, and is based on a manual process that used to happen to convert a URDF to an mjcf.
     """
-    print(f"Using {urdf_path=}")
-    # Create a temporary file for the raw urdf2mjcf output
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
-        raw_mjcf_path = tmp.name
+    
+    print(f"Generating mjcf from {urdf_path}")
+    urdf_path = Path(urdf_path)
+    if out_mjcf_path is None: 
+        out_mjcf_path = urdf_path.with_suffix(".mjcf")
+    else: 
+        out_mjcf_path = Path(out_mjcf_path)
 
-    # 1. Run urdf2mjcf
-    try:
-        subprocess.run(
-            ["urdf2mjcf", urdf_path, "--output", raw_mjcf_path], check=True, capture_output=True
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"urdf2mjcf failed: {e.stderr.decode()}")
+    # 1. Determine the root link
+    urdf_tree = ET.parse(urdf_path)
+    has_base_footprint = urdf_tree.getroot().find(".//link[@name='base_footprint']") is not None
+    root_link = "base_footprint" if has_base_footprint else "base_link"
+    offset_z = 0.0 if has_base_footprint else 0.03
+
+    metadata = ConversionMetadata(
+        # Adjust the initial altitude of the spawned robot to prevent omniwheels from clipping into the terrain plane
+        height_offset=offset_z,
+        # Allow the root link to be "unwelded"
+        freejoint=True,
+        # Do not anchor the root link to a surface
+        floating_base=True,
+        # Avoid the default "front_camera" and "side_camera" artifacts
+        cameras=[],
+    )
+
+    convert_urdf_to_mjcf(urdf_path, out_mjcf_path, metadata=metadata)
 
     # 2. Parse the raw MJCF
-    tree = ET.parse(raw_mjcf_path)
+    tree = ET.parse(out_mjcf_path)
     root = tree.getroot()
 
     # Create a new root holding only asset and worldbody
@@ -91,49 +109,35 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
         elif geom_class == "collision":
             geom_name = geom.get("name", "")
             if geom_name in [
-                "link_grasp_center_collision",
-                "link_quick_connect_interface_collision",
-                "link_tool_attachment_site_collision",
-            ] or geom_name.startswith("link_aruco_"):
+                "grasp_center_collision_link",
+                "quick_connect_interface_collision_link",
+                "tool_attachment_site_collision_link",
+            ] or geom_name.startswith("aruco__link"):
                 geom.set("contype", "0")
                 geom.set("conaffinity", "0")
             elif geom_name in [
-                "link_gripper_fingertip_left_collision",
-                "link_gripper_fingertip_right_collision",
+                "gripper_fingertip_left_collision_link",
+                "gripper_fingertip_right_collision_link",
             ]:
                 geom.set("class", "rubber")
 
         if "material" in geom.attrib and geom.attrib["material"] == "":
             del geom.attrib["material"]
 
-    # 4. Remove lights, ground, and cameras from worldbody
-    for tag in ["light", "camera"]:
-        for el in worldbody.findall(tag):
-            worldbody.remove(el)
-    for geom in worldbody.findall("geom"):
-        if geom.get("name") == "ground" or geom.get("type") == "plane":
-            worldbody.remove(geom)
 
-    # 5. Rename root body to stretch4 and update its geoms
+    # 4. Rename root body to stretch4 and update its geoms
     base_body = worldbody.find("body")
     if base_body is not None:
         if base_body.get("name") != "stretch4":
             base_body.set("name", "stretch4")
         if "childclass" in base_body.attrib:
             del base_body.attrib["childclass"]
-
-        # Shift the robot up slightly to avoid clipping wheels into the floor at spawn
-        base_body.set("pos", "0 0 0.03")
-
-        # Ensure freejoint exists
-        if base_body.find("freejoint") is None:
-            ET.SubElement(base_body, "freejoint")
-
+            
         ET.SubElement(base_body, "site", name="imu", size="0.01", pos="0 0 0")
 
-    # 6. Replace wheels with omniwheels and include omniwheels.xml
+    # 5. Replace wheels with omniwheels and include omniwheels.xml
     parent_map = {c: p for p in worldbody.iter() for c in p}
-    for old_name in ["link_wheel_0", "link_wheel_1", "link_wheel_2"]:
+    for old_name in ["wheel_0_link", "wheel_1_link", "wheel_2_link"]:
         w_body = find_body(old_name)
         if w_body is not None:
             p = parent_map.get(w_body)
@@ -143,16 +147,16 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
     if base_body is not None:
         ET.SubElement(base_body, "include", file="omniwheels.xml")
 
-    # 7. Add lidars, cameras, and laser
-    lidar_r = find_body("link_lidar_right")
+    # 6. Add lidars, cameras, and laser
+    lidar_r = find_body("lidar_right_link")
     if lidar_r is not None:
         ET.SubElement(lidar_r, "include", file="hemisphere_lidar_cameras_right.xml")
 
-    lidar_l = find_body("link_lidar_left")
+    lidar_l = find_body("lidar_left_link")
     if lidar_l is not None:
         ET.SubElement(lidar_l, "include", file="hemisphere_lidar_cameras_left.xml")
 
-    for cam in ["link_camera_right", "link_camera_left", "link_camera_center"]:
+    for cam in ["camera_right_link", "camera_left_link", "camera_center_link"]:
         cam_body = find_body(cam)
         if cam_body is not None:
             ET.SubElement(cam_body, "camera", name=cam, pos="0 0 0.015", euler="0 3.14 0")
@@ -169,8 +173,8 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
         rep = ET.SubElement(laser, "replicate", count="360", euler="0 0 0.0174533")
         ET.SubElement(rep, "site", name="lidar", zaxis="1 0 0")
 
-    # 8. Encapsulate gripper camera in wrist
-    wrist_roll = find_body("link_wrist_roll")
+    # 7. Encapsulate gripper camera in wrist
+    wrist_roll = find_body("wrist_roll_link")
     if wrist_roll is not None:
         gripper = ET.SubElement(
             wrist_roll,
@@ -181,30 +185,30 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
         )
         ET.SubElement(gripper, "include", file="gripper_cameras.xml")
 
-    # 9. Modify Mast to use appropriate collision mass
-    mast = find_body("link_mast")
+    # 8. Modify Mast to use appropriate collision mass
+    mast = find_body("mast_link")
     if mast is not None:
         for geom in mast.findall("geom"):
             mast.remove(geom)
-        ET.SubElement(mast, "geom", type="mesh", mesh="link_mast", **{"class": "visualgeom"})
+        ET.SubElement(mast, "geom", type="mesh", mesh="mast_link", **{"class": "visualgeom"})
         ET.SubElement(
-            mast, "geom", mesh="link_mast_collision", **{"class": "collision"}, mass="4.25"
+            mast, "geom", mesh="mast_collision_link", **{"class": "collision"}, mass="4.25"
         )
 
-    # 10. Update link_arm_l4 if needed and add gravcomp to lift, arm, wrist, gripper bodies
+    # 9. Update arm_l0_link if needed and add gravcomp to lift, arm, wrist, gripper bodies
     for b in worldbody.findall(".//body"):
         name = b.get("name", "")
-        if "link_lift" in name or "link_arm" in name or "link_wrist" in name or "gripper" in name:
+        if "lift_link" in name or "arm_link" in name or "wrist_link" in name or "gripper" in name:
             b.set("gravcomp", "1")
 
-    # 11. Encapsulate gripper fingers into link_gripper_slider
-    f_right = find_body("link_gripper_finger_right")
-    f_left = find_body("link_gripper_finger_left")
+    # 10. Encapsulate gripper fingers into gripper_slider_link
+    f_right = find_body("gripper_finger_right_link")
+    f_left = find_body("gripper_finger_left_link")
     if f_right is not None and f_left is not None:
         parent_map = {c: p for p in worldbody.iter() for c in p}
         p = parent_map.get(f_right)
         if p is not None:
-            slider = ET.Element("body", name="link_gripper_slider", pos="0 0 0", gravcomp="1")
+            slider = ET.Element("body", name="gripper_slider_link", pos="0 0 0", gravcomp="1")
             ET.SubElement(
                 slider,
                 "geom",
@@ -220,32 +224,17 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
             slider.append(f_left)
             p.append(slider)
 
-    # 12. Add "rubber" class to gripper fingers and fix thin-shell mesh issues
+    # 11. Add "rubber" class to gripper fingers and fix thin-shell mesh issues
     for geom in worldbody.findall(".//geom"):
         mesh = geom.get("mesh", "")
         if "gripper_finger" in mesh or "gripper_fingertip" in mesh:
             if geom.get("class") != "visualgeom":
                 geom.set("class", "rubber")
 
-                # # Replace complex gray finger meshes with robust solid primitive boxes to prevent objects from tunneling/getting stuck in the scissor mechanism
-                # The are not placed correctly - press 1, 2, and 4 on the mujoco viewer to see them.
-                # if mesh == "link_gripper_finger_right":
-                #     geom.set("type", "box")
-                #     geom.set("size", "0.035 0.005 0.015")
-                #     geom.set("pos", "0.033 -0.007 0")
-                #     if "mesh" in geom.attrib:
-                #         del geom.attrib["mesh"]
-                # elif mesh == "link_gripper_finger_left":
-                #     geom.set("type", "box")
-                #     geom.set("size", "0.035 0.005 0.015")
-                #     geom.set("pos", "-0.033 -0.007 0")
-                #     if "mesh" in geom.attrib:
-                #         del geom.attrib["mesh"]
-
     # Add compliant passive joints to fingertips to allow surface alignment
     for body in worldbody.findall(".//body"):
         name = body.get("name", "")
-        if name in ["link_gripper_fingertip_right", "link_gripper_fingertip_left"]:
+        if name in ["gripper_fingertip_right_link", "gripper_fingertip_left_link"]:
             ET.SubElement(
                 body,
                 "joint",
@@ -271,32 +260,27 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
                 range="-0.15 0.15",
             )
 
-    # 13. Update Joint Classes
+    # 12. Update Joint Classes
     for j in worldbody.findall(".//joint"):
         name = j.get("name", "")
-        if "joint_lift" in name:
+        if "lift_joint" in name:
             j.set("class", "lift_stretch4")
-        elif "joint_arm_l" in name:
+        elif "arm_l" in name and "_joint" in name:
             j.set("class", "telescope")
-        elif "joint_wrist_yaw" in name:
+        elif "wrist_yaw_joint" in name:
             j.set("class", "wrist_yaw_stretch4")
-            # TODO: remove this temporary fix when the urdf is fixed to switch the negative z-axis direction in ../stretch4_urdf/stretch4_urdf urdf's for the wrist joints
-            j.set("axis", "0 0 1")
-            j.set("range", "-4.276 1.134")
-        elif "joint_wrist_pitch" in name:
+        elif "wrist_pitch_joint" in name:
             j.set("class", "wrist_pitch_stretch4")
-            # TODO: remove this temporary fix when the urdf is fixed to switch the negative z-axis direction in ../stretch4_urdf/stretch4_urdf urdf's for the wrist joints
-            j.set("axis", "0 0 1")
-            j.set("range", "-4.276 1.134")
-        elif "joint_wrist_roll" in name:
+        elif "wrist_roll_joint" in name:
             j.set("class", "wrist_roll_stretch4")
-            # TODO: remove this temporary fix when the urdf is fixed to switch the negative z-axis direction in ../stretch4_urdf/stretch4_urdf urdf's for the wrist joints
-            j.set("axis", "0 0 1")
-            j.set("range", "-1.134 4.276")
-        elif "joint_gripper_finger_left" in name:
+        elif "gripper_finger_left_joint" in name:
             j.set("class", "gripper_left_finger")
-        elif "joint_gripper_finger_right" in name:
+        elif "gripper_finger_right_joint" in name:
             j.set("class", "gripper_right_finger")
+        else:
+            # urdf2mjcf assigns 'motor' by default. If it wasn't remapped above, it's invalid.
+            if j.get("class") == "motor":
+                raise ValueError(f"Unexpected joint '{name}' retains invalid default class 'motor'. Please add a dedicated class mapping in mjcf_generator.py")
 
     # Clean up the generated string and save
     ET.indent(new_root, space="  ", level=0)
@@ -315,18 +299,18 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
             act_tree = ET.parse(actuator_xml_path)
             act_root = act_tree.getroot()
 
-            joint_ranges = {}
+            ranges_joint = {}
             for j in worldbody.findall(".//joint"):
                 name = j.get("name")
                 r = j.get("range")
                 if name and r:
-                    joint_ranges[name] = r
+                    ranges_joint[name] = r
 
             # The arm tendon "extend" represents the sum of 4 telescope joints
-            if "joint_arm_l0" in joint_ranges:
+            if "arm_l4_joint" in ranges_joint:
                 try:
-                    l_min, l_max = map(float, joint_ranges["joint_arm_l0"].split())
-                    joint_ranges["tendon_extend"] = f"{l_min * 4} {l_max * 4}"
+                    l_min, l_max = map(float, ranges_joint["arm_l4_joint"].split())
+                    ranges_joint["tendon_extend"] = f"{l_min * 4} {l_max * 4}"
                 except ValueError:
                     pass
 
@@ -335,10 +319,10 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
                 t_name = pos.get("tendon")
 
                 r = None
-                if j_name and j_name in joint_ranges:
-                    r = joint_ranges[j_name]
-                elif t_name == "extend" and "tendon_extend" in joint_ranges:
-                    r = joint_ranges["tendon_extend"]
+                if j_name and j_name in ranges_joint:
+                    r = ranges_joint[j_name]
+                elif t_name == "extend" and "tendon_extend" in ranges_joint:
+                    r = ranges_joint["tendon_extend"]
 
                 if r:
                     pos.set("ctrlrange", r)
@@ -349,10 +333,3 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str):
     except Exception as e:
         print(f"Failed to generate autogenerated_actuator_sensor.xml: {e}")
 
-    # Cleanup temp file
-    try:
-        import os
-
-        os.remove(raw_mjcf_path)
-    except OSError:
-        pass
