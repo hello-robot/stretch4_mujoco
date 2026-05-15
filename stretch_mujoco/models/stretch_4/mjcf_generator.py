@@ -20,15 +20,11 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     else: 
         out_mjcf_path = Path(out_mjcf_path)
 
-    # 1. Determine the root link
-    urdf_tree = ET.parse(urdf_path)
-    has_base_footprint = urdf_tree.getroot().find(".//link[@name='base_footprint']") is not None
-    root_link = "base_footprint" if has_base_footprint else "base_link"
-    offset_z = 0.0 if has_base_footprint else 0.03
+    # 1. Update default settings
 
     metadata = ConversionMetadata(
-        # Adjust the initial altitude of the spawned robot to prevent omniwheels from clipping into the terrain plane
-        height_offset=offset_z,
+        # Adjust the height so the wheels do not start below the floor (measure from the base_link)
+        height_offset=0.056,
         # Allow the root link to be "unwelded"
         freejoint=True,
         # Do not anchor the root link to a surface
