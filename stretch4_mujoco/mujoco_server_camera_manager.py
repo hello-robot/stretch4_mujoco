@@ -7,13 +7,13 @@ import mujoco
 import mujoco._enums
 import numpy as np
 
-from stretch_mujoco import config, utils
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
-from stretch_mujoco.utils import FpsCounter, switch_to_glfw_renderer
+from stretch4_mujoco import config, utils
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
+from stretch4_mujoco.utils import FpsCounter, switch_to_glfw_renderer
 
 if TYPE_CHECKING:
-    from stretch_mujoco.mujoco_server import MujocoServer
+    from stretch4_mujoco.mujoco_server import MujocoServer
 
 
 class MujocoServerCameraManagerSync:
@@ -111,7 +111,7 @@ class MujocoServerCameraManagerSync:
 
         renderer._scene_option.flags[mujoco._enums.mjtVisFlag.mjVIS_RANGEFINDER] = False # Disables the lidar yellow lines.
 
-        from stretch_mujoco.mujoco_server_passive import MujocoServerPassive
+        from stretch4_mujoco.mujoco_server_passive import MujocoServerPassive
 
         if platform.system() == "Darwin" and not isinstance(
             self.mujoco_server, MujocoServerPassive

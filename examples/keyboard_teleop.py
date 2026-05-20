@@ -7,11 +7,11 @@ import click
 from examples.rerun_utils import init_pointcloud_viz, update_pointcloud_viz
 from examples.camera_feeds import show_camera_feeds_sync
 from examples.laser_scan import show_laser_scan
-from stretch_mujoco import StretchMujocoSimulator
-from stretch_mujoco.enums.actuators import Actuators
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.enums.stretch_sensors import StretchSensors
-from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch4_mujoco import StretchMujocoSimulator
+from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.enums.stretch_sensors import StretchSensors
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
 
 def print_keyboard_options():
@@ -237,7 +237,7 @@ def main(
     model = None
 
     if select_env:
-        from stretch_mujoco.robocasa_gen import model_generation_wizard
+        from stretch4_mujoco.robocasa_gen import model_generation_wizard
 
         model, xml, objects_info = model_generation_wizard(
             stretch_xml_absolute=simulator_class.get_robot_xml_path()

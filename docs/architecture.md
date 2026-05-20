@@ -1,16 +1,20 @@
 # Using the Mujoco Simulator with Stretch
 
-When using Mujoco to simulate Stretch, you can command [joints](../stretch_mujoco/enums/actuators.py) and access joint poses and [camera](../stretch_mujoco/enums/stretch_cameras.py) data.
+When using Mujoco to simulate Stretch, you can command [joints](../stretch4_mujoco/enums/actuators.py) and access joint poses and [camera](../stretch4_mujoco/enums/stretch_cameras.py) data.
 
 ## Getting Started
 
 1. Read the [README](../README.md) to install the required dependencies.
 2. Check out the controller examples, such as:
+
 - [keyboard_teleop.py](../examples/keyboard_teleop.py)
 - [gamepad_teleopy.py](../examples/gamepad_teleop.py)
+
 3. Check out the headless examples, such as:
+
 - [draw_circles.py](../examples/draw_circles.py)
 - [camera_feeds.py](../examples/camera_feeds.py)
+
 4. Check out the sensor example: [laser_scan.py](../examples/laser_scan.py)
 
 ### Terminology
@@ -20,11 +24,11 @@ The following words apply to this document only, to make it easier to read:
 - [Mujoco](https://mujoco.readthedocs.io/en/stable/overview.html): An open-source physics engine.
 - [Mujoco Viewer](https://mujoco.readthedocs.io/en/stable/programming/samples.html#sasimulate): An interactive Mujoco GUI that ships with Mujoco. This is spawned when you don't use `headless` mode.
 - [Headless Mode](https://mujoco.readthedocs.io/en/stable/APIreference/APIfunctions.html#main-simulation): Using the Mujoco simulation without the Mujoco Viewer. This calls `mj_step` directly to step the simulation. For the purposes of Stretch Mujoco Simulations, this is a performant mode to run simulations in.
-- [Stretch Mujoco Simulator](../stretch_mujoco/stretch_mujoco_simulator.py): A scaffolding that enables you to send commands and receive sensor data to and from Stretch in a Mujoco environment.
+- [Stretch Mujoco Simulator](../stretch4_mujoco/stretch4_mujoco_simulator.py): A scaffolding that enables you to send commands and receive sensor data to and from Stretch in a Mujoco environment.
 
 ## Control Flow
 
-All simulations using [Stretch Mujoco Simulator](../stretch_mujoco/stretch_mujoco_simulator.py) should have an entry point that looks similar to this:
+All simulations using [Stretch Mujoco Simulator](../stretch4_mujoco/stretch4_mujoco_simulator.py) should have an entry point that looks similar to this:
 
 ```python
 if __name__ == "__main__":
@@ -58,7 +62,7 @@ There are two methods for pulling data from the simulation: `sim.pull_status()` 
 
 Use `sim.pull_status()` to fetch the joint states of the robot.
 
-This method returns a `StatusStretchJoints` [dataclass](../stretch_mujoco/datamodels/status_stretch_joints.py) with the names of all the joints populated.
+This method returns a `StatusStretchJoints` [dataclass](../stretch4_mujoco/datamodels/status_stretch_joints.py) with the names of all the joints populated.
 
 The statuses of all the joints are fetched at the same time.
 
@@ -66,11 +70,11 @@ The statuses of all the joints are fetched at the same time.
 
 Use `sim.pull_sensor_data()` to fetch data from sensors on Stretch.
 
-This methods returns a `StatusStretchSensors` [dataclass](../stretch_mujoco/datamodels/status_stretch_sensors.py)
+This methods returns a `StatusStretchSensors` [dataclass](../stretch4_mujoco/datamodels/status_stretch_sensors.py)
 
 The statuses of all the sensors are fetched at the same time.
 
-All the sensors defined in [`stretch.xml`](../stretch_mujoco/models/scene.xml) are fetched:
+All the sensors defined in [`stretch.xml`](../stretch4_mujoco/models/scene.xml) are fetched:
 
 ```
   <sensor>
@@ -82,12 +86,11 @@ All the sensors defined in [`stretch.xml`](../stretch_mujoco/models/scene.xml) a
 
 > Note: The Lidar sensor (implemented as `<rangefinder/>`) is compute intensive. Comment it out in the XML, if you are not using it.
 
-
 #### Stretch Cameras
 
 Use `sim.pull_camera_data()` to fetch the pixel values from Stretch's cameras.
 
-This method returns a `StatusStretchCameras` [dataclass](../stretch_mujoco/datamodels/status_stretch_camera.py) with the names of all the cameras populated.
+This method returns a `StatusStretchCameras` [dataclass](../stretch4_mujoco/datamodels/status_stretch_camera.py) with the names of all the cameras populated.
 
 The pixel values of all the renderings of the cameras are fetched at the same time.
 
@@ -135,7 +138,6 @@ When you call `sim.start()`, the following process diagram explains how Mujoco i
 > tl;dr The Mujoco simulator is started on a spawned process, and data is communicated between your main process and the Mujoco process using a [Multiprocesing Manager](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Manager).
 
 <img src="images/mujoco_server_process_diagram.jpg" width=600>
-
 
 ### Mujoco rendering locks
 

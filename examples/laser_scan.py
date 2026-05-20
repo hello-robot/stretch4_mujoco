@@ -3,10 +3,10 @@ import click
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.enums.stretch_sensors import StretchSensors
-from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.enums.stretch_sensors import StretchSensors
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch4_mujoco.stretch4_mujoco_simulator import StretchMujocoSimulator
 
 try:
     # Some machines seem to need this for matplotlib to work.

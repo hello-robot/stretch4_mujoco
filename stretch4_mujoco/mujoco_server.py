@@ -15,22 +15,22 @@ import numpy as np
 from mujoco._structs import MjData, MjModel
 import mujoco._enums
 
-from stretch_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
-from stretch_mujoco.datamodels.status_stretch_joints import StatusStretchJoints
-from stretch_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
-from stretch_mujoco.enums.actuators import Actuators
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-import stretch_mujoco.config as config
-from stretch_mujoco.enums.stretch_sensors import StretchSensors
-from stretch_mujoco.mujoco_server_camera_manager import (
+from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
+from stretch4_mujoco.datamodels.status_stretch_joints import StatusStretchJoints
+from stretch4_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
+from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+import stretch4_mujoco.config as config
+from stretch4_mujoco.enums.stretch_sensors import StretchSensors
+from stretch4_mujoco.mujoco_server_camera_manager import (
     MujocoServerCameraManagerThreaded,
     MujocoServerCameraManagerSync,
 )
-from stretch_mujoco.datamodels.status_command import CommandBaseVelocity, CommandMove, StatusCommand
-from stretch_mujoco.mujoco_server_sensor_manager import MujocoServerSensorManagerThreaded
-import stretch_mujoco.utils as utils
-from stretch_mujoco.utils import FpsCounter, change_start_pose, H0_from_driving_dir, inverse_3x3_matrix, rotation_3x3_matrix
-from stretch_mujoco.trapezoidal_profile import TrapezoidalProfile
+from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity, CommandMove, StatusCommand
+from stretch4_mujoco.mujoco_server_sensor_manager import MujocoServerSensorManagerThreaded
+import stretch4_mujoco.utils as utils
+from stretch4_mujoco.utils import FpsCounter, change_start_pose, H0_from_driving_dir, inverse_3x3_matrix, rotation_3x3_matrix
+from stretch4_mujoco.trapezoidal_profile import TrapezoidalProfile
 
 @dataclass
 class MujocoServerProxies:
@@ -426,7 +426,7 @@ class MujocoServer:
 
         if scene_xml_path is None:
             # Import here to avoid circular dependency
-            from stretch_mujoco import StretchMujocoSimulator
+            from stretch4_mujoco import StretchMujocoSimulator
             scene_xml_path = StretchMujocoSimulator.get_scene_xml_path()
 
         if model is None:

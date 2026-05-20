@@ -4,10 +4,10 @@ import click
 import numpy as np
 
 from examples.camera_feeds import show_camera_feeds_sync
-from stretch_mujoco.enums.actuators import Actuators
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch4_mujoco.stretch4_mujoco_simulator import StretchMujocoSimulator
 
 
 def draw_circle(n, diameter_m, arm_init, lift_init, sim: StretchMujocoSimulator):

@@ -2,9 +2,9 @@ import click
 import cv2
 
 from examples.camera_feeds import show_camera_feeds_sync
-from stretch_mujoco import StretchMujocoSimulator
-from stretch_mujoco.robocasa_gen import model_generation_wizard
-from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch4_mujoco import StretchMujocoSimulator
+from stretch4_mujoco.robocasa_gen import model_generation_wizard
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
 
 @click.command()

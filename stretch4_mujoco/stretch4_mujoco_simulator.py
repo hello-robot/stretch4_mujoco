@@ -6,13 +6,13 @@ import numpy as np
 from mujoco._structs import MjModel
 from stretch4_urdf import get_urdf
 
-import stretch_mujoco.utils as utils
-from stretch_mujoco.datamodels.status_command import CommandBaseVelocity
-from stretch_mujoco.enums.actuators import Actuators
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.pointcloud_utils import get_pointcloud_from_camera_status
-from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
-from stretch_mujoco.utils import block_until_check_succeeds, require_connection
+import stretch4_mujoco.utils as utils
+from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity
+from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.pointcloud_utils import get_pointcloud_from_camera_status
+from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+from stretch4_mujoco.utils import block_until_check_succeeds, require_connection
 
 
 class Stretch4MujocoSimulator(StretchMujocoSimulator):
@@ -65,7 +65,7 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         """
         Returns the default robot XML path for the Stretch Mujoco Simulator.
         """
-        from stretch_mujoco.models.stretch_4.mjcf_generator import generate_mjcf
+        from stretch4_mujoco.models.stretch_4.mjcf_generator import generate_mjcf
 
         urdf_path = Stretch4MujocoSimulator.get_urdf_path()
 
