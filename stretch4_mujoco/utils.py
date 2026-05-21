@@ -24,13 +24,13 @@ import numpy as np
 from mujoco._structs import MjModel
 from mujoco.glfw import GLContext as GlFwContext
 
-import stretch_mujoco.config as config
+import stretch4_mujoco.config as config
 
 if TYPE_CHECKING:
-    from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+    from stretch4_mujoco.stretch4_mujoco_simulator import StretchMujocoSimulator
 
 
-models_path = importlib.resources.files("stretch_mujoco") / "models"
+models_path = importlib.resources.files("stretch4_mujoco") / "models"
 
 
 def get_urdf_package_path(package_name="stretch_urdf"):

@@ -1,6 +1,6 @@
 import copy
 from dataclasses import asdict, dataclass
-from stretch_mujoco.utils import dataclass_from_dict
+from stretch4_mujoco.utils import dataclass_from_dict
 
 @dataclass
 class PositionVelocity:

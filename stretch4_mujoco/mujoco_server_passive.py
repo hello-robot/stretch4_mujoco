@@ -1,7 +1,7 @@
 import threading
 import time
-from stretch_mujoco.datamodels.status_command import StatusCommand
-from stretch_mujoco.utils import Rx, Ry, Rz, override
+from stretch4_mujoco.datamodels.status_command import StatusCommand
+from stretch4_mujoco.utils import Rx, Ry, Rz, override
 import numpy as np
 
 import click
@@ -9,9 +9,9 @@ import mujoco
 import mujoco._functions
 import mujoco.viewer
 from mujoco._enums import mjtGeom
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.mujoco_server import MujocoServer
-from stretch_mujoco.utils import FpsCounter
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.mujoco_server import MujocoServer
+from stretch4_mujoco.utils import FpsCounter
 
 import mujoco._enums
 

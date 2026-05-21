@@ -5,7 +5,7 @@ from typing import Callable
 
 import numpy as np
 
-from stretch_mujoco import config, utils
+from stretch4_mujoco import config, utils
 
 
 class StretchCameras(Enum):

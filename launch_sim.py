@@ -1,9 +1,9 @@
 from examples.rerun_utils import init_pointcloud_viz, update_pointcloud_viz
-import stretch_mujoco
+import stretch4_mujoco
 import click
 import cv2
 
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
 
 @click.command()
@@ -29,7 +29,7 @@ def main(
         cameras_to_use += StretchCameras.hemispherical_lidars()
         init_pointcloud_viz()
 
-    sim = stretch_mujoco.StretchMujocoSimulator(scene_xml_path,cameras_to_use=cameras_to_use) if use_stretch_3 else stretch_mujoco.Stretch4MujocoSimulator(scene_xml_path, cameras_to_use=cameras_to_use)
+    sim = stretch4_mujoco.StretchMujocoSimulator(scene_xml_path,cameras_to_use=cameras_to_use) if use_stretch_3 else stretch4_mujoco.Stretch4MujocoSimulator(scene_xml_path, cameras_to_use=cameras_to_use)
 
     sim.start(headless=headless)
     try:
