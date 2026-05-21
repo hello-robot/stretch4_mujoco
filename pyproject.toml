@@ -9,7 +9,6 @@ dependencies = [
     "click>=8.1.8",
     "hello-robot-stretch-urdf>=0.1.0",
     "hello-robot-stretch4-urdf>=2026.5.6",
-    "hello-robot-stretch4_body",
     "inputs>=0.5",
     "matplotlib>=3.10.1",
     "mujoco==3.3.1",
@@ -21,8 +20,6 @@ dependencies = [
     "urdf2mjcf>=0.2.39"
 
 ]
-[build.packages.my_component.dependencies.apt]
-packages = ["libasound-dev", "portaudio19-dev", "python3-all-dev"]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},
 ]
