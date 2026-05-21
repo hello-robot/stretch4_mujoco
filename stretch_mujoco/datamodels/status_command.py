@@ -5,8 +5,8 @@ Dataclasses that communicate movement commands to Mujoco.
 import copy
 from dataclasses import asdict, dataclass, field
 
-from stretch4_mujoco.enums.actuators import Actuators
-from stretch4_mujoco.utils import dataclass_from_dict
+from stretch_mujoco.enums.actuators import Actuators
+from stretch_mujoco.utils import dataclass_from_dict
 
 
 @dataclass

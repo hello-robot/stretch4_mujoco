@@ -1,4 +1,4 @@
-from stretch4_mujoco.stretch4_mujoco_simulator import StretchMujocoSimulator
+from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 
 
 if __name__ == "__main__":

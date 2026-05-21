@@ -2,7 +2,7 @@ import signal
 import threading
 from multiprocessing import Manager
 
-from stretch4_mujoco.mujoco_server import MujocoServer, MujocoServerProxies
+from stretch_mujoco.mujoco_server import MujocoServer, MujocoServerProxies
 
 def main():
     _manager = Manager()

@@ -1,8 +1,8 @@
 import click
 import pathlib
-from stretch4_mujoco import StretchMujocoSimulator
-from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-import stretch4_mujoco.utils as utils
+from stretch_mujoco import StretchMujocoSimulator
+from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+import stretch_mujoco.utils as utils
 from mujoco._structs import MjModel
 
 

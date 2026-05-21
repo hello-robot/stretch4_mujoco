@@ -3,8 +3,8 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from stretch4_mujoco.enums.stretch_sensors import StretchSensors
-from stretch4_mujoco.utils import dataclass_from_dict
+from stretch_mujoco.enums.stretch_sensors import StretchSensors
+from stretch_mujoco.utils import dataclass_from_dict
 
 
 @dataclass

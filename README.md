@@ -1,6 +1,6 @@
 # Overview
 
-This repo provides a simulation stack for Stretch 4, built on [MuJoCo](https://github.com/google-deepmind/mujoco). The simulation for Stretch 3 can be found in the [stretch4_mujoco](https://github.com/hello-robot/stretch4_mujoco) repo. The simulation includes position control for the arm and gripper joints, velocity control for mobile base, calibrated camera RGB + depth imagery, 3D lidar clouds, and more. There is a visualizer that supports user interaction, or a more efficient headless mode. There is a [ROS2 package](https://github.com/hello-robot/stretch4_ros2/tree/jazzy/stretch_simulation), built on this library, that works with Nav2 and more. There is 100s of permutations of Robocasa-provided kitchen environments that Stretch can spawn into. The MuJoCo API can be used for features like deformables, procedural model generation, SDF collisions, cloth simulation, and more.
+This repo provides a simulation stack for Stretch 4, built on [MuJoCo](https://github.com/google-deepmind/mujoco). The simulation for Stretch 3 can be found in the [stretch_mujoco](https://github.com/hello-robot/stretch_mujoco) repo. The simulation includes position control for the arm and gripper joints, velocity control for mobile base, calibrated camera RGB + depth imagery, 3D lidar clouds, and more. There is a visualizer that supports user interaction, or a more efficient headless mode. There is a [ROS2 package](https://github.com/hello-robot/stretch4_ros2/tree/jazzy/stretch_simulation), built on this library, that works with Nav2 and more. There is 100s of permutations of Robocasa-provided kitchen environments that Stretch can spawn into. The MuJoCo API can be used for features like deformables, procedural model generation, SDF collisions, cloth simulation, and more.
 
 ## Getting Started
 
@@ -33,7 +33,6 @@ uv run launch_sim.py
 To exit, press `Ctrl+C` in the terminal.
 
 > On MacOS, if `mjpython` fails to locate `libpython3.10.dylib` and `libz.1.dylib`, run these commands:
-
 ```shell
 # Before proceeding, please reload your terminal and/or IDE window, to make sure the correct UV environment variables are loaded.
 
@@ -97,16 +96,16 @@ Ignore any warnings.
 
 Use the Stretch4MujocoSimulator class to:
 
-- start the simulation
-- position control the robot's ranged joints
-- velocity control the robot's mobile base
-- read joint states
-- read camera imagery
+ * start the simulation
+ * position control the robot's ranged joints
+ * velocity control the robot's mobile base
+ * read joint states
+ * read camera imagery
 
 Try the code below using `uv run ipython`. For advanced Mujoco users, the class also exposes the `mjModel` and `mjData`. See the [official Mujoco documentation](https://mujoco.readthedocs.io/en/stable/python.html).
 
 ```python
-from stretch4_mujoco import Stretch4MujocoSimulator
+from stretch_mujoco import Stretch4MujocoSimulator
 
 if __name__ == "__main__":
     sim = Stretch4MujocoSimulator()
@@ -141,7 +140,7 @@ if __name__ == "__main__":
 
 ### Loading Robocasa Kitchen Scenes
 
-The `stretch4_mujoco.robocasa_gen.model_generation_wizard()` method gives you:
+The `stretch_mujoco.robocasa_gen.model_generation_wizard()` method gives you:
 
 - Wizard/API to generate a kitchen model for a given task, layout, and style.
 - If layout and style are not provided, it will take you through a wizard to choose them in the terminal.
@@ -149,8 +148,8 @@ The `stretch4_mujoco.robocasa_gen.model_generation_wizard()` method gives you:
 - You can also write the generated xml model with absolutepaths to a file.
 
 ```python
-from stretch4_mujoco import Stretch4MujocoSimulator
-from stretch4_mujoco.robocasa_gen import model_generation_wizard
+from stretch_mujoco import Stretch4MujocoSimulator
+from stretch_mujoco.robocasa_gen import model_generation_wizard
 
 # Use the wizard:
 model, xml, objects_info = model_generation_wizard(stretch_xml_absolute=StretchMujocoSimulator.get_robot_xml_path(),)
@@ -177,7 +176,7 @@ You can use this simulation in ROS2 using the [`stretch_simulation` package](htt
 Check out the following documentation resources:
 
 - [Architecture](./docs/architecture.md)
-- [Stretch 4 MJCF and URDF](./stretch4_mujoco/models/stretch_4/README.md)
+- [Stretch 4 MJCF and URDF](./stretch_mujoco/models/stretch_4/README.md)
 
 ### Feature Requests and Bug reporting
 
@@ -186,6 +185,7 @@ All the enhancements/bugfixes are tracked by [Github Issues](https://github.com/
 ## Acknowledgment
 
 The assets in this repository contain significant contributions and efforts from [Kevin Zakka](https://github.com/kevinzakka) and [Google Deepmind](https://github.com/google-deepmind), along with others in Hello Robot Inc. who helped us in modeling Stretch in Mujoco. Thank you for your contributions.
+
 
 ## License
 

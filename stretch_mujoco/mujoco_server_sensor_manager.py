@@ -3,12 +3,12 @@ import time
 from typing import TYPE_CHECKING
 import numpy as np
 
-from stretch4_mujoco.enums.stretch_sensors import StretchSensors
-from stretch4_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
-from stretch4_mujoco.utils import FpsCounter
+from stretch_mujoco.enums.stretch_sensors import StretchSensors
+from stretch_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
+from stretch_mujoco.utils import FpsCounter
 
 if TYPE_CHECKING:
-    from stretch4_mujoco.mujoco_server import MujocoServer
+    from stretch_mujoco.mujoco_server import MujocoServer
 
 
 class MujocoServerSensorManagerSync:

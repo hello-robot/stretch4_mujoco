@@ -1,4 +1,4 @@
-from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 from scipy.spatial.transform import Rotation as R
 
 

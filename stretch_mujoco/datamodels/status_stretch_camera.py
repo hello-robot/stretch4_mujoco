@@ -3,8 +3,8 @@ from dataclasses import asdict, dataclass
 import cv2
 import numpy as np
 
-from stretch4_mujoco.enums.stretch_cameras import StretchCameras
-from stretch4_mujoco.utils import dataclass_from_dict, get_depth_color_map
+from stretch_mujoco.enums.stretch_cameras import StretchCameras
+from stretch_mujoco.utils import dataclass_from_dict, get_depth_color_map
 
 
 @dataclass

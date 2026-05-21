@@ -1,8 +1,8 @@
 import numpy as np
 
-from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
-from stretch4_mujoco.enums.stretch_cameras import StretchCameras
-from stretch4_mujoco.utils import Rx, Ry, Rz
+from stretch_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
+from stretch_mujoco.enums.stretch_cameras import StretchCameras
+from stretch_mujoco.utils import Rx, Ry, Rz
 from scipy.spatial.transform import Rotation
 
 # TODO: Move this cam_hemilidar_top45 settings pull somewhere less ambiguous

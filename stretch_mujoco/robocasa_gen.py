@@ -10,7 +10,7 @@ from robocasa.models.scenes.scene_registry import LayoutType, StyleType
 from robosuite import load_part_controller_config
 from termcolor import colored
 
-from stretch4_mujoco.utils import (
+from stretch_mujoco.utils import (
     insert_line_after_mujoco_tag,
     replace_xml_tag_value,
     xml_modify_body_pos,
@@ -284,7 +284,7 @@ def model_generation_wizard(
 def custom_cleanups(xml: str) -> Tuple[str, dict]:
     """
     Custom cleanups to models from robocasa envs to support
-    use with stretch4_mujoco package.
+    use with stretch_mujoco package.
     """
 
     # make invisible the red/blue boxes around geom/sites of interests found

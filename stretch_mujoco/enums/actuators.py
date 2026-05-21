@@ -1,7 +1,7 @@
 from enum import Enum
 from functools import cache
 
-from stretch4_mujoco.datamodels.status_stretch_joints import StatusStretchJoints
+from stretch_mujoco.datamodels.status_stretch_joints import StatusStretchJoints
 
 
 class Actuators(Enum):

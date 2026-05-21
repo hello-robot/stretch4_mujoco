@@ -2,8 +2,8 @@ import collections
 import click
 from math import hypot
 
-from stretch4_mujoco import StretchMujocoSimulator
-from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch_mujoco import StretchMujocoSimulator
+from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 from matplotlib.pyplot import subplots, show
 
 

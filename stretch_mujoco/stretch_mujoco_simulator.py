@@ -12,23 +12,23 @@ import click
 import numpy as np
 from mujoco._structs import MjModel
 
-from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
-from stretch4_mujoco.datamodels.status_stretch_joints import StatusStretchJoints
-from stretch4_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
-from stretch4_mujoco.enums.actuators import Actuators
-from stretch4_mujoco.enums.stretch_cameras import StretchCameras
-from stretch4_mujoco.mujoco_server import MujocoServer, MujocoServerProxies
-from stretch4_mujoco.mujoco_server_managed import MujocoServerManaged
-from stretch4_mujoco.mujoco_server_passive import MujocoServerPassive
-from stretch4_mujoco.datamodels.status_command import (
+from stretch_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
+from stretch_mujoco.datamodels.status_stretch_joints import StatusStretchJoints
+from stretch_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
+from stretch_mujoco.enums.actuators import Actuators
+from stretch_mujoco.enums.stretch_cameras import StretchCameras
+from stretch_mujoco.mujoco_server import MujocoServer, MujocoServerProxies
+from stretch_mujoco.mujoco_server_managed import MujocoServerManaged
+from stretch_mujoco.mujoco_server_passive import MujocoServerPassive
+from stretch_mujoco.datamodels.status_command import (
     CommandBaseVelocity,
     CommandCoordinateFrameArrowsViz,
     CommandKeyframe,
     CommandMove,
     StatusCommand,
 )
-import stretch4_mujoco.utils as utils
-from stretch4_mujoco.utils import require_connection, block_until_check_succeeds
+import stretch_mujoco.utils as utils
+from stretch_mujoco.utils import require_connection, block_until_check_succeeds
 
 
 class StretchMujocoSimulator:
