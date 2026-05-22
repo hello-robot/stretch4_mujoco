@@ -1,0 +1,75 @@
+<mujoco model="stretch contact">
+  <contact>
+    <!-- <exclude body1="head_pan_link" body2="head_link"/> -->
+
+    <!-- References https://ekumenlabs.com/blog/posts/modeling-lekiwis-omni-base-in-mujoco/ -->
+    <pair geom1="floor" geom2="back_wheel_link" condim="3" friction="0.001 1.0" solref="0.005 1"
+      solimp="0.9 0.95 0.001" />
+    <pair geom1="floor" geom2="left_wheel_link" condim="3" friction="0.001 1.0" solref="0.005 1"
+      solimp="0.9 0.95 0.001" />
+    <pair geom1="floor" geom2="right_wheel_link" condim="3" friction="0.001 1.0" solref="0.005 1"
+      solimp="0.9 0.95 0.001" />
+    <pair geom1="floor" geom2="base_link_collision" condim="3" friction="0.0 0.0" />
+
+
+    <exclude body1="left_wheel_link" body2="base_link" />
+    <exclude body1="right_wheel_link" body2="base_link" />
+    <exclude body1="back_wheel_link" body2="base_link" />
+    <exclude body1="base_link" body2="mast_link" />
+    <exclude body1="lift_link" body2="mast_link" />
+    <!-- <exclude body1="lift_link" body2="head_link"/> -->
+    <exclude body1="arm_l4_link" body2="arm_l3_link" />
+    <exclude body1="arm_l4_link" body2="arm_l2_link" />
+    <exclude body1="arm_l4_link" body2="arm_l1_link" />
+    <exclude body1="arm_l4_link" body2="lift_link" />
+    <exclude body1="arm_l3_link" body2="arm_l1_link" />
+    <exclude body1="arm_l3_link" body2="lift_link" />
+    <exclude body1="arm_l2_link" body2="lift_link" />
+    <exclude body1="arm_l2_link" body2="arm_l1_link" />
+    <exclude body1="arm_l1_link" body2="lift_link" />
+    <exclude body1="wrist_yaw_link" body2="arm_l4_link" />
+    <exclude body1="wrist_yaw_link" body2="arm_l3_link" />
+    <exclude body1="wrist_yaw_link" body2="arm_l2_link" />
+    <exclude body1="wrist_yaw_link" body2="arm_l1_link" />
+    <exclude body1="wrist_yaw_link" body2="arm_l0_link" />
+    <exclude body1="arm_l3_link" body2="arm_l0_link" />
+    <exclude body1="arm_l2_link" body2="arm_l0_link" />
+    <exclude body1="arm_l1_link" body2="arm_l0_link" />
+    <exclude body1="arm_l4_link" body2="arm_l0_link" />
+    <exclude body1="gripper_finger_left_link" body2="wrist_pitch_link" />
+    <exclude body1="gripper_finger_right_link" body2="wrist_pitch_link" />
+    <exclude body1="gripper_finger_left_link" body2="wrist_yaw_link" />
+    <exclude body1="gripper_finger_right_link" body2="wrist_yaw_link" />
+    <exclude body1="gripper_finger_left_link" body2="grasp_center_link" />
+    <exclude body1="gripper_finger_right_link" body2="grasp_center_link" />
+    <exclude body1="gripper_finger_left_link" body2="gripper_finger_right_link" />
+    <exclude body1="gripper_fingertip_left_link" body2="gripper_fingertip_right_link" />
+    <exclude body1="gripper_fingertip_left_link" body2="gripper_finger_right_link" />
+    <exclude body1="gripper_fingertip_right_link" body2="gripper_finger_left_link" />
+    <exclude body1="aruco_fingertip_left_link" body2="aruco_fingertip_right_link" />
+    <exclude body1="aruco_fingertip_left_link" body2="gripper_finger_right_link" />
+    <exclude body1="aruco_fingertip_right_link" body2="gripper_finger_left_link" />
+    <exclude body1="aruco_fingertip_left_link" body2="gripper_fingertip_right_link" />
+    <exclude body1="aruco_fingertip_right_link" body2="gripper_fingertip_left_link" />
+  </contact>
+
+  <tendon>
+    <fixed name="extend">
+      <joint joint="arm_l4_joint" coef="1" />
+      <joint joint="arm_l3_joint" coef="1" />
+      <joint joint="arm_l2_joint" coef="1" />
+      <joint joint="arm_l1_joint" coef="1" />
+    </fixed>
+  </tendon>
+
+  <equality>
+    <joint joint1="arm_l4_joint" joint2="arm_l3_joint" />
+    <joint joint1="arm_l3_joint" joint2="arm_l2_joint" />
+    <joint joint1="arm_l2_joint" joint2="arm_l1_joint" />
+    <!-- <joint joint1="gripper_finger_left_joint" joint2="gripper_slide_joint" polycoef="0 10
+    0 0 0" solref="0.005 1"/>
+    <joint joint1="gripper_finger_right_joint" joint2="gripper_slide_joint" polycoef="0 10 0 0 0"
+    solref="0.005 1"/> -->
+
+  </equality>
+</mujoco>

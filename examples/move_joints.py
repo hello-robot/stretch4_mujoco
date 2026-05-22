@@ -3,9 +3,9 @@ import threading
 import click
 import numpy as np
 
-from stretch_mujoco.enums.actuators import Actuators
-from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch4_mujoco.stretch4_mujoco_simulator import StretchMujocoSimulator
 
 
 def lift_sequence(

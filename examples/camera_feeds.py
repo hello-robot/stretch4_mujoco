@@ -3,10 +3,10 @@ import threading
 import time
 import click
 import cv2
-from stretch_mujoco.enums.actuators import Actuators
-from stretch_mujoco.enums.stretch_cameras import StretchCameras
-from stretch_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-from stretch_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+from stretch4_mujoco.stretch4_mujoco_simulator import StretchMujocoSimulator
 
 
 def show_camera_feeds_sync(sim: StretchMujocoSimulator, print_fps: bool):
