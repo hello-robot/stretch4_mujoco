@@ -1,5 +1,5 @@
 <mujoco model="hemisphere_lidar_cameras_right">
 <!-- <camera name="cam_hemilidar_right_top45" pos="0 0 0.025" euler="0 2.355 1.57" />
 <camera name="cam_hemilidar_right_bottom45" pos="0 0 0.025" euler="0 3.925 1.57" /> -->
-<camera name="cam_hemilidar_right" pos="0 0 0" euler="0 3.14 0" />
+<camera name="cam_hemilidar_right" pos="0 0 0" euler="0 3.14 3.14" />
 </mujoco>
