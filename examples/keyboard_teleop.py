@@ -1,4 +1,4 @@
-from time import sleep
+from time import sleep, perf_counter
 from pynput import keyboard
 from pprint import pprint
 
@@ -265,6 +265,9 @@ def main(
         )
         listener.start()
 
+        last_loop = perf_counter()
+        loop_time = 1.0/rate #hz->sec
+        
         while sim.is_running():
 
             # rate limit loop
