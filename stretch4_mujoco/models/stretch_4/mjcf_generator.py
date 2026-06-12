@@ -2,6 +2,9 @@ import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import numpy as np
+from scipy.spatial.transform import Rotation
+import yourdfpy
 
 from urdf2mjcf.convert import convert_urdf_to_mjcf
 from urdf2mjcf.model import ConversionMetadata
@@ -143,19 +146,54 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     if base_body is not None:
         ET.SubElement(base_body, "include", file="omniwheels.xml")
 
-    # 6. Add lidars, cameras, and laser
-    lidar_r = find_body("lidar_right_link")
-    if lidar_r is not None:
-        ET.SubElement(lidar_r, "include", file="hemisphere_lidar_cameras_right.xml")
+    # 6. Add lidars, cameras, and laser dynamically from URDF
+    urdf = yourdfpy.URDF.load(urdf_path)
 
-    lidar_l = find_body("lidar_left_link")
-    if lidar_l is not None:
-        ET.SubElement(lidar_l, "include", file="hemisphere_lidar_cameras_left.xml")
+    def get_cam_pos_quat(link_name, parent_name, post_rotation:np.ndarray|None = None):
+        T_parent_link = urdf.get_transform(link_name, parent_name)
+        T_parent_cam = T_parent_link
+        if post_rotation is not None:
+            T_parent_cam = T_parent_link @ post_rotation
 
-    for cam in ["camera_right_link", "camera_left_link", "camera_center_link"]:
-        cam_body = find_body(cam)
-        if cam_body is not None:
-            ET.SubElement(cam_body, "camera", name=cam, pos="0 0 0.015", euler="0 3.14 0")
+        pos = T_parent_cam[:3, 3]
+        quat = Rotation.from_matrix(T_parent_cam[:3, :3]).as_quat() # xyzw
+        # MuJoCo quat format: w x y z
+        quat_mj = f"{quat[3]} {quat[0]} {quat[1]} {quat[2]}"
+        pos_mj = f"{pos[0]} {pos[1]} {pos[2]}"
+        return pos_mj, quat_mj
+
+
+    head = find_body("head_link")
+    T_opt_cam = np.eye(4)
+    # T_opt_cam[:3, :3] = Rotation.from_euler("x", 180, degrees=True).as_matrix()
+    T_opt_cam[:3, :3] = Rotation.from_euler('xyz', [180, 0, 0], degrees=True).as_matrix()
+    
+    if head is not None:
+        # Hemispherical lidars
+        pos_l, quat_l = get_cam_pos_quat("lidar_left_link", "head_link", post_rotation=T_opt_cam)
+        ET.SubElement(head, "camera", name="cam_hemilidar_left", pos=pos_l, quat=quat_l)
+
+        pos_r, quat_r = get_cam_pos_quat("lidar_right_link", "head_link", post_rotation=T_opt_cam)
+        ET.SubElement(head, "camera", name="cam_hemilidar_right", pos=pos_r, quat=quat_r)
+
+        # Wide angle cameras
+        # Right Camera
+        cam_r_body = find_body("camera_right_optical_link")
+        if cam_r_body is not None:
+            pos_r, quat_r = get_cam_pos_quat("camera_right_optical_link", "camera_right_optical_link", post_rotation=T_opt_cam)
+            ET.SubElement(cam_r_body, "camera", name="camera_right_link", pos=pos_r, quat=quat_r)
+
+        # Left Camera
+        cam_l_body = find_body("camera_left_optical_link")
+        if cam_l_body is not None:
+            pos_l, quat_l = get_cam_pos_quat("camera_left_optical_link", "camera_left_optical_link", post_rotation=T_opt_cam)
+            ET.SubElement(cam_l_body, "camera", name="camera_left_link", pos=pos_l, quat=quat_l)
+
+        # Center Camera
+        cam_c_body = find_body("camera_center_optical_link")
+        if cam_c_body is not None:
+            pos_c, quat_c = get_cam_pos_quat("camera_center_optical_link", "camera_center_optical_link", post_rotation=T_opt_cam)
+            ET.SubElement(cam_c_body, "camera", name="camera_center_link", pos=pos_c, quat=quat_c)
 
     if base_body is not None:
         old_laser = worldbody.find(".//body[@name='laser']")
@@ -169,17 +207,17 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
         rep = ET.SubElement(laser, "replicate", count="360", euler="0 0 0.0174533")
         ET.SubElement(rep, "site", name="lidar", zaxis="1 0 0")
 
-    # 7. Encapsulate gripper camera in wrist
-    wrist_roll = find_body("wrist_roll_link")
-    if wrist_roll is not None:
-        gripper = ET.SubElement(
-            wrist_roll,
-            "body",
-            name="gripper_camera_mount",
-            pos="0 0.0660509 -0.0253083",
-            quat="0.5 0.5 0.5 -0.5",
-        )
-        ET.SubElement(gripper, "include", file="gripper_cameras.xml")
+    # 7. Encapsulate gripper camera in gripper_camera_link
+    T_opt_cam_gripper = np.eye(4)
+    T_opt_cam_gripper[:3, :3] = Rotation.from_euler('xyz', [180, 0, 0], degrees=True).as_matrix()
+
+    gripper_cam = find_body("gripper_camera_link")
+    if gripper_cam is not None:
+        pos_g_rgb, quat_g_rgb = get_cam_pos_quat("gripper_stereo_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam_gripper)
+        ET.SubElement(gripper_cam, "camera", name="gripper_rgb", pos=pos_g_rgb, quat=quat_g_rgb)
+
+        pos_g_depth, quat_g_depth = get_cam_pos_quat("gripper_left_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam_gripper)
+        ET.SubElement(gripper_cam, "camera", name="gripper_depth", pos=pos_g_depth, quat=quat_g_depth)
 
     # 8. Modify Mast to use appropriate collision mass
     mast = find_body("mast_link")

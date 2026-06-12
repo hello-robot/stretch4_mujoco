@@ -2,7 +2,7 @@ import numpy as np
 
 from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
-from stretch4_mujoco.utils import Rx, Ry, Rz
+from stretch4_mujoco.utils import Rx, Ry, Rz, URDFmodel
 from scipy.spatial.transform import Rotation
 
 # TODO: Move this cam_hemilidar_top45 settings pull somewhere less ambiguous
@@ -35,8 +35,38 @@ def _get_pointcloud(depth_buffer):
     return points
 
 
+_cached_urdf_model = None
+
+
+def _get_default_urdf_model():
+    global _cached_urdf_model
+    if _cached_urdf_model is None:
+        import tempfile
+        from stretch4_urdf import get_urdf
+        from stretch4_mujoco.utils import URDFmodel
+
+        model_name = "SE4"
+        batch_name = "francis"
+        tool_name = "eoa_wrist_dw4_tool_sg4"
+
+        out_dir = tempfile.mkdtemp()
+        urdf_path = get_urdf(
+            model_name=model_name,
+            batch_name=batch_name,
+            tool_name=tool_name,
+            output_dir=out_dir,
+            description="mujoco_stretch_4",
+        )
+        _cached_urdf_model = URDFmodel(urdf_path)
+    return _cached_urdf_model
+
+
 def get_pointcloud_from_camera_status(
-    camera_status: StatusStretchCameras, in_world_frame: bool
+    camera_status: StatusStretchCameras,
+    in_world_frame: bool,
+    urdf_model: URDFmodel = None,
+    joint_positions: dict[str, float] = None,
+    base_pose: tuple[float, float, float] = None,
 ) -> list[tuple[str, np.ndarray]]:
     """Calculates a pointcloud from the simulated lidar depth cameras, returned in the world frame if requested.
 
@@ -44,38 +74,43 @@ def get_pointcloud_from_camera_status(
 
     if not in_world_frame:
         return [
-                (lidar.name, _get_pointcloud(camera_status.get_camera_data(lidar, use_depth_color_map=False)))
-                for lidar in StretchCameras.hemispherical_lidars()
-            ]
+            (
+                lidar.name,
+                _get_pointcloud(
+                    camera_status.get_camera_data(lidar, use_depth_color_map=False)
+                ),
+            )
+            for lidar in StretchCameras.hemispherical_lidars()
+        ]
 
     all_points = []
 
-    left_translation = np.array(
-        [0.0387442, 0.124414, 1.50375]
-    )  # from mjcf
-    left_quat = np.array(
-        [
-            -0.853553,
-            -0.353553,
-            -0.339444,
-            0.176704,
-        ]
-    )  # w last, from mjcv
-    left_rot_inv = Rotation.from_quat(left_quat).inv().as_matrix()
+    if urdf_model is None:
+        urdf_model = _get_default_urdf_model()
 
-    right_translation = np.array(
-        [0.0387442, -0.124414, 1.50375]
-    )  # from mjcf
-    right_quat = np.array(
-        [
-            -0.353553,
-            -0.853553,
-            0.176704,
-            -0.339444,
-        ]
-    )  # w last, from mjcv
-    right_rot_inv = Rotation.from_quat(right_quat).inv().as_matrix()
+    if joint_positions is None:
+        joint_positions = {
+            "wrist_yaw": 0.0,
+            "wrist_pitch": 0.0,
+            "wrist_roll": 0.0,
+            "lift": 0.0,
+            "arm": 0.0,
+            "head_pan": 0.0,
+            "head_tilt": 0.0,
+        }
 
+    T_base_left = urdf_model.get_transform(joint_positions, "lidar_left_link")
+    T_base_right = urdf_model.get_transform(joint_positions, "lidar_right_link")
+
+    # We transform the point cloud to be in base_link frame
+    T_world_left = T_base_left
+    T_world_right = T_base_right
+
+    left_translation = T_world_left[:3, 3]
+    left_rot_inv = T_world_left[:3, :3].T
+
+    right_translation = T_world_right[:3, 3]
+    right_rot_inv = T_world_right[:3, :3].T
 
     for lidar in StretchCameras.hemispherical_lidars():
         try:
@@ -83,12 +118,9 @@ def get_pointcloud_from_camera_status(
                 camera_status.get_camera_data(lidar, use_depth_color_map=False)
             )
             if "left" in lidar.name:
-                # rot_matrix = Rotation.from_euler("xyz", [0, 0, 0], degrees=True).as_matrix()
-                # points = (points) @ rot_matrix @ left_rot_inv + left_translation
                 points = (points) @ left_rot_inv + left_translation
             elif "right" in lidar.name:
-                rot_matrix = Rotation.from_euler("z", 180, degrees=True).as_matrix()
-                points = (points) @ rot_matrix @ right_rot_inv + right_translation
+                points = (points) @ right_rot_inv + right_translation
             else:
                 raise Exception(f"Unknown lidar, can't do pointcloud transform: {lidar.name}")
 

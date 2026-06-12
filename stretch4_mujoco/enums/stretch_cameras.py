@@ -123,11 +123,11 @@ class StretchCameras(Enum):
         if self == StretchCameras.cam_nav_rgb:
             return "nav_camera_rgb"
         if self == StretchCameras.cam_nav_rgb_se4_left:
-            return "link_camera_left"
+            return "camera_left_link"
         if self == StretchCameras.cam_nav_rgb_se4_right:
-            return "link_camera_right"
+            return "camera_right_link"
         if self == StretchCameras.cam_nav_rgb_se4_center:
-            return "link_camera_center"
+            return "camera_center_link"
         if self == StretchCameras.cam_hemilidar_left_top45:
             return "cam_hemilidar_left_top45"
         if self == StretchCameras.cam_hemilidar_left_bottom45:

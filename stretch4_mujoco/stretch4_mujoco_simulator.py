@@ -277,6 +277,21 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         """
         Computes a pointcloud from the simulated lidar depth cameras, returned in the world frame if requested.
         """
+        status = self.pull_status()
+        cfg = {
+            "wrist_yaw": status.wrist_yaw.pos,
+            "wrist_pitch": status.wrist_pitch.pos,
+            "wrist_roll": status.wrist_roll.pos,
+            "lift": status.lift.pos,
+            "arm": status.arm.pos,
+            "head_pan": status.head_pan.pos,
+            "head_tilt": status.head_tilt.pos,
+        }
+        base_xyt = self.get_base_pose()
         return get_pointcloud_from_camera_status(
-            self.pull_camera_data(), in_world_frame=in_world_frame
+            self.pull_camera_data(),
+            in_world_frame=in_world_frame,
+            urdf_model=self.urdf_model,
+            joint_positions=cfg,
+            base_pose=base_xyt if in_world_frame else None,
         )
