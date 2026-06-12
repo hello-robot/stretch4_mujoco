@@ -14,6 +14,8 @@ from stretch4_mujoco.pointcloud_utils import get_pointcloud_from_camera_status
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 from stretch4_mujoco.utils import block_until_check_succeeds, require_connection
 
+from stretch4_mujoco.utils import URDFmodel
+
 
 class Stretch4MujocoSimulator(StretchMujocoSimulator):
     """
@@ -52,6 +54,21 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             start_translation=start_translation,
             start_rotation_quat=start_rotation_quat,
         )
+
+
+        urdf_model = URDFmodel(Stretch4MujocoSimulator.get_urdf_path())
+        joint_positions = {
+            "wrist_yaw": 0.0,
+            "wrist_pitch": 0.0,
+            "wrist_roll": 0.0,
+            "lift": 0.0,
+            "arm": 0.0,
+            "head_pan": 0.0,
+            "head_tilt": 0.0,
+        }
+
+        self.T_base_left = urdf_model.get_transform(joint_positions, "lidar_left_link")
+        self.T_base_right = urdf_model.get_transform(joint_positions, "lidar_right_link")
 
     @staticmethod
     def get_scene_xml_path() -> str:
@@ -277,21 +294,9 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         """
         Computes a pointcloud from the simulated lidar depth cameras, returned in the world frame if requested.
         """
-        status = self.pull_status()
-        cfg = {
-            "wrist_yaw": status.wrist_yaw.pos,
-            "wrist_pitch": status.wrist_pitch.pos,
-            "wrist_roll": status.wrist_roll.pos,
-            "lift": status.lift.pos,
-            "arm": status.arm.pos,
-            "head_pan": status.head_pan.pos,
-            "head_tilt": status.head_tilt.pos,
-        }
-        base_xyt = self.get_base_pose()
         return get_pointcloud_from_camera_status(
             self.pull_camera_data(),
             in_world_frame=in_world_frame,
-            urdf_model=self.urdf_model,
-            joint_positions=cfg,
-            base_pose=base_xyt if in_world_frame else None,
+            T_base_left=self.T_base_left,
+            T_base_right=self.T_base_right,
         )
