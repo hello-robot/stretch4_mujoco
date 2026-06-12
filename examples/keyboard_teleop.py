@@ -1,4 +1,4 @@
-from time import sleep
+from time import sleep, perf_counter
 from pynput import keyboard
 from pprint import pprint
 
@@ -243,13 +243,14 @@ def main(
             stretch_xml_absolute=simulator_class.get_robot_xml_path()
         )
 
+    rate = 10.00 if lidar3d else 30.0
+    # Lower camera hz for lidar3d to avoid performance issues
+
     sim = simulator_class(
         model=model,
         scene_xml_path=scene_xml_path,
         cameras_to_use=cameras_to_use,
-        camera_hz=(
-            10.00 if lidar3d else 30.0
-        ),  # Lower camera hz for lidar3d to avoid performance issues
+        camera_hz=rate,
     )
 
     try:
@@ -264,14 +265,21 @@ def main(
         )
         listener.start()
 
+        last_loop = perf_counter()
+        loop_time = 1.0/rate #hz->sec
+        
         while sim.is_running():
+
+            # rate limit loop
+            elapsed = perf_counter()-last_loop
+            if elapsed < loop_time:
+                sleep(loop_time-elapsed)
+            last_loop = perf_counter()
+            
             if keyboard_controller.is_keyboard_control_active:
                 for key in keyboard_controller.key_buffer:
                     if isinstance(key, keyboard.KeyCode):
                         keyboard_controller.keyboard_control(key.char)
-
-            if not lidar2d and not use_imagery:
-                sleep(0.05)
 
             if print_ratio:
                 print(f"{sim.pull_status().sim_to_real_time_ratio_msg}")
