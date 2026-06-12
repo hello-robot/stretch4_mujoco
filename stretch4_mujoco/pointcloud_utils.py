@@ -5,7 +5,7 @@ from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.utils import Rx, Ry, Rz, URDFmodel
 from scipy.spatial.transform import Rotation
 
-# TODO: Move this cam_hemilidar_top45 settings pull somewhere less ambiguous
+# TODO: Move this cam_hemilidar settings pull somewhere less ambiguous
 camera_settings = StretchCameras.cam_hemilidar_right.initial_camera_settings
 
 fx, fy, cx, cy = (

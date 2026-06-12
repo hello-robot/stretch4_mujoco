@@ -165,7 +165,7 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
 
     head = find_body("head_link")
     T_opt_cam = np.eye(4)
-    # T_opt_cam[:3, :3] = Rotation.from_euler("x", 180, degrees=True).as_matrix()
+    # Note that Mujoco's camera frame coordinate system is different from ROS's: " Forward corresponds to the negative Z axis of the camera frame, while up corresponds to the positive Y axis. " , so in creating the Camera lement in the mjcf, we rotate by 180 degrees. https://mujoco.readthedocs.io/en/stable/programming/visualization.html
     T_opt_cam[:3, :3] = Rotation.from_euler('xyz', [180, 0, 0], degrees=True).as_matrix()
     
     if head is not None:
@@ -208,16 +208,14 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
         ET.SubElement(rep, "site", name="lidar", zaxis="1 0 0")
 
     # 7. Encapsulate gripper camera in gripper_camera_link
-    T_opt_cam_gripper = np.eye(4)
-    T_opt_cam_gripper[:3, :3] = Rotation.from_euler('xyz', [180, 0, 0], degrees=True).as_matrix()
-
     gripper_cam = find_body("gripper_camera_link")
     if gripper_cam is not None:
-        pos_g_rgb, quat_g_rgb = get_cam_pos_quat("gripper_stereo_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam_gripper)
-        ET.SubElement(gripper_cam, "camera", name="gripper_rgb", pos=pos_g_rgb, quat=quat_g_rgb)
-
-        pos_g_depth, quat_g_depth = get_cam_pos_quat("gripper_left_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam_gripper)
-        ET.SubElement(gripper_cam, "camera", name="gripper_depth", pos=pos_g_depth, quat=quat_g_depth)
+        pos_g_rgb, quat_g_rgb = get_cam_pos_quat("gripper_left_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam)
+        ET.SubElement(gripper_cam, "camera", name="gripper_camera_left_rgb", pos=pos_g_rgb, quat=quat_g_rgb)
+        pos_g_rgb, quat_g_rgb = get_cam_pos_quat("gripper_right_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam)
+        ET.SubElement(gripper_cam, "camera", name="gripper_camera_right_rgb", pos=pos_g_rgb, quat=quat_g_rgb)
+        pos_g_depth, quat_g_depth = get_cam_pos_quat("gripper_stereo_camera_color_optical_frame", "gripper_camera_link", post_rotation=T_opt_cam)
+        ET.SubElement(gripper_cam, "camera", name="gripper_camera_stereo_depth", pos=pos_g_depth, quat=quat_g_depth)
 
     # 8. Modify Mast to use appropriate collision mass
     mast = find_body("mast_link")

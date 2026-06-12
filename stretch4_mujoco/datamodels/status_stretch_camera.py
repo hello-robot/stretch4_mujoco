@@ -29,11 +29,11 @@ class StatusStretchCameras:
     cam_nav_rgb_se4_center: np.ndarray|None = None
 
     cam_hemilidar_left: np.ndarray|None = None
-    cam_hemilidar_left_top45: np.ndarray|None = None
-    cam_hemilidar_left_bottom45: np.ndarray|None = None
     cam_hemilidar_right: np.ndarray|None = None
-    cam_hemilidar_right_top45: np.ndarray|None = None
-    cam_hemilidar_right_bottom45: np.ndarray|None = None
+
+    cam_gripper_se4_left_rgb: np.ndarray|None = None
+    cam_gripper_se4_right_rgb: np.ndarray|None = None
+    cam_gripper_se4_stereo_depth: np.ndarray|None = None
 
     def get_all(self, *, auto_rotate: bool = True, auto_correct_rgb=True, use_depth_color_map=False)-> dict[StretchCameras, np.ndarray]:
         """Returns the camera `{StretchCameras: pixels}` that are available (not None).
@@ -70,20 +70,8 @@ class StatusStretchCameras:
         if camera == StretchCameras.cam_hemilidar_left and self.cam_hemilidar_left is not None:
             data = self.cam_hemilidar_left
             data = get_depth_color_map(data) if use_depth_color_map else data
-        if camera == StretchCameras.cam_hemilidar_left_top45 and self.cam_hemilidar_left_top45 is not None:
-            data = self.cam_hemilidar_left_top45
-            data = get_depth_color_map(data) if use_depth_color_map else data
-        if camera == StretchCameras.cam_hemilidar_left_bottom45 and self.cam_hemilidar_left_bottom45 is not None:
-            data = self.cam_hemilidar_left_bottom45
-            data = get_depth_color_map(data) if use_depth_color_map else data
         if camera == StretchCameras.cam_hemilidar_right and self.cam_hemilidar_right is not None:
             data = self.cam_hemilidar_right
-            data = get_depth_color_map(data) if use_depth_color_map else data
-        if camera == StretchCameras.cam_hemilidar_right_top45 and self.cam_hemilidar_right_top45 is not None:
-            data = self.cam_hemilidar_right_top45
-            data = get_depth_color_map(data) if use_depth_color_map else data
-        if camera == StretchCameras.cam_hemilidar_right_bottom45 and self.cam_hemilidar_right_bottom45 is not None:
-            data = self.cam_hemilidar_right_bottom45
             data = get_depth_color_map(data) if use_depth_color_map else data
         elif camera == StretchCameras.cam_gripper_rgb and self.cam_gripper_rgb is not None:
             data = self.cam_gripper_rgb
@@ -115,6 +103,15 @@ class StatusStretchCameras:
             data = self.cam_nav_rgb_se4_center
             data = np.rot90(data, -1) if auto_rotate else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
+        elif camera == StretchCameras.cam_gripper_se4_left_rgb and self.cam_gripper_se4_left_rgb is not None:
+            data = self.cam_gripper_se4_left_rgb
+            data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
+        elif camera == StretchCameras.cam_gripper_se4_right_rgb and self.cam_gripper_se4_right_rgb is not None:
+            data = self.cam_gripper_se4_right_rgb
+            data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
+        elif camera == StretchCameras.cam_gripper_se4_stereo_depth and self.cam_gripper_se4_stereo_depth is not None:
+            data = self.cam_gripper_se4_stereo_depth
+            data = get_depth_color_map(data) if use_depth_color_map else data
 
         if data is None:
             raise ValueError(f"Tried to get {camera} data, but it is empty or not implemented.")
@@ -154,20 +151,17 @@ class StatusStretchCameras:
         if camera == StretchCameras.cam_hemilidar_left:
             self.cam_hemilidar_left = data
             return
-        if camera == StretchCameras.cam_hemilidar_left_top45:
-            self.cam_hemilidar_left_top45 = data
-            return
-        if camera == StretchCameras.cam_hemilidar_left_bottom45:
-            self.cam_hemilidar_left_bottom45 = data
-            return
         if camera == StretchCameras.cam_hemilidar_right:
             self.cam_hemilidar_right = data
             return
-        if camera == StretchCameras.cam_hemilidar_right_top45:
-            self.cam_hemilidar_right_top45 = data
+        if camera == StretchCameras.cam_gripper_se4_left_rgb:
+            self.cam_gripper_se4_left_rgb = data
             return
-        if camera == StretchCameras.cam_hemilidar_right_bottom45:
-            self.cam_hemilidar_right_bottom45 = data
+        if camera == StretchCameras.cam_gripper_se4_right_rgb:
+            self.cam_gripper_se4_right_rgb = data
+            return
+        if camera == StretchCameras.cam_gripper_se4_stereo_depth:
+            self.cam_gripper_se4_stereo_depth = data
             return
 
         raise NotImplementedError(f"Camera {camera} is not implemented.")
