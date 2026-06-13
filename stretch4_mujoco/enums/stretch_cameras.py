@@ -181,15 +181,19 @@ class StretchCameras(Enum):
     def initial_camera_settings(self):
 
         if self in StretchCameras.hemispherical_lidars():
+            """
+            We are trying to emulate a hemispherical lidar that generated 1,152,000 pts/s.
+            A height of 340 with an FOV of 160 degrees in both directions should generate
+            approximately 115,600 pts/frame or 1,156,000 pts/s.
+            """
             field_of_view_vertical_in_degrees=160
-            field_of_view_horizontal_in_degrees = 160 # Note: it's impossible to get 180 with a pinhole camera model, max would be 179.9. This is reduced to increase performance.
-
+            field_of_view_horizontal_in_degrees = 160
 
             vfov_rad = np.radians(field_of_view_vertical_in_degrees)
             hfov_rad = np.radians(field_of_view_horizontal_in_degrees)
 
             aspect_ratio = np.tan(hfov_rad / 2) / np.tan(vfov_rad / 2)
-            height = 300*4
+            height = 340
             width = height * aspect_ratio
             width = int(width)
 

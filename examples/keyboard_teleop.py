@@ -1,3 +1,4 @@
+
 from time import sleep, perf_counter
 from pynput import keyboard
 from pprint import pprint
@@ -12,7 +13,7 @@ from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-
+from stretch4_mujoco.pointcloud_utils import estimate_pointcloud_density
 
 def print_keyboard_options():
     click.secho("\n       Keyboard Controls:", fg="yellow")
@@ -234,6 +235,7 @@ def main(
     use_imagery = len(cameras_to_use) > 0
 
     if lidar3d:
+        estimate_pointcloud_density()
         cameras_to_use += StretchCameras.hemispherical_lidars()
         rerun_logger.init_pointcloud_viz()
         
