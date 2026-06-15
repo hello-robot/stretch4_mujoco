@@ -36,8 +36,7 @@ def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
     x = (xx[valid] - cy) * z / fx
     y = (yy[valid] - cx) * z / fy
 
-    points = np.stack((x, y, z), axis=-1)
-    return points.reshape(-1, 3)
+    return np.stack((x, y, z), axis=-1)
 
 
 def _get_pointcloud(depth_buffer):
