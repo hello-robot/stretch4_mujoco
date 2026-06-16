@@ -13,8 +13,21 @@ fx, fy, cx, cy = (
     camera_settings.height / 2,
 )
 
+def estimate_pointcloud_density():
+    stride = 1
+    estimated_points = (camera_settings.width // stride) * (camera_settings.height // stride)
 
-def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
+    res_x = (1 / fx) * 100.0
+    res_y = (1 / fy) * 100.0
+    print(
+        f"Point cloud stride={stride}. "
+        f"Approx distance between adjacent points at 1.0m depth: "
+        f"{res_x:.2f} cm x {res_y:.2f} cm. "
+        f"Estimated points generated per frame: {estimated_points:,}, or {estimated_points*10}/s at 10hz per point cloud"
+    )
+
+
+def depth_to_points(depth_image, fx, fy, cx, cy):
     height, width = depth_image.shape
 
     xx, yy = np.meshgrid(np.arange(width), np.arange(height))
@@ -24,8 +37,13 @@ def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
     x = (xx[valid] - cy) * z / fx
     y = (yy[valid] - cx) * z / fy
 
-    points = np.stack((x, y, z), axis=-1)
-    return points.reshape(-1, 3)
+    return (x,y,z)
+    
+
+    
+def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
+    x,y,z=depth_to_points(depth_image, fx, fy, cx, cy)
+    return np.stack((x, y, z), axis=-1)
 
 
 def _get_pointcloud(depth_buffer):

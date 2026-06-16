@@ -6,7 +6,7 @@ import cv2
 from examples.camera_feeds import show_camera_feeds_sync
 from gamepad_controller import GamePadController, ButtonPressCounter, JointEffortTracker
 
-from examples.rerun_utils import init_pointcloud_viz, update_pointcloud_viz
+from examples.rerun_utils import RerunLogger
 from examples.laser_scan import show_laser_scan
 from stretch4_mujoco import StretchMujocoSimulator
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
@@ -41,6 +41,8 @@ def main(
 ):
     global sim, gamepad
 
+    rerun_logger = RerunLogger()
+
     simulator_class = StretchMujocoSimulator if use_stretch_3 else Stretch4MujocoSimulator
 
     use_head_joints = simulator_class is not Stretch4MujocoSimulator
@@ -52,7 +54,7 @@ def main(
 
     if lidar3d:
         cameras_to_use += StretchCameras.hemispherical_lidars()
-        init_pointcloud_viz()
+        rerun_logger.init_pointcloud_viz()
 
     use_imagery = len(cameras_to_use) > 0
 
@@ -88,7 +90,7 @@ def main(
                 show_camera_feeds_sync(sim, False)
 
             if lidar3d:
-                update_pointcloud_viz(
+                rerun_logger.update_pointcloud_viz(
                     sim.pull_hemi_lidar_points(in_world_frame=True), "world/lidar_points"
                 )
 
@@ -103,6 +105,9 @@ def main(
                 except:
                     ...
     except KeyboardInterrupt:
+        pass
+    finally:
+        rerun_logger.stop()
         sim.stop()
         cv2.destroyAllWindows()
 

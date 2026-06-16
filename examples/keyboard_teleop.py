@@ -1,10 +1,11 @@
+
 from time import sleep, perf_counter
 from pynput import keyboard
 from pprint import pprint
 
 import click
 
-from examples.rerun_utils import init_pointcloud_viz, update_pointcloud_viz
+from examples.rerun_utils import RerunLogger
 from examples.camera_feeds import show_camera_feeds_sync
 from examples.laser_scan import show_laser_scan
 from stretch4_mujoco import StretchMujocoSimulator
@@ -12,7 +13,7 @@ from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-
+from stretch4_mujoco.pointcloud_utils import estimate_pointcloud_density
 
 def print_keyboard_options():
     click.secho("\n       Keyboard Controls:", fg="yellow")
@@ -221,6 +222,8 @@ def main(
     use_stretch_3: bool,
 ):
 
+    rerun_logger = RerunLogger()
+
     simulator_class = StretchMujocoSimulator if use_stretch_3 else Stretch4MujocoSimulator
 
     cameras_to_use = simulator_class.get_rgb_cameras() if imagery else []
@@ -228,12 +231,14 @@ def main(
     if lidar3d and not simulator_class is Stretch4MujocoSimulator:
         raise NotImplementedError("3D Lidar is only supported in Stretch4MujocoSimulator.")
 
-    if lidar3d:
-        cameras_to_use += StretchCameras.hemispherical_lidars()
-        init_pointcloud_viz()
 
     use_imagery = len(cameras_to_use) > 0
 
+    if lidar3d:
+        estimate_pointcloud_density()
+        cameras_to_use += StretchCameras.hemispherical_lidars()
+        rerun_logger.init_pointcloud_viz()
+        
     model = None
 
     if select_env:
@@ -288,7 +293,7 @@ def main(
                 show_camera_feeds_sync(sim, False)
 
             if lidar3d:
-                update_pointcloud_viz(
+                rerun_logger.update_pointcloud_viz(
                     sim.pull_hemi_lidar_points(in_world_frame=True), "world/lidar_points"
                 )
 
@@ -303,9 +308,11 @@ def main(
                 except:
                     ...
 
-        listener.stop()
-
     except KeyboardInterrupt:
+        pass
+    finally:
+        rerun_logger.stop()
+        listener.stop()
         sim.stop()
 
 

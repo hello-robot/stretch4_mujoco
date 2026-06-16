@@ -1,4 +1,4 @@
-from examples.rerun_utils import init_pointcloud_viz, update_pointcloud_viz
+from examples.rerun_utils import RerunLogger
 import stretch4_mujoco
 import click
 import cv2
@@ -20,6 +20,8 @@ def main(
     use_stretch_3:bool
 ):
 
+    rerun_logger = RerunLogger()
+
     cameras_to_use =( StretchCameras.rgb_stretch4() if not use_stretch_3 else StretchCameras.all_stretch3()) if imagery else []
 
     if lidar3d and use_stretch_3:
@@ -27,7 +29,7 @@ def main(
 
     if lidar3d:
         cameras_to_use += StretchCameras.hemispherical_lidars()
-        init_pointcloud_viz()
+        rerun_logger.init_pointcloud_viz()
 
     sim = stretch4_mujoco.StretchMujocoSimulator(scene_xml_path,cameras_to_use=cameras_to_use) if use_stretch_3 else stretch4_mujoco.Stretch4MujocoSimulator(scene_xml_path, cameras_to_use=cameras_to_use)
 
@@ -41,13 +43,17 @@ def main(
                 cv2.imshow(camera.name, camera_data.get_camera_data(camera))
 
             if lidar3d:
-                update_pointcloud_viz(sim.pull_hemi_lidar_points(in_world_frame=True), "world/lidar_points")
+                rerun_logger.update_pointcloud_viz(sim.pull_hemi_lidar_points(in_world_frame=True), "world/lidar_points")
 
             cv2.waitKey(10)
 
     except KeyboardInterrupt:
+        pass
+    finally:
+        rerun_logger.stop()
         sim.stop()
         cv2.destroyAllWindows()
+
 
 
 if __name__ == "__main__":
