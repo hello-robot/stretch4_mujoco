@@ -26,7 +26,8 @@ def estimate_pointcloud_density():
         f"Estimated points generated per frame: {estimated_points:,}, or {estimated_points*10}/s at 10hz per point cloud"
     )
 
-def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
+
+def depth_to_points(depth_image, fx, fy, cx, cy):
     height, width = depth_image.shape
 
     xx, yy = np.meshgrid(np.arange(width), np.arange(height))
@@ -36,6 +37,12 @@ def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
     x = (xx[valid] - cy) * z / fx
     y = (yy[valid] - cx) * z / fy
 
+    return (x,y,z)
+    
+
+    
+def _depth_to_point_cloud(depth_image, fx, fy, cx, cy):
+    x,y,z=depth_to_points(depth_image, fx, fy, cx, cy)
     return np.stack((x, y, z), axis=-1)
 
 
