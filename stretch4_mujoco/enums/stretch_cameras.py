@@ -367,7 +367,7 @@ class CameraSettings:
     distortion_params: tuple | None = None
     """Specify this if they are available. Zeros will be used in `get_distortion_params_d()` otherwise."""
     rotate_number_of_times: int = 0
-    # Number of times to rotate the image (because the sensor is mounted rotated)
+    """Number of times to rotate the image (because the sensor is mounted rotated)"""
 
     @property
     def optical_center(self)-> tuple[float, float]:
