@@ -231,6 +231,7 @@ class StretchCameras(Enum):
                 height=240,  # from webteleop
                 sensor_resolution=(1920, 1080),  # from ov2740 spec
                 # sensor_pixel_size_micrometers=1.4 # from ov2740 spec
+                rotate_number_of_times=-1,
             )
 
         if self == StretchCameras.cam_d435i_depth:
@@ -259,7 +260,8 @@ class StretchCameras(Enum):
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
                 width=width,
-                height=height
+                height=height,
+                rotate_number_of_times=1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_right:
             # AR0234:
@@ -277,7 +279,8 @@ class StretchCameras(Enum):
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
                 width=width,
-                height=height
+                height=height,
+                rotate_number_of_times=-1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_center:
             # IMX378-W:
@@ -296,7 +299,8 @@ class StretchCameras(Enum):
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
                 width=width,
-                height=height
+                height=height,
+                rotate_number_of_times=1,
             )
 
         if self == StretchCameras.cam_nav_rgb:
@@ -311,6 +315,7 @@ class StretchCameras(Enum):
                 height=600,  # from webteleop
                 sensor_resolution=(1280, 720),  # from ov9782 spec
                 # sensor_pixel_size_micrometers=3.0 # from ov9782 spec, note: enabling this will not work with 0 `focal`
+                rotate_number_of_times=1,
             )
 
         raise NotImplementedError(f"Camera {self} initial settings are not implemented")
@@ -361,6 +366,8 @@ class CameraSettings:
     """This is currently being used in Stretch Web Teleop to crop a ROI"""
     distortion_params: tuple | None = None
     """Specify this if they are available. Zeros will be used in `get_distortion_params_d()` otherwise."""
+    rotate_number_of_times: int = 0
+    # Number of times to rotate the image (because the sensor is mounted rotated)
 
     @property
     def optical_center(self)-> tuple[float, float]:

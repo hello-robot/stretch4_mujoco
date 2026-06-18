@@ -81,27 +81,33 @@ class StatusStretchCameras:
             data = get_depth_color_map(data) if use_depth_color_map else data
         elif camera == StretchCameras.cam_d435i_rgb and self.cam_d435i_rgb is not None:
             data = self.cam_d435i_rgb
-            data = np.rot90(data, -1) if auto_rotate else data
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_d435i_depth and self.cam_d435i_depth is not None:
             data = self.cam_d435i_depth
-            data = np.rot90(data, -1) if auto_rotate else data
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = get_depth_color_map(data) if use_depth_color_map else data
         elif camera == StretchCameras.cam_nav_rgb and self.cam_nav_rgb is not None:
             data = self.cam_nav_rgb
-            data = np.rot90(data, 1) if auto_rotate else data
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_nav_rgb_se4_left and self.cam_nav_rgb_se4_left is not None:
             data = self.cam_nav_rgb_se4_left
-            data = np.rot90(data, -1) if auto_rotate else data
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_nav_rgb_se4_right and self.cam_nav_rgb_se4_right is not None:
             data = self.cam_nav_rgb_se4_right
-            data = np.rot90(data, 1) if auto_rotate else data
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_nav_rgb_se4_center and self.cam_nav_rgb_se4_center is not None:
             data = self.cam_nav_rgb_se4_center
-            data = np.rot90(data, -1) if auto_rotate else data
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_gripper_se4_left_rgb and self.cam_gripper_se4_left_rgb is not None:
             data = self.cam_gripper_se4_left_rgb
