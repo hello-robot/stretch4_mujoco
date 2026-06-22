@@ -432,7 +432,8 @@ class MujocoServer:
         if model is None:
             model = MjModel.from_xml_path(scene_xml_path)
 
-        change_start_pose(model, name="stretch4", translation=start_translation, rotation_quat=start_rotation_quat)
+        if start_translation is not None or start_rotation_quat is not None:
+            change_start_pose(model, name="stretch4", translation=start_translation, rotation_quat=start_rotation_quat)
 
         self.mjmodel = model
 

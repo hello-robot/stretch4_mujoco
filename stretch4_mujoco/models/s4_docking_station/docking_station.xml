@@ -1,0 +1,70 @@
+<mujoco model="URDF_FRANCIS_ASSEM_Docking_Station_V1">
+  <default>
+    <default class="robot">
+      <default class="visual">
+        <geom contype="0" conaffinity="0" group="2" />
+      </default>
+      <default class="collision">
+        <geom contype="0" conaffinity="1" group="3" />
+      </default>
+    </default>
+  </default>
+
+  <compiler angle="radian" meshdir="." balanceinertia="true" />
+
+  <visual>
+    <global offwidth="3840" offheight="2160" />
+  </visual>
+
+  <worldbody>
+    <body name="docking_station_link" childclass="robot" pos="0 0 0">
+      <geom name="docking_station_link_collision" type="mesh" mesh="docking_station_link_collision_docking_station_link" class="collision" />
+      <geom name="docking_station_link_visual" type="mesh" mesh="docking_station_link_docking_station_link" material="default_material" class="visual" />
+      <body name="contacts_link" pos="0 -0.0862 0.1335">
+        <inertial pos="1.66172251238081E-07 0.0070054388859602 -0.0825486379095388" mass="3.50739982324297" diaginertia="0.0154555398316763 0.022704997137557 0.033513884132033" />
+        <geom name="contacts_link_collision" type="mesh" mesh="contacts_link_collision_contacts_link" class="collision" />
+        <geom name="contacts_link_visual" type="mesh" mesh="contacts_link_contacts_link" material="default_material" class="visual" />
+      </body>
+      <body name="left_aruco_marker_link" pos="-0.105007224114583 -0.0325573575773015 0.129200277015667" quat="0.9534 0.3016 0 0">
+        <inertial pos="1.44482291657838E-05 -1.04083408558608E-16 -0.000199477439009985" mass="0.00101684792822397" diaginertia="2.11745889065529e-07 2.10646711071285e-07 4.20167128203572e-07" />
+        <geom name="left_aruco_marker_link_collision" type="mesh" mesh="left_aruco_marker_link_collision_left_aruco_marker_link" class="collision" />
+        <geom name="left_aruco_marker_link_visual" type="mesh" mesh="left_aruco_marker_link_left_aruco_marker_link" material="default_material" class="visual" />
+      </body>
+      <body name="right_aruco_marker_link" pos="0.105007224114583 -0.0325573575773018 0.129200277015666" quat="0.9534 0.3016 0 0">
+        <inertial pos="-1.44482291657283E-05 7.63278329429795E-17 -0.000199477439009971" mass="0.00101684792822398" diaginertia="2.11745889065533e-07 2.1064671107129e-07 4.2016712820358e-07" />
+        <geom name="right_aruco_marker_link_collision" type="mesh" mesh="right_aruco_marker_link_collision_right_aruco_marker_link" class="collision" />
+        <geom name="right_aruco_marker_link_visual" type="mesh" mesh="right_aruco_marker_link_right_aruco_marker_link" material="default_material" class="visual" />
+      </body>
+      <body name="apex_aruco_marker_link" pos="0 -0.289303330552929 0.0201">
+        <inertial pos="-3.97430642180935E-18 5.55111512312578E-17 -0.000200000000000033" mass="0.00101684792822398" diaginertia="2.10646711071288e-07 2.10646711071288e-07 4.21266306197823e-07" />
+        <geom name="apex_aruco_marker_link_collision" type="mesh" mesh="apex_aruco_marker_link_collision_apex_aruco_marker_link" class="collision" />
+        <geom name="apex_aruco_marker_link_visual" type="mesh" mesh="apex_aruco_marker_link_apex_aruco_marker_link" material="default_material" class="visual" />
+      </body>
+      <freejoint name="floating_base" />
+    </body>
+    <light pos="0 0 2." dir="0 0 -1" directional="true" />
+  </worldbody>
+
+  <asset>
+    <material name="default_material" rgba="0.7 0.7 0.7 1" />
+    <mesh name="docking_station_link_collision_docking_station_link" file="meshes/meshes\docking_station_link.STL" />
+    <mesh name="docking_station_link_docking_station_link" file="meshes/meshes\docking_station_link.STL" />
+    <mesh name="contacts_link_collision_contacts_link" file="meshes/meshes\contacts_link.STL" />
+    <mesh name="contacts_link_contacts_link" file="meshes/meshes\contacts_link.STL" />
+    <mesh name="left_aruco_marker_link_collision_left_aruco_marker_link" file="meshes/meshes\left_aruco_marker_link.STL" />
+    <mesh name="left_aruco_marker_link_left_aruco_marker_link" file="meshes/meshes\left_aruco_marker_link.STL" />
+    <mesh name="right_aruco_marker_link_collision_right_aruco_marker_link" file="meshes/meshes\right_aruco_marker_link.STL" />
+    <mesh name="right_aruco_marker_link_right_aruco_marker_link" file="meshes/meshes\right_aruco_marker_link.STL" />
+    <mesh name="apex_aruco_marker_link_collision_apex_aruco_marker_link" file="meshes/meshes\apex_aruco_marker_link.STL" />
+    <mesh name="apex_aruco_marker_link_apex_aruco_marker_link" file="meshes/meshes\apex_aruco_marker_link.STL" />
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
+  </asset>
+
+  <actuator />
+
+  <visual>
+    <rgba haze="0.15 0.25 0.35 1" />
+  </visual>
+</mujoco>
