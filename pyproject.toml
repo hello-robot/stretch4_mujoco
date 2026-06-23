@@ -9,8 +9,8 @@ dependencies = [
     "hello-robot-stretch4-urdf>=2026.5.6",
     "mujoco==3.3.1",
     "yourdfpy",
-    "urdf2mjcf>=0.2.39"
-
+    "urdf2mjcf>=0.2.39",
+    "click>=8.1.8",
 ]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},
@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-tools = ["matplotlib>=3.10.1", "inputs>=0.5", "click>=8.1.8", "pynput>=1.8.1", "rerun-sdk>=0.23.1", "opencv-python"]
+tools = ["matplotlib>=3.10.1", "inputs>=0.5", "pynput>=1.8.1", "rerun-sdk>=0.23.1", "opencv-python"]
 dev = [
     "pre-commit",
     "pytest",
