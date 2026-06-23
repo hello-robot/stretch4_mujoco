@@ -23,7 +23,7 @@ Then, install this repo:
 
 ```
 uv venv
-uv pip install -e .
+uv pip install -e .[tools]
 ```
 
 Lastly, run the simulation:

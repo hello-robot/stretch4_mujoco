@@ -6,16 +6,8 @@ description = "A Stretch 4 simulation in MuJoCo"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "click>=8.1.8",
-    "hello-robot-stretch-urdf>=0.1.0",
     "hello-robot-stretch4-urdf>=2026.5.6",
-    "inputs>=0.5",
-    "matplotlib>=3.10.1",
     "mujoco==3.3.1",
-    "numpy==2.2.5",
-    "opencv-python",
-    "pynput>=1.8.1",
-    "rerun-sdk>=0.23.1",
     "yourdfpy",
     "urdf2mjcf>=0.2.39"
 
@@ -29,6 +21,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
 ]
+
+[project.optional-dependencies]
+tools = ["matplotlib>=3.10.1", "inputs>=0.5", "click>=8.1.8", "pynput>=1.8.1", "rerun-sdk>=0.23.1", "opencv-python"]
 
 [tool.setuptools.packages.find]
 exclude = ["third_party*", "tests*"]
