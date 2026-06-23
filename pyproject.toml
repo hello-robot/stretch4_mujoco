@@ -24,18 +24,6 @@ classifiers = [
 
 [project.optional-dependencies]
 tools = ["matplotlib>=3.10.1", "inputs>=0.5", "click>=8.1.8", "pynput>=1.8.1", "rerun-sdk>=0.23.1", "opencv-python"]
-
-[tool.setuptools.packages.find]
-exclude = ["third_party*", "tests*"]
-
-[project.urls]
-Source = "https://github.com/hello-robot/stretch4_mujoco"
-Tracker = "https://github.com/hello-robot/stretch4_mujoco/issues"
-
-[tool.black]
-line-length = 100
-
-[project.optional-dependencies]
 dev = [
     "pre-commit",
     "pytest",
@@ -47,3 +35,13 @@ jupyter = [
     "ipykernel",
     "ipython",
 ]
+
+[tool.setuptools.packages.find]
+exclude = ["third_party*", "tests*"]
+
+[project.urls]
+Source = "https://github.com/hello-robot/stretch4_mujoco"
+Tracker = "https://github.com/hello-robot/stretch4_mujoco/issues"
+
+[tool.black]
+line-length = 100
