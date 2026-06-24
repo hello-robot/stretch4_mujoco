@@ -33,19 +33,17 @@ class StretchCameras(Enum):
     cam_nav_rgb_se4_center = 7
     """The wide-angle RGB camera in the head for Stretch 4."""
 
-    cam_hemilidar_left_top45 = 8
-    """The top 45 degrees of a depth camera used to simulate a hemispherical lidar."""
-    cam_hemilidar_left_bottom45 = 9
-    """The bottom 45 degrees of a depth camera used to simulate a hemispherical lidar."""
-    cam_hemilidar_right_top45 = 10
-    """The top 45 degrees of a depth camera used to simulate a hemispherical lidar."""
-    cam_hemilidar_right_bottom45 = 11
-    """The bottom 45 degrees of a depth camera used to simulate a hemispherical lidar."""
-
     cam_hemilidar_left = 12
     """Left hemispherical lidar."""
     cam_hemilidar_right = 13
     """Right hemispherical lidar."""
+
+    cam_gripper_se4_left_rgb = 14
+    """RGB camera in the wrist for SE4."""
+    cam_gripper_se4_right_rgb = 15
+    """RGB camera in the wrist for SE4."""
+    cam_gripper_se4_stereo_depth = 16
+    """Depth camera in the wrist for SE4."""
 
     def get_render_params(self):
         return (self.camera_name_in_mjcf, self.name, self.post_processing_callback)
@@ -62,8 +60,7 @@ class StretchCameras(Enum):
         """
         Returns all the available cameras to stretch 4.
         """
-        return [StretchCameras.cam_gripper_rgb, StretchCameras.cam_gripper_depth, StretchCameras.cam_nav_rgb_se4_left,StretchCameras.cam_nav_rgb_se4_right,StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
-        return [StretchCameras.cam_gripper_rgb, StretchCameras.cam_gripper_depth, StretchCameras.cam_nav_rgb_se4_left,StretchCameras.cam_nav_rgb_se4_right,StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_hemilidar_left_top45, StretchCameras.cam_hemilidar_left_bottom45,StretchCameras.cam_hemilidar_right_top45,StretchCameras.cam_hemilidar_right_bottom45,]
+        return [StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb, StretchCameras.cam_gripper_se4_stereo_depth, StretchCameras.cam_nav_rgb_se4_left,StretchCameras.cam_nav_rgb_se4_right,StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
 
     @staticmethod
     def none() -> list["StretchCameras"]:
@@ -89,7 +86,8 @@ class StretchCameras(Enum):
         Returns the RGB camera's only
         """
         return [
-            StretchCameras.cam_gripper_rgb,
+            StretchCameras.cam_gripper_se4_left_rgb,
+            StretchCameras.cam_gripper_se4_right_rgb,
             StretchCameras.cam_nav_rgb_se4_left,
             StretchCameras.cam_nav_rgb_se4_right,
             StretchCameras.cam_nav_rgb_se4_center,
@@ -107,8 +105,7 @@ class StretchCameras(Enum):
         """
         Returns the Depth camera's only
         """
-        return [StretchCameras.cam_gripper_depth,StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
-        return [StretchCameras.cam_gripper_depth,StretchCameras.cam_hemilidar_left_top45, StretchCameras.cam_hemilidar_left_bottom45,StretchCameras.cam_hemilidar_right_top45,StretchCameras.cam_hemilidar_right_bottom45,]
+        return [StretchCameras.cam_gripper_se4_stereo_depth,StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
 
     @property
     def camera_name_in_mjcf(self) -> str:
@@ -123,23 +120,21 @@ class StretchCameras(Enum):
         if self == StretchCameras.cam_nav_rgb:
             return "nav_camera_rgb"
         if self == StretchCameras.cam_nav_rgb_se4_left:
-            return "link_camera_left"
+            return "camera_left_link"
         if self == StretchCameras.cam_nav_rgb_se4_right:
-            return "link_camera_right"
+            return "camera_right_link"
         if self == StretchCameras.cam_nav_rgb_se4_center:
-            return "link_camera_center"
-        if self == StretchCameras.cam_hemilidar_left_top45:
-            return "cam_hemilidar_left_top45"
-        if self == StretchCameras.cam_hemilidar_left_bottom45:
-            return "cam_hemilidar_left_bottom45"
-        if self == StretchCameras.cam_hemilidar_right_top45:
-            return "cam_hemilidar_right_top45"
-        if self == StretchCameras.cam_hemilidar_right_bottom45:
-            return "cam_hemilidar_right_bottom45"
+            return "camera_center_link"
         if self == StretchCameras.cam_hemilidar_left:
             return "cam_hemilidar_left"
         if self == StretchCameras.cam_hemilidar_right:
             return "cam_hemilidar_right"
+        if self == StretchCameras.cam_gripper_se4_left_rgb:
+            return "gripper_camera_left_rgb"
+        if self == StretchCameras.cam_gripper_se4_right_rgb:
+            return "gripper_camera_right_rgb"
+        if self == StretchCameras.cam_gripper_se4_stereo_depth:
+            return "gripper_camera_stereo_depth"
 
         raise NotImplementedError(f"Camera {self} camera_name_in_mjcf is not implemented")
 
@@ -156,7 +151,7 @@ class StretchCameras(Enum):
     @property
     def post_processing_callback(self) -> Callable[[np.ndarray], np.ndarray] | None:
 
-        if self == StretchCameras.cam_gripper_depth:
+        if self == StretchCameras.cam_gripper_depth or self == StretchCameras.cam_gripper_se4_stereo_depth:
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["gripper"])
 
         if self == StretchCameras.cam_d435i_depth or self in StretchCameras.hemispherical_lidars():
@@ -172,18 +167,10 @@ class StretchCameras(Enum):
         return [
             StretchCameras.cam_hemilidar_left,
         ]
-        return [
-            StretchCameras.cam_hemilidar_left_top45,
-            StretchCameras.cam_hemilidar_left_bottom45,
-        ]
     @staticmethod
     def right_lidar():
         return [
             StretchCameras.cam_hemilidar_right,
-        ]
-        return [
-            StretchCameras.cam_hemilidar_right_top45,
-            StretchCameras.cam_hemilidar_right_bottom45,
         ]
 
     @staticmethod
@@ -194,15 +181,19 @@ class StretchCameras(Enum):
     def initial_camera_settings(self):
 
         if self in StretchCameras.hemispherical_lidars():
+            """
+            We are trying to emulate a hemispherical lidar that generated 1,152,000 pts/s.
+            A height of 340 with an FOV of 160 degrees in both directions should generate
+            approximately 115,600 pts/frame or 1,156,000 pts/s.
+            """
             field_of_view_vertical_in_degrees=160
-            field_of_view_horizontal_in_degrees = 160 # Note: it's impossible to get 180 with a pinhole camera model, max would be 179.9. This is reduced to increase performance.
-
+            field_of_view_horizontal_in_degrees = 160
 
             vfov_rad = np.radians(field_of_view_vertical_in_degrees)
             hfov_rad = np.radians(field_of_view_horizontal_in_degrees)
 
             aspect_ratio = np.tan(hfov_rad / 2) / np.tan(vfov_rad / 2)
-            height = 300*4
+            height = 340
             width = height * aspect_ratio
             width = int(width)
 
@@ -217,7 +208,7 @@ class StretchCameras(Enum):
                 height=height,
             )
 
-        if self == StretchCameras.cam_gripper_rgb:
+        if self in [StretchCameras.cam_gripper_rgb, StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb]:
             return CameraSettings(
                 field_of_view_vertical_in_degrees=58,  # from spec
                 focal=(242.56, 242.34),  # from calibration on SE3-3044
@@ -228,7 +219,7 @@ class StretchCameras(Enum):
                 # sensor_pixel_size_micrometers=3.0 # from ov9782 spec
             )
 
-        if self == StretchCameras.cam_gripper_depth:
+        if self in [StretchCameras.cam_gripper_depth, StretchCameras.cam_gripper_se4_stereo_depth]:
             # Stereo camera, we just use a depth camera camera in mujoco:
             return StretchCameras.cam_gripper_rgb.initial_camera_settings
 
@@ -240,6 +231,7 @@ class StretchCameras(Enum):
                 height=240,  # from webteleop
                 sensor_resolution=(1920, 1080),  # from ov2740 spec
                 # sensor_pixel_size_micrometers=1.4 # from ov2740 spec
+                rotate_number_of_times=-1,
             )
 
         if self == StretchCameras.cam_d435i_depth:
@@ -268,7 +260,8 @@ class StretchCameras(Enum):
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
                 width=width,
-                height=height
+                height=height,
+                rotate_number_of_times=1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_right:
             # AR0234:
@@ -286,7 +279,8 @@ class StretchCameras(Enum):
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
                 width=width,
-                height=height
+                height=height,
+                rotate_number_of_times=-1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_center:
             # IMX378-W:
@@ -305,7 +299,8 @@ class StretchCameras(Enum):
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
                 width=width,
-                height=height
+                height=height,
+                rotate_number_of_times=1,
             )
 
         if self == StretchCameras.cam_nav_rgb:
@@ -320,6 +315,7 @@ class StretchCameras(Enum):
                 height=600,  # from webteleop
                 sensor_resolution=(1280, 720),  # from ov9782 spec
                 # sensor_pixel_size_micrometers=3.0 # from ov9782 spec, note: enabling this will not work with 0 `focal`
+                rotate_number_of_times=1,
             )
 
         raise NotImplementedError(f"Camera {self} initial settings are not implemented")
@@ -370,6 +366,8 @@ class CameraSettings:
     """This is currently being used in Stretch Web Teleop to crop a ROI"""
     distortion_params: tuple | None = None
     """Specify this if they are available. Zeros will be used in `get_distortion_params_d()` otherwise."""
+    rotate_number_of_times: int = 0
+    """Number of times to rotate the image (because the sensor is mounted rotated)"""
 
     @property
     def optical_center(self)-> tuple[float, float]:

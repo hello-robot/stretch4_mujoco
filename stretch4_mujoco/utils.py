@@ -312,9 +312,9 @@ class URDFmodel:
             lk_cfg["gripper_finger_left_joint"] = cfg["gripper"]
             lk_cfg["gripper_finger_right_joint"] = cfg["gripper"]
             
-        # Filter lk_cfg to only include joints that exist in this specific urdf
         valid_lk_cfg = {k: v for k, v in lk_cfg.items() if k in self.urdf.joint_map}
-        return self.urdf.link_fk(valid_lk_cfg, link=link_name)  # type: ignore
+        self.urdf.update_cfg(valid_lk_cfg)
+        return self.urdf.get_transform(link_name, self.urdf.base_link)
 
 
 def replace_xml_tag_value(xml_str: str, tag: str, attribute: str, pattern: str, value: str) -> str:
