@@ -51,6 +51,10 @@
     <exclude body1="aruco_fingertip_right_link" body2="gripper_finger_left_link" />
     <exclude body1="aruco_fingertip_left_link" body2="gripper_fingertip_right_link" />
     <exclude body1="aruco_fingertip_right_link" body2="gripper_fingertip_left_link" />
+    <exclude body1="gripper_fingertip_left_link" body2="grasp_center_link" />
+    <exclude body1="gripper_fingertip_right_link" body2="grasp_center_link" />
+    <exclude body1="aruco_fingertip_left_link" body2="grasp_center_link" />
+    <exclude body1="aruco_fingertip_right_link" body2="grasp_center_link" />
   </contact>
 
   <tendon>
