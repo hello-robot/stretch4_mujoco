@@ -100,7 +100,7 @@ class BaseController:
         # Trapezoidal profiles for omni wheels
         # Values can be tuned. max_vel and max_accel should match or slightly exceed robot capabilities.
         # Stepper motors have a max velocity around 50.0 rad/s
-        max_vel_multiplier = 10
+        max_vel_multiplier = 1
         self.left_wheel_profile = TrapezoidalProfile(max_vel=50.0*max_vel_multiplier, max_accel=15.0*max_vel_multiplier)
         self.right_wheel_profile = TrapezoidalProfile(max_vel=50.0*max_vel_multiplier, max_accel=15.0*max_vel_multiplier)
         self.back_wheel_profile = TrapezoidalProfile(max_vel=50.0*max_vel_multiplier, max_accel=15.0*max_vel_multiplier)
@@ -209,9 +209,13 @@ class BaseController:
 
             # Apply to actuators (which are now position actuators)
             # The profile is in motor coordinates, but actuator expects wheel coordinates
-            self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).ctrl = l_pos / self.params['gr']
-            self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).ctrl = r_pos / self.params['gr']
-            self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).ctrl = b_pos / self.params['gr']
+            # self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).ctrl = l_pos / self.params['gr']
+            # self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).ctrl = r_pos / self.params['gr']
+            # self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).ctrl = b_pos / self.params['gr']
+
+            self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).ctrl = self.left_wheel_profile.current_vel / self.params['gr']
+            self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).ctrl = self.right_wheel_profile.current_vel / self.params['gr']
+            self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).ctrl = self.back_wheel_profile.current_vel / self.params['gr']
 
 
         if self.last_command is None:

@@ -40,9 +40,9 @@ class BaseController:
     is_clockwise: bool | None = None
 
     def __init__(self):
-        self.forward_velocity = 0.7
-        self.right_velocity = 0.7
-        self.clockwise_velocity = 1.0
+        self.forward_velocity = 0.2
+        self.right_velocity = 0.2
+        self.clockwise_velocity = 0.5
 
     def get_forward_velocity(self):
         if self.is_forward is None:
