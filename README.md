@@ -120,16 +120,15 @@ if __name__ == "__main__":
     sim.stow()
     sim.home()
 
-    # Position Control
-    sim.move_to('lift', 1.0)
-    sim.move_by('head_pan', -1.1)
-    sim.move_by('base_translate', 0.1)
+    # Position Control (Subsystem API)
+    sim.lift.move_to(1.0)
+    sim.end_of_arm.wrist_yaw.move_by(0.2)
+    sim.base.translate_by(0.1)
 
-    sim.wait_until_at_setpoint('lift')
-    sim.wait_while_is_moving('base_translate')
+    sim.wait_command()
 
     # Base Velocity control
-    sim.set_base_velocity(0.3, -0.1)
+    sim.base.set_velocity(vx_m=0.3, vy_m=0.0, w_r=-0.1)
 
     # Get Joint Status
     from pprint import pprint

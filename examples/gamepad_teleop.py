@@ -193,16 +193,16 @@ def gamepad_loop(use_head_joints):
         if use_head_joints:
             left_button_counter.trigger_on_tap(toggle_dex_switch)
 
-            if dex_switch:
+            if dex_switch and hasattr(sim, "head"):
                 if gamepad_state.get("bottom_pad_pressed"):
-                    sim.move_by(Actuators["head_tilt"], 1 * 0.2 * robot.precision_multiplier)
+                    sim.head.head_tilt.move_by(1 * 0.2 * robot.precision_multiplier)
                 elif gamepad_state.get("top_pad_pressed"):
-                    sim.move_by(Actuators["head_tilt"], -1 * 0.2 * robot.precision_multiplier)
+                    sim.head.head_tilt.move_by(-1 * 0.2 * robot.precision_multiplier)
 
                 if gamepad_state.get("left_pad_pressed"):
-                    sim.move_by(Actuators["head_pan"], 1 * 0.2 * robot.precision_multiplier)
+                    sim.head.head_pan.move_by(1 * 0.2 * robot.precision_multiplier)
                 elif gamepad_state.get("right_pad_pressed"):
-                    sim.move_by(Actuators["head_pan"], -1 * 0.2 * robot.precision_multiplier)
+                    sim.head.head_pan.move_by(-1 * 0.2 * robot.precision_multiplier)
 
                 adapter.controller_state["bottom_pad_pressed"] = False
                 adapter.controller_state["top_pad_pressed"] = False
@@ -272,21 +272,21 @@ class GripperHandedness(Enum):
             yaw_to = 0.0
             pitch_to = 0.0
             roll_to = 0.0
-            sim.move_to(Actuators["wrist_roll"], roll_to)
+            sim.end_of_arm.wrist_roll.move_to(roll_to)
             sim.wait_until_at_setpoint(Actuators["wrist_roll"])
-            sim.move_to(Actuators["wrist_pitch"], pitch_to)
+            sim.end_of_arm.wrist_pitch.move_to(pitch_to)
             sim.wait_until_at_setpoint(Actuators["wrist_pitch"])
-            sim.move_to(Actuators["wrist_yaw"], yaw_to)
+            sim.end_of_arm.wrist_yaw.move_to(yaw_to)
             sim.wait_until_at_setpoint(Actuators["wrist_yaw"])
         elif self is GripperHandedness.LEFT:
             yaw_to = -math.pi
             pitch_to = -math.pi
             roll_to = math.pi
-            sim.move_to(Actuators["wrist_yaw"], yaw_to)
+            sim.end_of_arm.wrist_yaw.move_to(yaw_to)
             sim.wait_until_at_setpoint(Actuators["wrist_yaw"])
-            sim.move_to(Actuators["wrist_pitch"], pitch_to)
+            sim.end_of_arm.wrist_pitch.move_to(pitch_to)
             sim.wait_until_at_setpoint(Actuators["wrist_pitch"])
-            sim.move_to(Actuators["wrist_roll"], roll_to)
+            sim.end_of_arm.wrist_roll.move_to(roll_to)
             sim.wait_until_at_setpoint(Actuators["wrist_roll"])
         else:
             raise NotImplementedError(f"No move_to defined for {self}")
@@ -511,6 +511,18 @@ class ControlMapping(Enum):
         return actuated_joints
 
 
+def get_subsystem_by_name(sim, name):
+    if name in ["lift", "arm"]:
+        return getattr(sim, name)
+    elif name in ["wrist_yaw", "wrist_pitch", "wrist_roll"]:
+        return getattr(sim.end_of_arm, name)
+    elif name == "gripper":
+        return sim.end_of_arm.stretch_gripper
+    elif name in ["head_pan", "head_tilt"]:
+        return getattr(sim.head, name) if hasattr(sim, "head") else None
+    return None
+
+
 class MockCommand:
     def __init__(self, sim, actuator_name, scale=1.0):
         self.sim = sim
@@ -519,16 +531,14 @@ class MockCommand:
         self.name = actuator_name
 
     def command_button_to_motion(self, val, robot):
-        self.sim.move_by(
-            Actuators[self.actuator_name],
-            val * self.scale * robot.precision_multiplier * robot.profile_multiplier,
-        )
+        sub = get_subsystem_by_name(self.sim, self.actuator_name)
+        if sub:
+            sub.move_by(val * self.scale * robot.precision_multiplier * robot.profile_multiplier)
 
     def command_stick_to_motion(self, val, robot):
-        self.sim.move_by(
-            Actuators[self.actuator_name],
-            val * self.scale * robot.precision_multiplier * robot.profile_multiplier,
-        )
+        sub = get_subsystem_by_name(self.sim, self.actuator_name)
+        if sub:
+            sub.move_by(val * self.scale * robot.precision_multiplier * robot.profile_multiplier)
 
     def stop_motion(self, robot):
         pass
@@ -545,7 +555,7 @@ class MockGripperCommand:
             val = 5.0
         else:
             val = 0.07
-        self.sim.move_by(Actuators["gripper"], val * robot.precision_multiplier)
+        self.sim.end_of_arm.stretch_gripper.move_by(val * robot.precision_multiplier)
 
     def close_gripper(self, robot):
         val = -1
@@ -553,7 +563,7 @@ class MockGripperCommand:
             val = -5.0
         else:
             val = -0.07
-        self.sim.move_by(Actuators["gripper"], val * robot.precision_multiplier)
+        self.sim.end_of_arm.stretch_gripper.move_by(val * robot.precision_multiplier)
 
     def stop_gripper(self, robot):
         pass
@@ -580,15 +590,15 @@ class MockBaseCommand:
         omega = cmd_t * angular_velocity * robot.precision_multiplier * robot.profile_multiplier
 
         if isinstance(self.sim, Stretch4MujocoSimulator):
-            self.sim.set_base_velocity(v_x=v_x_linear, v_y=v_y_linear, omega=omega)
+            self.sim.base.set_velocity(v_x_linear, v_y_linear, omega)
         else:
-            self.sim.set_base_velocity(v_y_linear, omega)
+            self.sim.base.set_velocity(v_y_linear, 0.0, omega)
 
     def stop_motion(self, robot):
         if isinstance(self.sim, Stretch4MujocoSimulator):
-            self.sim.set_base_velocity(0.0, 0.0, 0.0)
+            self.sim.base.set_velocity(0.0, 0.0, 0.0)
         else:
-            self.sim.set_base_velocity(0.0, 0.0)
+            self.sim.base.set_velocity(0.0, 0.0, 0.0)
 
 
 class GamepadTeleopAdapter:

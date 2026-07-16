@@ -73,9 +73,9 @@ def set_base_velocity(sim: StretchMujocoSimulator, v_linear: float, omega: float
     Set the base velocity of the robot.
     """
     if isinstance(sim, Stretch4MujocoSimulator):
-        sim.set_base_velocity(v_x=v_linear, v_y=0.0, omega=omega)
+        sim.base.set_velocity(v_linear, 0.0, omega)
     else:
-        sim.set_base_velocity(v_linear=v_linear, omega=omega)
+        sim.base.set_velocity(v_linear, 0.0, omega)
 
 
 @click.command()

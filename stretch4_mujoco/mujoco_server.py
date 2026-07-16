@@ -717,6 +717,12 @@ class MujocoServer:
             new_status.gripper_right_finger.vel = self.mjdata.actuator(Actuators.gripper_right_finger.name).velocity[0]
             new_status.gripper_right_finger.effort = self.mjdata.actuator(Actuators.gripper_right_finger.name).force[0]
 
+            # Populate gripper status (aperture in degrees) by converting from finger URDF joint angle
+            avg_finger_pos = (new_status.gripper_left_finger.pos + new_status.gripper_right_finger.pos) / 2.0
+            new_status.gripper.pos = self.urdf_angle_radians_to_aperture_angle_degrees(avg_finger_pos)
+            new_status.gripper.vel = (new_status.gripper_left_finger.vel + new_status.gripper_right_finger.vel) / 2.0
+            new_status.gripper.effort = (new_status.gripper_left_finger.effort + new_status.gripper_right_finger.effort) / 2.0
+
         left_wheel_vel = self.mjdata.actuator(Actuators.left_wheel_vel.name).velocity[0]
         right_wheel_vel = self.mjdata.actuator(Actuators.right_wheel_vel.name).velocity[0]
 
@@ -876,4 +882,26 @@ class MujocoServer:
             aperture_angle_degrees,
             (aperture_close_deg, aperture_open_deg),
             (self.robot_settings['gripper_conversion']['urdf_closed_rad'], self.robot_settings['gripper_conversion']['urdf_open_rad'])
+            )
+
+    def urdf_angle_radians_to_aperture_angle_degrees(self, urdf_angle_radians):
+        def get_angle_from_chord_length_and_radius(radius_m, chord_m):
+            return 2 * np.arcsin(chord_m / (2 * radius_m))   # radians
+
+        aperture_open_rad = get_angle_from_chord_length_and_radius(
+                                self.robot_settings['gripper_conversion']['finger_length_m'],
+                                self.robot_settings['gripper_conversion']['aperture_open_m'],
+                                )
+        aperture_open_deg = np.rad2deg(aperture_open_rad)
+
+        aperture_close_rad = get_angle_from_chord_length_and_radius(
+                                self.robot_settings['gripper_conversion']['finger_length_m'],
+                                self.robot_settings['gripper_conversion']['aperture_closed_m'],
+                                )
+        aperture_close_deg = np.rad2deg(aperture_close_rad)
+
+        return utils.map_between_ranges(
+            urdf_angle_radians,
+            (self.robot_settings['gripper_conversion']['urdf_closed_rad'], self.robot_settings['gripper_conversion']['urdf_open_rad']),
+            (aperture_close_deg, aperture_open_deg)
             )

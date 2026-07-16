@@ -20,8 +20,8 @@ def draw_circle(n, diameter_m, arm_init, lift_init, sim: StretchMujocoSimulator)
     circle_mat = np.c_[x, y]
     for pt in circle_mat:
         print(f"Moving to {pt}")
-        sim.move_to(Actuators.arm, pt[0])
-        sim.move_to(Actuators.lift, pt[1])
+        sim.arm.move_to(pt[0])
+        sim.lift.move_to(pt[1])
 
         sim.wait_until_at_setpoint(Actuators.arm)
         sim.wait_until_at_setpoint(Actuators.lift)
@@ -31,16 +31,16 @@ def _run_draw_circle(sim: StretchMujocoSimulator, use_head_pan_and_tilt: bool):
     time.sleep(2)
     try:
         while sim.is_running():
-            if use_head_pan_and_tilt:
-                sim.move_to(Actuators.head_tilt, -1.5707)
-                sim.move_to(Actuators.head_pan, -0.7853)
+            if use_head_pan_and_tilt and hasattr(sim, "head"):
+                sim.head.head_tilt.move_to(-1.5707)
+                sim.head.head_pan.move_to(-0.7853)
 
-            sim.move_to(Actuators.wrist_yaw, 1.5707)
-            sim.move_to(Actuators.gripper, 0.5)
+            sim.end_of_arm.wrist_yaw.move_to(1.5707)
+            sim.end_of_arm.stretch_gripper.move_to(0.5)
             sim.wait_until_at_setpoint(Actuators.wrist_yaw)
             sim.wait_until_at_setpoint(Actuators.gripper)
 
-            sim.move_to(Actuators.gripper, pos=-0.15)
+            sim.end_of_arm.stretch_gripper.move_to(-0.15)
             sim.wait_until_at_setpoint(Actuators.gripper)
 
             status = sim.pull_status()

@@ -12,18 +12,19 @@ def lift_sequence(
     sim: StretchMujocoSimulator,
 ):
     while sim.is_running():
-        sim.move_to(Actuators.wrist_pitch, random.random() * 2 - 1)
-        sim.move_to(Actuators.wrist_roll, random.random() * 2 - 1)
-        sim.move_to(Actuators.wrist_yaw, random.random() * 2 - 1)
-        sim.move_to(Actuators.gripper, random.random() / 2)
-        if not isinstance(sim, Stretch4MujocoSimulator):
-            sim.move_to(Actuators.head_pan, random.random() - 0.5)
-            sim.move_to(Actuators.head_tilt, random.random() - 0.5)
+        sim.end_of_arm.wrist_pitch.move_to(random.random() * 2 - 1)
+        sim.end_of_arm.wrist_roll.move_to(random.random() * 2 - 1)
+        sim.end_of_arm.wrist_yaw.move_to(random.random() * 2 - 1)
+        gripper_target = (random.random() * 50.0) if isinstance(sim, Stretch4MujocoSimulator) else (random.random() / 2)
+        sim.end_of_arm.stretch_gripper.move_to(gripper_target)
+        if hasattr(sim, "head"):
+            sim.head.head_pan.move_to(random.random() - 0.5)
+            sim.head.head_tilt.move_to(random.random() - 0.5)
 
         LIFT_START_POS = 0.1
         MOVE_LIFT_BY = 0.5
 
-        sim.move_to(Actuators.lift, LIFT_START_POS)
+        sim.lift.move_to(LIFT_START_POS)
         sim.wait_until_at_setpoint(Actuators.lift)
 
         start_lift_position = sim.pull_status().lift.pos
@@ -33,7 +34,7 @@ def lift_sequence(
                 f"The lift did not move to the starting position. Should be at {LIFT_START_POS}, but is at {start_lift_position:.2f} instead."
             )
 
-        sim.move_by(Actuators.lift, MOVE_LIFT_BY)
+        sim.lift.move_by(MOVE_LIFT_BY)
         sim.wait_while_is_moving(Actuators.lift)
 
         current_lift_position = sim.pull_status().lift.pos
@@ -43,7 +44,7 @@ def lift_sequence(
                 f"The lift did not move by the specified amount. Asked to move from {start_lift_position:.4f} by {MOVE_LIFT_BY}, but ended up at {current_lift_position:.4f}. Should be {start_lift_position + MOVE_LIFT_BY :.4f}"
             )
 
-        if not isinstance(sim, Stretch4MujocoSimulator):
+        if hasattr(sim, "head"):
             sim.wait_until_at_setpoint(Actuators.head_pan, timeout=0.1)
             sim.wait_until_at_setpoint(Actuators.head_tilt, timeout=0.1)
 
@@ -58,9 +59,9 @@ def set_base_velocity(sim: StretchMujocoSimulator, v_linear: float, omega: float
     Set the base velocity of the robot.
     """
     if isinstance(sim, Stretch4MujocoSimulator):
-        sim.set_base_velocity(v_x=v_linear, v_y=0.0, omega=omega / 3)
+        sim.base.set_velocity(v_linear, 0.0, omega / 3)
     else:
-        sim.set_base_velocity(v_linear=v_linear, omega=omega)
+        sim.base.set_velocity(v_linear, 0.0, omega)
 
 
 @click.command()
@@ -74,7 +75,7 @@ def main(use_stretch_3: bool):
     try:
         sim.stow()
 
-        set_base_velocity(sim, v_linear=5.0, omega=30)
+        set_base_velocity(sim, v_linear=0.5, omega=5)
 
         thread = threading.Thread(target=lift_sequence, daemon=False, args=[sim])
         thread.start()
@@ -90,10 +91,10 @@ def main(use_stretch_3: bool):
 
             if target > 0 and current_position > target:
                 target *= -1
-                set_base_velocity(sim, v_linear=-5.0, omega=-30)
+                set_base_velocity(sim, v_linear=-0.5, omega=-5)
             elif target < 0 and current_position < target:
                 target *= -1
-                set_base_velocity(sim, v_linear=5.0, omega=30)
+                set_base_velocity(sim, v_linear=0.5, omega=5)
 
         thread.join()
 
