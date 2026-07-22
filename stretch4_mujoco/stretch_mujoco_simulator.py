@@ -71,6 +71,16 @@ class StretchMujocoSimulator:
 
         self._command_lock = Lock()
 
+        self.base = BaseSubsystem(self)
+        self.omnibase = self.base
+        self.arm = JointSubsystem(self, 'arm', Actuators.arm)
+        self.lift = JointSubsystem(self, 'lift', Actuators.lift)
+        self.end_of_arm = EndOfArmSubsystem(self)
+        
+        # Stretch 4 does not have head
+        if self.__class__.__name__ != "Stretch4MujocoSimulator":
+            self.head = HeadSubsystem(self)
+
     @staticmethod
     def get_scene_xml_path() -> str:
         """
@@ -326,6 +336,81 @@ class StretchMujocoSimulator:
             return False
         return True
 
+    def wait_command(self, timeout: float = 15.0, check_interval: float = 0.1, position_tolerance: float = 0.001) -> bool:
+        """
+        Pause program execution until all motion is complete.
+        This loops and checks the positions of lift, arm, base, and end_of_arm.
+        When all positions remain stable (change < position_tolerance) over check_interval,
+        the motion is considered complete.
+        """
+        # Determine the actuators to watch
+        actuators = [
+            Actuators.lift,
+            Actuators.arm,
+            Actuators.wrist_yaw,
+            Actuators.gripper,
+            Actuators.base_translate,
+            Actuators.base_rotate,
+        ]
+        if hasattr(self, "end_of_arm"):
+            if hasattr(self.end_of_arm, "wrist_pitch"):
+                actuators.append(Actuators.wrist_pitch)
+            if hasattr(self.end_of_arm, "wrist_roll"):
+                actuators.append(Actuators.wrist_roll)
+        if hasattr(self, "head"):
+            actuators.append(Actuators.head_pan)
+            actuators.append(Actuators.head_tilt)
+
+        # Helper to get all current positions
+        def get_all_positions():
+            positions = {}
+            status = self.pull_status()
+            for act in actuators:
+                if act in [Actuators.base_translate, Actuators.base_rotate]:
+                    # Relative or absolute base position
+                    rel_pos = act.get_position_relative(status)
+                    if act == Actuators.base_translate:
+                        positions[act] = rel_pos[0]
+                    elif act == Actuators.base_rotate:
+                        positions[act] = rel_pos[2]
+                else:
+                    positions[act] = act.get_position(status)
+            return positions
+
+        start_time = time.time()
+        try:
+            last_positions = get_all_positions()
+        except Exception:
+            # If server isn't ready or status pull fails initially, wait and retry
+            time.sleep(check_interval)
+            last_positions = get_all_positions()
+        
+        while time.time() - start_time < timeout:
+            if not self.is_running():
+                break
+            time.sleep(check_interval)
+            try:
+                current_positions = get_all_positions()
+            except Exception:
+                continue
+            
+            # Check if any position changed significantly
+            any_moving = False
+            for act in actuators:
+                last_p = last_positions[act]
+                curr_p = current_positions[act]
+                if not np.isclose(curr_p, last_p, atol=position_tolerance):
+                    any_moving = True
+                    break
+                    
+            if not any_moving:
+                # All joints are stable!
+                return True
+                
+            last_positions = current_positions
+            
+        return False
+
     _last_movement_positions: dict[Actuators, float | tuple[float, float, float]] = {}
 
     def wait_while_is_moving(
@@ -388,7 +473,7 @@ class StretchMujocoSimulator:
         return True
 
     @require_connection
-    def move_to(self, actuator: str | Actuators, pos: float) -> None:
+    def _move_to(self, actuator: str | Actuators, pos: float) -> None:
         """
         Move the actuator to an absolute position.
         Args:
@@ -417,7 +502,7 @@ class StretchMujocoSimulator:
             self.data_proxies.set_command(command)
 
     @require_connection
-    def move_by(self, actuator: str | Actuators, pos: float):
+    def _move_by(self, actuator: str | Actuators, pos: float):
         """
         Move the actuator by a relative amount.
         Args:
@@ -449,7 +534,7 @@ class StretchMujocoSimulator:
             self.data_proxies.set_command(command)
 
     @require_connection
-    def set_base_velocity(self, v_linear: float, omega: float) -> None:
+    def _set_base_velocity(self, v_linear: float, omega: float) -> None:
         """
         Set the base velocity of the robot
         Args:
@@ -562,3 +647,61 @@ class StretchMujocoSimulator:
             return False
 
         return not self.is_stop_called
+
+
+class BaseSubsystem:
+    def __init__(self, sim: "StretchMujocoSimulator"):
+        self._sim = sim
+
+    @property
+    def status(self):
+        return self._sim.pull_status().base
+
+    def translate_by(self, x_m, y_m=0.0, v_m=None, a_m=None):
+        self._sim._move_by(Actuators.base_translate, x_m)
+        if y_m != 0.0:
+            self._sim._move_by(Actuators.base_translate_y, y_m)
+
+    def rotate_by(self, w_r, v_r=None, a_r=None):
+        self._sim._move_by(Actuators.base_rotate, w_r)
+
+    def set_velocity(self, vx_m, vy_m, w_r, a_m=None, a_r=None):
+        if self._sim.__class__.__name__ == "Stretch4MujocoSimulator":
+            self._sim._set_base_velocity(vx_m, vy_m, w_r)
+        else:
+            self._sim._set_base_velocity(vx_m, w_r)
+
+
+
+class JointSubsystem:
+    def __init__(self, sim: "StretchMujocoSimulator", name: str, actuator: Actuators):
+        self._sim = sim
+        self._name = name
+        self._actuator = actuator
+
+    @property
+    def status(self):
+        return getattr(self._sim.pull_status(), self._name)
+
+    def move_to(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
+        self._sim._move_to(self._actuator, x_m)
+
+    def move_by(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
+        self._sim._move_by(self._actuator, x_m)
+
+
+class EndOfArmSubsystem:
+    def __init__(self, sim: "StretchMujocoSimulator"):
+        self._sim = sim
+        self.wrist_yaw = JointSubsystem(sim, 'wrist_yaw', Actuators.wrist_yaw)
+        self.wrist_pitch = JointSubsystem(sim, 'wrist_pitch', Actuators.wrist_pitch)
+        self.wrist_roll = JointSubsystem(sim, 'wrist_roll', Actuators.wrist_roll)
+        self.stretch_gripper = JointSubsystem(sim, 'gripper', Actuators.gripper)
+        self.parallel_gripper = JointSubsystem(sim, 'gripper', Actuators.gripper)
+
+
+class HeadSubsystem:
+    def __init__(self, sim: "StretchMujocoSimulator"):
+        self._sim = sim
+        self.head_pan = JointSubsystem(sim, 'head_pan', Actuators.head_pan)
+        self.head_tilt = JointSubsystem(sim, 'head_tilt', Actuators.head_tilt)

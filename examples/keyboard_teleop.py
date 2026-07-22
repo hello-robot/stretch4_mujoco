@@ -78,13 +78,13 @@ class BaseController:
     def handle_base_velocity(self, sim: StretchMujocoSimulator):
 
         if isinstance(sim, Stretch4MujocoSimulator):
-            sim.set_base_velocity(
+            sim.base.set_velocity(
                 self.get_forward_velocity(),
                 self.get_right_velocity(),
                 self.get_clockwise_velocity(),
             )
         else:
-            sim.set_base_velocity(self.get_forward_velocity(), self.get_clockwise_velocity())
+            sim.base.set_velocity(self.get_forward_velocity(), 0.0, self.get_clockwise_velocity())
 
 
 class KeyboardController:
@@ -153,35 +153,35 @@ class KeyboardController:
         self.base_controller.handle_base_velocity(self.sim)
 
         if key == "u":
-            self.sim.move_by(Actuators.lift, 0.1)
+            self.sim.lift.move_by(0.1)
         elif key == "j":
-            self.sim.move_by(Actuators.lift, -0.1)
+            self.sim.lift.move_by(-0.1)
         elif key == "h":
-            self.sim.move_by(Actuators.arm, -0.05)
+            self.sim.arm.move_by(-0.05)
         elif key == "k":
-            self.sim.move_by(Actuators.arm, 0.05)
+            self.sim.arm.move_by(0.05)
         elif key == "o":
-            self.sim.move_by(Actuators.wrist_yaw, -0.2)
+            self.sim.end_of_arm.wrist_yaw.move_by(-0.2)
         elif key == "p":
-            self.sim.move_by(Actuators.wrist_yaw, 0.2)
+            self.sim.end_of_arm.wrist_yaw.move_by(0.2)
         elif key == "c":
-            self.sim.move_by(Actuators.wrist_pitch, 0.2)
+            self.sim.end_of_arm.wrist_pitch.move_by(0.2)
         elif key == "v":
-            self.sim.move_by(Actuators.wrist_pitch, -0.2)
+            self.sim.end_of_arm.wrist_pitch.move_by(-0.2)
         elif key == "t":
-            self.sim.move_by(Actuators.wrist_roll, 0.2)
+            self.sim.end_of_arm.wrist_roll.move_by(0.2)
         elif key == "y":
-            self.sim.move_by(Actuators.wrist_roll, -0.2)
+            self.sim.end_of_arm.wrist_roll.move_by(-0.2)
         elif key == "n":
             if self.use_stretch_3:
-                self.sim.move_by(Actuators.gripper, 0.07)
+                self.sim.end_of_arm.stretch_gripper.move_by(0.07)
             else:
-                self.sim.move_by(Actuators.gripper, 5.0)  # degrees (aperture angle)
+                self.sim.end_of_arm.stretch_gripper.move_by(5.0)  # degrees (aperture angle)
         elif key == "m":
             if self.use_stretch_3:
-                self.sim.move_by(Actuators.gripper, -0.07)
+                self.sim.end_of_arm.stretch_gripper.move_by(-0.07)
             else:
-                self.sim.move_by(Actuators.gripper, -5.0)  # degrees (aperture angle)
+                self.sim.end_of_arm.stretch_gripper.move_by(-5.0)  # degrees (aperture angle)
         elif key == "l":
             pprint(self.sim.pull_status())
         elif key == ".":

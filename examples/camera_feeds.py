@@ -32,7 +32,7 @@ def show_camera_feeds_sync(sim: StretchMujocoSimulator, print_fps: bool):
 
 def my_control_loop(sim: StretchMujocoSimulator,):
     while sim.is_running():
-        sim.move_to(Actuators.lift, random.random())
+        sim.lift.move_to(random.random())
         time.sleep(3)
 
 

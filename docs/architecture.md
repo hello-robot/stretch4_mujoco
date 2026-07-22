@@ -52,7 +52,7 @@ if __name__ == "__main__":
 
 When the simulator is running, you can use your script to send commands to Stretch, or read data from the simulation.
 
-Use the following command to move the lift to `0.5m`: `sim.move_to(Actuators.lift, 0.5)`
+Use the following command to move the lift to `0.5m`: `sim.lift.move_to(0.5)`
 
 ### Reading data from Stretch
 

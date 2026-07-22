@@ -220,7 +220,7 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         return True
 
     @require_connection
-    def move_to(self, actuator: str | Actuators, pos: float) -> None:
+    def _move_to(self, actuator: str | Actuators, pos: float) -> None:
         """
         Move the actuator to an absolute position.
         Args:
@@ -242,10 +242,10 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             raise Exception(
                 f"Cannot set an absolute position for a continuous joint {actuator.name}"
             )
-        return super().move_to(actuator=actuator, pos=pos)
+        return super()._move_to(actuator=actuator, pos=pos)
 
     @require_connection
-    def move_by(self, actuator: str | Actuators, pos: float):
+    def _move_by(self, actuator: str | Actuators, pos: float):
         """
         Move the actuator by a relative amount.
         Args:
@@ -270,10 +270,10 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
                 f"Cannot set an absolute position for a continuous joint {actuator.name}"
             )
 
-        return super().move_by(actuator=actuator, pos=pos)
+        return super()._move_by(actuator=actuator, pos=pos)
 
     @require_connection
-    def set_base_velocity(self, v_x: float, v_y: float, omega: float) -> None:
+    def _set_base_velocity(self, v_x: float, v_y: float, omega: float) -> None:
         """
         Set the base velocity of the robot
         Args:
@@ -287,6 +287,7 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             command.set_base_velocity(
                 CommandBaseVelocity(v_x=v_x, v_y=v_y, omega=omega, trigger=True)
             )
+
 
             self.data_proxies.set_command(command)
 

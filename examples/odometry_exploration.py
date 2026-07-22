@@ -64,9 +64,9 @@ def main(use_stretch_3:bool, doy:bool, quick:bool):
                     plot_data[field].append(getattr(status.base, field))
 
             if use_stretch_3:
-                sim.set_base_velocity(xv, tv)
+                sim.base.set_velocity(xv, 0.0, tv)
             else:
-                sim.set_base_velocity(xv, yv, tv)
+                sim.base.set_velocity(xv, yv, tv)
             plot_data['cx_vel'].append(xv)
             plot_data['cy_vel'].append(yv)
             plot_data['ctheta_vel'].append(tv)
