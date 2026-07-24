@@ -133,21 +133,30 @@ class BaseController:
     def push_command(self, command: CommandMove | CommandBaseVelocity):
         """Push a command to the base. Call `update()` to set the next trajectory."""
         if isinstance(command, CommandBaseVelocity):
-            self.active_velocity = command
-            self.active_translate_x = None
-            self.active_translate_y = None
-            self.active_rotate = None
+            if command.v_x == 0.0 and command.v_y == 0.0 and command.omega == 0.0:
+                self._clear_command(is_stop_motion=True)
+            else:
+                self.active_velocity = command
+                self.active_translate_x = None
+                self.active_translate_y = None
+                self.active_rotate = None
         elif isinstance(command, CommandMove):
             self.active_velocity = None
             if command.actuator_name == Actuators.base_translate.name:
                 self.active_translate_x = command
                 curr_pose = self.get_base_pose()
+                # reset start pos based on current position and currently executing translation
                 self.start_pose_x = curr_pose[0]
                 self.start_pose_y = curr_pose[1]
                 self.start_pose_theta = curr_pose[2]
+                self.active_translate_y = None # Ensure any previous Y translation is canceled if X is commanded
             elif command.actuator_name == Actuators.base_translate_y.name:
                 self.active_translate_y = command
                 curr_pose = self.get_base_pose()
+                self.start_pose_x = curr_pose[0]
+                self.start_pose_y = curr_pose[1]
+                self.start_pose_theta = curr_pose[2]
+                self.active_translate_x = None # Ensure any previous X translation is canceled if Y is commanded
                 self.start_pose_x = curr_pose[0]
                 self.start_pose_y = curr_pose[1]
                 self.start_pose_theta = curr_pose[2]
@@ -214,7 +223,7 @@ class BaseController:
         self.status['x'] += float(Sb[0])
         self.status['y'] += float(Sb[1])
         self.status['theta'] += float(Sb[2])
-        if abs(Vb[1]) > 1e-3:
+        if True:
             print(f"DEBUG_ODOM: wheel_speeds={wheel_speeds}, Vb={Vb}, dt={dt:.4f}, Sb={Sb}, status_y={self.status['y']:.4f}, status_theta={self.status['theta']:.4f}")
         self.status['pose_time_s'] = time.time()
 
@@ -237,8 +246,8 @@ class BaseController:
             r_pos = self.right_wheel_profile.update(dt)
             b_pos = self.back_wheel_profile.update(dt)
 
-            # if abs(self.left_wheel_profile.current_vel) > 1e-3 or abs(self.right_wheel_profile.current_vel) > 1e-3 or abs(self.back_wheel_profile.current_vel) > 1e-3:
-            #     print(f"DEBUG_WHEELS: L_vel={self.left_wheel_profile.current_vel:.4f}/{self.left_wheel_profile.target_vel:.4f}, R_vel={self.right_wheel_profile.current_vel:.4f}/{self.right_wheel_profile.target_vel:.4f}, B_vel={self.back_wheel_profile.current_vel:.4f}/{self.back_wheel_profile.target_vel:.4f}, L_pos={l_pos:.4f}, R_pos={r_pos:.4f}, B_pos={b_pos:.4f}")
+            if abs(self.left_wheel_profile.current_vel) > 1e-3 or abs(self.right_wheel_profile.current_vel) > 1e-3 or abs(self.back_wheel_profile.current_vel) > 1e-3:
+                print(f"DEBUG_WHEELS: L_vel={self.left_wheel_profile.current_vel:.4f}/{self.left_wheel_profile.target_vel:.4f}, R_vel={self.right_wheel_profile.current_vel:.4f}/{self.right_wheel_profile.target_vel:.4f}, B_vel={self.back_wheel_profile.current_vel:.4f}/{self.back_wheel_profile.target_vel:.4f}, L_pos={l_pos:.4f}, R_pos={r_pos:.4f}, B_pos={b_pos:.4f}")
 
             # Apply to actuators (which are now velocity actuators)
             # The profile is in motor coordinates, but actuator expects wheel coordinates
@@ -257,8 +266,11 @@ class BaseController:
             return self._base_rotate_by(self.active_rotate.pos)
 
         if self.active_translate_x is not None or self.active_translate_y is not None:
+            # Re-read active translate properties, because one might be finished
             x_inc = self.active_translate_x.pos if self.active_translate_x is not None else 0.0
             y_inc = self.active_translate_y.pos if self.active_translate_y is not None else 0.0
+            if x_inc == 0.0 and y_inc == 0.0:
+                 return self._clear_command(is_stop_motion=True)
             return self._base_translate_by_combined(x_inc, y_inc)
 
     def get_base_pose(self) -> np.ndarray:
@@ -282,24 +294,37 @@ class BaseController:
         local_dx = dx * np.cos(theta) + dy * np.sin(theta)
         local_dy = -dx * np.sin(theta) + dy * np.cos(theta)
         
+        err_x = x_inc - local_dx
+        err_y = y_inc - local_dy
+
         # Check if X translation has finished
         if self.active_translate_x is not None:
-            if abs(local_dx) >= abs(x_inc) - 0.005:
+            is_vel_zero = (
+                abs(self.left_wheel_profile.current_vel) < 0.05 and
+                abs(self.right_wheel_profile.current_vel) < 0.05 and
+                abs(self.back_wheel_profile.current_vel) < 0.05
+            )
+            if abs(err_x) < 0.005 and is_vel_zero:
                 self.active_translate_x = None
-                x_inc = 0.0
+                err_x = 0.0
 
         # Check if Y translation has finished
         if self.active_translate_y is not None:
-            if abs(local_dy) >= abs(y_inc) - 0.005:
+            is_vel_zero = (
+                abs(self.left_wheel_profile.current_vel) < 0.05 and
+                abs(self.right_wheel_profile.current_vel) < 0.05 and
+                abs(self.back_wheel_profile.current_vel) < 0.05
+            )
+            if abs(err_y) < 0.005 and is_vel_zero:
                 self.active_translate_y = None
-                y_inc = 0.0
+                err_y = 0.0
 
         if self.active_translate_x is None and self.active_translate_y is None:
-            print("DEBUG: Both translations finished! Clearing command.")
             return self._clear_command(is_stop_motion=True)
 
-        x_v = np.sign(x_inc) if x_inc != 0.0 else 0.0
-        y_v = np.sign(y_inc) if y_inc != 0.0 else 0.0
+        Kp = 2.0
+        x_v = np.clip(Kp * err_x, -self.curr_max_vel_xy_m, self.curr_max_vel_xy_m)
+        y_v = np.clip(Kp * err_y, -self.curr_max_vel_xy_m, self.curr_max_vel_xy_m)
 
         # Active closed-loop heading stabilization
         curr_theta = curr_pose[2]
@@ -316,12 +341,24 @@ class BaseController:
         """
         Rotate the base by a certain w.r.t base global pose
         """
-        start_pose = self.start_pose_theta
-        sign = 1 if theta_inc > 0 else -1
-        if not abs(start_pose - self.get_base_pose()[-1]) <= abs(theta_inc):
-            return self._clear_command(is_stop_motion=True)
+        target_theta = self.start_pose_theta + theta_inc
+        curr_theta = self.get_base_pose()[2]
+        
+        # Normalize angle difference to [-pi, pi]
+        theta_err = (target_theta - curr_theta + np.pi) % (2 * np.pi) - np.pi
 
-        self._set_base_velocity(0.0, 0.0, sign)
+        is_vel_zero = (
+            abs(self.left_wheel_profile.current_vel) < 0.05 and
+            abs(self.right_wheel_profile.current_vel) < 0.05 and
+            abs(self.back_wheel_profile.current_vel) < 0.05
+        )
+        if abs(theta_err) < 0.02 and is_vel_zero: # ~1 degree tolerance
+            return self._clear_command(is_stop_motion=True)
+            
+        Kp = 2.0
+        w_v = np.clip(Kp * theta_err, -self.curr_max_vel_w_r, self.curr_max_vel_w_r)
+
+        self._set_base_velocity(0.0, 0.0, w_v)
 
 
     def _set_base_velocity_diff_drive(self, v_linear: float, omega: float) -> None:
@@ -398,11 +435,17 @@ class BaseController:
         Return the accelerations (motor frame) that achieve the target
         at the same time in the future.
         """
-        wheel_speeds = np.array([self.status['wheel0_vel'],
-                                 self.status['wheel1_vel'],
-                                 self.status['wheel2_vel']])  # current motor velocities
-
-        u_current_w = wheel_speeds / self.params['gr']  # current wheel velocities
+        if hasattr(self, 'left_wheel_profile'):
+            u_current_w = np.array([
+                self.params['wheel0_polarity'] * self.left_wheel_profile.current_vel,
+                self.params['wheel1_polarity'] * self.back_wheel_profile.current_vel,
+                self.params['wheel2_polarity'] * self.right_wheel_profile.current_vel
+            ]) / self.params['gr']
+        else:
+            wheel_speeds = np.array([self.status['wheel0_vel'],
+                                     self.status['wheel1_vel'],
+                                     self.status['wheel2_vel']])  # current motor velocities
+            u_current_w = wheel_speeds / self.params['gr']  # current wheel velocities
 
         delta_u = u_target_w - u_current_w
         max_delta = np.max(np.abs(delta_u))

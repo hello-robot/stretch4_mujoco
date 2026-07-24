@@ -12,7 +12,7 @@
       <general biastype="affine" />
 
       <default class="wheel">
-        <joint axis="0 0 1" armature="0.01" damping="0.1" frictionloss="0" limited="false" />
+        <joint axis="0 0 1" armature="0.01" damping="0.1" frictionloss="15.0" limited="false" />
         <velocity kv="100" gear="6" forcerange="-300.0 300.0"/>
       </default>
       <default class="lift">

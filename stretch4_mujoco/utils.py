@@ -522,7 +522,7 @@ def dataclass_from_dict(klass, dict_data: dict):
 
 
 def block_until_check_succeeds(
-    wait_timeout: float | None, check: Callable[[], bool], is_alive: Callable[[], bool]
+    wait_timeout: float | None, check: Callable[[], bool], is_alive: Callable[[], bool], time_fn: Callable[[], float] | None = None
 ) -> bool:
     """Blocks until the check callback succeeds"""
 
@@ -532,13 +532,15 @@ def block_until_check_succeeds(
                 return True
         return False
 
-    start_time = time.time()
+    t_fn = time_fn if time_fn is not None else time.time
+    start_time = t_fn()
 
-    while time.time() - start_time < wait_timeout:
+    while t_fn() - start_time < wait_timeout:
         if not is_alive():
             return False
         if check():
             return True
+        time.sleep(0.01)
 
     return False
 

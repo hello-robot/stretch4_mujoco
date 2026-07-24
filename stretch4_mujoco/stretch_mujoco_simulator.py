@@ -325,6 +325,7 @@ class StretchMujocoSimulator:
             )
             == True,
             is_alive=self.is_running,
+            time_fn=lambda: self.pull_status().time,
         ):
             pos = move_command.pos
             actual = actuator.get_position(self.pull_status())
@@ -380,15 +381,16 @@ class StretchMujocoSimulator:
                     positions[act] = act.get_position(status)
             return positions
 
-        start_time = time.time()
         try:
+            start_time = self.pull_status().time
             last_positions = get_all_positions()
         except Exception:
             # If server isn't ready or status pull fails initially, wait and retry
             time.sleep(check_interval)
+            start_time = self.pull_status().time
             last_positions = get_all_positions()
         
-        while time.time() - start_time < timeout:
+        while self.pull_status().time - start_time < timeout:
             if not self.is_running():
                 break
             time.sleep(check_interval)
@@ -474,6 +476,7 @@ class StretchMujocoSimulator:
             wait_timeout=timeout,
             check=lambda: check_if_moved() == False,
             is_alive=self.is_running,
+            time_fn=lambda: self.pull_status().time,
         ):
             if timeout is not None:
                 click.secho(
