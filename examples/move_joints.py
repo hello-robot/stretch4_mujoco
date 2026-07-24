@@ -15,7 +15,7 @@ def lift_sequence(
         sim.end_of_arm.wrist_pitch.move_to(random.random() * 2 - 1)
         sim.end_of_arm.wrist_roll.move_to(random.random() * 2 - 1)
         sim.end_of_arm.wrist_yaw.move_to(random.random() * 2 - 1)
-        gripper_target = (random.random() * 50.0) if isinstance(sim, Stretch4MujocoSimulator) else (random.random() / 2)
+        gripper_target = random.random() * 0.5  # radians (safe upper limit for both models)
         sim.end_of_arm.stretch_gripper.move_to(gripper_target)
         if hasattr(sim, "head"):
             sim.head.head_pan.move_to(random.random() - 0.5)
