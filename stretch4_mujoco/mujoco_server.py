@@ -94,13 +94,19 @@ class BaseController:
 
     def __init__(self, mujoco_server: "MujocoServer") -> None:
         self.mujoco_server = mujoco_server
-        self.last_command: CommandMove | CommandBaseVelocity | None = None
-        self.start_pose = np.array([0, 0, 0])
+        self.active_translate_x: CommandMove | None = None
+        self.active_translate_y: CommandMove | None = None
+        self.active_rotate: CommandMove | None = None
+        self.active_velocity: CommandBaseVelocity | None = None
+        
+        self.start_pose_x = 0.0
+        self.start_pose_y = 0.0
+        self.start_pose_theta = 0.0
 
         # Trapezoidal profiles for omni wheels
         # Values can be tuned. max_vel and max_accel should match or slightly exceed robot capabilities.
         # Stepper motors have a max velocity around 50.0 rad/s
-        max_vel_multiplier = 10
+        max_vel_multiplier = 1.0
         self.left_wheel_profile = TrapezoidalProfile(max_vel=50.0*max_vel_multiplier, max_accel=15.0*max_vel_multiplier)
         self.right_wheel_profile = TrapezoidalProfile(max_vel=50.0*max_vel_multiplier, max_accel=15.0*max_vel_multiplier)
         self.back_wheel_profile = TrapezoidalProfile(max_vel=50.0*max_vel_multiplier, max_accel=15.0*max_vel_multiplier)
@@ -126,22 +132,44 @@ class BaseController:
 
     def push_command(self, command: CommandMove | CommandBaseVelocity):
         """Push a command to the base. Call `update()` to set the next trajectory."""
-        self.last_command = command
-        self.start_pose = self.get_base_pose()
+        if isinstance(command, CommandBaseVelocity):
+            self.active_velocity = command
+            self.active_translate_x = None
+            self.active_translate_y = None
+            self.active_rotate = None
+        elif isinstance(command, CommandMove):
+            self.active_velocity = None
+            if command.actuator_name == Actuators.base_translate.name:
+                self.active_translate_x = command
+                curr_pose = self.get_base_pose()
+                self.start_pose_x = curr_pose[0]
+                self.start_pose_y = curr_pose[1]
+                self.start_pose_theta = curr_pose[2]
+            elif command.actuator_name == Actuators.base_translate_y.name:
+                self.active_translate_y = command
+                curr_pose = self.get_base_pose()
+                self.start_pose_x = curr_pose[0]
+                self.start_pose_y = curr_pose[1]
+                self.start_pose_theta = curr_pose[2]
+            elif command.actuator_name == Actuators.base_rotate.name:
+                self.active_rotate = command
+                self.start_pose_theta = self.get_base_pose()[2]
 
     def _clear_command(self, is_stop_motion: bool):
-        self.last_command = None
+        self.active_translate_x = None
+        self.active_translate_y = None
+        self.active_rotate = None
+        self.active_velocity = None
 
         if is_stop_motion:
-            self._set_base_velocity(0.0, 0.0, 0.0)
+            self._set_base_velocity(0.0, 0.0, 0.0, a_m=15.0, a_r=15.0)
 
     def _set_wheel_vel(self, left_wheel_vel, back_wheel_vel, right_wheel_vel):
         # Wheel number is based on http://3.12.229.27/index.php/Base_Frame_Convention_%26_Wheel_Odometry
         # Wheel polarity was trial and error
-        gr = self.params.get('gr', 1.0)
-        self.status['wheel0_vel'] = self.params['wheel0_polarity'] * left_wheel_vel * gr
-        self.status['wheel1_vel'] = self.params['wheel1_polarity'] * back_wheel_vel * gr
-        self.status['wheel2_vel'] = self.params['wheel2_polarity'] * right_wheel_vel * gr
+        self.status['wheel0_vel'] = self.params['wheel0_polarity'] * left_wheel_vel * self.params['gr']
+        self.status['wheel1_vel'] = self.params['wheel1_polarity'] * back_wheel_vel * self.params['gr']
+        self.status['wheel2_vel'] = self.params['wheel2_polarity'] * right_wheel_vel * self.params['gr']
 
     def _control_wheel_vel(self, wheel0_vel, wheel0_accel, wheel1_vel, wheel1_accel, wheel2_vel, wheel2_accel):
         # Wheel number is based on http://3.12.229.27/index.php/Base_Frame_Convention_%26_Wheel_Odometry
@@ -186,6 +214,8 @@ class BaseController:
         self.status['x'] += float(Sb[0])
         self.status['y'] += float(Sb[1])
         self.status['theta'] += float(Sb[2])
+        if abs(Vb[1]) > 1e-3:
+            print(f"DEBUG_ODOM: wheel_speeds={wheel_speeds}, Vb={Vb}, dt={dt:.4f}, Sb={Sb}, status_y={self.status['y']:.4f}, status_theta={self.status['theta']:.4f}")
         self.status['pose_time_s'] = time.time()
 
     def update(self):
@@ -207,25 +237,29 @@ class BaseController:
             r_pos = self.right_wheel_profile.update(dt)
             b_pos = self.back_wheel_profile.update(dt)
 
-            # Apply to actuators (which are now position actuators)
+            # if abs(self.left_wheel_profile.current_vel) > 1e-3 or abs(self.right_wheel_profile.current_vel) > 1e-3 or abs(self.back_wheel_profile.current_vel) > 1e-3:
+            #     print(f"DEBUG_WHEELS: L_vel={self.left_wheel_profile.current_vel:.4f}/{self.left_wheel_profile.target_vel:.4f}, R_vel={self.right_wheel_profile.current_vel:.4f}/{self.right_wheel_profile.target_vel:.4f}, B_vel={self.back_wheel_profile.current_vel:.4f}/{self.back_wheel_profile.target_vel:.4f}, L_pos={l_pos:.4f}, R_pos={r_pos:.4f}, B_pos={b_pos:.4f}")
+
+            # Apply to actuators (which are now velocity actuators)
             # The profile is in motor coordinates, but actuator expects wheel coordinates
-            self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).ctrl = l_pos / self.params['gr']
-            self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).ctrl = r_pos / self.params['gr']
-            self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).ctrl = b_pos / self.params['gr']
+            self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).ctrl = self.left_wheel_profile.current_vel / self.params['gr']
+            self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).ctrl = self.right_wheel_profile.current_vel / self.params['gr']
+            self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).ctrl = self.back_wheel_profile.current_vel / self.params['gr']
 
-
-        if self.last_command is None:
-            return
-
-        if isinstance(self.last_command, CommandMove):
-            return self.handle_move_by(self.last_command)
-
-        if isinstance(self.last_command, CommandBaseVelocity):
+        if self.active_velocity is not None:
             return self._set_base_velocity(
-                translational_velocity_x=self.last_command.v_x,
-                  translational_velocity_y=self.last_command.v_y,
-                  angular_velocity_z=self.last_command.omega
-                  )
+                translational_velocity_x=self.active_velocity.v_x,
+                translational_velocity_y=self.active_velocity.v_y,
+                angular_velocity_z=self.active_velocity.omega
+            )
+
+        if self.active_rotate is not None:
+            return self._base_rotate_by(self.active_rotate.pos)
+
+        if self.active_translate_x is not None or self.active_translate_y is not None:
+            x_inc = self.active_translate_x.pos if self.active_translate_x is not None else 0.0
+            y_inc = self.active_translate_y.pos if self.active_translate_y is not None else 0.0
+            return self._base_translate_by_combined(x_inc, y_inc)
 
     def get_base_pose(self) -> np.ndarray:
         """Get the se(2) base pose: x, y, and theta"""
@@ -234,45 +268,55 @@ class BaseController:
         theta = np.arctan2(rotation[1, 0], rotation[0, 0])
         return np.array([xyz[0], xyz[1], theta])
 
-    def handle_move_by(self, command: CommandMove):
-        if command.actuator_name == Actuators.base_translate.name:
-            return self._base_translate_by(
-                command.pos,
-                0.0
-            )
-
-        if command.actuator_name == Actuators.base_translate_y.name:
-            return self._base_translate_by(
-                0.0,
-                command.pos,
-            )
-
-        if command.actuator_name == Actuators.base_rotate.name:
-            return self._base_rotate_by(
-                command.pos,
-            )
-
-        raise NotImplementedError(f"Actuator {command.actuator_name} is not supported.")
-
-    def _base_translate_by(self, x_inc: float, y_inc: float) -> None:
+    def _base_translate_by_combined(self, x_inc: float, y_inc: float) -> None:
         """
-        Translate the base by a certain w.r.t base global pose
+        Translate the base by certain increments in X and/or Y
         """
-        start_pose = self.start_pose[:2]
+        curr_pose = self.get_base_pose()
+        
+        # Calculate displacement in starting local frame
+        dx = curr_pose[0] - self.start_pose_x
+        dy = curr_pose[1] - self.start_pose_y
+        theta = self.start_pose_theta
+        
+        local_dx = dx * np.cos(theta) + dy * np.sin(theta)
+        local_dy = -dx * np.sin(theta) + dy * np.cos(theta)
+        
+        # Check if X translation has finished
+        if self.active_translate_x is not None:
+            if abs(local_dx) >= abs(x_inc) - 0.005:
+                self.active_translate_x = None
+                x_inc = 0.0
 
-        if not np.linalg.norm(self.get_base_pose()[:2] - start_pose) <= np.linalg.norm([x_inc, y_inc]):
+        # Check if Y translation has finished
+        if self.active_translate_y is not None:
+            if abs(local_dy) >= abs(y_inc) - 0.005:
+                self.active_translate_y = None
+                y_inc = 0.0
+
+        if self.active_translate_x is None and self.active_translate_y is None:
+            print("DEBUG: Both translations finished! Clearing command.")
             return self._clear_command(is_stop_motion=True)
 
         x_v = np.sign(x_inc) if x_inc != 0.0 else 0.0
         y_v = np.sign(y_inc) if y_inc != 0.0 else 0.0
 
-        self._set_base_velocity(x_v, y_v, 0)
+        # Active closed-loop heading stabilization
+        curr_theta = curr_pose[2]
+        theta_err = curr_theta - self.start_pose_theta
+        # Normalize angle difference to [-pi, pi]
+        theta_err = (theta_err + np.pi) % (2 * np.pi) - np.pi
+        
+        # Command a proportional correcting angular velocity
+        w_v = -5.0 * theta_err
+        
+        self._set_base_velocity(x_v, y_v, w_v)
 
     def _base_rotate_by(self, theta_inc: float) -> None:
         """
         Rotate the base by a certain w.r.t base global pose
         """
-        start_pose = self.start_pose[-1]
+        start_pose = self.start_pose_theta
         sign = 1 if theta_inc > 0 else -1
         if not abs(start_pose - self.get_base_pose()[-1]) <= abs(theta_inc):
             return self._clear_command(is_stop_motion=True)
@@ -308,12 +352,12 @@ class BaseController:
                                      self.curr_max_vel_w_r)
 
         if a_m is not None:
-            a_m = min(abs(a_m), self.curr_max_accel_xy_m)
+            a_m = abs(a_m)
         else:
             a_m = self.curr_max_accel_xy_m
 
         if a_r is not None:
-            a_r = min(abs(a_r), self.curr_max_accel_w_r)
+            a_r = abs(a_r)
         else:
             a_r = self.curr_max_accel_w_r
 
@@ -372,11 +416,11 @@ class BaseController:
         return accel * self.params["gr"]  # Convert to motor velocities
 
     def _set_base_velocity(self,
-    translational_velocity_x: float, translational_velocity_y:float, angular_velocity_z: float) -> None:
+    translational_velocity_x: float, translational_velocity_y:float, angular_velocity_z: float, a_m=None, a_r=None) -> None:
         if self.mujoco_server.use_diff_drive:
             return self._set_base_velocity_diff_drive(translational_velocity_x, angular_velocity_z)
 
-        return self._set_base_velocity_omni_drive(translational_velocity_x, translational_velocity_y, angular_velocity_z)
+        return self._set_base_velocity_omni_drive(translational_velocity_x, translational_velocity_y, angular_velocity_z, a_m=a_m, a_r=a_r)
 
 
 class MujocoServer:
@@ -437,6 +481,11 @@ class MujocoServer:
         self.mjmodel = model
 
         self.mjdata = MjData(self.mjmodel)
+        mujoco.mj_forward(self.mjmodel, self.mjdata)
+        # Initialize position actuators to current positions to prevent initial slumping
+        for i in range(self.mjmodel.na):
+            if self.mjmodel.actuator_biastype[i] == 1: # position/affine actuators
+                self.mjdata.ctrl[i] = self.mjdata.actuator(i).length[0]
 
         self.use_diff_drive = True
         for b_name in Actuators.back_wheel_vel.get_joint_names_in_mjcf():
@@ -600,6 +649,14 @@ class MujocoServer:
         with lock:
             mujoco._functions.mj_step(self.mjmodel, self.mjdata)
             self._ctrl_callback(self.mjmodel, self.mjdata)
+            if self.mjdata.time > 1.5 and not getattr(self, "_printed_contacts", False):
+                self._printed_contacts = True
+                print("SERVER CONTACT DIAGNOSTICS:")
+                for i in range(self.mjdata.ncon):
+                    con = self.mjdata.contact[i]
+                    geom1 = mujoco.mj_id2name(self.mjmodel, mujoco.mjtObj.mjOBJ_GEOM, con.geom1)
+                    geom2 = mujoco.mj_id2name(self.mjmodel, mujoco.mjtObj.mjOBJ_GEOM, con.geom2)
+                    print(f"Contact {i}: geom1='{geom1}', geom2='{geom2}', friction={con.friction}")
 
         time_until_next_step = self.mjmodel.opt.timestep - (time.perf_counter() - start_time)
         if time_until_next_step > 0:
@@ -762,9 +819,10 @@ class MujocoServer:
             new_status.base.x_vel = self.base_controller.status['x_vel']
             new_status.base.y_vel = self.base_controller.status['y_vel']
             new_status.base.theta_vel = self.base_controller.status['theta_vel']
-            new_status.base.x = self.base_controller.status['x']
-            new_status.base.y = self.base_controller.status['y']
-            new_status.base.theta = self.base_controller.get_base_pose()[2]
+            new_status.base.x, new_status.base.y, new_status.base.theta = self.base_controller.get_base_pose()
+            new_status.base.active_translate_x = (self.base_controller.active_translate_x is not None)
+            new_status.base.active_translate_y = (self.base_controller.active_translate_y is not None)
+            new_status.base.active_rotate = (self.base_controller.active_rotate is not None)
         else:
             (
                 new_status.base.x_vel,
@@ -814,10 +872,12 @@ class MujocoServer:
         """
         Handles setting mujoco ctrl properties to move joints.
         """
+        modified = False
         # move_by
         for _, command in command_status.move_by.items():
             if command.trigger:
                 command.trigger = False
+                modified = True
                 actuator_name = command.actuator_name
                 pos = command.pos
                 if actuator_name in (Actuators.base_translate.name, Actuators.base_translate_y.name, Actuators.base_rotate.name):
@@ -844,6 +904,7 @@ class MujocoServer:
         for _, command in command_status.move_to.items():
             if command.trigger:
                 command.trigger = False
+                modified = True
                 actuator_name = command.actuator_name
 
                 pos = command.pos
@@ -861,19 +922,44 @@ class MujocoServer:
                 else:
                     self.mjdata.actuator(actuator_name).ctrl = pos
 
+        # joint_velocities (continuous integration control)
+        dt = self.mjmodel.opt.timestep
+        for actuator_name, target_vel in list(command_status.joint_velocities.items()):
+            if target_vel != 0.0:
+                if actuator_name == Actuators.gripper.name:
+                    if self.use_diff_drive:
+                        current_ctrl = self._to_real_gripper_range(
+                            self.mjdata.actuator(actuator_name).ctrl[0]
+                        )
+                        self.mjdata.actuator(actuator_name).ctrl = self._to_sim_gripper_range(
+                            current_ctrl + target_vel * dt
+                        )
+                    else:
+                        current_ctrl_left = self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl[0]
+                        current_ctrl_right = self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl[0]
+                        finger_cmd = self.aperture_angle_degrees_to_urdf_angle_radians(target_vel * dt)
+                        self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl = current_ctrl_left + finger_cmd
+                        self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl = current_ctrl_right + finger_cmd
+                else:
+                    current_ctrl = self.mjdata.actuator(actuator_name).ctrl[0]
+                    self.mjdata.actuator(actuator_name).ctrl = current_ctrl + target_vel * dt
+
         # set_base_velocity
         if command_status.base_velocity is not None and command_status.base_velocity.trigger:
             command_status.base_velocity.trigger = False
+            modified = True
             self.base_controller.push_command(command_status.base_velocity)
 
         # keyframe
         if command_status.keyframe is not None and command_status.keyframe.trigger:
             command_status.keyframe.trigger = False
+            modified = True
             self.mjdata.ctrl = self.mjmodel.keyframe(command_status.keyframe.name).ctrl
 
         self.base_controller.update()
 
-        self.data_proxies.set_command(command_status)
+        if modified:
+            self.data_proxies.set_command(command_status)
 
     def _to_sim_gripper_range(self, pos: float) -> float:
         """

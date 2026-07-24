@@ -350,6 +350,7 @@ class StretchMujocoSimulator:
             Actuators.wrist_yaw,
             Actuators.gripper,
             Actuators.base_translate,
+            Actuators.base_translate_y,
             Actuators.base_rotate,
         ]
         if hasattr(self, "end_of_arm"):
@@ -366,11 +367,13 @@ class StretchMujocoSimulator:
             positions = {}
             status = self.pull_status()
             for act in actuators:
-                if act in [Actuators.base_translate, Actuators.base_rotate]:
+                if act in [Actuators.base_translate, Actuators.base_translate_y, Actuators.base_rotate]:
                     # Relative or absolute base position
                     rel_pos = act.get_position_relative(status)
                     if act == Actuators.base_translate:
                         positions[act] = rel_pos[0]
+                    elif act == Actuators.base_translate_y:
+                        positions[act] = rel_pos[1]
                     elif act == Actuators.base_rotate:
                         positions[act] = rel_pos[2]
                 else:
@@ -402,6 +405,11 @@ class StretchMujocoSimulator:
                 if not np.isclose(curr_p, last_p, atol=position_tolerance):
                     any_moving = True
                     break
+            
+            # Also check server-side active flags for base translation/rotation
+            status = self.pull_status()
+            if status.base.active_translate_x or status.base.active_translate_y or status.base.active_rotate:
+                any_moving = True
                     
             if not any_moving:
                 # All joints are stable!
@@ -436,10 +444,13 @@ class StretchMujocoSimulator:
                 Actuators.right_wheel_vel,
                 Actuators.base_rotate,
                 Actuators.base_translate,
+                Actuators.base_translate_y,
             ]:
                 current_position = actuator.get_position_relative(self.pull_status())
                 if actuator == Actuators.left_wheel_vel or actuator == Actuators.base_translate:
                     current_position = current_position[0]
+                elif actuator == Actuators.base_translate_y:
+                    current_position = current_position[1]
                 elif actuator == Actuators.right_wheel_vel:
                     current_position = current_position[1]
                 elif actuator == Actuators.base_rotate:
@@ -531,6 +542,19 @@ class StretchMujocoSimulator:
                 CommandMove(actuator_name=actuator.name, pos=pos, trigger=True)
             )
 
+            self.data_proxies.set_command(command)
+
+    @require_connection
+    def _set_joint_velocity(self, actuator: str | Actuators, v_m: float):
+        """
+        Set continuous velocity for a joint.
+        """
+        if isinstance(actuator, str):
+            actuator = Actuators[actuator]
+
+        with self._command_lock:
+            command = self.data_proxies.get_command()
+            command.set_joint_velocity(actuator.name, v_m)
             self.data_proxies.set_command(command)
 
     @require_connection
@@ -658,7 +682,8 @@ class BaseSubsystem:
         return self._sim.pull_status().base
 
     def translate_by(self, x_m, y_m=0.0, v_m=None, a_m=None):
-        self._sim._move_by(Actuators.base_translate, x_m)
+        if x_m != 0.0:
+            self._sim._move_by(Actuators.base_translate, x_m)
         if y_m != 0.0:
             self._sim._move_by(Actuators.base_translate_y, y_m)
 
@@ -688,6 +713,9 @@ class JointSubsystem:
 
     def move_by(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
         self._sim._move_by(self._actuator, x_m)
+
+    def set_velocity(self, v_m, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
+        self._sim._set_joint_velocity(self._actuator, v_m)
 
 
 class EndOfArmSubsystem:

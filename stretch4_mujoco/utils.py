@@ -117,7 +117,7 @@ def H0_from_driving_dir(wheel_dia_m, base_radius, forward_dir):
     Vb = Twist velocity of the base frame (vx, vy, wz)
     https://control.ros.org/rolling/doc/ros2_controllers/doc/mobile_robot_kinematics.html#omnidirectional-wheeled-mobile-robots
     """
-    forwards = {"basquiat": 30.0, "basquiat+": 30, "calder": 30}
+    forwards = {"basquiat": 30.0, "basquiat+": 30, "calder": 30.0}
     gamma = forwards[forward_dir]
     h0 = np.array(
         [

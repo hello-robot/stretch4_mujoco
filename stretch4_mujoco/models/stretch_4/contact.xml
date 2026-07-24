@@ -3,11 +3,11 @@
     <!-- <exclude body1="head_pan_link" body2="head_link"/> -->
 
     <!-- References https://ekumenlabs.com/blog/posts/modeling-lekiwis-omni-base-in-mujoco/ -->
-    <pair geom1="floor" geom2="back_wheel_link" condim="3" friction="0.001 1.0" solref="0.005 1"
+    <pair geom1="floor" geom2="back_wheel_link" condim="6" friction="0.05 0.8 0.001 0.001 0.001" solref="0.005 1"
       solimp="0.9 0.95 0.001" />
-    <pair geom1="floor" geom2="left_wheel_link" condim="3" friction="0.001 1.0" solref="0.005 1"
+    <pair geom1="floor" geom2="left_wheel_link" condim="6" friction="0.05 0.8 0.001 0.001 0.001" solref="0.005 1"
       solimp="0.9 0.95 0.001" />
-    <pair geom1="floor" geom2="right_wheel_link" condim="3" friction="0.001 1.0" solref="0.005 1"
+    <pair geom1="floor" geom2="right_wheel_link" condim="6" friction="0.05 0.8 0.001 0.001 0.001" solref="0.005 1"
       solimp="0.9 0.95 0.001" />
     <pair geom1="floor" geom2="base_link_collision" condim="3" friction="0.0 0.0" />
 
@@ -18,6 +18,31 @@
     <exclude body1="base_link" body2="mast_link" />
     <exclude body1="lift_link" body2="mast_link" />
     <!-- <exclude body1="lift_link" body2="head_link"/> -->
+    
+    <exclude body1="base_link" body2="docking_contact_link" />
+    <exclude body1="wrist_link" body2="base_link" />
+    <exclude body1="wrist_yaw_link" body2="base_link" />
+    <exclude body1="wrist_pitch_link" body2="base_link" />
+    <exclude body1="wrist_roll_link" body2="base_link" />
+    <exclude body1="quick_connect_interface_link" body2="base_link" />
+    <exclude body1="tool_attachment_site_link" body2="base_link" />
+    <exclude body1="gripper_slider_link" body2="base_link" />
+    <exclude body1="gripper_finger_left_link" body2="base_link" />
+    <exclude body1="gripper_finger_right_link" body2="base_link" />
+    <exclude body1="gripper_fingertip_left_link" body2="base_link" />
+    <exclude body1="gripper_fingertip_right_link" body2="base_link" />
+    
+    <exclude body1="wrist_link" body2="docking_contact_link" />
+    <exclude body1="wrist_yaw_link" body2="docking_contact_link" />
+    <exclude body1="wrist_pitch_link" body2="docking_contact_link" />
+    <exclude body1="wrist_roll_link" body2="docking_contact_link" />
+    <exclude body1="quick_connect_interface_link" body2="docking_contact_link" />
+    <exclude body1="tool_attachment_site_link" body2="docking_contact_link" />
+    <exclude body1="gripper_slider_link" body2="docking_contact_link" />
+    <exclude body1="gripper_finger_left_link" body2="docking_contact_link" />
+    <exclude body1="gripper_finger_right_link" body2="docking_contact_link" />
+    <exclude body1="gripper_fingertip_left_link" body2="docking_contact_link" />
+    <exclude body1="gripper_fingertip_right_link" body2="docking_contact_link" />
     <exclude body1="arm_l4_link" body2="arm_l3_link" />
     <exclude body1="arm_l4_link" body2="arm_l2_link" />
     <exclude body1="arm_l4_link" body2="arm_l1_link" />
