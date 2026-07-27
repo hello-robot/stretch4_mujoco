@@ -491,7 +491,7 @@ class MujocoServer:
 
         for actuator, ranges in limits.items():
             if actuator == Actuators.arm:
-                min_limit = 0
+                min_limit = 0.0
                 max_limit = sum(r[1] for r in ranges)
             elif actuator == Actuators.gripper and not self.use_diff_drive:
                     def get_angle_from_chord_length_and_radius(radius_m, chord_m):
