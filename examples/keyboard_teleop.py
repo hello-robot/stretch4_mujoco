@@ -173,15 +173,9 @@ class KeyboardController:
         elif key == "y":
             self.sim.end_of_arm.wrist_roll.move_by(-0.2)
         elif key == "n":
-            if self.use_stretch_3:
-                self.sim.end_of_arm.stretch_gripper.move_by(0.07)
-            else:
-                self.sim.end_of_arm.stretch_gripper.move_by(5.0)  # degrees (aperture angle)
+            self.sim.end_of_arm.stretch_gripper.move_by(0.07)  # radians
         elif key == "m":
-            if self.use_stretch_3:
-                self.sim.end_of_arm.stretch_gripper.move_by(-0.07)
-            else:
-                self.sim.end_of_arm.stretch_gripper.move_by(-5.0)  # degrees (aperture angle)
+            self.sim.end_of_arm.stretch_gripper.move_by(-0.07)  # radians
         elif key == "l":
             pprint(self.sim.pull_status())
         elif key == ".":

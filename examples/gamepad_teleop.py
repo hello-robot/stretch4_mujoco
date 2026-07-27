@@ -550,19 +550,11 @@ class MockGripperCommand:
         self.name = "gripper"
 
     def open_gripper(self, robot):
-        val = 1
-        if isinstance(self.sim, Stretch4MujocoSimulator):
-            val = 5.0
-        else:
-            val = 0.07
+        val = 0.07
         self.sim.end_of_arm.stretch_gripper.move_by(val * robot.precision_multiplier)
 
     def close_gripper(self, robot):
-        val = -1
-        if isinstance(self.sim, Stretch4MujocoSimulator):
-            val = -5.0
-        else:
-            val = -0.07
+        val = -0.07
         self.sim.end_of_arm.stretch_gripper.move_by(val * robot.precision_multiplier)
 
     def stop_gripper(self, robot):
