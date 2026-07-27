@@ -477,33 +477,40 @@ class MujocoServer:
         return config.robot_settings_se4
 
     def update_joint_limits(self):
+        limits = {}
         for i in range(self.mjmodel.njnt):
             name = mujoco._functions.mj_id2name(self.mjmodel, mujoco._enums.mjtObj.mjOBJ_JOINT, i)
             joint_range = self.mjmodel.jnt_range[i]  # This gives [lower_limit, upper_limit]
             try:
                 actuator = Actuators.get_actuator_by_joint_names_in_mjcf(name)
-                self.data_proxies.set_joint_limit(
-                    actuator=actuator, min_max=(joint_range[0], joint_range[1])
-                )
+                if actuator not in limits:
+                    limits[actuator] = []
+                limits[actuator].append((joint_range[0], joint_range[1]))
             except:
                 ...
 
-        # For Stretch 4, Actuators.gripper is not mapped to any mjmodel joint.
-        # We manually calculate and set its joint limit in radians.
-        if not self.use_diff_drive:
-            def get_angle_from_chord_length_and_radius(radius_m, chord_m):
-                return 2 * np.arcsin(chord_m / (2 * radius_m))   # radians
+        for actuator, ranges in limits.items():
+            if actuator == Actuators.arm:
+                min_limit = 0.0
+                max_limit = sum(r[1] for r in ranges)
+            elif actuator == Actuators.gripper and not self.use_diff_drive:
+                    def get_angle_from_chord_length_and_radius(radius_m, chord_m):
+                        return 2 * np.arcsin(chord_m / (2 * radius_m))   # radians
+        
+                    max_limit = get_angle_from_chord_length_and_radius(
+                                            self.robot_settings['gripper_conversion']['finger_length_m'],
+                                            self.robot_settings['gripper_conversion']['aperture_open_m'],
+                                            )
+                    min_limit = get_angle_from_chord_length_and_radius(
+                                            self.robot_settings['gripper_conversion']['finger_length_m'],
+                                            self.robot_settings['gripper_conversion']['aperture_closed_m'],
+                                            )
 
-            aperture_open_rad = get_angle_from_chord_length_and_radius(
-                                    self.robot_settings['gripper_conversion']['finger_length_m'],
-                                    self.robot_settings['gripper_conversion']['aperture_open_m'],
-                                    )
-            aperture_close_rad = get_angle_from_chord_length_and_radius(
-                                    self.robot_settings['gripper_conversion']['finger_length_m'],
-                                    self.robot_settings['gripper_conversion']['aperture_closed_m'],
-                                    )
+            else:
+                min_limit, max_limit = ranges[-1]
+
             self.data_proxies.set_joint_limit(
-                actuator=Actuators.gripper, min_max=(aperture_close_rad, aperture_open_rad)
+                actuator=actuator, min_max=(min_limit, max_limit)
             )
 
     def set_camera_manager(
