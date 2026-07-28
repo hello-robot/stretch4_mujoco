@@ -980,7 +980,7 @@ class MujocoServer:
                     else:
                         current_ctrl_left = self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl[0]
                         current_ctrl_right = self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl[0]
-                        finger_cmd = self.aperture_angle_degrees_to_urdf_angle_radians(target_vel * dt)
+                        finger_cmd = self.aperture_angle_radians_to_urdf_angle_radians(target_vel * dt)
                         self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl = current_ctrl_left + finger_cmd
                         self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl = current_ctrl_right + finger_cmd
                 else:
