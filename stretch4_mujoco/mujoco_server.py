@@ -241,7 +241,8 @@ class BaseController:
         # Always step the profiles if we are in omni mode
         if not self.mujoco_server.use_diff_drive:
             # Step profiles
-            dt = self.mujoco_server.mjmodel.opt.timestep
+            # dt = self.mujoco_server.mjmodel.opt.timestep
+            dt = 1.0 / self.mujoco_server.control_rate_hz
             l_pos = self.left_wheel_profile.update(dt)
             r_pos = self.right_wheel_profile.update(dt)
             b_pos = self.back_wheel_profile.update(dt)
@@ -541,6 +542,12 @@ class MujocoServer:
         )
 
         self.update_joint_limits()
+        
+        self.control_rate_hz = 100.0
+        self.physics_dt = self.mjmodel.opt.timestep
+        self.physics_steps_per_control_step = int(1.0 / (self.control_rate_hz * self.physics_dt)) 
+        print(f"Physics dt: {self.physics_dt}, Control rate: {self.control_rate_hz}Hz, "
+              f"Physics steps per control step: {self.physics_steps_per_control_step}")
 
         signal.signal(signal.SIGTERM, lambda num, h: self.request_to_stop())
         signal.signal(signal.SIGINT, lambda num, h: self.request_to_stop())
@@ -670,35 +677,37 @@ class MujocoServer:
 
     def _physics_step(self, lock: contextlib.AbstractContextManager):
         """
-        Calls mj_step and _ctrl_callback, and sleeps until the next timestep.
+        Calls mj_step multiple times and _ctrl_callback once.
         """
-        start_time = time.perf_counter()
-
         with lock:
-            mujoco._functions.mj_step(self.mjmodel, self.mjdata)
-            self._ctrl_callback(self.mjmodel, self.mjdata)
-            if self.mjdata.time > 1.5 and not getattr(self, "_printed_contacts", False):
-                self._printed_contacts = True
-                print("SERVER CONTACT DIAGNOSTICS:")
-                for i in range(self.mjdata.ncon):
-                    con = self.mjdata.contact[i]
-                    geom1 = mujoco.mj_id2name(self.mjmodel, mujoco.mjtObj.mjOBJ_GEOM, con.geom1)
-                    geom2 = mujoco.mj_id2name(self.mjmodel, mujoco.mjtObj.mjOBJ_GEOM, con.geom2)
-                    print(f"Contact {i}: geom1='{geom1}', geom2='{geom2}', friction={con.friction}")
+            # Run physics steps
+            for _ in range(self.physics_steps_per_control_step):
+                mujoco._functions.mj_step(self.mjmodel, self.mjdata)
 
-        time_until_next_step = self.mjmodel.opt.timestep - (time.perf_counter() - start_time)
-        if time_until_next_step > 0:
-            # Sleep to match the timestep.
-            time.sleep(time_until_next_step)
+            self._ctrl_callback(self.mjmodel, self.mjdata)
 
     def _physics_loop(
         self, lock: contextlib.AbstractContextManager, termination_check: Callable[[], bool]
     ):
         """
-        A loop to use when starting physics in a thread.
+        A loop to use when starting physics in a thread, maintaining precise real-time synchronization.
         """
+        target_period = 1.0 / self.control_rate_hz
+        next_target_time = time.perf_counter()
+
         while termination_check():
+            next_target_time += target_period
             self._physics_step(lock=lock)
+
+            time_until_next = next_target_time - time.perf_counter()
+            if time_until_next > 0.001:
+                time.sleep(time_until_next - 0.0005)
+
+            while time.perf_counter() < next_target_time:
+                pass
+
+            if next_target_time < time.perf_counter() - (target_period * 10):
+                next_target_time = time.perf_counter()
 
         click.secho("Physics Loop has terminated.", fg="red")
 
@@ -719,9 +728,23 @@ class MujocoServer:
             cameras_to_use=cameras_to_use,
         )
 
+        target_period = 1.0 / self.control_rate_hz
+        next_target_time = time.perf_counter()
+
         while not self._is_requested_to_stop():
+            next_target_time += target_period
             self._physics_step(contextlib.nullcontext())
             self.camera_manager.pull_camera_data_at_camera_rate(is_sleep_until_ready=False)
+
+            time_until_next = next_target_time - time.perf_counter()
+            if time_until_next > 0.001:
+                time.sleep(time_until_next - 0.0005)
+
+            while time.perf_counter() < next_target_time:
+                pass
+
+            if next_target_time < time.perf_counter() - (target_period * 10):
+                next_target_time = time.perf_counter()
 
         self.close()
 

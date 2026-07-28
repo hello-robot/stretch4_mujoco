@@ -16,7 +16,6 @@
   <sensor>
     <gyro name="base_gyro" site="imu" />
     <accelerometer name="base_accel" site="imu" />
-    <rangefinder name="base_lidar" site="lidar" cutoff="10.0"/>
   </sensor>
 
 </mujoco>
