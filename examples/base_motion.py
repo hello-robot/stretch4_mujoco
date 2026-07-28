@@ -17,6 +17,8 @@ def main():
 
             status = sim.pull_status()
 
+            print(f"{status.sim_to_real_time_ratio_msg}")
+
             sim.base.translate_by(0.5, 0.0)
             
             sim.wait_command()

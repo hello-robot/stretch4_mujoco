@@ -13,7 +13,7 @@
 
       <default class="wheel">
         <joint axis="0 0 1" armature="0.01" damping="0.1" frictionloss="15.0" limited="false" />
-        <velocity kv="100" gear="6" forcerange="-300.0 300.0"/>
+        <velocity />
       </default>
       <default class="lift">
         <joint damping="50" stiffness="0.03" armature="0.01" frictionloss="1.5" />
