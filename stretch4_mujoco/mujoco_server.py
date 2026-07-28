@@ -143,24 +143,24 @@ class BaseController:
         elif isinstance(command, CommandMove):
             self.active_velocity = None
             if command.actuator_name == Actuators.base_translate.name:
+                self.active_rotate = None
+                if self.active_translate_y is None:
+                    curr_pose = self.get_base_pose()
+                    self.start_pose_x = curr_pose[0]
+                    self.start_pose_y = curr_pose[1]
+                    self.start_pose_theta = curr_pose[2]
                 self.active_translate_x = command
-                curr_pose = self.get_base_pose()
-                # reset start pos based on current position and currently executing translation
-                self.start_pose_x = curr_pose[0]
-                self.start_pose_y = curr_pose[1]
-                self.start_pose_theta = curr_pose[2]
-                self.active_translate_y = None # Ensure any previous Y translation is canceled if X is commanded
             elif command.actuator_name == Actuators.base_translate_y.name:
+                self.active_rotate = None
+                if self.active_translate_x is None:
+                    curr_pose = self.get_base_pose()
+                    self.start_pose_x = curr_pose[0]
+                    self.start_pose_y = curr_pose[1]
+                    self.start_pose_theta = curr_pose[2]
                 self.active_translate_y = command
-                curr_pose = self.get_base_pose()
-                self.start_pose_x = curr_pose[0]
-                self.start_pose_y = curr_pose[1]
-                self.start_pose_theta = curr_pose[2]
-                self.active_translate_x = None # Ensure any previous X translation is canceled if Y is commanded
-                self.start_pose_x = curr_pose[0]
-                self.start_pose_y = curr_pose[1]
-                self.start_pose_theta = curr_pose[2]
             elif command.actuator_name == Actuators.base_rotate.name:
+                self.active_translate_x = None
+                self.active_translate_y = None
                 self.active_rotate = command
                 self.start_pose_theta = self.get_base_pose()[2]
 
@@ -299,30 +299,20 @@ class BaseController:
 
         # Check if X translation has finished
         if self.active_translate_x is not None:
-            is_vel_zero = (
-                abs(self.left_wheel_profile.current_vel) < 0.05 and
-                abs(self.right_wheel_profile.current_vel) < 0.05 and
-                abs(self.back_wheel_profile.current_vel) < 0.05
-            )
-            if abs(err_x) < 0.005 and is_vel_zero:
+            if abs(err_x) < 0.01:
                 self.active_translate_x = None
                 err_x = 0.0
 
         # Check if Y translation has finished
         if self.active_translate_y is not None:
-            is_vel_zero = (
-                abs(self.left_wheel_profile.current_vel) < 0.05 and
-                abs(self.right_wheel_profile.current_vel) < 0.05 and
-                abs(self.back_wheel_profile.current_vel) < 0.05
-            )
-            if abs(err_y) < 0.005 and is_vel_zero:
+            if abs(err_y) < 0.01:
                 self.active_translate_y = None
                 err_y = 0.0
 
         if self.active_translate_x is None and self.active_translate_y is None:
             return self._clear_command(is_stop_motion=True)
 
-        Kp = 2.0
+        Kp = 3.0
         x_v = np.clip(Kp * err_x, -self.curr_max_vel_xy_m, self.curr_max_vel_xy_m)
         y_v = np.clip(Kp * err_y, -self.curr_max_vel_xy_m, self.curr_max_vel_xy_m)
 
@@ -347,15 +337,10 @@ class BaseController:
         # Normalize angle difference to [-pi, pi]
         theta_err = (target_theta - curr_theta + np.pi) % (2 * np.pi) - np.pi
 
-        is_vel_zero = (
-            abs(self.left_wheel_profile.current_vel) < 0.05 and
-            abs(self.right_wheel_profile.current_vel) < 0.05 and
-            abs(self.back_wheel_profile.current_vel) < 0.05
-        )
-        if abs(theta_err) < 0.02 and is_vel_zero: # ~1 degree tolerance
+        if abs(theta_err) < 0.03: # ~1.7 degree tolerance
             return self._clear_command(is_stop_motion=True)
             
-        Kp = 2.0
+        Kp = 3.0
         w_v = np.clip(Kp * theta_err, -self.curr_max_vel_w_r, self.curr_max_vel_w_r)
 
         self._set_base_velocity(0.0, 0.0, w_v)

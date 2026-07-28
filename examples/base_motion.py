@@ -1,3 +1,4 @@
+import math
 import time
 
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
@@ -16,23 +17,23 @@ def main():
 
             status = sim.pull_status()
 
-            sim.base.translate_by(1.0, 0.0)
+            sim.base.translate_by(0.5, 0.0)
             
             sim.wait_command()
 
-            sim.base.translate_by(0.0, 1.0)
+            sim.base.translate_by(0.0, 0.5)
             
             sim.wait_command()
 
-            sim.base.translate_by(-1.0, -1.0)
+            sim.base.translate_by(-0.5, -0.5)
             
             sim.wait_command()
 
-            sim.base.rotate_by(45)
+            sim.base.rotate_by(math.radians(-45))
 
             sim.wait_command()
 
-            sim.base.rotate_by(-90)
+            sim.base.rotate_by(math.radians(90))
 
             sim.wait_command()
 
