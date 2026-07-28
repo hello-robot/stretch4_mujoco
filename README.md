@@ -79,6 +79,14 @@ Control Stretch in simulation using any xbox type gamepad (uses xinput)
 uv run examples/gamepad_teleop.py
 ```
 
+[Velocity Control](./examples/velocity_control.py)
+
+Demonstrate base and joint velocity control with `set_velocity()`
+
+```
+uv run examples/velocity_control.py
+```
+
 [Robocasa environments](./examples/robocasa_environment.py)
 
 ```

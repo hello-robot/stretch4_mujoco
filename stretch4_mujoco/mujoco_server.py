@@ -223,8 +223,8 @@ class BaseController:
         self.status['x'] += float(Sb[0])
         self.status['y'] += float(Sb[1])
         self.status['theta'] += float(Sb[2])
-        if True:
-            print(f"DEBUG_ODOM: wheel_speeds={wheel_speeds}, Vb={Vb}, dt={dt:.4f}, Sb={Sb}, status_y={self.status['y']:.4f}, status_theta={self.status['theta']:.4f}")
+        # if True:
+        #     print(f"DEBUG_ODOM: wheel_speeds={wheel_speeds}, Vb={Vb}, dt={dt:.4f}, Sb={Sb}, status_y={self.status['y']:.4f}, status_theta={self.status['theta']:.4f}")
         self.status['pose_time_s'] = time.time()
 
     def update(self):
@@ -246,8 +246,8 @@ class BaseController:
             r_pos = self.right_wheel_profile.update(dt)
             b_pos = self.back_wheel_profile.update(dt)
 
-            if abs(self.left_wheel_profile.current_vel) > 1e-3 or abs(self.right_wheel_profile.current_vel) > 1e-3 or abs(self.back_wheel_profile.current_vel) > 1e-3:
-                print(f"DEBUG_WHEELS: L_vel={self.left_wheel_profile.current_vel:.4f}/{self.left_wheel_profile.target_vel:.4f}, R_vel={self.right_wheel_profile.current_vel:.4f}/{self.right_wheel_profile.target_vel:.4f}, B_vel={self.back_wheel_profile.current_vel:.4f}/{self.back_wheel_profile.target_vel:.4f}, L_pos={l_pos:.4f}, R_pos={r_pos:.4f}, B_pos={b_pos:.4f}")
+            # if abs(self.left_wheel_profile.current_vel) > 1e-3 or abs(self.right_wheel_profile.current_vel) > 1e-3 or abs(self.back_wheel_profile.current_vel) > 1e-3:
+            #     print(f"DEBUG_WHEELS: L_vel={self.left_wheel_profile.current_vel:.4f}/{self.left_wheel_profile.target_vel:.4f}, R_vel={self.right_wheel_profile.current_vel:.4f}/{self.right_wheel_profile.target_vel:.4f}, B_vel={self.back_wheel_profile.current_vel:.4f}/{self.back_wheel_profile.target_vel:.4f}, L_pos={l_pos:.4f}, R_pos={r_pos:.4f}, B_pos={b_pos:.4f}")
 
             # Apply to actuators (which are now velocity actuators)
             # The profile is in motor coordinates, but actuator expects wheel coordinates
