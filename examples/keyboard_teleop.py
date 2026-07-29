@@ -13,7 +13,6 @@ from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
-from stretch4_mujoco.pointcloud_utils import estimate_pointcloud_density
 
 def print_keyboard_options():
     click.secho("\n       Keyboard Controls:", fg="yellow")
@@ -245,8 +244,7 @@ def main(
         rerun_logger.init_rerun(use_stretch_3)
 
     if lidar3d:
-        estimate_pointcloud_density()
-        cameras_to_use += StretchCameras.hemispherical_lidars()
+        pass
         
     model = None
 
@@ -257,8 +255,7 @@ def main(
             stretch_xml_absolute=simulator_class.get_robot_xml_path()
         )
 
-    rate = 10.00 if lidar3d else 30.0
-    # Lower camera hz for lidar3d to avoid performance issues
+    rate = 30.0
 
     sim = simulator_class(
         model=model,

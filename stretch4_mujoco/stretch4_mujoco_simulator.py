@@ -11,7 +11,6 @@ from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity
 from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
 from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
-from stretch4_mujoco.pointcloud_utils import get_pointcloud_from_camera_status
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 from stretch4_mujoco.utils import block_until_check_succeeds, require_connection
 
@@ -312,13 +311,9 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
 
             self.data_proxies.set_command(command)
 
-    def pull_hemi_lidar_points(self, in_world_frame: bool) -> list[tuple[str, np.ndarray]]:
+    @require_connection
+    def pull_hemi_lidar_points(self, in_world_frame: bool = True) -> list[tuple[str, np.ndarray]]:
         """
-        Computes a pointcloud from the simulated lidar depth cameras, returned in the world frame if requested.
+        Traces rays and computes point clouds from the simulated Hesai J128 Lidars using MuJoCo-LiDAR.
         """
-        return get_pointcloud_from_camera_status(
-            self.pull_camera_data(),
-            in_world_frame=in_world_frame,
-            T_base_left=self.T_base_left,
-            T_base_right=self.T_base_right,
-        )
+        return self.data_proxies.get_hesai_lidar_points()

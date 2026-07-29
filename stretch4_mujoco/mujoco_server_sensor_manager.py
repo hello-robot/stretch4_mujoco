@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import mujoco
 
+from mujoco_lidar import MjLidarWrapper, scan_gen
+
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
 from stretch4_mujoco.utils import FpsCounter
@@ -39,6 +41,51 @@ class MujocoServerSensorManagerSync:
             self.mujoco_server.mjmodel, StretchSensors.base_lidar
         )
 
+        # Initialize MuJoCo-LiDAR wrappers for Hesai J128 3D lidars
+        # Optimized to 180 cols x 64 rows (11,520 rays/sensor) for real-time 10Hz simulation performance
+        self.hesai_wrappers: dict[str, MjLidarWrapper] = {}
+        self.hesai_theta, self.hesai_phi = scan_gen.generate_grid_scan_pattern(
+            num_ray_cols=180,
+            num_ray_rows=64,
+            theta_range=(-np.pi, np.pi),
+            phi_range=(-np.deg2rad(93.5), np.deg2rad(93.5)),
+        )
+
+        # Ray trace against Group 0 geoms (environment/room/floor) and Group 3 (robot body geoms), excluding head_link
+        head_body_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_BODY, "head_link")
+        scene_and_robot_geomgroup = np.array([1, 0, 0, 1, 0, 0], dtype=np.uint8)
+
+        for site_name in ["lidar_left", "lidar_right"]:
+            site_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_SITE, site_name)
+            if site_id != -1:
+                try:
+                    self.hesai_wrappers[site_name] = MjLidarWrapper(
+                        self.mujoco_server.mjmodel,
+                        site_name=site_name,
+                        backend="cpu",
+                        cutoff_dist=30.0,
+                        args={"geomgroup": scene_and_robot_geomgroup, "bodyexclude": head_body_id},
+                    )
+                except Exception as e:
+                    print(f"Failed to initialize MjLidarWrapper for site '{site_name}': {e}")
+
+        # Initialize MuJoCo-LiDAR wrapper for 2D base lidar if site 'lidar' exists
+        site_id_base = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_SITE, "lidar")
+        if site_id_base != -1:
+            try:
+                self.base_lidar_wrapper = MjLidarWrapper(
+                    self.mujoco_server.mjmodel,
+                    site_name="lidar",
+                    backend="cpu",
+                    cutoff_dist=10.0,
+                    args={"geomgroup": scene_geomgroup},
+                )
+                self.base_lidar_theta, self.base_lidar_phi = scan_gen.create_lidar_single_line(360)
+            except Exception:
+                self.base_lidar_wrapper = None
+        else:
+            self.base_lidar_wrapper = None
+
     def is_ready_to_pull_sensor_data(self, is_sleep_until_ready: bool = False):
         """
         Checks to see if a duration of time has passed since the last call
@@ -67,7 +114,41 @@ class MujocoServerSensorManagerSync:
 
         self.sensor_fps_counter.tick()
 
+    def pull_hesai_lidar_points(self, in_world_frame: bool = True) -> list[tuple[str, np.ndarray]]:
+        """
+        Traces rays for Hesai J128 Lidars using MuJoCo-LiDAR and returns hit points.
+        """
+        results = []
+        model = self.mujoco_server.mjmodel
+        data = self.mujoco_server.mjdata
+
+        for site_name, wrapper in self.hesai_wrappers.items():
+            wrapper.trace_rays(data, self.hesai_theta, self.hesai_phi, site_name=site_name)
+            local_pts = wrapper.get_hit_points()
+            dists = wrapper.get_distances()
+            valid_mask = (dists > 0) & (dists < wrapper.cutoff_dist)
+            pts = local_pts[valid_mask]
+
+            if in_world_frame and len(pts) > 0:
+                site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+                if site_id != -1:
+                    site_pos = data.site_xpos[site_id]
+                    site_mat = data.site_xmat[site_id].reshape(3, 3)
+                    pts = pts @ site_mat.T + site_pos
+
+            results.append((site_name, pts))
+
+        return results
+
     def _compute_lidar_rays(self) -> np.ndarray:
+        if self.base_lidar_wrapper is not None:
+            self.base_lidar_wrapper.trace_rays(
+                self.mujoco_server.mjdata, self.base_lidar_theta, self.base_lidar_phi
+            )
+            dists = self.base_lidar_wrapper.get_distances().copy()
+            dists[dists < 0] = 10.0
+            return dists
+
         model = self.mujoco_server.mjmodel
         data = self.mujoco_server.mjdata
         geom_id = np.zeros(1, dtype=np.int32)
@@ -91,29 +172,37 @@ class MujocoServerSensorManagerSync:
         """
         Pull data from the simulator.
         """
-        sensor_status = StatusStretchSensors.default()
-        sensor_status.time = self.mujoco_server.mjdata.time
-        sensor_status.fps = self.sensor_fps_counter.fps
+        lock_mgr = getattr(self.mujoco_server, "camera_manager", None)
+        camera_lock = lock_mgr.camera_lock if lock_mgr and hasattr(lock_mgr, "camera_lock") else self.sensor_lock
 
-        for sensor in self.sensors_to_use:
-            data: np.ndarray
-            if sensor == StretchSensors.base_lidar:
-                if self.lidar_sensor_names:
-                    data = np.array(
-                        [
-                            d
-                            for lidar_name in self.lidar_sensor_names
-                            for d in self.mujoco_server.mjdata.sensor(lidar_name).data
-                        ]
-                    )
+        with camera_lock:
+            sensor_status = StatusStretchSensors.default()
+            sensor_status.time = self.mujoco_server.mjdata.time
+            sensor_status.fps = self.sensor_fps_counter.fps
+
+            for sensor in self.sensors_to_use:
+                data: np.ndarray
+                if sensor == StretchSensors.base_lidar:
+                    if self.lidar_sensor_names:
+                        data = np.array(
+                            [
+                                d
+                                for lidar_name in self.lidar_sensor_names
+                                for d in self.mujoco_server.mjdata.sensor(lidar_name).data
+                            ]
+                        )
+                    else:
+                        data = self._compute_lidar_rays()
                 else:
-                    data = self._compute_lidar_rays()
-            else:
-                data = self.mujoco_server.mjdata.sensor(sensor.name).data
+                    data = self.mujoco_server.mjdata.sensor(sensor.name).data
 
-            sensor_status.set_data(sensor, data)
+                sensor_status.set_data(sensor, data)
 
-        self.mujoco_server.data_proxies.set_sensors(sensor_status)
+            self.mujoco_server.data_proxies.set_sensors(sensor_status)
+
+            if self.hesai_wrappers:
+                hesai_pts = self.pull_hesai_lidar_points(in_world_frame=True)
+                self.mujoco_server.data_proxies.set_hesai_lidar_points(hesai_pts)
 
 
 class MujocoServerSensorManagerThreaded(MujocoServerSensorManagerSync):
