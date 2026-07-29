@@ -51,6 +51,14 @@ class StretchSensors(Enum):
 
         except IndexError: ...
 
+        # If base_lidar wasn't found in XML sensors, check if lidar sites exist in model
+        if StretchSensors.base_lidar in remaining_sensors:
+            for index in range(mjmodel.nsite):
+                site_name = mujoco.mj_id2name(mjmodel, mujoco.mjtObj.mjOBJ_SITE, index)
+                if site_name and "lidar" in site_name:
+                    sensors.add(StretchSensors.base_lidar)
+                    break
+
         return list(sensors)
 
 
