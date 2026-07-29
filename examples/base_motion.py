@@ -39,11 +39,11 @@ def main():
 
             sim.wait_command()
 
-            sim.base.set_velocity(0.5, 0.5, 0.0)
+            sim.base.set_velocity(0.2, 0.2, 0.0)
 
             time.sleep(2)
 
-            sim.base.set_velocity(-0.5, -0.5, 0.5)
+            sim.base.set_velocity(-0.2, -0.2, 0.5)
 
             time.sleep(2)
             

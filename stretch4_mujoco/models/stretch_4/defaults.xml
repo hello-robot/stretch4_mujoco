@@ -12,14 +12,15 @@
       <general biastype="affine" />
 
       <default class="wheel">
-        <joint axis="0 0 1" armature="0.01" damping="0.1" frictionloss="15.0" limited="false" />
-        <velocity />
+        <joint axis="0 0 1" armature="0.01" damping="0.01" frictionloss="0.01" limited="false" />
+        <velocity kv="1" gear="6" forcerange="-100 100" />
+        <position kp="1" gear="6" forcerange="-100 100"/>
       </default>
       <default class="lift">
         <joint damping="50" stiffness="0.03" armature="0.01" frictionloss="1.5" />
-        <general gainprm="500" biasprm="0 -1000 -100" forcerange="-200 200" />
+        <general gainprm="2500" biasprm="0 -1000 -100" forcerange="-200 200" />
         <default class="lift_stretch4">
-          <general gainprm="500" biasprm="0 -1000 -100" forcerange="-200 200" />
+          <general gainprm="2500" biasprm="0 -1000 -100" forcerange="-200 200" />
         </default>
       </default>
       <default class="telescope">

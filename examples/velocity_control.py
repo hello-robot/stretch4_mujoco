@@ -47,21 +47,21 @@ def main(use_stretch_3: bool):
             time.sleep(2.0)
         else:
             # Stretch 4: Omnidirectional base (supports sideways/crab walk translation)
-            click.secho("Moving diagonally (vx = 0.4 m/s, vy = 0.4 m/s)...", fg="cyan")
-            sim.base.set_velocity(vx_m=0.4, vy_m=0.4, w_r=0.0)
-            time.sleep(5.0)
+            click.secho("Moving diagonally (vx = 0.2 m/s, vy = 0.2 m/s)...", fg="cyan")
+            sim.base.set_velocity(vx_m=0.2, vy_m=0.2, w_r=0.0)
+            time.sleep(2.0)
             
-            click.secho("Crab-walking sideways to the left (vy = -0.4 m/s)...", fg="cyan")
-            sim.base.set_velocity(vx_m=0.0, vy_m=-0.4, w_r=0.0)
-            time.sleep(5.0)
+            click.secho("Crab-walking sideways to the left (vy = -0.2 m/s)...", fg="cyan")
+            sim.base.set_velocity(vx_m=0.0, vy_m=-0.2, w_r=0.0)
+            time.sleep(2.0)
 
-            click.secho("Crab-walking backward to the left (vx = -0.4 m/s)...", fg="cyan")
-            sim.base.set_velocity(vx_m=-0.4, vy_m=0.0, w_r=0.0)
-            time.sleep(5.0)
+            click.secho("Crab-walking backward to the left (vx = -0.2 m/s)...", fg="cyan")
+            sim.base.set_velocity(vx_m=-0.2, vy_m=0.0, w_r=0.0)
+            time.sleep(2.0)
             
-            click.secho("Rotating while moving forward (vx = 0.5 m/s, w_r = 1 rad/s)...", fg="cyan")
-            sim.base.set_velocity(vx_m=0.5, vy_m=0.0, w_r=1)
-            time.sleep(5.0)
+            click.secho("Rotating while moving forward (vx = 0.2 m/s, w_r = 0.5 rad/s)...", fg="cyan")
+            sim.base.set_velocity(vx_m=0.2, vy_m=0.0, w_r=0.5)
+            time.sleep(2.0)
 
         click.secho("Stopping the base...", fg="cyan")
         sim.base.set_velocity(0.0, 0.0, 0.0)
