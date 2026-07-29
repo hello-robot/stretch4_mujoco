@@ -12,7 +12,7 @@ import importlib.resources
 import yourdfpy as urdf_loader
 
 
-from functools import wraps
+from functools import wraps, lru_cache
 
 import mujoco
 import mujoco._functions
@@ -616,3 +616,75 @@ except:  # noqa
             return func(*args, **kwargs)
 
         return wrapper
+
+
+@lru_cache(maxsize=16)
+def _get_fisheye_remap_matrices(
+    fx: float, fy: float, cx: float, cy: float, distortion_params: tuple, width: int, height: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    grid_y, grid_x = np.indices((height, width), dtype=np.float32)
+
+    x_d = (grid_x - cx) / fx
+    y_d = (grid_y - cy) / fy
+    r_d = np.sqrt(x_d**2 + y_d**2)
+    r_d_safe = np.maximum(r_d, 1e-8)
+
+    # Circular lens aperture radius in pixels (touches the 1200-pixel edge and clips top/bottom in landscape)
+    circle_radius_px = max(width, height) * 0.45
+    max_r_norm = circle_radius_px / fy
+
+    valid_mask = r_d <= max_r_norm
+
+    theta_d = r_d
+    if len(distortion_params) >= 4:
+        k1, k2, k3, k4 = distortion_params[:4]
+        theta_d2 = theta_d**2
+        distortion_factor = 1.0 + theta_d2 * (k1 + theta_d2 * (k2 + theta_d2 * (k3 + theta_d2 * k4)))
+        theta = theta_d * distortion_factor
+    else:
+        theta = theta_d
+
+    # Tangent mapping from fisheye ray angle theta to pinhole image plane radius r_p
+    fovy_rad = 2.0 * np.arctan(max(width, height) / (2.0 * fy))
+    f_pinhole = (height / 2.0) / np.tan(fovy_rad / 2.0)
+
+    r_p = np.tan(np.minimum(theta, np.radians(82.0)))
+
+    scale_x = (f_pinhole / fx) * (r_p / r_d_safe)
+    scale_y = (f_pinhole / fy) * (r_p / r_d_safe)
+
+    map_x = np.where(valid_mask, cx + (grid_x - cx) * scale_x, -1.0).astype(np.float32)
+    map_y = np.where(valid_mask, cy + (grid_y - cy) * scale_y, -1.0).astype(np.float32)
+
+    return map_x, map_y, valid_mask
+
+
+def apply_fisheye_distortion(
+    image: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    distortion_params: tuple,
+) -> np.ndarray:
+    """
+    Applies fisheye lens distortion to a pinhole image using cached remap matrices.
+    """
+    height, width = image.shape[:2]
+    map_x, map_y, valid_mask = _get_fisheye_remap_matrices(
+        fx, fy, cx, cy, tuple(distortion_params), width, height
+    )
+    distorted = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    distorted[~valid_mask] = 0
+
+    # Soft vignetting ring around the lens aperture border
+    grid_y, grid_x = np.indices((height, width), dtype=np.float32)
+    r_d = np.sqrt(((grid_x - cx) / fx)**2 + ((grid_y - cy) / fy)**2)
+    max_r_norm = (max(width, height) * 0.45) / fy
+    vignette = (r_d > max_r_norm * 0.96) & (r_d <= max_r_norm)
+    if np.any(vignette):
+        alpha = (max_r_norm - r_d[vignette]) / (max_r_norm * 0.04)
+        distorted[vignette] = (distorted[vignette] * alpha[:, None]).astype(np.uint8)
+
+    return distorted
+
