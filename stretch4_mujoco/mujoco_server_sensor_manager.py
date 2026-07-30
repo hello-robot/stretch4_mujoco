@@ -1,3 +1,5 @@
+import csv
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -41,15 +43,36 @@ class MujocoServerSensorManagerSync:
             self.mujoco_server.mjmodel, StretchSensors.base_lidar
         )
 
-        # Initialize MuJoCo-LiDAR wrappers for Hesai J128 3D lidars
-        # Optimized to 180 cols x 64 rows (11,520 rays/sensor) for real-time 10Hz simulation performance
+        # Initialize MuJoCo-LiDAR wrappers for Hesai J128 3D lidars using official Hesai JT128 calibration table
         self.hesai_wrappers: dict[str, MjLidarWrapper] = {}
-        self.hesai_theta, self.hesai_phi = scan_gen.generate_grid_scan_pattern(
-            num_ray_cols=180,
-            num_ray_rows=64,
-            theta_range=(-np.pi, np.pi),
-            phi_range=(-np.deg2rad(93.5), np.deg2rad(93.5)),
+        csv_path = os.path.join(
+            os.path.dirname(__file__), "models", "stretch_4", "hesai_jt128_calibration.csv"
         )
+        elevations_deg, azimuth_offsets_deg = [], []
+        if os.path.exists(csv_path):
+            with open(csv_path, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    elevations_deg.append(float(row["Elevation"]))
+                    azimuth_offsets_deg.append(float(row["Azimuth"]))
+
+        if elevations_deg:
+            elevations_rad = np.deg2rad(np.array(elevations_deg))
+            azimuth_offsets_rad = np.deg2rad(np.array(azimuth_offsets_deg))
+            num_azimuth_steps = 250
+            spin_angles = np.linspace(-np.pi, np.pi, num_azimuth_steps)
+            theta_grid = spin_angles[:, None] + azimuth_offsets_rad[None, :]
+            phi_grid = np.tile(elevations_rad[None, :], (num_azimuth_steps, 1))
+            theta_grid = (theta_grid + np.pi) % (2 * np.pi) - np.pi
+            self.hesai_theta = theta_grid.flatten()
+            self.hesai_phi = phi_grid.flatten()
+        else:
+            self.hesai_theta, self.hesai_phi = scan_gen.generate_grid_scan_pattern(
+                num_ray_cols=240,
+                num_ray_rows=128,
+                theta_range=(-np.pi, np.pi),
+                phi_range=(-np.deg2rad(93.5), np.deg2rad(93.5)),
+            )
 
         # Ray trace against Group 0 geoms (environment/room/floor) and Group 3 (robot body geoms), excluding head_link
         head_body_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_BODY, "head_link")
