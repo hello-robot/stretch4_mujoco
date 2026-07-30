@@ -314,6 +314,6 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
     @require_connection
     def pull_hemi_lidar_points(self, in_world_frame: bool = True) -> list[tuple[str, np.ndarray]]:
         """
-        Traces rays and computes point clouds from the simulated Hesai J128 Lidars using MuJoCo-LiDAR.
+        Traces rays and computes point clouds from the simulated lidars.
         """
         return self.data_proxies.get_hesai_lidar_points()

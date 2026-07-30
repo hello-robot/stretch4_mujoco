@@ -113,10 +113,10 @@ class MujocoServerSensorManagerSync:
             self.mujoco_server.mjmodel, StretchSensors.base_lidar
         )
 
-        # Initialize native MuJoCo LiDAR wrappers for Hesai J128 3D lidars using official Hesai JT128 calibration table
+        # Initialize a calibration table from a real lidar
         self.hesai_wrappers: dict[str, NativeMjLidar] = {}
         csv_path = os.path.join(
-            os.path.dirname(__file__), "models", "stretch_4", "hesai_jt128_calibration.csv"
+            os.path.dirname(__file__), "models", "stretch_4", "lidar_calibration.csv"
         )
         elevations_deg, azimuth_offsets_deg = [], []
         if os.path.exists(csv_path):
@@ -212,7 +212,7 @@ class MujocoServerSensorManagerSync:
 
     def pull_hesai_lidar_points(self, in_world_frame: bool = True) -> list[tuple[str, np.ndarray]]:
         """
-        Traces rays for Hesai J128 Lidars using MuJoCo-LiDAR and returns hit points.
+        Traces rays for lidars and returns hit points.
         """
         results = []
         model = self.mujoco_server.mjmodel
