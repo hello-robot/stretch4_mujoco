@@ -169,7 +169,6 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     T_opt_cam[:3, :3] = Rotation.from_euler('xyz', [180, 0, 0], degrees=True).as_matrix()
     
     if head is not None:
-        # Hesai J128 Lidars
         lidar_left_body = find_body("lidar_left_link")
         if lidar_left_body is not None:
             ET.SubElement(lidar_left_body, "site", name="lidar_left", pos="0 0 0", quat="1 0 0 0")
