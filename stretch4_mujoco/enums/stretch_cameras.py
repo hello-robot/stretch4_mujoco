@@ -308,13 +308,17 @@ class StretchCameras(Enum):
                 rotate_number_of_times=-1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_center:
-            # IMX378-W / head_center:
+            # # IMX378-W / head_center:
             width = 4032
             height = 3040
-            fx = 2329.4044093344937
-            fy = 2338.7901418403994
-            cx = 2061.704964987135
-            cy = 1518.022485719209
+            # width = 1280
+            # height = 965
+            scale = width / 4032.0
+            fx = 2329.4044093344937 * scale
+            fy = 2338.7901418403994 * scale
+            cx = 2061.704964987135 * scale
+            cy = 1518.022485719209 * scale
+            
 
             # field_of_view_vertical = 2 * np.arctan(height / (2 * fy))
             field_of_view_vertical = 2 * np.arctan(width / (2 * fx))
