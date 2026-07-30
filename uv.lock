@@ -1467,22 +1467,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mujoco-lidar"
-version = "0.3.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "matplotlib" },
-    { name = "mujoco" },
-    { name = "numpy" },
-    { name = "pynput" },
-    { name = "scipy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/74/ea/28a0a59fdb9618b0c0959c29569d505081dd766b8fc3d52df0843f2ee3d3/mujoco_lidar-0.3.3.tar.gz", hash = "sha256:49a61e69ace8ea5dc68fbb137dd24c50c6d7d2dac04948ef4da71f96a53be84c", size = 39321631, upload-time = "2026-06-21T06:48:05.264Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ee/40/a08a885b6a099d106f62d0d28dae3b420849c7f29f31d53007bbdbb5b59a/mujoco_lidar-0.3.3-py3-none-any.whl", hash = "sha256:7bfe0eb56214ccea09e7ccc1e4ccf9a7a6ea1dabf724895c05d029a3da8cec63", size = 39321207, upload-time = "2026-06-21T06:48:02.596Z" },
-]
-
-[[package]]
 name = "mypy"
 version = "1.20.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2839,7 +2823,6 @@ dependencies = [
     { name = "inputs" },
     { name = "matplotlib" },
     { name = "mujoco" },
-    { name = "mujoco-lidar" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pynput" },
@@ -2873,7 +2856,6 @@ requires-dist = [
     { name = "ipython", marker = "extra == 'jupyter'" },
     { name = "matplotlib", specifier = ">=3.10.1" },
     { name = "mujoco", specifier = "==3.3.1" },
-    { name = "mujoco-lidar", specifier = ">=0.3.3" },
     { name = "mypy", marker = "extra == 'dev'" },
     { name = "numpy", specifier = "==2.2.5" },
     { name = "opencv-python" },
