@@ -320,6 +320,6 @@ def add_stretch_to_kitchen(xml: str, robot_pose_attrib: dict, stretch_xml_absolu
     # add Stretch xml
     xml = insert_line_after_mujoco_tag(
         xml,
-        f' <include file="{stretch_xml_absolute}"/>',
+        f' <include file="{pathlib.Path(stretch_xml_absolute).as_posix()}"/>',
     )
     return xml

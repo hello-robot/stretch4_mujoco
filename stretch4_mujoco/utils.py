@@ -433,10 +433,12 @@ def insert_line_after_mujoco_tag(xml_string: str, line_to_insert: str) -> str:
     # Define the pattern to match the mujoco tag
     pattern = r'(<mujoco\s+model="base"\s*>)'
 
-    # Use re.sub to insert the new line after the matched tag
-    modified_xml = re.sub(pattern, f"\\1\n    {line_to_insert}", xml_string, count=1)
+    match = re.search(pattern, xml_string)
+    if match:
+        tag = match.group(1)
+        return xml_string.replace(tag, f"{tag}\n    {line_to_insert}", 1)
 
-    return modified_xml
+    return xml_string
 
 
 def get_absolute_path_stretch_xml(xml_file: str, robot_pose_attrib: dict | None = None) -> str:
@@ -456,8 +458,8 @@ def get_absolute_path_stretch_xml(xml_file: str, robot_pose_attrib: dict | None 
     parent_folder = pathlib.Path(xml_file).parent
     assets_folder = models_path / "assets"
 
-    default_robot_xml = re.sub(
-        'assetdir="assets"', f'assetdir="{assets_folder}"', default_robot_xml
+    default_robot_xml = default_robot_xml.replace(
+        'assetdir="assets"', f'assetdir="{assets_folder.as_posix()}"'
     )
 
     # find all the line which has the pattern {file="something.type"}
@@ -469,15 +471,14 @@ def get_absolute_path_stretch_xml(xml_file: str, robot_pose_attrib: dict | None 
         for folder_option in [parent_folder, models_path, assets_folder]:
             abs_path = folder_option / file_path
             if abs_path.exists():
-                default_robot_xml = default_robot_xml.replace(file_path, str(abs_path))
+                default_robot_xml = default_robot_xml.replace(file_path, abs_path.as_posix())
                 break
 
     if robot_pose_attrib is not None:
         pos = f'pos="{robot_pose_attrib["pos"]}" quat="{robot_pose_attrib["quat"]}"'
-        default_robot_xml = re.sub(
+        default_robot_xml = default_robot_xml.replace(
             '<body name="base_link" childclass="stretch">',
             f'<body name="base_link" childclass="stretch" {pos}>',
-            default_robot_xml,
         )
 
     # Absosolute path converted streth xml
