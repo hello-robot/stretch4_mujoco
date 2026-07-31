@@ -31,7 +31,9 @@ class StretchCameras(Enum):
     cam_nav_rgb_se4_right = 6
     """The wide-angle RGB camera in the head for Stretch 4."""
     cam_nav_rgb_se4_center = 7
-    """The wide-angle RGB camera in the head for Stretch 4."""
+    """The full resolution (4034x3040) wide-angle RGB camera in the head for Stretch 4."""
+    cam_nav_rgb_se4_center_low_rez = 8
+    """The low resolution (1280x965) wide-angle RGB camera in the head for Stretch 4."""
 
     cam_hemilidar_left = 12
     """Left hemispherical lidar."""
@@ -60,7 +62,16 @@ class StretchCameras(Enum):
         """
         Returns all the available cameras to stretch 4.
         """
-        return [StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb, StretchCameras.cam_gripper_se4_stereo_depth, StretchCameras.cam_nav_rgb_se4_left,StretchCameras.cam_nav_rgb_se4_right,StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
+        return [
+            StretchCameras.cam_gripper_se4_left_rgb,
+            StretchCameras.cam_gripper_se4_right_rgb,
+            StretchCameras.cam_gripper_se4_stereo_depth,
+            StretchCameras.cam_nav_rgb_se4_left,
+            StretchCameras.cam_nav_rgb_se4_right,
+            StretchCameras.cam_nav_rgb_se4_center,
+            StretchCameras.cam_hemilidar_left,
+            StretchCameras.cam_hemilidar_right,
+        ]
 
     @staticmethod
     def none() -> list["StretchCameras"]:
@@ -123,7 +134,7 @@ class StretchCameras(Enum):
             return "camera_left_link"
         if self == StretchCameras.cam_nav_rgb_se4_right:
             return "camera_right_link"
-        if self == StretchCameras.cam_nav_rgb_se4_center:
+        if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
             return "camera_center_link"
         if self == StretchCameras.cam_hemilidar_left:
             return "cam_hemilidar_left"
@@ -143,7 +154,11 @@ class StretchCameras(Enum):
     def is_depth(self) -> bool:
         if self in StretchCameras.depth_stretch4() or self in StretchCameras.depth_stretch3():
             return True
-        if self in StretchCameras.rgb_stretch4() or self in StretchCameras.rgb_stretch3():
+        if (
+            self in StretchCameras.rgb_stretch4()
+            or self == StretchCameras.cam_nav_rgb_se4_center_low_rez
+            or self in StretchCameras.rgb_stretch3()
+        ):
             return False
 
         raise NotImplementedError(f"Camera {self} is_depth is not implemented")
@@ -307,18 +322,19 @@ class StretchCameras(Enum):
                 ),
                 rotate_number_of_times=-1,
             )
-        if self == StretchCameras.cam_nav_rgb_se4_center:
+        if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
             # # IMX378-W / head_center:
-            width = 4032
-            height = 3040
-            # width = 1280
-            # height = 965
-            scale = width / 4032.0
+            if self == StretchCameras.cam_nav_rgb_se4_center:
+                width = 4034
+                height = 3040
+            else:
+                width = 1280
+                height = 965
+            scale = width / 4034.0
             fx = 2329.4044093344937 * scale
             fy = 2338.7901418403994 * scale
             cx = 2061.704964987135 * scale
             cy = 1518.022485719209 * scale
-            
 
             # field_of_view_vertical = 2 * np.arctan(height / (2 * fy))
             field_of_view_vertical = 2 * np.arctan(width / (2 * fx))

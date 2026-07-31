@@ -651,7 +651,9 @@ class MujocoServer:
             )
         else:
             self.camera_manager = MujocoServerCameraManagerSync(
-                camera_hz=camera_hz, cameras_to_use=cameras_to_use, mujoco_server=self
+                camera_hz=camera_hz,
+                cameras_to_use=cameras_to_use,
+                mujoco_server=self,
             )
 
     def run(
@@ -662,7 +664,8 @@ class MujocoServer:
     ):
         # self.__run_headless_simulation(camera_hz=camera_hz, cameras_to_use=cameras_to_use)
         self.__run_headless_simulation_with_physics_thread(
-            camera_hz=camera_hz, cameras_to_use=cameras_to_use
+            camera_hz=camera_hz,
+            cameras_to_use=cameras_to_use,
         )
 
     def _is_requested_to_stop(self):
@@ -775,7 +778,9 @@ class MujocoServer:
         self.close()
 
     def __run_headless_simulation_with_physics_thread(
-        self, camera_hz: float, cameras_to_use: list[StretchCameras]
+        self,
+        camera_hz: float,
+        cameras_to_use: list[StretchCameras],
     ) -> None:
         """
         Run the simulation without the viewer headless.
