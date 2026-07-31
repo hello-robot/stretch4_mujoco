@@ -8,6 +8,7 @@ from stretch4_urdf import get_urdf
 
 import stretch4_mujoco.utils as utils
 from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity
+from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
 from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.pointcloud_utils import get_pointcloud_from_camera_status
@@ -38,6 +39,7 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         cameras_to_use: list[StretchCameras] = [],
         start_translation: list | None = None,
         start_rotation_quat: list | None = None,
+        use_full_center_camera_resolution: bool = False,
     ) -> None:
         # Dynamically generate the MJCF so it's ready for any scene that includes it
         self.get_robot_xml_path()
@@ -45,6 +47,17 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         if model is None and scene_xml_path is None:
             # if no scene or model is provided, use the se4 default
             scene_xml_path = self.get_scene_xml_path()
+
+        if not cameras_to_use:
+            cameras_to_use = self.get_all_cameras()
+
+        if not use_full_center_camera_resolution:
+            cameras_to_use = [
+                StretchCameras.cam_nav_rgb_se4_center_low_rez
+                if cam == StretchCameras.cam_nav_rgb_se4_center
+                else cam
+                for cam in cameras_to_use
+            ]
 
         super().__init__(
             scene_xml_path=scene_xml_path,
@@ -134,6 +147,13 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
     @staticmethod
     def get_rgb_cameras() -> list[StretchCameras]:
         return StretchCameras.rgb_stretch4()
+
+    def pull_camera_data(self) -> StatusStretchCameras:
+        data = super().pull_camera_data()
+        if data.cam_nav_rgb_se4_center_low_rez is not None:
+            data.cam_nav_rgb_se4_center = data.cam_nav_rgb_se4_center_low_rez
+            data.cam_nav_rgb_se4_center_low_rez = None
+        return data
 
     def is_reached_set_position(self, actuator: str | Actuators, position_tolerance: float = 0.05):
         """

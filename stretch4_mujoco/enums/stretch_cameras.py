@@ -31,7 +31,9 @@ class StretchCameras(Enum):
     cam_nav_rgb_se4_right = 6
     """The wide-angle RGB camera in the head for Stretch 4."""
     cam_nav_rgb_se4_center = 7
-    """The wide-angle RGB camera in the head for Stretch 4."""
+    """The full resolution (4034x3040) wide-angle RGB camera in the head for Stretch 4."""
+    cam_nav_rgb_se4_center_low_rez = 8
+    """The low resolution (1280x965) wide-angle RGB camera in the head for Stretch 4."""
 
     cam_hemilidar_left = 12
     """Left hemispherical lidar."""
@@ -60,7 +62,16 @@ class StretchCameras(Enum):
         """
         Returns all the available cameras to stretch 4.
         """
-        return [StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb, StretchCameras.cam_gripper_se4_stereo_depth, StretchCameras.cam_nav_rgb_se4_left,StretchCameras.cam_nav_rgb_se4_right,StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
+        return [
+            StretchCameras.cam_gripper_se4_left_rgb,
+            StretchCameras.cam_gripper_se4_right_rgb,
+            StretchCameras.cam_gripper_se4_stereo_depth,
+            StretchCameras.cam_nav_rgb_se4_left,
+            StretchCameras.cam_nav_rgb_se4_right,
+            StretchCameras.cam_nav_rgb_se4_center,
+            StretchCameras.cam_hemilidar_left,
+            StretchCameras.cam_hemilidar_right,
+        ]
 
     @staticmethod
     def none() -> list["StretchCameras"]:
@@ -123,7 +134,7 @@ class StretchCameras(Enum):
             return "camera_left_link"
         if self == StretchCameras.cam_nav_rgb_se4_right:
             return "camera_right_link"
-        if self == StretchCameras.cam_nav_rgb_se4_center:
+        if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
             return "camera_center_link"
         if self == StretchCameras.cam_hemilidar_left:
             return "cam_hemilidar_left"
@@ -143,7 +154,11 @@ class StretchCameras(Enum):
     def is_depth(self) -> bool:
         if self in StretchCameras.depth_stretch4() or self in StretchCameras.depth_stretch3():
             return True
-        if self in StretchCameras.rgb_stretch4() or self in StretchCameras.rgb_stretch3():
+        if (
+            self in StretchCameras.rgb_stretch4()
+            or self == StretchCameras.cam_nav_rgb_se4_center_low_rez
+            or self in StretchCameras.rgb_stretch3()
+        ):
             return False
 
         raise NotImplementedError(f"Camera {self} is_depth is not implemented")
@@ -156,6 +171,19 @@ class StretchCameras(Enum):
 
         if self == StretchCameras.cam_d435i_depth or self in StretchCameras.hemispherical_lidars():
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["d435i"])
+
+        if self in [
+            StretchCameras.cam_nav_rgb_se4_left,
+            StretchCameras.cam_nav_rgb_se4_right,
+        ]:
+            settings = self.initial_camera_settings
+            if settings.distortion_params is not None:
+                fx, fy = settings.focal
+                cx, cy = settings.optical_center
+                distortion_params = settings.distortion_params
+                return lambda render: utils.apply_fisheye_distortion(
+                    render, fx, fy, cx, cy, distortion_params
+                )
 
         if not self.is_depth:
             return None
@@ -245,51 +273,68 @@ class StretchCameras(Enum):
         #     )
 
         if self == StretchCameras.cam_nav_rgb_se4_left:
-            # AR0234:
+            # AR0234 / head_left:
             width = 1920
             height = 1200
-            fx = 516.3209766240785
-            fy = 516.3209766240785
-            cx =  633.9972207132915
-            cy = 968.6880128694355
-            # field_of_view_vertical = 2 * np.arctan(height / (2 * fy))
+            fx = 516.9768177458288
+            fy = 517.3644719961303
+            cx = 933.1137897347201
+            cy = 612.4085502991915
             field_of_view_vertical = 2 * np.arctan(width / (2 * fx))
             field_of_view_vertical_in_degrees = np.degrees(field_of_view_vertical)
 
             return CameraSettings(
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
+                optical_center_px=(cx, cy),
                 width=width,
                 height=height,
+                distortion_params=(
+                    -0.02523316108971853,
+                    0.011127651341704358,
+                    -0.005848339151583135,
+                    0.0007940458582321494,
+                ),
                 rotate_number_of_times=1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_right:
-            # AR0234:
+            # AR0234 / head_right:
             width = 1920
             height = 1200
-            fx = 516.3209766240785
-            fy = 516.3209766240785
-            cx =  633.9972207132915
-            cy = 968.6880128694355
-            # field_of_view_vertical = 2 * np.arctan(height / (2 * fy))
+            fx = 519.094494257149
+            fy = 518.418931744225
+            cx = 974.2541200745
+            cy = 575.5427056279029
             field_of_view_vertical = 2 * np.arctan(width / (2 * fx))
             field_of_view_vertical_in_degrees = np.degrees(field_of_view_vertical)
 
             return CameraSettings(
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
+                optical_center_px=(cx, cy),
                 width=width,
                 height=height,
+                distortion_params=(
+                    -0.025962597755860257,
+                    0.0111022256976195,
+                    -0.005205105236511768,
+                    0.0004939891505609986,
+                ),
                 rotate_number_of_times=-1,
             )
-        if self == StretchCameras.cam_nav_rgb_se4_center:
-            # IMX378-W:
-            width = 4032
-            height = 3040
-            fx = 2340.8241351931174
-            fy = 1508.9936655394183
-            cx = 2339.941538302098
-            cy = 2010.9566259742428
+        if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
+            # # IMX378-W / head_center:
+            if self == StretchCameras.cam_nav_rgb_se4_center:
+                width = 4034
+                height = 3040
+            else:
+                width = 1280
+                height = 965
+            scale = width / 4034.0
+            fx = 2329.4044093344937 * scale
+            fy = 2338.7901418403994 * scale
+            cx = 2061.704964987135 * scale
+            cy = 1518.022485719209 * scale
 
             # field_of_view_vertical = 2 * np.arctan(height / (2 * fy))
             field_of_view_vertical = 2 * np.arctan(width / (2 * fx))
@@ -298,9 +343,26 @@ class StretchCameras(Enum):
             return CameraSettings(
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
                 focal=(fx, fy),
+                optical_center_px=(cx, cy),
                 width=width,
                 height=height,
-                rotate_number_of_times=1,
+                distortion_params=(
+                    1.2129752168148256,
+                    5.841373920191379,
+                    -0.0016434465993966064,
+                    -0.004229881605602358,
+                    -0.7139811586224234,
+                    1.380989287039654,
+                    6.445212600290566,
+                    -0.03269498452468606,
+                    0.001801163713650778,
+                    0.001218315951582083,
+                    0.0031951489521495073,
+                    -0.0006358028024435923,
+                    0.002186544781267366,
+                    -0.020580090114988337,
+                ),
+                rotate_number_of_times=-1,
             )
 
         if self == StretchCameras.cam_nav_rgb:
@@ -366,13 +428,16 @@ class CameraSettings:
     """This is currently being used in Stretch Web Teleop to crop a ROI"""
     distortion_params: tuple | None = None
     """Specify this if they are available. Zeros will be used in `get_distortion_params_d()` otherwise."""
+    optical_center_px: tuple[float, float] | None = None
+    """Optional (cx, cy) optical center in pixels."""
     rotate_number_of_times: int = 0
     """Number of times to rotate the image (because the sensor is mounted rotated)"""
 
     @property
-    def optical_center(self)-> tuple[float, float]:
-        """(x,y) Optical center in mm."""
-        # TODO: needs a property setter
+    def optical_center(self) -> tuple[float, float]:
+        """(x,y) Optical center in pixels."""
+        if self.optical_center_px is not None:
+            return self.optical_center_px
         return (self.width / 2, self.height / 2)
 
     @property
@@ -428,13 +493,14 @@ class CameraSettings:
         fx and fy are the focal lengths in pixels along the x and y axes, respectively.
         cx and cy are the coordinates of the principal point (center of the image) in pixels.
         """
+        cx, cy = self.optical_center
         return [
             self.focal[0],
             0.0,
-            self.width / 2,
+            cx,
             0.0,
             self.focal[1],
-            self.height / 2,
+            cy,
             0.0,
             0.0,
             1.0,
@@ -453,17 +519,19 @@ class CameraSettings:
         Tx and Ty are used in stereo setups to represent the translation of the second camera relative to the first. For monocular cameras, Tx and Ty are typically 0.
 
         """
+        cx, cy = self.optical_center
         return [
             self.focal[0],
             0.0,
-            self.width / 2,
+            cx,
             0.0,
             0.0,
             self.focal[1],
-            self.height / 2,
+            cy,
             0.0,
             0.0,
             0.0,
             1.0,
             0.0,
         ]
+

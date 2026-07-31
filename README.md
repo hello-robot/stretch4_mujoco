@@ -175,7 +175,7 @@ model, xml = model_generation_wizard(
     wrtie_to_file=<filename>,
 )
 
-sim = Stretch4MujocoSimulator(model=model)
+sim = Stretch4MujocoSimulator(model=model, use_full_center_camera_resolution=False)
 sim.start()
 ```
 
