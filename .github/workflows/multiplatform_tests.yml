@@ -56,7 +56,8 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run -a uv run pytest tests/
         env:
-          MUJOCO_GL: osmesa
+          MUJOCO_GL: egl
+          PYOPENGL_PLATFORM: egl
 
       - name: Run test suite (Windows & macOS)
         if: runner.os != 'Linux'
