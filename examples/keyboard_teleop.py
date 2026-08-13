@@ -242,9 +242,6 @@ def main(
 
     if lidar3d or use_imagery:
         rerun_logger.init_rerun(use_stretch_3)
-
-    if lidar3d:
-        pass
         
     model = None
 
