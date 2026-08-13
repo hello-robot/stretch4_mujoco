@@ -312,7 +312,14 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             self.data_proxies.set_command(command)
 
     @require_connection
-    def pull_hemi_lidar_points(self, in_world_frame: bool = True) -> list[tuple[str, np.ndarray]]:
+    def pull_hemi_lidar_points(self) -> dict[str, np.ndarray]:
+        """
+        Traces rays and computes point clouds from the simulated lidars.
+        """
+        return self.data_proxies.get_hesai_lidar_points()
+
+    @require_connection
+    def pull_hesai_lidar_points(self) -> dict[str, np.ndarray]:
         """
         Traces rays and computes point clouds from the simulated lidars.
         """
