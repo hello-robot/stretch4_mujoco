@@ -114,6 +114,7 @@ Use the Stretch4MujocoSimulator class to:
 - velocity control the robot's mobile base
 - read joint states
 - read camera imagery
+- read 2D and 3D LiDAR point clouds
 
 Try the code below using `uv run ipython`. For advanced Mujoco users, the class also exposes the `mjModel` and `mjData`. See the [official Mujoco documentation](https://mujoco.readthedocs.io/en/stable/python.html).
 
@@ -145,6 +146,16 @@ if __name__ == "__main__":
     # Get Camera Frames
     camera_data = sim.pull_camera_data()
     pprint(camera_data)
+
+    # Get 2D LiDAR Scan Data (from status sensors)
+    sensor_data = sim.pull_sensor_data()
+    from stretch4_mujoco.enums.stretch_sensors import StretchSensors
+    pprint(sensor_data.get_data(StretchSensors.base_lidar))
+
+    # Get 3D LiDAR Point Clouds (from left and right Hesai scanners)
+    lidar_data = sim.pull_hesai_lidar_points()
+    pprint(lidar_data["left"])
+    pprint(lidar_data["right"])
 
     # Kills simulation process
     sim.stop()

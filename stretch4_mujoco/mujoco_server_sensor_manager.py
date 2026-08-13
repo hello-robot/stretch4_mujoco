@@ -210,11 +210,11 @@ class MujocoServerSensorManagerSync:
 
         self.sensor_fps_counter.tick()
 
-    def pull_hesai_lidar_points(self, in_world_frame: bool = True) -> list[tuple[str, np.ndarray]]:
+    def pull_hesai_lidar_points(self, in_world_frame: bool = True) -> dict[str, np.ndarray]:
         """
         Traces rays for lidars and returns hit points.
         """
-        results = []
+        results = {}
         model = self.mujoco_server.mjmodel
         data = self.mujoco_server.mjdata
 
@@ -232,7 +232,13 @@ class MujocoServerSensorManagerSync:
                     site_mat = data.site_xmat[site_id].reshape(3, 3)
                     pts = pts @ site_mat.T + site_pos
 
-            results.append((site_name, pts))
+            key = "left" if "left" in site_name else "right"
+            results[key] = pts
+
+        if "left" not in results:
+            results["left"] = np.empty((0, 3), dtype=np.float64)
+        if "right" not in results:
+            results["right"] = np.empty((0, 3), dtype=np.float64)
 
         return results
 

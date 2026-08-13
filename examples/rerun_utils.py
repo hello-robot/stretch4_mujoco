@@ -69,7 +69,16 @@ class RerunLogger:
                 item_type = item[0]
                 if item_type == "pointcloud":
                     _, points, label = item
-                    if isinstance(points, list):
+                    if isinstance(points, dict):
+                        for points_name, points_instance in points.items():
+                            if len(points_instance) > 0:
+                                # Left lidar cyan, right lidar amber
+                                c = [0, 220, 255] if "left" in points_name else [255, 180, 0]
+                                rr.log(
+                                    f"{label}/{points_name}",
+                                    rr.Points3D(positions=points_instance, radii=0.008, colors=c),
+                                )
+                    elif isinstance(points, list):
                         for points_name, points_instance in points:
                             if len(points_instance) > 0:
                                 # Left lidar cyan, right lidar amber
