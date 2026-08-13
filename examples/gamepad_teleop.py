@@ -90,7 +90,7 @@ def main(
 
             if lidar3d:
                 rerun_logger.update_pointcloud_viz(
-                    sim.pull_hemi_lidar_points(), "world/lidar_points"
+                    sim.pull_lidar_points(), "world/lidar_points"
                 )
 
             if lidar2d:

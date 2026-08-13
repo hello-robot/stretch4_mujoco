@@ -96,14 +96,14 @@ The pixel values of all the renderings of the cameras are fetched at the same ti
 
 Note: this operation is computationally heavy. The more cameras that are requested, the slower the simulation may run.
 
-#### Stretch 3D LiDAR (Hesai) Point Clouds
+#### Stretch 3D LiDAR Point Clouds
 
-Use `sim.pull_hesai_lidar_points()` or `sim.pull_hemi_lidar_points()` to retrieve 3D LiDAR point clouds from the simulated left and right Hesai scanners on Stretch 4.
+Use `sim.pull_lidar_points()` or `sim.pull_lidar_points()` to retrieve 3D LiDAR point clouds from the simulated left and right lidars on Stretch 4.
 
 This method returns a dictionary with `"left"` and `"right"` keys, where each value is a NumPy array of shape `(N, 3)` containing the 3D hit points in the world coordinate frame:
 
 ```python
-lidar_data = sim.pull_hesai_lidar_points()
+lidar_data = sim.pull_lidar_points()
 
 # Access left and right lidar point clouds
 left_points = lidar_data["left"]    # shape: (N, 3)

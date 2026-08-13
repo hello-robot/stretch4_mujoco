@@ -152,8 +152,8 @@ if __name__ == "__main__":
     from stretch4_mujoco.enums.stretch_sensors import StretchSensors
     pprint(sensor_data.get_data(StretchSensors.base_lidar))
 
-    # Get 3D LiDAR Point Clouds (from left and right Hesai scanners)
-    lidar_data = sim.pull_hesai_lidar_points()
+    # Get 3D LiDAR Point Clouds (from left and right lidars)
+    lidar_data = sim.pull_lidar_points()
     pprint(lidar_data["left"])
     pprint(lidar_data["right"])
 
