@@ -42,7 +42,7 @@ def main(
                 cv2.imshow(camera.name, camera_data.get_camera_data(camera))
 
             if lidar3d:
-                rerun_logger.update_pointcloud_viz(sim.pull_hemi_lidar_points(in_world_frame=True), "world/lidar_points")
+                rerun_logger.update_pointcloud_viz(sim.pull_lidar_points(), "world/lidar_points")
 
             cv2.waitKey(10)
 

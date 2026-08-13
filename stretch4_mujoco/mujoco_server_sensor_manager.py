@@ -114,7 +114,7 @@ class MujocoServerSensorManagerSync:
         )
 
         # Initialize a calibration table from a real lidar
-        self.hesai_wrappers: dict[str, NativeMjLidar] = {}
+        self.lidar_wrappers: dict[str, NativeMjLidar] = {}
         csv_path = os.path.join(
             os.path.dirname(__file__), "models", "stretch_4", "lidar_calibration.csv"
         )
@@ -134,8 +134,8 @@ class MujocoServerSensorManagerSync:
             theta_grid = spin_angles[:, None] + azimuth_offsets_rad[None, :]
             phi_grid = np.tile(elevations_rad[None, :], (num_azimuth_steps, 1))
             theta_grid = (theta_grid + np.pi) % (2 * np.pi) - np.pi
-            self.hesai_theta = theta_grid.flatten()
-            self.hesai_phi = phi_grid.flatten()
+            self.lidar_theta = theta_grid.flatten()
+            self.lidar_phi = phi_grid.flatten()
         else:
             num_ray_cols = 240
             num_ray_rows = 128
@@ -143,8 +143,8 @@ class MujocoServerSensorManagerSync:
                 np.linspace(-np.pi, np.pi, num_ray_cols),
                 np.linspace(-np.deg2rad(93.5), np.deg2rad(93.5), num_ray_rows),
             )
-            self.hesai_theta = theta_grid.flatten()
-            self.hesai_phi = phi_grid.flatten()
+            self.lidar_theta = theta_grid.flatten()
+            self.lidar_phi = phi_grid.flatten()
 
         # Ray trace against Group 0 geoms (environment/room/floor) and Group 3 (robot body geoms), excluding head_link
         head_body_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_BODY, "head_link")
@@ -155,7 +155,7 @@ class MujocoServerSensorManagerSync:
             site_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_SITE, site_name)
             if site_id != -1:
                 try:
-                    self.hesai_wrappers[site_name] = NativeMjLidar(
+                    self.lidar_wrappers[site_name] = NativeMjLidar(
                         self.mujoco_server.mjmodel,
                         site_name=site_name,
                         cutoff_dist=30.0,
@@ -210,7 +210,7 @@ class MujocoServerSensorManagerSync:
 
         self.sensor_fps_counter.tick()
 
-    def pull_hesai_lidar_points(self, in_world_frame: bool = True) -> dict[str, np.ndarray]:
+    def pull_lidar_points(self, in_world_frame: bool = True) -> dict[str, np.ndarray]:
         """
         Traces rays for lidars and returns hit points.
         """
@@ -218,8 +218,8 @@ class MujocoServerSensorManagerSync:
         model = self.mujoco_server.mjmodel
         data = self.mujoco_server.mjdata
 
-        for site_name, wrapper in self.hesai_wrappers.items():
-            wrapper.trace_rays(data, self.hesai_theta, self.hesai_phi, site_name=site_name)
+        for site_name, wrapper in self.lidar_wrappers.items():
+            wrapper.trace_rays(data, self.lidar_theta, self.lidar_phi, site_name=site_name)
             local_pts = wrapper.get_hit_points()
             dists = wrapper.get_distances()
             valid_mask = (dists > 0) & (dists < wrapper.cutoff_dist)
@@ -302,9 +302,9 @@ class MujocoServerSensorManagerSync:
 
             self.mujoco_server.data_proxies.set_sensors(sensor_status)
 
-            if self.hesai_wrappers:
-                hesai_pts = self.pull_hesai_lidar_points(in_world_frame=True)
-                self.mujoco_server.data_proxies.set_hesai_lidar_points(hesai_pts)
+            if self.lidar_wrappers:
+                lidar_pts = self.pull_lidar_points(in_world_frame=True)
+                self.mujoco_server.data_proxies.set_lidar_points(lidar_pts)
 
 
 class MujocoServerSensorManagerThreaded(MujocoServerSensorManagerSync):

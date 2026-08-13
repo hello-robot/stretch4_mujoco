@@ -39,7 +39,7 @@ class MujocoServerProxies:
     _cameras: "DictProxy[str, StatusStretchCameras]"
     _sensors: "DictProxy[str, StatusStretchSensors]"
     _joint_limits: "DictProxy[str, dict[Actuators, tuple[float, float]]]"
-    _hesai_lidar_points: "DictProxy[str, dict[str, np.ndarray]]"
+    _lidar_lidar_points: "DictProxy[str, dict[str, np.ndarray]]"
 
     def __setattr__(self, name: str, value) -> None:
         try:
@@ -71,11 +71,11 @@ class MujocoServerProxies:
     def set_sensors(self, value: StatusStretchSensors):
         self._sensors["val"] = value
 
-    def get_hesai_lidar_points(self) -> dict[str, np.ndarray]:
-        return self._hesai_lidar_points.get("val", {})
+    def get_lidar_points(self) -> dict[str, np.ndarray]:
+        return self._lidar_lidar_points.get("val", {})
 
-    def set_hesai_lidar_points(self, value: dict[str, np.ndarray]):
-        self._hesai_lidar_points["val"] = value
+    def set_lidar_points(self, value: dict[str, np.ndarray]):
+        self._lidar_lidar_points["val"] = value
 
     def get_joint_limits(self) -> dict[Actuators, tuple[float, float]]:
         return self._joint_limits["val"]
@@ -94,7 +94,7 @@ class MujocoServerProxies:
             _cameras=manager.dict({"val": StatusStretchCameras.default()}),
             _sensors=manager.dict({"val": StatusStretchSensors.default()}),
             _joint_limits=manager.dict({"val": {}}),
-            _hesai_lidar_points=manager.dict({"val": {}}),
+            _lidar_lidar_points=manager.dict({"val": {}}),
         )
 
 
