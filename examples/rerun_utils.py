@@ -69,11 +69,29 @@ class RerunLogger:
                 item_type = item[0]
                 if item_type == "pointcloud":
                     _, points, label = item
-                    if isinstance(points, list):
+                    if isinstance(points, dict):
+                        for points_name, points_instance in points.items():
+                            if len(points_instance) > 0:
+                                # Left lidar cyan, right lidar amber
+                                c = [0, 220, 255] if "left" in points_name else [255, 180, 0]
+                                rr.log(
+                                    f"{label}/{points_name}",
+                                    rr.Points3D(positions=points_instance, radii=0.008, colors=c),
+                                )
+                    elif isinstance(points, list):
                         for points_name, points_instance in points:
-                            rr.log(f"{label}/{points_name}", rr.Points3D(points_instance))
-                    else:
-                        rr.log(label, rr.Points3D(points))
+                            if len(points_instance) > 0:
+                                # Left lidar cyan, right lidar amber
+                                c = [0, 220, 255] if "left" in points_name else [255, 180, 0]
+                                rr.log(
+                                    f"{label}/{points_name}",
+                                    rr.Points3D(positions=points_instance, radii=0.008, colors=c),
+                                )
+                    elif len(points) > 0:
+                        rr.log(
+                            label,
+                            rr.Points3D(positions=points, radii=0.008, colors=[0, 220, 255]),
+                        )
                 self._log_queue.task_done()
             except queue.Empty:
                 pass
@@ -88,7 +106,7 @@ class RerunLogger:
 
             threading.Event().wait(0.01)
 
-    def init_rerun(self, use_stretch_3:bool):
+    def init_rerun(self, use_stretch_3: bool = False):
         if not self._initialized:
             rr.init("Stretch4 Mujoco", spawn=False)
             rr.spawn(memory_limit='5GB')
@@ -109,8 +127,8 @@ class RerunLogger:
             self._log_thread.start()
             self._initialized = True
 
-    def init_pointcloud_viz(self):
-        self.init_rerun()
+    def init_pointcloud_viz(self, use_stretch_3: bool):
+        self.init_rerun(use_stretch_3)
 
     def _put_queue(self, item):
         if self._stop_event.is_set():
@@ -125,9 +143,14 @@ class RerunLogger:
                 except queue.Empty:
                     pass
 
-    def update_pointcloud_viz(self, points: np.ndarray | list[tuple[str, np.ndarray]], label: str):
+    def update_pointcloud_viz(
+        self,
+        points: np.ndarray | list[tuple[str, np.ndarray]],
+        label: str,
+        use_stretch_3: bool = False,
+    ):
         if not self._initialized:
-            self.init_rerun()
+            self.init_rerun(use_stretch_3)
         self._put_queue(("pointcloud", points, label))
 
     def update_camera_images(self, camera_data):
