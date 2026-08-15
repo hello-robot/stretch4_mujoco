@@ -9,7 +9,7 @@ The `mjcf_generator.py` applies the following changes to the raw `urdf2mjcf` out
 
 1. Removes all tags except `asset` and `worldbody`.
 2. Removes specific tags from worldbody (e.g., `light`, `camera`, `ground` plane).
-3. Replaces the default wheel joints with custom bodies (`link_left_wheel`, `link_right_wheel`, `link_back_wheel`) containing `class="wheel"` and associated wheel rollers to support omnibase motion, and includes `omniwheels.xml`.
+3. Converts the URDF's rolling wheels into omniwheels (`left_wheel_link`, `back_wheel_link`, `right_wheel_link`). Placement and inertials are left exactly as derived from the URDF; only the omnidirectional contact model (the `omniwheel_collision` capsule) and the joint names the actuators drive are overridden. Note the URDF's axles point opposite to what the `H0` drive kinematics assumes, which is what the negative `wheelN_polarity` values in `config.py` compensate for.
 4. Encapsulates lidar and camera geoms with dedicated bodies and includes `hemisphere_lidar_cameras_right/left.xml`.
 5. Replaces `link_mast` geometry with appropriate `collision` and `visualgeom` classes.
 6. Renames the root body to `base_link` and adds an `imu` site.
