@@ -151,6 +151,13 @@ class MujocoServerSensorManagerSync:
         scene_and_robot_geomgroup = np.array([1, 0, 0, 1, 0, 0], dtype=np.uint8)
         scene_geomgroup = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
 
+        # "stretch4" is the floating root body (base_footprint equivalent). urdf2mjcf
+        # raises it above the URDF's reference height so the wheels don't start
+        # clipped into the floor, so world-frame points must be re-expressed
+        # relative to this body's *live* pose (not the compiled reference pose,
+        # which the physics won't exactly hold once the robot settles/moves).
+        self.root_body_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_BODY, "stretch4")
+
         for site_name in ["lidar_left", "lidar_right"]:
             site_id = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_SITE, site_name)
             if site_id != -1:
@@ -231,6 +238,13 @@ class MujocoServerSensorManagerSync:
                     site_pos = data.site_xpos[site_id]
                     site_mat = data.site_xmat[site_id].reshape(3, 3)
                     pts = pts @ site_mat.T + site_pos
+
+                    if self.root_body_id != -1:
+                        # Re-express relative to the root body's current pose so
+                        # points line up with base_footprint (see __init__ note).
+                        root_pos = data.xpos[self.root_body_id]
+                        root_mat = data.xmat[self.root_body_id].reshape(3, 3)
+                        pts = (pts - root_pos) @ root_mat
 
             key = "left" if "left" in site_name else "right"
             results[key] = pts
