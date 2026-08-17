@@ -11,7 +11,7 @@ dependencies = [
     "hello-robot-stretch4-urdf>=2026.5.6",
     "inputs>=0.5",
     "matplotlib>=3.10.1",
-    "mujoco==3.3.1",
+    "mujoco~=3.5.0",
     "numpy==2.2.5",
     "opencv-python",
     "pynput>=1.8.1",
@@ -29,6 +29,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [tool.setuptools.packages.find]
 exclude = ["third_party*", "tests*"]
 
@@ -38,6 +42,9 @@ Tracker = "https://github.com/hello-robot/stretch4_mujoco/issues"
 
 [tool.black]
 line-length = 100
+
+[tool.uv.sources]
+molmo-spaces = { git = "https://github.com/allenai/molmospaces.git" }
 
 [project.optional-dependencies]
 dev = [
@@ -50,4 +57,7 @@ dev = [
 jupyter = [
     "ipykernel",
     "ipython",
+]
+molmo = [
+    "molmo-spaces[mujoco]",
 ]
