@@ -14,16 +14,19 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 @click.option("--scene-xml-path", type=str, default=None, help="Path to the scene xml file")
 @click.option("--select_env", is_flag=True, help="Use robocasa environment")
 @click.option("--imagery", is_flag=True, help="Show all the cameras' imagery")
-@click.option("--lidar2d", is_flag=True, help="Show the lidar scan in Matplotlib")
-@click.option("--lidar3d", is_flag=True, help="Show the point cloud in Rerun")
+@click.option(
+    "--lidar",
+    is_flag=True,
+    help="Show the lidar scan: a 3D point cloud in Rerun for Stretch4MujocoSimulator, "
+    "or a 2D scan in Matplotlib for Stretch3.",
+)
 @click.option("--print-ratio", is_flag=True, help="Print the sim-to-real time ratio to the cli.")
 @click.option("--use_stretch_3", type=bool, is_flag=True, help="Use Stretch 3")
 def main(
     scene_xml_path: str | None,
     select_env: bool,
     imagery: bool,
-    lidar2d: bool,
-    lidar3d: bool,
+    lidar: bool,
     print_ratio: bool,
     use_stretch_3: bool,
 ):
@@ -34,13 +37,12 @@ def main(
 
     cameras_to_use = simulator_class.get_all_cameras() if imagery else []
 
-    if lidar3d and not simulator_class is Stretch4MujocoSimulator:
-        raise NotImplementedError("3D Lidar is only supported in Stretch4MujocoSimulator.")
-
+    show_lidar_3d = lidar and simulator_class is Stretch4MujocoSimulator
+    show_lidar_2d = lidar and not show_lidar_3d
 
     use_imagery = len(cameras_to_use) > 0
 
-    if lidar3d or use_imagery:
+    if show_lidar_3d or use_imagery:
         rerun_logger.init_rerun(use_stretch_3)
 
     model = None
@@ -87,12 +89,12 @@ def main(
             if use_imagery:
                 rerun_logger.update_camera_images(sim.pull_camera_data())
 
-            if lidar3d:
+            if show_lidar_3d:
                 rerun_logger.update_pointcloud_viz(
                     sim.pull_lidar_points(), "world/lidar_points"
                 )
 
-            if lidar2d:
+            if show_lidar_2d:
                 sensor_data = sim.pull_sensor_data()
 
                 try:

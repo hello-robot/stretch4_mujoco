@@ -35,6 +35,7 @@ import numpy as np
 from mujoco import MjModel, MjSpec, MjsBody
 
 from examples.camera_feeds import show_camera_feeds_sync
+from examples.rerun_utils import RerunLogger
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
 # `mjcf_generator.generate_mjcf()` names the root (free-jointed) body "stretch4",
@@ -423,6 +424,7 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
 @click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
 @click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
+@click.option("--lidar", is_flag=True, help="Show the lidar point cloud in Rerun")
 def main(
     scene: str | None,
     dataset: str,
@@ -439,6 +441,7 @@ def main(
     headless: bool,
     keyboard: bool,
     gamepad: bool,
+    lidar: bool,
 ):
     if keyboard and gamepad:
         raise click.UsageError("Pass at most one of --keyboard/--gamepad.")
@@ -456,10 +459,17 @@ def main(
         write_to_file=write_to_file,
     )
 
+    rerun_logger = RerunLogger()
+
     sim = Stretch4MujocoSimulator(
-        model=model, cameras_to_use=Stretch4MujocoSimulator.get_rgb_cameras()
+        model=model,
+        cameras_to_use=Stretch4MujocoSimulator.get_rgb_cameras(),
+        camera_hz=10.0 if lidar else 30.0,
     )
     sim.start(headless=headless)
+
+    if lidar:
+        rerun_logger.init_pointcloud_viz(use_stretch_3=False)
 
     teleop = None
     if keyboard:
@@ -477,9 +487,12 @@ def main(
     try:
         while sim.is_running():
             show_camera_feeds_sync(sim, True)
+            if lidar:
+                rerun_logger.update_pointcloud_viz(sim.pull_lidar_points(), "world/lidar_points")
     except KeyboardInterrupt:
         pass
     finally:
+        rerun_logger.stop()
         if teleop is not None:
             teleop.stop()
         sim.stop()
