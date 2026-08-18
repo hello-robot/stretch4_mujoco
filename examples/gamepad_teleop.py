@@ -53,7 +53,11 @@ def main(
     use_imagery = len(cameras_to_use) > 0
 
     if show_lidar_3d or ((use_imagery or show_metrics) and not opencv):
-        rerun_logger.init_rerun(use_stretch_3)
+        # With --opencv the frames go to OpenCV windows, so Rerun shouldn't lay
+        # out camera panels that will never receive an image.
+        rerun_logger.init_rerun(
+            use_stretch_3, cameras_to_use=[] if opencv else cameras_to_use
+        )
 
     model = None
 

@@ -473,15 +473,21 @@ def main(
 
     rerun_logger = RerunLogger()
 
+    cameras_to_use = Stretch4MujocoSimulator.get_rgb_cameras()
+
     sim = Stretch4MujocoSimulator(
         model=model,
-        cameras_to_use=Stretch4MujocoSimulator.get_rgb_cameras(),
+        cameras_to_use=cameras_to_use,
         camera_hz=10.0 if lidar else 30.0,
     )
     sim.start(headless=headless)
 
     if lidar or not opencv:
-        rerun_logger.init_rerun(use_stretch_3=False)
+        # With --opencv the frames go to OpenCV windows, so Rerun shouldn't lay
+        # out camera panels that will never receive an image.
+        rerun_logger.init_rerun(
+            use_stretch_3=False, cameras_to_use=[] if opencv else cameras_to_use
+        )
 
     teleop = None
     if keyboard:
