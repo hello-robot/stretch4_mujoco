@@ -24,7 +24,12 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
     help="Show the lidar scan: a 3D point cloud in Rerun for Stretch4MujocoSimulator, "
     "or a 2D scan in Matplotlib for Stretch3.",
 )
-@click.option("--print-ratio", is_flag=True, help="Print the sim-to-real time ratio to the cli.")
+@click.option(
+    "--opencv",
+    is_flag=True,
+    help="Show camera imagery in OpenCV windows instead of Rerun.",
+)
+@click.option("--show_metrics", is_flag=True, help="Print the sim-to-real time ratio to the cli.")
 @click.option("--use_stretch_3", type=bool, is_flag=True, help="Use Stretch 3")
 def main(
     scene_xml_path: str | None,
@@ -32,7 +37,8 @@ def main(
     headless: bool,
     imagery: bool,
     lidar: bool,
-    print_ratio: bool,
+    opencv: bool,
+    show_metrics: bool,
     use_stretch_3: bool,
 ):
     rerun_logger = RerunLogger()
@@ -44,10 +50,10 @@ def main(
     show_lidar_3d = lidar and simulator_class is Stretch4MujocoSimulator
     show_lidar_2d = lidar and not show_lidar_3d
 
-    if show_lidar_3d:
-        rerun_logger.init_pointcloud_viz(use_stretch_3)
-
     use_imagery = len(cameras_to_use) > 0
+
+    if show_lidar_3d or ((use_imagery or show_metrics) and not opencv):
+        rerun_logger.init_rerun(use_stretch_3)
 
     model = None
 
@@ -76,11 +82,23 @@ def main(
             if not show_lidar_2d and not use_imagery:
                 time.sleep(0.05)
 
-            if print_ratio:
-                print(f"{sim.pull_status().sim_to_real_time_ratio_msg}")
-
+            camera_data = None
             if use_imagery:
-                show_camera_feeds_sync(sim, False)
+                if opencv:
+                    show_camera_feeds_sync(sim, False)
+                else:
+                    camera_data = sim.pull_camera_data()
+                    rerun_logger.update_camera_images(camera_data)
+
+            if show_metrics:
+                if opencv:
+                    print(f"{sim.pull_status().sim_to_real_time_ratio_msg}")
+                else:
+                    status = sim.pull_status()
+                    metrics = {"physics_fps": status.fps}
+                    if camera_data is not None:
+                        metrics["camera_fps"] = camera_data.fps
+                    rerun_logger.update_metrics(metrics, message=status.sim_to_real_time_ratio_msg)
 
             if show_lidar_3d:
                 rerun_logger.update_pointcloud_viz(

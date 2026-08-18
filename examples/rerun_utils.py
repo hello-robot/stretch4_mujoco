@@ -53,10 +53,18 @@ def get_default_blueprint(use_stretch_3:bool) -> rrb.Blueprint:
 
 
 class RerunLogger:
-    def __init__(self, maxsize: int = 5):
+    def __init__(self, maxsize: int = 1):
+        # maxsize=1: `_put_queue()` drops a still-pending item in favor of the
+        # newest one, so the logging thread (which does the expensive rr.log
+        # serialization/IPC) never falls behind and builds a backlog of stale
+        # pointclouds that would otherwise get logged one-by-one after the
+        # fact, dragging out the visible lag between sim and viewer.
         self._log_queue = queue.Queue(maxsize=maxsize)
         self._latest_images = {}
         self._latest_images_lock = threading.Lock()
+        self._latest_metrics = {}
+        self._latest_metrics_message = None
+        self._latest_metrics_lock = threading.Lock()
         self._log_thread = None
         self._stop_event = threading.Event()
         self._initialized = False
@@ -103,6 +111,18 @@ class RerunLogger:
 
             for camera_name, pixels in current_images.items():
                 rr.log(f"world/cameras/{camera_name}", rr.Image(pixels))
+
+            # 3. Log latest metrics (drops older backlog values for zero lag)
+            with self._latest_metrics_lock:
+                current_metrics = self._latest_metrics.copy()
+                self._latest_metrics.clear()
+                current_message = self._latest_metrics_message
+                self._latest_metrics_message = None
+
+            for name, value in current_metrics.items():
+                rr.log(f"metrics/{name}", rr.Scalars(value))
+            if current_message is not None:
+                rr.log("metrics/sim_to_real_ratio", rr.TextLog(current_message))
 
             threading.Event().wait(0.01)
 
@@ -166,6 +186,19 @@ class RerunLogger:
                         scale = 1280.0 / max(h, w)
                         pixels = cv2.resize(pixels, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
                     self._latest_images[camera.name] = pixels
+
+    def update_metrics(self, metrics: dict[str, float], message: str | None = None):
+        """
+        Log scalar metrics (e.g. fps) as Rerun time-series, plus an optional
+        one-line text message (e.g. a sim-to-real ratio summary that isn't a
+        bare number).
+        """
+        if not self._initialized:
+            self.init_rerun()
+        with self._latest_metrics_lock:
+            self._latest_metrics.update(metrics)
+            if message is not None:
+                self._latest_metrics_message = message
 
     def stop(self):
         self._stop_event.set()

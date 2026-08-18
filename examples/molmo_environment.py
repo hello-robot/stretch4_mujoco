@@ -425,6 +425,16 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
 @click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
 @click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
 @click.option("--lidar", is_flag=True, help="Show the lidar point cloud in Rerun")
+@click.option(
+    "--opencv",
+    is_flag=True,
+    help="Show camera imagery in OpenCV windows instead of Rerun.",
+)
+@click.option(
+    "--show_metrics",
+    is_flag=True,
+    help="Print the physics/camera fps and sim-to-real time ratio to the cli.",
+)
 def main(
     scene: str | None,
     dataset: str,
@@ -442,6 +452,8 @@ def main(
     keyboard: bool,
     gamepad: bool,
     lidar: bool,
+    opencv: bool,
+    show_metrics: bool,
 ):
     if keyboard and gamepad:
         raise click.UsageError("Pass at most one of --keyboard/--gamepad.")
@@ -468,8 +480,8 @@ def main(
     )
     sim.start(headless=headless)
 
-    if lidar:
-        rerun_logger.init_pointcloud_viz(use_stretch_3=False)
+    if lidar or not opencv:
+        rerun_logger.init_rerun(use_stretch_3=False)
 
     teleop = None
     if keyboard:
@@ -486,7 +498,17 @@ def main(
 
     try:
         while sim.is_running():
-            show_camera_feeds_sync(sim, True)
+            if opencv:
+                show_camera_feeds_sync(sim, show_metrics)
+            else:
+                camera_data = sim.pull_camera_data()
+                if show_metrics:
+                    status = sim.pull_status()
+                    rerun_logger.update_metrics(
+                        {"physics_fps": status.fps, "camera_fps": camera_data.fps},
+                        message=status.sim_to_real_time_ratio_msg,
+                    )
+                rerun_logger.update_camera_images(camera_data)
             if lidar:
                 rerun_logger.update_pointcloud_viz(sim.pull_lidar_points(), "world/lidar_points")
     except KeyboardInterrupt:
