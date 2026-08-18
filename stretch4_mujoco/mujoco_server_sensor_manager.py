@@ -72,6 +72,7 @@ class NativeMjLidar:
             bodyexclude=self.bodyexclude,
             geomid=_geomid,
             dist=self._dist,
+            normal=None,
             nray=n_rays,
             cutoff=self.cutoff_dist,
         )
