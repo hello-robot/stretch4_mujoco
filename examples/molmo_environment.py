@@ -26,6 +26,7 @@ Usage:
     python -m examples.molmo_environment --scene /path/to/scene.xml
 """
 
+import re
 from pathlib import Path
 
 import click
@@ -44,6 +45,82 @@ STRETCH_ROOT_BODY = "stretch4"
 # geom named "floor" (the one in models/room_scene/room_scene.xml). A MolmoSpaces
 # house has its own floors, so those pairs get retargeted at attach time.
 STRETCH_FLOOR_GEOM = "floor"
+
+# `molmo_spaces/housegen/builder.py`'s `add_room()` names each room's floor
+# mesh geom "room_<id>_visual_0".
+ROOM_FLOOR_GEOM_PATTERN = re.compile(r"^room_(\d+)_visual_0$")
+
+
+def find_largest_room_spawn_xy(spec: MjSpec) -> tuple[float, float] | None:
+    """
+    Find a point inside the largest room of a MolmoSpaces house, in scene xy.
+
+    A procthor house is not generally centered on the scene origin, so
+    defaulting the robot's spawn x/y to (0, 0) -- as if the scene origin were
+    always inside the house -- can spawn it outside the building entirely.
+
+    housegen's `add_room()` positions each room's floor geom (named
+    "room_<id>_visual_0") with `pos=[0, 0, room_z]` relative to a body that is
+    otherwise left at the world origin. MuJoCo's mesh compiler recenters a
+    mesh around its own centroid and folds the offset into the compiled
+    `geom_pos`, so after compiling, `geom_pos[:2]` for a room's floor mesh is
+    already a point at that room's centroid, in scene world coordinates.
+
+    Returns None if the scene has no MolmoSpaces room floor meshes (e.g. a
+    bare, non-MolmoSpaces scene XML), so callers can fall back to their own
+    default.
+    """
+    model = spec.compile()
+
+    best_xy = None
+    best_area = -1.0
+    for geom_id in range(model.ngeom):
+        name = model.geom(geom_id).name
+        if not name or not ROOM_FLOOR_GEOM_PATTERN.match(name):
+            continue
+        # geom_aabb is [center_x, center_y, center_z, half_x, half_y, half_z]
+        # in the geom's own (mesh-inertia-aligned) frame, which generally
+        # doesn't line up with world xy -- but since a floor mesh is flat,
+        # its two largest half-extents approximate the room's footprint
+        # regardless of that frame's orientation.
+        half_extents = sorted(model.geom_aabb[geom_id][3:], reverse=True)
+        area = 4.0 * half_extents[0] * half_extents[1]
+        if area > best_area:
+            best_area = area
+            best_xy = (float(model.geom_pos[geom_id][0]), float(model.geom_pos[geom_id][1]))
+    return best_xy
+
+
+def resolve_spawn_position(
+    spec: MjSpec, x: float | None, y: float | None, z: float
+) -> list[float]:
+    """
+    Fill in unset x/y spawn coordinates from the scene's largest room, if any.
+
+    x and y default to None (rather than 0.0) on the CLI specifically so this
+    can tell "the user wants the origin" apart from "let the scene pick a
+    spawn point that's actually inside the house".
+    """
+    if x is not None and y is not None:
+        return [x, y, z]
+
+    room_xy = find_largest_room_spawn_xy(spec)
+    if room_xy is None:
+        if x is None and y is None:
+            click.secho(
+                "No MolmoSpaces room floor meshes found in the scene; "
+                "defaulting spawn x/y to 0.0. Pass --x/--y explicitly if the "
+                "robot spawns outside the scene.",
+                fg="yellow",
+            )
+        room_xy = (0.0, 0.0)
+    else:
+        click.secho(
+            f"Defaulting spawn to the largest room's centroid: x={room_xy[0]:.2f}, "
+            f"y={room_xy[1]:.2f}. Pass --x/--y to override.",
+            fg="yellow",
+        )
+    return [x if x is not None else room_xy[0], y if y is not None else room_xy[1], z]
 
 
 def find_floor_geoms(spec: MjSpec) -> list[str]:
@@ -217,7 +294,9 @@ def add_stretch_to_scene(
 
 def build_model(
     scene_xml_path: str,
-    pos: list[float],
+    x: float | None,
+    y: float | None,
+    z: float,
     quat: list[float],
     floor_geom_names: list[str] | None = None,
     match_solver_options: bool = True,
@@ -226,9 +305,13 @@ def build_model(
     """
     Load a MolmoSpaces scene, attach Stretch 4 to it, and compile it.
 
-    Returns a model ready for `Stretch4MujocoSimulator(model=...)`.
+    Returns a model ready for `Stretch4MujocoSimulator(model=...)`. x/y may be
+    None to auto-spawn in the scene's largest room, see
+    `resolve_spawn_position()`.
     """
     spec = MjSpec.from_file(str(scene_xml_path))
+
+    pos = resolve_spawn_position(spec, x, y, z)
 
     add_stretch_to_scene(
         spec,
@@ -302,8 +385,20 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
     default="base",
     help="House variant. 'base' omits the ceiling, which keeps the scene viewable from above.",
 )
-@click.option("--x", type=float, default=0.0, help="Robot spawn x, in scene coordinates")
-@click.option("--y", type=float, default=0.0, help="Robot spawn y, in scene coordinates")
+@click.option(
+    "--x",
+    type=float,
+    default=None,
+    help="Robot spawn x, in scene coordinates. Defaults to the centroid of the "
+    "scene's largest room.",
+)
+@click.option(
+    "--y",
+    type=float,
+    default=None,
+    help="Robot spawn y, in scene coordinates. Defaults to the centroid of the "
+    "scene's largest room.",
+)
 @click.option(
     "--z",
     type=float,
@@ -326,26 +421,35 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
 )
 @click.option("--write-to-file", type=str, default=None, help="Write the combined scene XML here")
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
+@click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
+@click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
 def main(
     scene: str | None,
     dataset: str,
     split: str,
     house_index: int,
     variant: str,
-    x: float,
-    y: float,
+    x: float | None,
+    y: float | None,
     z: float,
     yaw: float,
     floor_geom: tuple[str, ...],
     match_solver_options: bool,
     write_to_file: str | None,
     headless: bool,
+    keyboard: bool,
+    gamepad: bool,
 ):
+    if keyboard and gamepad:
+        raise click.UsageError("Pass at most one of --keyboard/--gamepad.")
+
     scene_xml_path = scene or resolve_molmospaces_scene(dataset, split, house_index, variant)
 
     model = build_model(
         scene_xml_path=scene_xml_path,
-        pos=[x, y, z],
+        x=x,
+        y=y,
+        z=z,
         quat=[np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)],
         floor_geom_names=list(floor_geom) or None,
         match_solver_options=match_solver_options,
@@ -357,12 +461,27 @@ def main(
     )
     sim.start(headless=headless)
 
+    teleop = None
+    if keyboard:
+        from stretch4_mujoco.sim_teleop import KeyboardTeleop, print_keyboard_help
+
+        print_keyboard_help()
+        teleop = KeyboardTeleop(sim)
+    elif gamepad:
+        from stretch4_mujoco.sim_teleop import GamepadTeleop
+
+        teleop = GamepadTeleop(sim)
+    if teleop is not None:
+        teleop.start()
+
     try:
         while sim.is_running():
             show_camera_feeds_sync(sim, True)
     except KeyboardInterrupt:
         pass
     finally:
+        if teleop is not None:
+            teleop.stop()
         sim.stop()
         cv2.destroyAllWindows()
 
