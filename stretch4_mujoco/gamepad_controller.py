@@ -1,31 +1,105 @@
 #!/usr/bin/env python3
-from __future__ import print_function
+"""
+Port of the real robot's `stretch4_body/core/gamepad_controller.py`.
 
+The `GamePadController` is a threading class that polls for gamepad events by
+listening to the gamepad's USB dongle, processes them, and makes an easy to
+consume gamepad state available as a dictionary - `GamePadController.get_state()`.
+
+Kept deliberately close to the robot-side file so the two can be diffed. The
+only removals are the `stretch4_body` dependencies (`Device`, `LoopStats` and
+the `/tmp` teleop singleton lock), which have no meaning in simulation.
+"""
+
+import glob
+import logging
 import threading
 import time
+from dataclasses import dataclass
+from select import select
+from typing import Callable
 
-import click
-from inputs import DeviceManager, GamepadLED, UnpluggedError
+from evdev import InputDevice, ecodes, list_devices
 
-"""
-This script is copy of the GamePadController class from the Stretch Body package.
-https://github.com/hello-robot/stretch_body/blob/master/body/stretch_body/gamepad_controller.py
+logger = logging.getLogger(__name__)
 
-The GamePadController is a threading class that polls for the gamepad inputs (gamepad_state) by
-listening to the gamepad's USB dongle plugged into the robot.
-"""
+# --- Utilities to discover a joystick device --------------------------------
+WANTED_KEY_CODES = {
+    ecodes.BTN_SOUTH,
+    ecodes.BTN_EAST,
+    ecodes.BTN_NORTH,
+    ecodes.BTN_WEST,
+    ecodes.BTN_TL,
+    ecodes.BTN_TR,
+    ecodes.BTN_THUMBL,
+    ecodes.BTN_THUMBR,
+    ecodes.BTN_SELECT,
+    ecodes.BTN_START,
+    getattr(ecodes, "BTN_MODE", 0),
+}
+WANTED_ABS_CODES = {
+    ecodes.ABS_X,
+    ecodes.ABS_Y,
+    ecodes.ABS_RX,
+    ecodes.ABS_RY,
+    ecodes.ABS_Z,
+    ecodes.ABS_RZ,
+    ecodes.ABS_HAT0X,
+    ecodes.ABS_HAT0Y,
+}
+
+
+def is_probable_gamepad(dev: InputDevice) -> bool:
+    caps = dev.capabilities()
+    if ecodes.EV_ABS not in caps or ecodes.EV_KEY not in caps:
+        return False
+    keyset = set(caps.get(ecodes.EV_KEY, []))
+    absset = set(a if isinstance(a, int) else a[0] for a in caps.get(ecodes.EV_ABS, []))
+    # Must have at least one face button and a stick axis
+    return (len(keyset & WANTED_KEY_CODES) >= 1) and (len(absset & WANTED_ABS_CODES) >= 2)
+
+
+def find_first_gamepad() -> str | None:
+    # Prefer stable by-id symlinks when present
+    for path in sorted(glob.glob("/dev/input/by-id/*-event-joystick")):
+        try:
+            dev = InputDevice(path)
+            ok = is_probable_gamepad(dev)
+            dev.close()
+            if ok:
+                return path
+        except Exception:
+            pass
+
+    # Fallback: scan all event devices
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+            ok = is_probable_gamepad(dev)
+            dev.close()
+            if ok:
+                return path
+        except Exception:
+            pass
+    return None
+
+
+# --- Controller -----------------------------------
+class UnpluggedError(Exception):
+    pass
+
+
+@dataclass
+class GPEvent:
+    code: str
+    state: int
+    ev_type: str = ""  # not required, but used by the optional print
 
 
 class Stick:
     def __init__(self):
-        # joystick pushed
-        #   all the way down: y = -1.0
-        #   all the way up: y ~= 1.0
-        #   all the way left: x = -1.0
-        #   all the way right: x ~= 1.0
         self.x = 0.0
         self.y = 0.0
-        # normalized signed 16 bit integers to be in the range [-1.0, 1.0]
         self.norm = float(pow(2, 15))
 
     def update_x(self, abs_x):
@@ -43,10 +117,7 @@ class Button:
         self.pressed = False
 
     def update(self, state):
-        if state == 0:
-            self.pressed = False
-        elif state == 1:
-            self.pressed = True
+        self.pressed = state == 1
 
     def print_string(self):
         return str(self.pressed)
@@ -54,29 +125,12 @@ class Button:
 
 class Trigger:
     def __init__(self, xbox_one=False):
-        # Xbox One trigger
-        #   not pulled = 0
-        #   max pulled = 1023
-        # normalize unsigned 10 bit integer to be in the range [0.0, 1.0]
-
-        # Xbox 360 trigger
-        #   not pulled = 0
-        #   max pulled = 255
-        # normalize unsigned 8 bit integer to be in the range [0.0, 1.0]
-        if xbox_one:
-            # xbox one
-            num_bits = 10
-        else:
-            # xbox 360
-            num_bits = 8
+        num_bits = 10 if xbox_one else 8
         self.norm = float(pow(2, num_bits) - 1)
         self.pulled = 0.0
 
     def update(self, state):
         self.pulled = int(state) / self.norm
-        # Ensure that the pulled value is not greater than 1.0, which
-        # will can happen with the use of an Xbox One controller, if
-        # the option was not properly set.
         if self.pulled > 1.0:
             self.pulled = 1.0
 
@@ -84,42 +138,25 @@ class Trigger:
         return "{0:4.2f}".format(self.pulled)
 
 
-class GamePadDevice(DeviceManager):
-    def _parse_led_path(self, path):
-        name = path.rsplit("/", 1)[1]
-        if name.startswith("xpad"):
-            self.leds.append(GamepadLED(self, path, name))
+class GamePadController:
+    """Interface to gamepad controllers.
 
-
-class GamePadController(threading.Thread):
-    """Successfully tested with the following controllers:
-         + Xbox One Controller connected using a USB cable (change xbox_one parameter to True for full 10 bit
-         trigger information)
-         + EasySMX wireless controller set to appropriate mode (Xbox 360 mode with upper half of ring LED illuminated -
-         top two LED quarter circle arcs)
-         + JAMSWALL Xbox 360 Wireless Controller (Sometimes issues would occur after inactivity that would seem to
-         require unplugging and replugging the USB dongle.)
-
-    Unsuccessful tests:
-         - Xbox One Controller connected via Bluetooth
-         - Xbox 360 Controller connected with an Insten Wireless Controller USB Charging Cable
-         +/- VOYEE Wired Xbox 360 Controller mostly worked, but it had various issues including false
-        middle LED button presses, phantom shoulder button presses, and low joystick sensitivity that made
-        small motions more difficult to execute.
+    Successfully tested with the following controllers:
+        + Xbox One Controller connected using a USB cable (change xbox_one parameter to True
+          for full 10 bit trigger information)
+        + EasySMX wireless controller set to appropriate mode (Xbox 360 mode with upper half
+          of ring LED illuminated - top two LED quarter circle arcs)
+        + JAMSWALL Xbox 360 Wireless Controller
     """
 
-    def __init__(self, print_events=False, print_dongle_status=True):
-        threading.Thread.__init__(self, name=self.__class__.__name__)
+    def __init__(self, print_events=False, is_xbox_one=False):
+        self.name = "gamepad_controller"
         self.print_events = print_events
-        self.devices = GamePadDevice()
-        self.is_gamepad_dongle = False
-        self._i = 0
-        self.print_dongle_status = print_dongle_status
+
+        self.rumble_effect_id = -1
 
         self.left_stick = Stick()
         self.right_stick = Stick()
-
-        self.ros_logger = None
 
         self.left_stick_button = Button()
         self.right_stick_button = Button()
@@ -137,8 +174,8 @@ class GamePadController(threading.Thread):
         self.select_button = Button()
         self.start_button = Button()
 
-        self.left_trigger = Trigger(xbox_one=False)
-        self.right_trigger = Trigger(xbox_one=False)
+        self.left_trigger = Trigger(xbox_one=is_xbox_one)
+        self.right_trigger = Trigger(xbox_one=is_xbox_one)
 
         self.left_pad = Button()
         self.right_pad = Button()
@@ -146,71 +183,211 @@ class GamePadController(threading.Thread):
         self.bottom_pad = Button()
 
         self.lock = threading.Lock()
-        # self.thread = threading.Thread(target=self.update,name="GamepadEvents_thread")
-        self.daemon = True
-        self.stop_thread = False
-        self.shutdown_flag = threading.Event()
 
-        self.set_zero_state()
-        self.gamepad_state = self.get_state()
+        self.device_path = None
+        self.dev: InputDevice | None = None
+        self.is_gamepad_active = False
 
-    def run(self):
-        while not self.shutdown_flag.is_set():
-            if not self.shutdown_flag.is_set():
-                self.update()
+        self._last_vibrated_tags = {}
 
-    def get_gamepad(self):
-        """Get a single action from a gamepad."""
-        try:
-            gamepad = self.devices.gamepads[0]
-            return gamepad.read()
-        except Exception:
-            raise UnpluggedError("No gamepad found.")
+        # Filtering parameters
+        self.last_event_ts = 0.0
+        self.EVENT_ACTIVITY_TIMEOUT = 0.5
+        self.zero_state_sent_counter = 6
+        self.STOP_FRAME_COUNT = 5
 
-    # def start(self):
-    #     self.stop_thread = False
-    # self.thread.start()
+        # Threading attributes natively managed
+        self.thread_rate_hz = 25.0
+        self.thread = None
+        self.thread_shutdown_flag = threading.Event()
+
+    def startup(self):
+        if self.thread is not None:
+            self.thread_shutdown_flag.set()
+            self.thread.join(1)
+        self.thread = threading.Thread(target=self._thread_target, daemon=True)
+        self.thread_shutdown_flag.clear()
+        self.thread.start()
+
+        logger.warning("Waiting for Gamepad Dongle...")
+
+        return True
+
+    # `start()` is kept as an alias so existing sim scripts keep working.
+    start = startup
+
+    def _thread_target(self):
+        period = 1.0 / self.thread_rate_hz
+        while not self.thread_shutdown_flag.is_set():
+            start = time.perf_counter()
+            self.update()
+            elapsed = time.perf_counter() - start
+            if not self.thread_shutdown_flag.is_set() and elapsed < period:
+                time.sleep(period - elapsed)
 
     def stop(self):
-        if not self.stop_thread:
-            with self.lock:
-                self.stop_thread = True
-            # self.thread.join() # Thread._wait_for_tstate_lock() never returns if trying to join this thread
-
-    def poll_till_gamepad_dongle_present(self):
-        # self.is_gamepad_dongle = False
-        # while not self.is_gamepad_dongle:
-        with self.lock:
-            self.is_gamepad_dongle = False
-        if self._i % 50 == 0 and self.print_dongle_status:
-            click.secho("Waiting for Gamepad Dongle.................", fg="yellow")
+        self.thread_shutdown_flag.set()
+        if self.thread is not None:
+            self.thread.join(1)
+            self.thread = None
         try:
-            self.devices.__init__()
-            if len(self.devices.gamepads) > 0:
-                click.secho("Gamepad Dongle FOUND!", fg="green", bold=True)
-                with self.lock:
-                    self.is_gamepad_dongle = True
+            self.dev.close()
         except Exception:
             pass
 
+    def poll_till_gamepad_dongle_present(self):
+        with self.lock:
+            self.is_gamepad_active = False
+        try:
+            self.device_path = find_first_gamepad()
+            if self.device_path:
+                # Open non-blocking; do NOT grab to allow other readers if needed
+                self.dev = InputDevice(self.device_path)
+                self.rumble_effect_id = -1
+                logger.info(f"Gamepad Dongle FOUND! ({self.dev.name})")
+                with self.lock:
+                    self.is_gamepad_active = True
+        except Exception:
+            # keep trying silently
+            pass
+
+    # --- Event retrieval (non-blocking) ---
+    def get_gamepad_events(self) -> list[GPEvent]:
+        if not self.dev:
+            raise UnpluggedError("No gamepad found.")
+        # Wait briefly for readiness; 20ms timeout keeps thread responsive
+        r, _, _ = select([self.dev.fd], [], [], 0.02)
+        if not r:
+            return []
+        events = []
+        try:
+            for ev in self.dev.read():
+                if ev.type not in (ecodes.EV_KEY, ecodes.EV_ABS):
+                    continue
+                code_name = ecodes.bytype[ev.type][ev.code]  # e.g., 'ABS_X', 'BTN_SOUTH'
+                events.append(
+                    GPEvent(
+                        code=code_name,
+                        state=ev.value,
+                        ev_type="EV_KEY" if ev.type == ecodes.EV_KEY else "EV_ABS",
+                    )
+                )
+        except BlockingIOError:
+            pass
+        except OSError:
+            # device likely went away
+            raise UnpluggedError("Gamepad disconnected.")
+        return events
+
     def update(self):
-        while not self.stop_thread:
-            self._i = self._i + 1
-            if len(self.devices.gamepads) > 0:
-                self.is_gamepad_dongle = True
-                try:
-                    events = self.get_gamepad()
-                    self.update_button_encodings(events)
-                except (OSError, UnpluggedError, Exception):
-                    click.secho("Gamepad Dongle DISCONNECTED........", fg="red", bold=True)
-                    self.poll_till_gamepad_dongle_present()
-            else:
-                self.is_gamepad_dongle = False
-                self.poll_till_gamepad_dongle_present()
-            if not self.is_gamepad_dongle:
-                if self._i % 2 == 0:
-                    self.set_zero_state()
-            self.gamepad_state = self.get_state()
+        if not self.is_gamepad_active:
+            self.poll_till_gamepad_dongle_present()
+            return
+
+        try:
+            events = self.get_gamepad_events()
+            if events:
+                self.last_event_ts = time.monotonic()
+            self.update_button_encodings(events)
+        except (UnpluggedError, OSError):
+            logger.error("Gamepad Dongle DISCONNECTED...")
+            try:
+                self.dev.close()
+            except Exception:
+                pass
+            self.dev = None
+            with self.lock:
+                self.is_gamepad_active = False
+            self.set_zero_state()
+
+    def vibrate(
+        self,
+        duration_ms: int = 150,
+        strong_magnitude: float = 1.0,
+        weak_magnitude: float = 1.0,
+        tag: str | None = None,
+        cooldown: float = 0.0,
+    ):
+        """
+        Vibrates the gamepad.
+        duration_ms: Duration of the vibration in milliseconds.
+        strong_magnitude: Magnitude of the strong motor (0.0 to 1.0).
+        weak_magnitude: Magnitude of the weak motor (0.0 to 1.0).
+        tag: Optional string tag to identify this vibration event.
+        cooldown: Optional cooldown in seconds. If another vibration with the same tag
+                  is requested within this cooldown, it will be ignored.
+        """
+        if tag is not None and cooldown > 0.0:
+            now = time.time()
+            if now - self._last_vibrated_tags.get(tag, 0.0) < cooldown:
+                return
+            self._last_vibrated_tags[tag] = now
+
+        with self.lock:
+            if not self.dev:
+                return
+            try:
+                from evdev import ff
+
+                strong = max(0, min(int(strong_magnitude * 65535), 65535))
+                weak = max(0, min(int(weak_magnitude * 65535), 65535))
+
+                rumble = ff.Rumble(strong_magnitude=strong, weak_magnitude=weak)
+                effect_type = ff.EffectType(ff_rumble_effect=rumble)
+
+                effect = ff.Effect(
+                    ecodes.FF_RUMBLE,
+                    self.rumble_effect_id if self.rumble_effect_id != -1 else -1,
+                    0,
+                    ff.Trigger(0, 0),
+                    ff.Replay(int(duration_ms), 0),
+                    effect_type,
+                )
+
+                self.rumble_effect_id = self.dev.upload_effect(effect)
+                self.dev.write(ecodes.EV_FF, self.rumble_effect_id, 1)
+            except Exception:
+                pass
+
+    def vibrate_sequence(
+        self,
+        sequence_ms: list[int],
+        strong_magnitude: float = 1.0,
+        weak_magnitude: float = 1.0,
+        tag: str | None = None,
+        cooldown: float = 0.0,
+    ):
+        """
+        Vibrates the gamepad in a sequence of alternating on/off durations.
+        sequence_ms: List of durations in milliseconds. Example: [200, 100, 200]
+                     will vibrate 200ms, pause 100ms, vibrate 200ms.
+        """
+        if tag is not None and cooldown > 0.0:
+            now = time.time()
+            if now - self._last_vibrated_tags.get(tag, 0.0) < cooldown:
+                return
+            self._last_vibrated_tags[tag] = now
+
+        with self.lock:
+            if not self.dev:
+                return
+        threading.Thread(
+            target=self._vibrate_sequence_thread,
+            args=(sequence_ms, strong_magnitude, weak_magnitude),
+            daemon=True,
+        ).start()
+
+    def _vibrate_sequence_thread(
+        self, sequence_ms: list[int], strong_magnitude: float, weak_magnitude: float
+    ):
+        for i, duration in enumerate(sequence_ms):
+            if i % 2 == 0:
+                self.vibrate(
+                    duration_ms=duration,
+                    strong_magnitude=strong_magnitude,
+                    weak_magnitude=weak_magnitude,
+                )
+            time.sleep(duration / 1000.0)
 
     def update_button_encodings(self, events):
         with self.lock:
@@ -228,37 +405,37 @@ class GamePadController(threading.Thread):
                 if event.code == "BTN_MODE":
                     self.middle_led_ring_button.update(event.state)
 
-                if event.code == "BTN_SOUTH":  # green A, bottom button
+                if "BTN_SOUTH" in list(event.code):  # green A, bottom button
                     self.bottom_button.update(event.state)
-                if event.code == "BTN_WEST":  # yellow Y, ***top button*** WEIRD!
+                if "BTN_WEST" in list(event.code):  # yellow Y, top button
                     self.top_button.update(event.state)
-                if event.code == "BTN_NORTH":  # blue X, ***left button*** WEIRD!
+                if "BTN_NORTH" in list(event.code):  # blue X, left button
                     self.left_button.update(event.state)
-                if event.code == "BTN_EAST":  # red B, right button
+                if "BTN_EAST" in list(event.code):  # red B, right button
                     self.right_button.update(event.state)
 
-                if event.code == "BTN_TL":  # left shoulder button
+                if event.code == "BTN_TL":
                     self.left_shoulder_button.update(event.state)
-                if event.code == "BTN_TR":  # right shoulder button
+                if event.code == "BTN_TR":
                     self.right_shoulder_button.update(event.state)
 
-                if event.code == "ABS_Z":  # left trigger 0-1023
+                if event.code == "ABS_Z":
                     self.left_trigger.update(event.state)
-                if event.code == "ABS_RZ":  # right trigger 0-1023
+                if event.code == "ABS_RZ":
                     self.right_trigger.update(event.state)
 
-                if event.code == "BTN_SELECT":  # 1/0
+                if event.code == "BTN_SELECT":
                     self.select_button.update(event.state)
-                if event.code == "BTN_START":  # 1/0
+                if event.code == "BTN_START":
                     self.start_button.update(event.state)
 
-                if event.code == "BTN_THUMBL":  # 1/0
+                if event.code == "BTN_THUMBL":
                     self.left_stick_button.update(event.state)
-                if event.code == "BTN_THUMBR":  # 1/0
+                if event.code == "BTN_THUMBR":
                     self.right_stick_button.update(event.state)
 
                 # 4-way pad
-                if event.code == "ABS_HAT0Y":  # -1 up / 1 down
+                if event.code == "ABS_HAT0Y":
                     if event.state == 0:
                         self.top_pad.update(0)
                         self.bottom_pad.update(0)
@@ -269,7 +446,7 @@ class GamePadController(threading.Thread):
                         self.bottom_pad.update(0)
                         self.top_pad.update(1)
 
-                if event.code == "ABS_HAT0X":  # -1 left / 1 right
+                if event.code == "ABS_HAT0X":
                     if event.state == 0:
                         self.left_pad.update(0)
                         self.right_pad.update(0)
@@ -308,8 +485,11 @@ class GamePadController(threading.Thread):
 
             self.left_trigger.pulled = 0
             self.right_trigger.pulled = 0
+        self.zero_state_sent_counter = 0
 
     def get_state(self):
+        """Returns the gamepad state dict, or None once the gamepad has been idle
+        for a few frames (so a control loop knows to stop commanding motion)."""
         with self.lock:
             state = {
                 "middle_led_ring_button_pressed": self.middle_led_ring_button.pressed,
@@ -334,76 +514,59 @@ class GamePadController(threading.Thread):
                 "left_pad_pressed": self.left_pad.pressed,
                 "right_pad_pressed": self.right_pad.pressed,
             }
-        return state
 
-    def vibrate(self, duration_ms: int = 150, strong_magnitude: float = 1.0, weak_magnitude: float = 1.0, tag: str = None, cooldown: float = 0.0):
-        if not hasattr(self, '_last_vibrated_tags'):
-            self._last_vibrated_tags = {}
-        if tag is not None and cooldown > 0.0:
-            now = time.time()
-            if now - self._last_vibrated_tags.get(tag, 0.0) < cooldown:
-                return
-            self._last_vibrated_tags[tag] = now
+            # Check for activity
+            is_active = False
+            # 1. Recent events
+            if time.monotonic() - self.last_event_ts < self.EVENT_ACTIVITY_TIMEOUT:
+                is_active = True
 
-        def _vib():
-            try:
-                import evdev
-                from evdev import ecodes, ff
-                if not hasattr(self, '_evdev_dev') or self._evdev_dev is None:
-                    import glob
-                    dev_path = None
-                    for path in glob.glob("/dev/input/event*"):
-                        try:
-                            d = evdev.InputDevice(path)
-                            caps = d.capabilities()
-                            if ecodes.EV_FF in caps and ecodes.EV_ABS in caps:
-                                dev_path = path
-                                break
-                            d.close()
-                        except:
-                            pass
-                    if dev_path:
-                        self._evdev_dev = evdev.InputDevice(dev_path)
-                    else:
-                        return
-                
-                strong = max(0, min(int(strong_magnitude * 65535), 65535))
-                weak = max(0, min(int(weak_magnitude * 65535), 65535))
-                rumble = ff.Rumble(strong_magnitude=strong, weak_magnitude=weak)
-                effect_type = ff.EffectType(ff_rumble_effect=rumble)
-                effect = ff.Effect(
-                    ecodes.FF_RUMBLE, -1, 0,
-                    ff.Trigger(0, 0),
-                    ff.Replay(int(duration_ms), 0),
-                    effect_type
-                )
-                effect_id = self._evdev_dev.upload_effect(effect)
-                self._evdev_dev.write(ecodes.EV_FF, effect_id, 1)
-            except Exception:
-                self._evdev_dev = None
-        threading.Thread(target=_vib, daemon=True).start()
+            # 2. Holding state (buttons pressed, sticks moved, triggers pulled)
+            if not is_active:
+                if (
+                    state["middle_led_ring_button_pressed"]
+                    or state["left_stick_button_pressed"]
+                    or state["right_stick_button_pressed"]
+                    or state["bottom_button_pressed"]
+                    or state["top_button_pressed"]
+                    or state["left_button_pressed"]
+                    or state["right_button_pressed"]
+                    or state["left_shoulder_button_pressed"]
+                    or state["right_shoulder_button_pressed"]
+                    or state["select_button_pressed"]
+                    or state["start_button_pressed"]
+                    or state["bottom_pad_pressed"]
+                    or state["top_pad_pressed"]
+                    or state["left_pad_pressed"]
+                    or state["right_pad_pressed"]
+                ):
+                    is_active = True
+                elif (
+                    abs(state["left_stick_x"]) > 1e-3
+                    or abs(state["left_stick_y"]) > 1e-3
+                    or abs(state["right_stick_x"]) > 1e-3
+                    or abs(state["right_stick_y"]) > 1e-3
+                ):
+                    is_active = True
+                elif state["left_trigger_pulled"] > 1e-3 or state["right_trigger_pulled"] > 1e-3:
+                    is_active = True
 
-    def vibrate_sequence(self, sequence_ms: list, strong_magnitude: float = 1.0, weak_magnitude: float = 1.0, tag: str = None, cooldown: float = 0.0):
-        if not hasattr(self, '_last_vibrated_tags'):
-            self._last_vibrated_tags = {}
-        if tag is not None and cooldown > 0.0:
-            now = time.time()
-            if now - self._last_vibrated_tags.get(tag, 0.0) < cooldown:
-                return
-            self._last_vibrated_tags[tag] = now
-            
-        def _vibrate_sequence_thread():
-            for i, duration in enumerate(sequence_ms):
-                if i % 2 == 0:
-                    self.vibrate(duration_ms=duration, strong_magnitude=strong_magnitude, weak_magnitude=weak_magnitude)
-                time.sleep(duration / 1000.0)
-                
-        threading.Thread(target=_vibrate_sequence_thread, daemon=True).start()
+            if is_active:
+                self.zero_state_sent_counter = 0
+                return state
+
+            if self.zero_state_sent_counter < self.STOP_FRAME_COUNT:
+                self.zero_state_sent_counter += 1
+                return state
+
+            return None
+
 
 class ButtonPressCounter:
     """
     Provides an easy way to track button presses and holds.
-    You can assign callback using `trigger_on_tap` and `trigger_on_hold` to perform an action when a button is tapped or held.
+    You can assign callback using `trigger_on_tap` and `trigger_on_hold` to perform an action
+    when a button is tapped or held.
     Call `step()` in the main loop to make sure this works properly.
     """
 
@@ -416,25 +579,26 @@ class ButtonPressCounter:
         self.was_released_last_step = False
 
         self.hold_triggered_cooldown_start_time = 0.0
-    
+
     def _is_pressed(self, controller_state):
-        return controller_state.get(self.button_name, False)
-    
+        return controller_state[self.button_name]
+
     @property
     def hold_duration(self):
         return self.last_hold_time - self.first_press_after_hold
-    
+
     @property
     def _hold_triggered_elapsed(self):
         return self.last_hold_time - self.hold_triggered_cooldown_start_time
-    
-    def trigger_on_tap(self, callback, max_tap_duration:float = 1.0):
+
+    def trigger_on_tap(self, callback: Callable, max_tap_duration: float = 1.0):
         """Calls the callback when the button is tapped."""
         if self.was_released_last_step and self.last_hold_duration < max_tap_duration:
             callback()
-    
-    def trigger_on_hold(self, hold_duration:float, callback):
-        """Triggers when the user keeps the button held. If the button is continously held, it will trigger again after the `hold_duration`"""
+
+    def trigger_on_hold(self, hold_duration: float, callback: Callable):
+        """Triggers when the user keeps the button held. If the button is continuously held,
+        it will trigger again after the `hold_duration`"""
         if self.hold_duration >= hold_duration and (self._hold_triggered_elapsed > hold_duration):
             callback()
             self.hold_triggered_cooldown_start_time = time.time()
@@ -446,13 +610,13 @@ class ButtonPressCounter:
 
         is_pressed = self._is_pressed(controller_state)
 
-        if self.is_released and is_pressed: # pressed for the first time
+        if self.is_released and is_pressed:  # pressed for the first time
             self.is_released = False
             self.first_press_after_hold = time.time()
             self.last_hold_time = time.time()
-        elif not self.is_released and is_pressed: # holding down
+        elif not self.is_released and is_pressed:  # holding down
             self.last_hold_time = time.time()
-        elif not self.is_released and not is_pressed: # let go
+        elif not self.is_released and not is_pressed:  # let go
             self.is_released = True
             self.last_hold_duration = self.hold_duration
             self.first_press_after_hold = 0.0
@@ -460,52 +624,42 @@ class ButtonPressCounter:
             self.was_released_last_step = True
             self.hold_triggered_cooldown_start_time = 0.0
 
-def get_joint_effort(status, joint_type, joint_name=None):
-    try:
-        if joint_type == 'lift':
-            return status.lift.effort
-        elif joint_type == 'arm':
-            return status.arm.effort
-        elif joint_type == 'eoa':
-            if joint_name == 'wrist_yaw':
-                return status.wrist_yaw.effort
-            elif joint_name == 'wrist_pitch':
-                return status.wrist_pitch.effort
-            elif joint_name == 'wrist_roll':
-                return status.wrist_roll.effort
-            elif 'gripper' in joint_name:
-                if hasattr(status, 'gripper') and hasattr(status.gripper, 'effort'):
-                    return status.gripper.effort
-                else:
-                    return status.gripper_left_finger.effort
-        return 0.0
-    except Exception:
-        return 0.0
 
 class JointEffortTracker:
-    def __init__(self, joint_type: str, pos_thresholds: list[float], neg_thresholds: list[float] = None, joint_name: str = None) -> None:
+    """
+    Provides an easy way to track joint efforts over time.
+    Call step() in the main loop to track actuated joint efforts.
+    """
+
+    def __init__(
+        self,
+        joint_type: str,
+        pos_thresholds: list[float],
+        neg_thresholds: list[float] | None = None,
+        joint_name: str | None = None,
+    ) -> None:
         self.joint_type = joint_type
         self.joint_name = joint_name
         self.pos_thresholds = pos_thresholds
         self.neg_thresholds = neg_thresholds if neg_thresholds is not None else pos_thresholds
-        
+
         self.first_exceed_time = 0.0
         self.last_exceed_time = 0.0
         self.is_below = True
-        
+
         self.hold_triggered_cooldown_start_time = 0.0
         self.current_effort = 0.0
         self.last_direction = 0
-        
+
     @property
     def hold_duration(self):
         return self.last_exceed_time - self.first_exceed_time
-    
+
     @property
     def _hold_triggered_elapsed(self):
         return self.last_exceed_time - self.hold_triggered_cooldown_start_time
-        
-    def trigger_on_hold(self, hold_duration: float, callback):
+
+    def trigger_on_hold(self, hold_duration: float, callback: Callable):
         """Triggers when the effort exceeds the threshold continuously."""
         if self.hold_duration >= hold_duration and (self._hold_triggered_elapsed > hold_duration):
             callback(self.current_effort)
@@ -518,20 +672,19 @@ class JointEffortTracker:
         self.hold_triggered_cooldown_start_time = 0.0
 
     def step(self, status, is_actuated, direction=0):
-        is_exceeding = False
         self.current_effort = 0.0
 
         if not is_actuated or direction != self.last_direction:
             self._reset()
             self.last_direction = direction
-            return  
-        
+            return
+
         self.current_effort = get_joint_effort(status, self.joint_type, self.joint_name)
         self.last_direction = direction
         thresholds = self.pos_thresholds if direction >= 0 else self.neg_thresholds
 
         is_exceeding = abs(self.current_effort) >= thresholds[0]
-        
+
         if is_exceeding:
             self.last_exceed_time = time.time()
             if self.is_below:
@@ -543,20 +696,63 @@ class JointEffortTracker:
             self._reset()
 
 
-def main():
-    gamepad_controller = GamePadController(print_events=False)
-    gamepad_controller.start()
+def get_joint_effort(status, joint_type, joint_name=None):
+    """Sim equivalent of the robot-side `get_joint_effort()`: reads efforts off a
+    `StatusStretchJoints` snapshot instead of off a `robot.Robot` instance."""
     try:
+        if joint_type == "lift":
+            return status.lift.effort
+        elif joint_type == "arm":
+            return status.arm.effort
+        elif joint_type == "eoa":
+            if joint_name == "wrist_yaw":
+                return status.wrist_yaw.effort
+            elif joint_name == "wrist_pitch":
+                return status.wrist_pitch.effort
+            elif joint_name == "wrist_roll":
+                return status.wrist_roll.effort
+            elif joint_name and "gripper" in joint_name:
+                if hasattr(status, "gripper") and hasattr(status.gripper, "effort"):
+                    return status.gripper.effort
+                return status.gripper_left_finger.effort
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def main():
+    import curses
+
+    gamepad_controller = GamePadController(print_events=False)
+    gamepad_controller.startup()
+
+    def live_view(stdscr, controller):
+        curses.curs_set(0)  # hide cursor
+        prev_state = None
+        controller.set_zero_state()  # allows for some zero state messages to return from get_state()
         while True:
-            state = gamepad_controller.get_state()
-            print("------------------------------")
-            print("GAMEPAD CONTROLLER STATE")
-            for k in state.keys():
-                print(k, " : ", state[k])
-            print("------------------------------")
-            time.sleep(0.1)
+            curr_state = controller.get_state()
+            state = curr_state or prev_state
+            stdscr.erase()
+            stdscr.addstr(
+                0,
+                0,
+                f"GAMEPAD CONTROLLER STATE {'- ACTIVE' if curr_state else '- INACTIVE'}",
+                curses.A_BOLD,
+            )
+            for i, (k, v) in enumerate(state.items(), start=2):
+                stdscr.addstr(i, 2, f"{k:30}: {v}")
+            stdscr.refresh()
+            time.sleep(0.05)
+            prev_state = state
+
+    try:
+        while not gamepad_controller.is_gamepad_active:
+            time.sleep(0.05)
+        curses.wrapper(live_view, gamepad_controller)
     except (KeyboardInterrupt, SystemExit):
-        pass
+        print("Closing gamepad controller...")
+        gamepad_controller.stop()
 
 
 if __name__ == "__main__":
