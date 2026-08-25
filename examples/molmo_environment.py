@@ -24,6 +24,10 @@ Usage:
 
     # Or any scene XML on disk
     python -m examples.molmo_environment --scene /path/to/scene.xml
+
+    # Drive it yourself and record demonstrations for fine-tuning
+    python -m examples.molmo_environment --dataset procthor-10k --house-index 0 \
+        --keyboard --record_dataset data/teleop_pick --record-task "pick up the mug"
 """
 
 import re
@@ -92,9 +96,7 @@ def find_largest_room_spawn_xy(spec: MjSpec) -> tuple[float, float] | None:
     return best_xy
 
 
-def resolve_spawn_position(
-    spec: MjSpec, x: float | None, y: float | None, z: float
-) -> list[float]:
+def resolve_spawn_position(spec: MjSpec, x: float | None, y: float | None, z: float) -> list[float]:
     """
     Fill in unset x/y spawn coordinates from the scene's largest room, if any.
 
@@ -375,6 +377,156 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
     return str(scene_path)
 
 
+RECORD_KEYS = {"r": "start", "t": "keep", "x": "discard"}
+"""
+Keys that drive dataset recording, and what they do.
+
+Chosen to miss the teleop bindings: `KeyboardTeleop` drives with WASDQE and the
+arrow keys, so R/T/X are free. Recording is *not* continuous -- see
+`finetuning/live_recorder.py` for why an operator-delimited episode is the only
+kind worth training on.
+"""
+
+
+def start_recording(output_dir: Path, task: str | None, fps: float, teleop):
+    """Build a `LiveDatasetRecorder` and bind `RECORD_KEYS` to it.
+
+    Returns `(recorder, listener)`. The listener is None when the recorder was
+    able to share the keyboard teleop's own pynput listener, which is the case
+    worth preferring: two global pynput listeners on the same keys race each
+    other, so the shared one is used whenever there is one to share.
+
+    Imported lazily because `finetuning/` is part of the MolmoSpaces
+    integration, while this example runs fine on a bare `--scene` with
+    MolmoSpaces absent. Recording, though, writes MolmoSpaces' own trajectory
+    format, so it needs the pieces that know it.
+    """
+    try:
+        from examples.machine_learning.molmospaces.finetuning.live_recorder import (
+            TRAINED_CAMERA_MJCF_NAMES,
+            LiveDatasetRecorder,
+        )
+    except ImportError as error:  # pragma: no cover - depends on the optional install
+        raise click.ClickException(
+            f"--record_dataset needs the dataset-recording pieces ({error}). They live under\n"
+            "  examples/machine_learning/molmospaces/finetuning/\n"
+            'and want the optional MolmoSpaces extra:  pip install -e ".[molmo]"'
+        ) from error
+
+    recorder = LiveDatasetRecorder(
+        output_dir=output_dir,
+        camera_names=list(TRAINED_CAMERA_MJCF_NAMES),
+        fps=fps,
+        task_description=task or "",
+    )
+
+    def dispatch(name: str) -> None:
+        if name == "start":
+            recorder.start_episode()
+        elif name == "keep":
+            recorder.finish_episode(success=True)
+        else:
+            recorder.discard_episode()
+
+    click.secho(
+        f"Recording to {output_dir}. R = start an episode, T = keep it, X = discard it."
+        + ("" if task else "  (no --record-task given; episodes will have a generic prompt)"),
+        fg="cyan",
+    )
+    listener = _bind_record_keys(teleop, dispatch)
+    return recorder, listener
+
+
+def _bind_record_keys(teleop, dispatch):
+    """Route `RECORD_KEYS` to `dispatch`, sharing the teleop's listener if it has one.
+
+    `KeyboardTeleop` owns a pynput listener and exposes `on_press`/`on_release`,
+    so its handlers get wrapped -- exactly as `live_policy._install_space_toggle`
+    does, and for the same reasons: a second listener on the same keys races the
+    first, and pynput repeats `on_press` while a key is held, so a plain handler
+    would start and discard an episode dozens of times a second. `held` is the
+    edge detection pynput does not give.
+
+    `GamepadTeleop` has no keyboard listener, so one is started here instead.
+    """
+    from pynput import keyboard
+
+    held: set[str] = set()
+
+    def handle_press(key) -> None:
+        name = getattr(key, "char", None)
+        if name is None or name.lower() not in RECORD_KEYS or name.lower() in held:
+            return
+        held.add(name.lower())
+        dispatch(RECORD_KEYS[name.lower()])
+
+    def handle_release(key) -> None:
+        name = getattr(key, "char", None)
+        if name is not None:
+            held.discard(name.lower())
+
+    if teleop is not None and hasattr(teleop, "on_press") and hasattr(teleop, "on_release"):
+        original_on_press, original_on_release = teleop.on_press, teleop.on_release
+
+        def on_press(key):
+            handle_press(key)
+            return original_on_press(key)
+
+        def on_release(key):
+            handle_release(key)
+            return original_on_release(key)
+
+        teleop.on_press = on_press
+        teleop.on_release = on_release
+        return None
+
+    listener = keyboard.Listener(on_press=handle_press, on_release=handle_release)
+    listener.start()
+    return listener
+
+
+def record_frame(recorder, sim: Stretch4MujocoSimulator, camera_data) -> None:
+    """Hand one frame of state and imagery to the recorder.
+
+    The recorder drops repeats itself, keyed on `camera_data.time`; see
+    `LiveDatasetRecorder.record_step`.
+    """
+    from examples.machine_learning.molmospaces.finetuning.live_recorder import (
+        camera_frames_for,
+        pose7_from_matrix,
+        qpos_from_status,
+    )
+
+    if camera_data is None:
+        return
+    frames = camera_data.get_all()
+    cameras = camera_frames_for(recorder.camera_names)
+    images = {name: frames.get(camera) for name, camera in cameras.items()}
+
+    status = sim.pull_status()
+    base_pose = np.eye(4)
+    base_pose[:2, 3] = [status.base.x, status.base.y]
+    base_pose[:3, :3] = np.array(
+        [
+            [np.cos(status.base.theta), -np.sin(status.base.theta), 0.0],
+            [np.sin(status.base.theta), np.cos(status.base.theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    # `tcp_pose` is recorded base-relative, as MolmoSpaces' `TCPPoseSensor` does;
+    # `get_ee_pose()` is in the world, so the base is divided back out.
+    tool_in_base = np.linalg.inv(base_pose) @ sim.get_ee_pose()
+
+    recorder.record_step(
+        qpos=qpos_from_status(status),
+        base_pose7=pose7_from_matrix(base_pose),
+        tcp_pose7=pose7_from_matrix(tool_in_base),
+        images=images,
+        sim_time=status.time,
+        frame_time=float(getattr(camera_data, "time", 0.0)),
+    )
+
+
 @click.command()
 @click.option("--scene", type=str, default=None, help="Path to a scene XML. Overrides --dataset.")
 @click.option("--dataset", type=str, default="procthor-10k", help="MolmoSpaces house dataset")
@@ -421,6 +573,30 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
     help="Overwrite the scene's <option> with the values the Stretch model is tuned for.",
 )
 @click.option("--write-to-file", type=str, default=None, help="Write the combined scene XML here")
+@click.option(
+    "--record_dataset",
+    "record_dataset",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Record teleoperated demonstrations here, in MolmoSpaces trajectory format. "
+    "R starts an episode, T keeps it, X discards it. Feeds "
+    "examples/machine_learning/molmospaces/finetuning/ directly.",
+)
+@click.option(
+    "--record-task",
+    type=str,
+    default=None,
+    help='Language instruction for the recorded episodes, e.g. "pick up the mug". '
+    "This is the whole conditioning signal a trained policy gets, so it is worth "
+    "restarting the session rather than recording a batch under the wrong one.",
+)
+@click.option(
+    "--record-fps",
+    type=float,
+    default=None,
+    help="Frame rate to record at. Defaults to the simulator's camera rate, which is "
+    "the rate frames actually arrive at.",
+)
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
 @click.option(
     "--follow-robot/--no-follow-robot",
@@ -455,6 +631,9 @@ def main(
     floor_geom: tuple[str, ...],
     match_solver_options: bool,
     write_to_file: str | None,
+    record_dataset: Path | None,
+    record_task: str | None,
+    record_fps: float | None,
     headless: bool,
     follow_robot: bool,
     keyboard: bool,
@@ -465,6 +644,12 @@ def main(
 ):
     if keyboard and gamepad:
         raise click.UsageError("Pass at most one of --keyboard/--gamepad.")
+    if record_dataset is not None and not (keyboard or gamepad):
+        raise click.UsageError(
+            "--record_dataset records what you drive, so it needs --keyboard or --gamepad. "
+            "For scripted demonstrations at scale use "
+            "`python -m examples.machine_learning.molmospaces.finetuning.generate_dataset`."
+        )
 
     scene_xml_path = scene or resolve_molmospaces_scene(dataset, split, house_index, variant)
 
@@ -510,6 +695,17 @@ def main(
         from stretch4_mujoco.sim_teleop import GamepadTeleop
 
         teleop = GamepadTeleop(sim)
+
+    recorder = None
+    key_listener = None
+    if record_dataset is not None:
+        recorder, key_listener = start_recording(
+            output_dir=record_dataset,
+            task=record_task,
+            fps=record_fps if record_fps is not None else (10.0 if lidar else 30.0),
+            teleop=teleop,
+        )
+
     if teleop is not None:
         teleop.start()
 
@@ -517,6 +713,7 @@ def main(
         while sim.is_running():
             if opencv:
                 show_camera_feeds_sync(sim, show_metrics)
+                camera_data = sim.pull_camera_data() if recorder is not None else None
             else:
                 camera_data = sim.pull_camera_data()
                 if show_metrics:
@@ -528,9 +725,15 @@ def main(
                 rerun_logger.update_camera_images(camera_data)
             if lidar:
                 rerun_logger.update_pointcloud_viz(sim.pull_lidar_points(), "world/lidar_points")
+            if recorder is not None and recorder.recording:
+                record_frame(recorder, sim, camera_data)
     except KeyboardInterrupt:
         pass
     finally:
+        if recorder is not None:
+            recorder.close()
+        if key_listener is not None:
+            key_listener.stop()
         rerun_logger.stop()
         if teleop is not None:
             teleop.stop()

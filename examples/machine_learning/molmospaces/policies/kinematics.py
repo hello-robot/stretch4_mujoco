@@ -88,7 +88,7 @@ TOP_DOWN_REACH_DOFS = ("lift", "arm", "base_x", "base_y")
 class StretchReachSolver:
     """Solves a subset of Stretch's joints to put the tool centre at a world point.
 
-    Base *yaw* is always held: `stretch/episode_overrides.py` already aimed the
+    Base *yaw* is always held: `franka_remapping/episode_overrides.py` already aimed the
     base at the target, and re-aiming mid-reach would swing the whole arm through
     the scene.
     """

@@ -19,13 +19,28 @@ stretch/
   robot_view.py         Stretch as MolmoSpaces move groups
   robot.py              Stretch as a MolmoSpaces Robot; scene attachment
   config.py             robot config + camera system
+franka_remapping/
   episode_overrides.py  retarget a Franka/RBY1 episode onto Stretch
+  episode_frame.py      carry the authoring arm's frame past the retarget
+  franka_arm.py         the Franka Droid arm as pure FK/IK
+  pose_solver.py        full 6-DOF tool-pose solving for Stretch
+  action_remap.py       Franka joint space <-> Stretch move groups
+  vla_policy.py         a Franka-space VLA server, driving Stretch
+  vla_client.py         websocket/msgpack transport for that server
+finetuning/
+  datagen_configs.py    Stretch versions of the MolmoSpaces datagen configs
+  generate_dataset.py   generate demonstrations, then optionally export them
+  live_recorder.py      record teleop demonstrations from molmo_environment.py
+  hdf5_layout.py        the MolmoSpaces trajectory format: writer, repair, splits
+  lerobot_export.py     rollouts -> a LeRobot dataset, in either action space
+  finetune.py           check the data, prepare it, write the config, launch
 policies/
   kinematics.py         reach solving
   scripted.py           the scripted expert (baseline + BC teacher)
   networks.py           the BC network and the action/state encoding
   checkpoint.py         loading and running a checkpoint, robot-stack agnostic
   bc_policy.py          the trained policy, as a MolmoSpaces InferencePolicy
+  molmobot_policy.py    a MolmoBot checkpoint driving Stretch natively
 training/
   collect.py            roll out the expert, keep what worked
   dataset.py            HDF5 + MP4 rollouts -> training shards
@@ -191,7 +206,7 @@ about 8cm.
 | `lift`    | 1   | mast                                                 |
 | `arm`     | 1   | four telescoping segments, one tendon actuator       |
 | `wrist`   | 3   | yaw, pitch, roll                                     |
-| `gripper` | 2   | the two finger joints                                |
+| `gripper` | 2   | the mirrored finger pair of the one `stretch_gripper` DOF |
 
 The telescoping arm is the awkward one: four MuJoCo joints held equal by
 `<equality>` constraints and driven by a single tendon actuator whose range is
@@ -203,7 +218,7 @@ correspondingly the *mean* of the four segment columns, not their sum.
 
 ### The episode
 
-`stretch/episode_overrides.py` is registered as MolmoSpaces'
+`franka_remapping/episode_overrides.py` is registered as MolmoSpaces'
 `robot_override_fn`, which runs per episode with both the episode spec and the
 experiment config mutable. It rewrites three things and leaves the scene, the
 object poses, the instruction and the success criteria untouched:
@@ -246,6 +261,219 @@ styles are not equivalent:
   they only creep when nothing else will do.
 
 Run `--policy scripted_top_down` to compare them.
+
+## Which `--policy` for which model
+
+Retargeting the *episode* makes the benchmark runnable at all. Getting a
+particular *model* to drive Stretch is a separate question, and the answer
+depends on one thing: what action space the checkpoint was trained on.
+
+| model | action space it emits | how to run it |
+| --- | --- | --- |
+| `allenai/MolmoBot-DROID` | `franka_joint`: 7 arm joints + gripper | `--policy vla` (remapped) |
+| pi0.5 / pi0 DROID, DreamZero | 7 Franka joints + gripper | `--policy vla` (remapped) |
+| MolmoBot fine-tuned on Stretch | Stretch's 5 move groups, 10 dims | `--policy molmobot` (native) |
+| your BC checkpoint | Stretch's 10-dim encoding | `--policy bc` |
+| scripted expert / A\* planner | — | `--policy baseline` |
+
+```bash
+# Franka-space model: serve it on the websocket protocol, then remap
+python -m examples.machine_learning.molmospaces.run_benchmarks \
+    --policy vla --vla-host localhost --vla-port 8000 --benchmark pick
+
+# MolmoBot fine-tuned on Stretch's own move groups: no remapping at all
+python -m examples.machine_learning.molmospaces.run_benchmarks \
+    --policy molmobot --checkpoint /path/to/checkpoint --benchmark pick
+```
+
+`--policy molmobot` needs MolmoBot importable
+(`git clone https://github.com/allenai/MolmoBot`, then that repo's inner
+`MolmoBot/` directory on `PYTHONPATH`); it is not a dependency here.
+`policies/molmobot_policy.py` supplies Stretch's move-group spec and delegates to
+MolmoBot's own `SynthVLAPolicy`, which already returns an action dict keyed by
+move group — exactly what Stretch's controllers take. See `finetuning/README.md`
+for how to produce such a checkpoint.
+
+The rest of this section is about the remapped path.
+
+### How the remap works
+
+A joint vector is a robot-specific *parameterisation* of a tool pose, so the
+retarget turns it back into the thing it parameterises and works in the world:
+
+```
+VLA action (7 joints + gripper)
+  -> FrankaArm.forward()          tool pose in the authoring arm's frame
+  -> FrankaEpisodeFrame           the same pose in the world
+  -> StretchPoseSolver.solve()    lift / arm / wrist / base targets
+```
+
+and the observation the model is fed runs the same path backwards through
+`FrankaArm.inverse()`, so its proprioception tracks where Stretch's tool actually
+is rather than where it was last told to go.
+
+The world is the hinge, and no workspace calibration is fitted by hand. The
+episode's authoring Franka was placed so *its* workspace covered the target, and
+`episode_frame.py` records that pose on the way past — before
+`retarget_base_pose()` overwrites it. Compose a VLA-space tool pose with it and
+you get an absolute world pose, and the object is at the same world pose for
+either robot.
+
+Solving Stretch's joints for a full 6-DOF pose is unusually clean, because its
+wrist turns out to be an exact ZYX Euler triple:
+
+```
+R_tool_world = Rz(base_yaw + wrist_yaw) @ Ry(wrist_pitch) @ Rx(wrist_roll)
+```
+
+verified to machine precision on the compiled MJCF. So pitch and roll are read
+straight off a requested orientation and only the *sum* of base yaw and wrist yaw
+is constrained — which leaves one free parameter inside an exactly-matched
+orientation, the **yaw split**: turn the base by `+s` and the wrist by `-s` and
+the arm swings around the base axis while the tool keeps pointing exactly where
+it was asked to. `lift + arm + split` is then a square, well-conditioned system
+for position, and unlike the wrist-yaw solve it does *not* go singular reaching
+straight down.
+
+### What it measures, and what it costs
+
+Over the pick benchmark's grasp trajectories (Franka joint targets interpolated
+from each episode's own `init_qpos` to a top-down grasp at its object, retargeted
+step by step):
+
+| quantity                              | median | p90    |
+| ------------------------------------- | ------ | ------ |
+| grasp-pose position error             | 3.7mm  | 24mm   |
+| grasp-pose orientation error          | 0.008 rad | 0.018 rad |
+| base rotation used over an episode    | 0.13 rad | 0.16 rad |
+| virtual-arm IK error (proprioception) | 0.3mm  | 1.1mm  |
+
+Three things the remap does not fix, all reported per episode in
+`RemapTelemetry` rather than hidden:
+
+- **Stretch's minimum reach.** Its tool cannot come closer than ~0.39m to its own
+  base axis; a Franka's home posture is tucked in at ~0.23m. Roughly a third of
+  the *intermediate* poses of a Franka approach fall in that hole and are
+  retargeted to the nearest reachable pose. The grasp pose itself, which is what
+  scores, is almost always reachable.
+- **The base turns.** Matching an orientation exactly costs the yaw split, which
+  swings the head camera. It is small (0.13 rad) but it is not nothing.
+- **The cameras are Stretch's.** A DROID-trained model expects two fixed,
+  off-robot shoulder views and gets one egocentric view that moves with the
+  robot, fed to both inputs. This is the largest single mismatch and the one
+  kinematics cannot touch. It is what the next section is for.
+
+Stretch also spawns stowed, a configuration no Franka pose maps to, so the first
+~30 steps of an episode drive to the authoring arm's own start pose *without*
+querying the model. The model's first observation is then one it could plausibly
+have been trained on, and the unstow never enters its action history.
+
+`--policy vla` uses `solver_mode="exact"` (the yaw split). Two alternatives are
+implemented and measured worse: `free_azimuth` spends the wrist yaw on reaching
+instead and mis-orients the gripper by more than a radian through the approach;
+`translating` lets the base drive, which tracks the *approach* better but ends
+the grasp worse, because the base wanders off the standoff the episode chose.
+
+## Fine-tuning on Stretch's own data
+
+The other road: stop translating for the model and teach it Stretch. This needs
+demonstrations, and the benchmark's own 1000 episodes are the test set — so
+`finetuning/` drives MolmoSpaces' *data generation* pipeline instead, which
+samples tasks procedurally and is unbounded. `finetuning/README.md` has the
+details; the short version is that **MolmoBot needs neither a dataset conversion
+nor a remapping.**
+
+It trains straight off MolmoSpaces trajectories, and its action space is
+configured by move group — so a Stretch fine-tune learns Stretch's own ten
+numbers (`base` 3, `lift` 1, `arm` 1, `wrist` 3, `gripper` 2) and is evaluated
+with `--policy molmobot`.
+
+```bash
+# 2 episodes, 1 house — check the setup before spending a day on it
+python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+    --task debug --output-dir data/stretch_debug --no-export
+
+# a real run
+python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+    --task pick --task pnp --episodes 2000 --num-workers 8 \
+    --output-dir data/stretch_pick --no-export
+
+# prepare it and print MolmoBot's commands (preprocessing, then training)
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --rollouts data/stretch_pick/rollouts/pick --trainer molmobot
+
+# or, for pi0.5, export to LeRobot first and use --trainer openpi
+python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+    --task pick --episodes 2000 --output-dir data/stretch_pick --action-space franka
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --dataset data/stretch_pick/lerobot --trainer openpi --base-checkpoint pi05_droid
+```
+
+Demonstrations can also come from you rather than the scripted expert:
+
+```bash
+python -m examples.molmo_environment --dataset procthor-10k --house-index 0 \
+    --keyboard --record_dataset data/teleop_pick --record-task "pick up the mug"
+```
+
+`R` starts an episode, `T` keeps it, `X` discards it. It writes the same on-disk
+format, so it feeds the same trainers. The action recorded for a frame is the
+*next* frame's state — for a position-controlled arm that is the command,
+retrospectively — and the operator delimits episodes rather than recording
+continuously, because a demonstration that starts thirty seconds before the reach
+teaches a policy to wait.
+
+`datagen_configs.py` registers Stretch versions of the MolmoSpaces datagen
+configs — same task classes, same success criteria, Stretch's robot, cameras and
+scripted expert substituted in. One thing beyond the substitution genuinely has
+to change: the samplers place a Franka within 0.7m of the target because that is
+a Franka's reach, and Stretch cannot work closer than 0.39m or further than
+0.99m. `STRETCH_PLACEMENT` widens those constraints to the same 0.55–0.90m band
+the episode retarget uses, so generated and retargeted episodes present the robot
+with the same geometry.
+
+They are also addressable from MolmoSpaces' own entry point:
+
+```bash
+python -m molmo_spaces.data_generation.main \
+    examples.machine_learning.molmospaces.finetuning.datagen_configs:StretchPickDataGenConfig
+```
+
+### The action space is the decision
+
+`lerobot_export.py` turns the recorded HDF5 + MP4 rollouts into a LeRobot v2.1
+dataset, in one of two spaces:
+
+- **`franka`** (the default) — the same 8-dimensional Franka joint space the
+  pretrained model already emits, obtained by running `franka_remapping/`
+  *backwards*: Stretch's recorded tool poses become virtual Franka joints. The
+  model keeps its action head and its pretrained weights, and is evaluated
+  through the same remapper. Because the forward and reverse maps are the same
+  code, whatever the retarget cannot express the training data does not contain
+  either — the model is never trained to ask for something the robot cannot do.
+  On recorded expert rollouts the encoding reproduces the motions to **0.5mm**
+  mean; `ExportMetadata.mean_shadow_ik_error_m` reports it per dataset and
+  `finetune.py` refuses to launch above 20mm.
+- **`stretch`** — Stretch's own 10-dimensional move-group vector, the encoding in
+  `policies/networks.py`. Nothing is lost to a retarget and the policy drives the
+  base directly, but the action head has to be reshaped and re-learned, so it
+  wants far more data.
+
+One trap worth naming, because it is silent: a `franka`-space export encodes
+against a *virtual* Franka mounted on Stretch itself (`MAST_MOUNT_FORWARD_M`,
+`MAST_MOUNT_HEIGHT_M`, chosen by workspace overlap), while benchmark evaluation
+defaults to the *authoring* Franka's recorded frame. A checkpoint fine-tuned on
+the former must be evaluated with `frame_source="mast"`, or every action it emits
+is offset by the standoff between the two shoulders and the arm reaches
+consistently short. `finetune.py` prints the setting the dataset needs.
+
+The fine-tune itself runs in the model's own repository — openpi for pi0/pi0.5,
+LeRobot for ACT/diffusion/SmolVLA — because that is where the trainers and their
+JAX/PyTorch stacks live, and neither is a dependency here. `finetune.py` does the
+parts that are this repo's business: validate the dataset, compute the
+normalisation statistics, write the trainer config, and print or run the command.
+Serving the result over the same websocket protocol makes it scorable with
+`run_benchmarks.py --policy vla`.
 
 ## Watching a policy, and keeping proof
 
