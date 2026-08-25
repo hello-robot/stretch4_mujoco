@@ -116,7 +116,7 @@ uv run python -m examples.molmo_environment --dataset procthor-10k --house-index
 
 [MolmoSpaces benchmarks](./examples/machine_learning/molmospaces/README.md)
 
-Score Stretch on the eight MolmoSpaces benchmark evaluations, with a scripted
+Score Stretch on the eight MolmoSpaces benchmark evaluations, with a simple ik
 baseline and a behaviour-cloning training pipeline.
 
 ```

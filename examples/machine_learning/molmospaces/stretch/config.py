@@ -121,7 +121,8 @@ class Stretch4RobotConfig(BaseRobotConfig):
     # wrist: (yaw, pitch, roll); gripper: (right finger, left finger).
     init_qpos: dict[str, list[float]] = {
         # This is the "stow" pose in `keyframes.xml`
-        "base": [0.0, 0.0, 0.0],
+        # with base x moved 1m away so the robot spawns a little far away from the workspace.
+        "base": [-1.0, 0.0, 0.0],
         "lift": [0.35],
         "arm": [0.0],
         "wrist": [3.14, -0.4, 0.0],

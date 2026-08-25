@@ -647,7 +647,7 @@ def main(
     if record_dataset is not None and not (keyboard or gamepad):
         raise click.UsageError(
             "--record_dataset records what you drive, so it needs --keyboard or --gamepad. "
-            "For scripted demonstrations at scale use "
+            "For simple ik demonstrations at scale use "
             "`python -m examples.machine_learning.molmospaces.finetuning.generate_dataset`."
         )
 

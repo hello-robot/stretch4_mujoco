@@ -24,7 +24,7 @@ The base pose is the only interesting one; see `retarget_base_pose()`.
 
 This is scene and spawn adaptation, not a translation of the authoring robot's
 *actions*: nothing here converts one robot's joint vector into another's. Every
-policy path -- the scripted expert, a BC checkpoint, a MolmoBot fine-tune --
+policy path -- the simple_ik expert, a BC checkpoint, a MolmoBot fine-tune --
 drives Stretch's own move groups directly and goes through this same override.
 """
 

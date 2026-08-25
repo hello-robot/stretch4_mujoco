@@ -1,7 +1,7 @@
 # Stretch 4 on the MolmoSpaces benchmarks
 
 Runs Stretch 4 against the eight [MolmoSpaces](https://github.com/allenai/molmospaces)
-benchmark evaluations, with a scripted expert as the baseline and two roads to a
+benchmark evaluations, with a simple ik expert as the baseline and two roads to a
 learned policy that beats it: behaviour cloning from scratch ([`training/`](training/README.md))
 and fine-tuning a pretrained VLA ([`finetuning/`](finetuning/README.md)).
 
@@ -30,7 +30,7 @@ finetuning/             fine-tune a pretrained VLA -- see finetuning/README.md
   finetune.py           check the data, prepare it, write the config, launch
 policies/
   kinematics.py         reach solving
-  simple_ik_policy.py   the scripted IK expert (baseline + BC teacher)
+  simple_ik_policy.py   the simple ik IK expert (baseline + BC teacher)
   networks.py           the BC network and the action/state encoding
   checkpoint.py         loading and running a checkpoint, robot-stack agnostic
   bc_policy.py          the trained policy, as a MolmoSpaces InferencePolicy
@@ -110,7 +110,7 @@ python -m examples.machine_learning.molmospaces.run_benchmarks \
     --benchmark pick --episodes 200 --num-workers 8
 ```
 
-`--policy baseline` (the default) runs the scripted expert on the manipulation
+`--policy baseline` (the default) runs the simple ik expert on the manipulation
 and articulation benchmarks, and MolmoSpaces' own A* planner on navigation.
 Results land in `<output>/results.csv` next to the per-episode HDF5 trajectories
 and MP4s.
@@ -137,7 +137,7 @@ baseline: MB-Pick has since measured 3/8 (37.5%) over eight episodes, against
 
 Navigation is solved because MolmoSpaces' A* planner does the hard part and
 Stretch's holonomic base executes its waypoints directly. The manipulation
-numbers are the scripted expert's, and they are what the behaviour-cloning
+numbers are the simple ik expert's, and they are what the behaviour-cloning
 pipeline below is meant to improve on — see *Known limitations* for why the
 expert is not a ceiling.
 
@@ -145,14 +145,14 @@ The eval configs are also addressable from MolmoSpaces' entry point directly:
 
 ```bash
 python molmo_spaces/evaluation/eval_main.py \
-    examples.machine_learning.molmospaces.configs:StretchScriptedEvalConfig \
+    examples.machine_learning.molmospaces.configs:StretchSimpleIKEvalConfig \
     --benchmark_dir <dir> --no_wandb
 ```
 
 ## Training a policy
 
 Demonstrations come from the same place either way: `finetuning/generate_dataset.py`
-rolls the scripted expert over procedurally sampled houses, because a benchmark's
+rolls the simple ik expert over procedurally sampled houses, because a benchmark's
 own 1000-2000 episodes are the *test set* and cloning them measures memorisation.
 From there the two roads split, and each has its own README.
 
@@ -242,7 +242,7 @@ styles are not equivalent:
   base — so top-down solves recruit the holonomic slides, weighted against so
   they only creep when nothing else will do.
 
-Run `--policy scripted_top_down` to compare them.
+Run `--policy simple ik_top_down` to compare them.
 
 ## Which `--policy` for which model
 
@@ -255,7 +255,7 @@ translates another robot's joint vector.
 | --- | --- | --- |
 | MolmoBot fine-tuned on Stretch | Stretch's 5 move groups, 10 dims | `--policy molmobot` |
 | your BC checkpoint | Stretch's 10-dim encoding | `--policy bc` |
-| scripted expert / A\* planner | — | `--policy baseline` |
+| simple ik expert / A\* planner | — | `--policy baseline` |
 | `allenai/MolmoBot-DROID`, pi0.5 / pi0 DROID, DreamZero | 7 Franka joints + gripper | not runnable as released — fine-tune it first |
 
 ```bash
@@ -443,7 +443,7 @@ a position target, so it lags the benchmark base by a control step or two.
   head camera is a fixed forward-and-down view rigidly tied to base yaw. That is
   a real constraint on navigation and on any vision-driven policy, not something
   this integration chose.
-- **The scripted expert is not a planner.** No collision-aware motion planning
+- **The simple ik expert is not a planner.** No collision-aware motion planning
   and no grasp-pose search: MolmoSpaces' own solvers do both, but they need
   CuRobo and a Stretch grasp library that does not exist. The expert aims the
   tool at the object's body origin and closes. It succeeds on a minority of

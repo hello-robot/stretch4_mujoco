@@ -4,7 +4,7 @@ A simple IK-driven Stretch 4 expert for the manipulation and articulation benchm
 "Simple IK" is the whole design: every task compiles to a list of tool-centre
 waypoints, and each waypoint is pursued by asking `policies/kinematics.py` for
 the joint configuration that puts the tool there. There is no trajectory
-optimisation and no search -- just a reach solve per step against a scripted
+optimisation and no search -- just a reach solve per step against a simple_ik
 curve.
 
 This policy serves two purposes:
@@ -102,7 +102,7 @@ def _finger_joint_for_width(gripper: StretchGripperGroup, width_m: float) -> flo
 
 @dataclass
 class Waypoint:
-    """One tool-centre target in a scripted plan.
+    """One tool-centre target in a simple_ik plan.
 
     Attributes:
         position: world xyz for the tool centre.
@@ -161,7 +161,7 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     `policies/kinematics.py`.
     """
 
-    pregrasp_standoff_m: float = 0.14
+    pregrasp_standoff_m: float = 0.24
     """How far back along the approach axis to pause before closing in."""
 
     grasp_depth_m: float = 0.01
@@ -215,7 +215,7 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     real gripper uses, and it needs no estimate.
     """
 
-    unstow_clearance_m: float = 0.15
+    unstow_clearance_m: float = 0.25
     """
     How far above the grasp to swing the arm out of its stowed pose.
 
@@ -589,6 +589,7 @@ class StretchSimpleIKPolicy(BasePolicy):
 
     def _plan_pick_and_place(self, with_place: bool) -> list[Waypoint]:
         pitch = self._grasp_pitch()
+        is_top_down = self.config.policy_config.grasp_style == "top_down"
         grasp_point = self._pickup_grasp_point(pitch)
         if grasp_point is None:
             return []
@@ -607,7 +608,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             f"{'unknown' if grip_width is None else f'{grip_width:.3f}m'}"
         )
 
-        plan = [self._unstow_waypoint(grasp_point, pitch)]
+        plan = self._unstow_waypoints(grasp_point, pitch)
         pregrasp = self._reachable_standoff(grasp_point, approach, pitch)
         if pregrasp is not None:
             plan.append(
@@ -813,8 +814,8 @@ class StretchSimpleIKPolicy(BasePolicy):
             return None
         return np.asarray(scene_object.position, dtype=float)
 
-    def _unstow_waypoint(self, grasp_point: np.ndarray, pitch: float) -> Waypoint:
-        """Swing the arm out of its stowed pose, clear of whatever it is reaching over.
+    def _unstow_waypoints(self, grasp_point: np.ndarray, pitch: float) -> list[Waypoint]:
+        """Get the arm out of its stowed pose, clear of whatever it is reaching over.
 
         Joint-space on purpose. The point of this move is the configuration --
         arm retracted so the swing radius is as small as the robot gets, wrist
@@ -822,6 +823,19 @@ class StretchSimpleIKPolicy(BasePolicy):
         surface rather than through it. Asking for a tool position instead would
         let the solver extend the arm during the swing, which is the opposite of
         what is wanted.
+
+        Two waypoints rather than one, because the height and the swing have to
+        happen *in that order*. Commanded together they race, and the wrist wins:
+        the lift is hauling the whole arm through half a metre at kp=2500 while
+        the wrist is a couple of kilos at kp=20, so measured in free space the
+        wrist is 80% through its 3.14rad arc while the lift is barely half way --
+        tool at z=0.86 and swung out to 0.47m, which is exactly counter height at
+        exactly counter distance. The arc that was supposed to pass over the
+        surface goes through it, and the gripper jams there: observed on the
+        debug config, the fingertips stay in contact with the countertop for all
+        500 steps of the episode while the base is shoved 0.26m out of reach, and
+        every reach solve from then on fails. Raising first and swinging second
+        costs about ten policy steps and puts the arc in free air.
         """
         policy_config = self.config.policy_config
         solver = self._solver
@@ -841,17 +855,35 @@ class StretchSimpleIKPolicy(BasePolicy):
             np.clip(wanted - base_z - tool_height_at_zero_lift, lift_limits[0], lift_limits[1])
         )
 
-        return Waypoint(
-            position=np.asarray(grasp_point, dtype=float),
-            wrist_pitch=pitch,
-            gripper_open=True,
-            label="unstow",
-            joint_targets={
-                "lift": np.array([lift]),
-                "arm": np.array([0.0]),
-                "wrist": np.array([0.0, pitch, 0.0]),
-            },
-        )
+        position = np.asarray(grasp_point, dtype=float)
+        return [
+            Waypoint(
+                position=position,
+                wrist_pitch=pitch,
+                gripper_open=True,
+                label="raise",
+                # The wrist is deliberately absent: `_command_for` holds every
+                # group a joint-space waypoint does not name at its current
+                # value, which keeps the arm stowed on the way up without also
+                # making a stowed wrist something this waypoint waits to arrive
+                # at. It is already there.
+                joint_targets={
+                    "lift": np.array([lift]),
+                    "arm": np.array([0.0]),
+                },
+            ),
+            Waypoint(
+                position=position,
+                wrist_pitch=pitch,
+                gripper_open=True,
+                label="unstow",
+                joint_targets={
+                    "lift": np.array([lift]),
+                    "arm": np.array([0.0]),
+                    "wrist": np.array([0.0, pitch, 0.0]),
+                },
+            ),
+        ]
 
     def _pickup_grasp_point(self, pitch: float) -> np.ndarray | None:
         """Where to aim the tool to pick up the task's object.

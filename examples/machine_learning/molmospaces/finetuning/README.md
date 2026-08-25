@@ -106,7 +106,7 @@ not want a debugging session.
 
 ## Where the demonstrations come from
 
-**The scripted expert, procedurally** — `datagen_configs.py` +
+**The simple_ik expert, procedurally** — `datagen_configs.py` +
 `generate_dataset.py`. MolmoSpaces' data generation pipeline samples tasks
 procedurally (pick a house, pick an object, place the robot, plan, roll out), so
 it is unbounded and drawn from the training splits. The benchmark's own 1000
@@ -119,7 +119,7 @@ python -m molmo_spaces.data_generation.main \
 ```
 
 Each is a MolmoSpaces datagen config with three substitutions — Stretch's robot,
-cameras and scripted expert — and the task class, sampler and success criteria
+cameras and simple_ik expert — and the task class, sampler and success criteria
 left alone, because those are what make the data comparable to the benchmark.
 One thing beyond the substitution has to change: **where the robot is placed.**
 The samplers put a Franka within 0.7m of the target because that is a Franka's

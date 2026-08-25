@@ -1,5 +1,5 @@
 """
-Behaviour-cloning a Stretch policy from scratch, off the scripted expert.
+Behaviour-cloning a Stretch policy from scratch, off the simple_ik expert.
 
     collect.py   generated rollouts -> .npz shards
     dataset.py   the shard format, and the torch-side reader
