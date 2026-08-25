@@ -264,9 +264,15 @@ def fit_wrist(
 class StretchPoseSolver:
     """Solves Stretch's joints for a world tool pose, on a scratch copy of the robot.
 
-    Built the same way as `policies/kinematics.StretchReachSolver`: a private,
-    mesh-free copy of the robot attached to an empty scene, so a candidate pose
-    can be evaluated without disturbing the live simulation.
+    A private, mesh-free copy of the robot attached to an empty scene, so a
+    candidate pose can be evaluated without disturbing the live simulation.
+
+    Note this is *not* how `policies/kinematics.StretchReachSolver` works any
+    more: that one solves through `stretch4_kinematics` (Pinocchio) and keeps a
+    MuJoCo copy only long enough to measure the fixed offset between the two
+    models' base frames. This solver is still the MuJoCo-native one because it
+    exists to answer a different question -- what the *retarget* should do with a
+    Franka-authored pose -- and is not on the per-step policy path.
     """
 
     def __init__(self, robot_config: "BaseRobotConfig") -> None:

@@ -1,45 +1,76 @@
 """
-Reach solving for Stretch 4, on a scratch copy of the robot.
+Reach solving for Stretch 4, backed by `stretch4_kinematics` (Pinocchio).
 
-Stretch's manipulator is almost Cartesian, which makes reaching a much smaller
-problem than it is for a 7-DOF arm:
+Both halves of this module come from Hello Robot's own kinematics library rather
+than from a hand-rolled solver:
 
-    lift        moves the tool straight up
-    arm         extends the tool along the base's +x axis
-    wrist yaw   swings the tool laterally about +z
-    wrist pitch tips the approach axis from horizontal (+x) to straight down (-z)
-    wrist roll  spins the fingers about the approach axis
+    FK   `StretchKinematics.forward()`            -- full SE(3) pose of a frame
+    IK   `StretchKinematics.inverse_6dof_local()` -- 6-DOF pose IK about the base
 
-Position and approach direction therefore decouple almost completely: pitch and
-roll choose *how* to grasp, and the rest choose *where*. So this module fixes
-pitch and roll from the caller's chosen grasp style and solves the remaining
-degrees of freedom against a position-only Jacobian.
+The library models Stretch as six inverse-kinematic degrees of freedom -- base
+yaw, lift, telescoping arm, and the three wrist joints -- against a full 6-DOF
+target pose, which is square and therefore well posed. That is the important
+difference from what used to be here: a position-only damped least-squares
+descent over `lift + arm + wrist yaw` with the base held fixed.
 
-Which degrees of freedom those are depends on the grasp, and the reason is worth
-stating because it constrains everything the scripted policy can do. In a
-*horizontal* grasp the tool sticks out ahead of the wrist yaw axis, so yaw gives
-real lateral authority and `lift + arm + wrist yaw` is a square, well-conditioned
-3x3 system. In a *top-down* grasp the tool hangs directly beneath that axis, the
-lever arm collapses, and yaw stops moving the tool sideways at all -- the
-Jacobian goes singular in exactly the direction the solve needs. Stretch simply
-has no wrist-driven lateral freedom when reaching straight down; a real Stretch
-drives its base instead. So top-down solves add the two holonomic base slides,
-heavily weighted against so the base only creeps when nothing else will do.
+**Why the base yaw matters.** Stretch's arm extends along the base's +x axis and
+the wrist yaw swings the tool through a narrow lateral band. Measured on the
+compiled model, the set of points reachable at a 0.55-0.90m standoff spans only
+about +-0.25 rad of bearing off that axis: at 0.3 rad a position-only solve over
+`lift + arm + wrist yaw` finds 100% of targets, at 0.5 rad 70%, and at 0.785 rad
+none at all. A real Stretch does not stand still and stretch sideways -- it turns
+its base to point the arm. Letting the solver do the same is what makes targets
+off the axis reachable, and it is the single largest effect on whether a scripted
+grasp succeeds.
 
-Solving happens on a private, mesh-free copy of the robot (the same trick
-`MlSpacesKinematics` uses) so a candidate reach can be evaluated without
-disturbing the live simulation.
+**Grasp style pins pitch and roll, not yaw.** The tool's orientation factors
+exactly (verified against the model to 2e-16) as
+
+    R_tcp = Rz(base_yaw + wrist_yaw) @ Ry(wrist_pitch) @ Rx(wrist_roll)
+
+so a grasp style -- horizontal or top-down, plus a finger spin -- pins `Ry` and
+`Rx` and leaves exactly one free angle: the yaw the tool approaches along. That
+freedom has to be preserved. Pinning it as well makes the problem square in
+position alone -- three constraints against base yaw, lift and arm -- and
+measurably *worse* than the solver it replaces (75% against 100% on near-axis
+targets). Since `inverse_6dof_local` takes a fully determined pose, "free" is
+expressed by solving at several headings and keeping the first that converges,
+nominal bearing first. The solver then splits that heading between turning the
+base and turning the wrist, which is the redundancy Stretch actually has and the
+position-only formulation could not express.
+
+**The two models pivot about different points.** MuJoCo turns the base about the
+holonomic base body; Pinocchio turns it about the URDF root, ~7cm away. A solve
+that turns the base by `bt` therefore lands `|(I - Rz(bt)) @ offset|` from where
+it believes it is -- 14.6mm at a third of a radian, which silently exceeds a 15mm
+grasp tolerance. `_solve_at_yaw()` closes that by feeding the solved rotation
+back into the target and re-solving, and every solve is finally accepted only if
+it survives a round trip through this module's own FK.
+
+**Frame calibration.** The Pinocchio model is built from the Stretch URDF, while
+MolmoSpaces drives a MuJoCo model in which the robot hangs off a virtual
+holonomic base body (see `Stretch4Robot.add_robot_to_scene`). The two disagree by
+a fixed translation in the base frame -- measured at [+0.04075, 0, -0.0565]m,
+constant to zero variance over 200 random configurations. `_tcp_offset_in_base()`
+recovers it from the compiled MuJoCo model rather than hard-coding it, so a
+change to the MJCF cannot silently reintroduce a 7cm error into every grasp.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
+import pinocchio as pin
 from mujoco import MjSpec
 from scipy.spatial.transform import Rotation as R
+from stretch4_kinematics.kinematic_models.base_kinematic_models import StretchKinematics
+from stretch4_kinematics.state.joint_positions import StretchJointPositions
 
 from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
 
@@ -49,66 +80,141 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Wrist pitch that points the gripper's approach axis straight down, and the one
-# that points it horizontally along the base's +x. Verified by forward
-# kinematics on the compiled MJCF: pitch 1.57 gives an approach of (0, 0, -1),
-# pitch 0 gives (1, 0, 0).
+# that points it horizontally along the approach yaw. Verified by forward
+# kinematics: pitch pi/2 gives an approach of (0, 0, -1), pitch 0 gives (1, 0, 0)
+# in the frame the approach yaw defines.
 PITCH_TOP_DOWN = np.pi / 2
 PITCH_HORIZONTAL = 0.0
 
-# Column of `get_jacobian("gripper", ["base", "lift", "arm", "wrist"])` that each
-# named degree of freedom occupies. The base contributes (x, y, theta), lift and
-# the telescoping arm one each, and the wrist (yaw, pitch, roll).
-_DOF_COLUMN = {
-    "base_x": 0,
-    "base_y": 1,
-    "base_theta": 2,
-    "lift": 3,
-    "arm": 4,
-    "wrist_yaw": 5,
-}
+# How many times to re-solve while feeding the solved base rotation back into the
+# target. Three is generous; the correction is exact and settles on the second.
+_BASE_PIVOT_CORRECTION_PASSES = 3
 
-# Relative willingness to move each degree of freedom, as diagonal weights in a
-# weighted damped-least-squares step. Driving the base to fine-tune a grasp is a
-# last resort -- it is slow, and it invalidates the collision-free standoff the
-# benchmark episode was authored with -- so the slides are worth two orders of
-# magnitude less than the arm.
-_DOF_WEIGHT = {
-    "base_x": 0.01,
-    "base_y": 0.01,
-    "base_theta": 0.01,
-    "lift": 1.0,
-    "arm": 1.0,
-    "wrist_yaw": 1.0,
-}
+# The URDF/MJCF frame both models call the tool centre. It sits between the
+# fingertips, about 19mm ahead of them, so aiming it at an object's centre
+# straddles the object rather than butting the fingers against it.
+TCP_FRAME = "grasp_center_link"
 
-HORIZONTAL_REACH_DOFS = ("lift", "arm", "wrist_yaw")
-TOP_DOWN_REACH_DOFS = ("lift", "arm", "base_x", "base_y")
+# How far either side of the nominal approach the solver may rotate the grasp,
+# and how finely it samples that range.
+#
+# Grasp style pins the tool's pitch and roll, which leaves exactly one free
+# angle: the yaw it closes along. Pinning that too would make the problem square
+# in position alone -- three constraints against base yaw, lift and arm -- and
+# measurably worse than the position-only solver it replaces (75% against 100%
+# on near-axis targets). Leaving it free is what makes the sixth degree of
+# freedom worth having, and `inverse_6dof_local` takes a fully determined pose,
+# so "free" is expressed by solving at several yaws and keeping the first that
+# converges. The nominal bearing is tried first, so an unobstructed grasp still
+# closes straight along the line from the base to the object.
+APPROACH_YAW_SPREAD_RAD = np.pi / 3
+APPROACH_YAW_SAMPLES = 9
+
+
+def grasp_orientation(approach_yaw: float, wrist_pitch: float, wrist_roll: float) -> np.ndarray:
+    """World rotation matrix for a tool approaching along `approach_yaw`.
+
+    The factorisation this relies on is exact for Stretch, not an approximation:
+    `R_tcp = Rz(base_yaw + wrist_yaw) @ Ry(wrist_pitch) @ Rx(wrist_roll)`. So the
+    grasp style fixes the last two factors and the approach direction fixes the
+    first, with no residual freedom to resolve.
+    """
+    return (
+        R.from_euler("z", approach_yaw).as_matrix()
+        @ R.from_euler("y", wrist_pitch).as_matrix()
+        @ R.from_euler("x", wrist_roll).as_matrix()
+    )
+
+
+_TCP_OFFSET_CACHE: dict[tuple[str, str], np.ndarray] = {}
+
+
+def _tcp_offset_in_base(robot_config: "BaseRobotConfig") -> np.ndarray:
+    """Translation from the MuJoCo base body's TCP to the Pinocchio model's TCP.
+
+    MolmoSpaces poses the robot by the virtual holonomic base body that
+    `add_robot_to_scene` wraps around the URDF root, so MuJoCo's notion of "the
+    base" is offset from the URDF's. The offset is a pure translation in the base
+    frame (the rotations agree to machine precision) and is a constant of the
+    generated MJCF, so it is measured once per model and cached.
+
+    Measured rather than hard-coded: a change to the MJCF that moved the base
+    body would otherwise put a silent seven-centimetre error into every grasp.
+    """
+    key = (str(robot_config.robot_dir), robot_config.robot_namespace)
+    if key in _TCP_OFFSET_CACHE:
+        return _TCP_OFFSET_CACHE[key]
+
+    namespace = robot_config.robot_namespace
+    spec = MjSpec()
+    robot_config.robot_cls.add_robot_to_scene(
+        robot_config,
+        spec,
+        prefix=namespace,
+        pos=[0.0, 0.0, 0.0],
+        quat=[1.0, 0.0, 0.0, 0.0],
+        strip_meshes=True,
+    )
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    view = Stretch4RobotView(data, namespace)
+
+    reference = {"lift": np.array([0.6]), "arm": np.array([0.26]), "wrist": np.zeros(3)}
+    for group, value in reference.items():
+        view.get_move_group(group).joint_pos = value
+    mujoco.mj_kinematics(model, data)
+    mujoco_tcp = np.asarray(view.get_move_group("gripper").leaf_frame_to_world[:3, 3], dtype=float)
+
+    pinocchio_tcp = _kinematics().forward(
+        StretchJointPositions(
+            lift=float(reference["lift"][0]),
+            arm=float(reference["arm"][0]),
+            wrist_yaw=0.0,
+            wrist_pitch=0.0,
+            wrist_roll=0.0,
+        ),
+        TCP_FRAME,
+    ).translation
+
+    offset = np.asarray(pinocchio_tcp, dtype=float) - mujoco_tcp
+    log.debug(f"[stretch-kinematics] pinocchio-to-mujoco TCP offset in base frame: {offset}")
+    _TCP_OFFSET_CACHE[key] = offset
+    return offset
+
+
+@lru_cache(maxsize=1)
+def _kinematics():
+    """The library's solver, built once per process.
+
+    Constructing it parses the URDF and compiles two Pinocchio models, which is
+    far too expensive to repeat for every `StretchScriptedPolicy` -- and it is
+    stateless, so there is nothing to keep separate between them.
+    """
+    return StretchKinematics()
 
 
 class StretchReachSolver:
-    """Solves a subset of Stretch's joints to put the tool centre at a world point.
+    """Puts Stretch's tool centre at a world point, at a chosen grasp orientation.
 
-    Base *yaw* is always held: `franka_remapping/episode_overrides.py` already aimed the
-    base at the target, and re-aiming mid-reach would swing the whole arm through
-    the scene.
+    Stateless with respect to the simulation: every call takes the base pose it
+    should solve about, so a candidate reach can be evaluated without disturbing
+    anything.
     """
 
     def __init__(self, robot_config: "BaseRobotConfig") -> None:
-        spec = MjSpec()
-        robot_config.robot_cls.add_robot_to_scene(
-            robot_config,
-            spec,
-            prefix=robot_config.robot_namespace,
-            pos=[0.0, 0.0, 0.0],
-            quat=[1.0, 0.0, 0.0, 0.0],
-            strip_meshes=True,
-        )
-        self._model = spec.compile()
-        self._data = mujoco.MjData(self._model)
-        self._view = Stretch4RobotView(self._data, robot_config.robot_namespace)
+        self._kinematics = _kinematics()
+        self._namespace = robot_config.robot_namespace
+        self._offset = _tcp_offset_in_base(robot_config)
+
+        model = self._kinematics.model_ik
+        # BASE_ROTATE order: base_theta, lift, arm, wrist yaw/pitch/roll.
+        lower, upper = model.lowerPositionLimit, model.upperPositionLimit
         self._limits = {
-            group: self._view.get_move_group(group).joint_pos_limits
-            for group in ("lift", "arm", "wrist")
+            "lift": np.array([[lower[1], upper[1]]]),
+            "arm": np.array([[lower[2], upper[2]]]),
+            "wrist": np.array(
+                [[lower[3], upper[3]], [lower[4], upper[4]], [lower[5], upper[5]]]
+            ),
         }
 
     @property
@@ -116,10 +222,43 @@ class StretchReachSolver:
         """Per-group `(n, 2)` joint limit arrays for lift, arm and wrist."""
         return self._limits
 
+    # =========================================================================
+    # Forward kinematics
+    # =========================================================================
+
     def forward(self, configuration: dict[str, np.ndarray]) -> np.ndarray:
-        """World 4x4 pose of the tool centre for a `{group: joint_pos}` mapping."""
-        self._apply(configuration)
-        return self._view.get_move_group("gripper").leaf_frame_to_world
+        """World 4x4 pose of the tool centre for a `{group: joint_pos}` mapping.
+
+        Expressed in MolmoSpaces' base convention, so the result is directly
+        comparable to `robot_view.get_move_group("gripper").leaf_frame_to_world`.
+        """
+        base = np.asarray(configuration["base"], dtype=float).reshape(-1)
+        wrist = np.asarray(configuration["wrist"], dtype=float).reshape(-1)
+        pose_se3 = self._kinematics.forward(
+            StretchJointPositions(
+                base_x=float(base[0]),
+                base_y=float(base[1]),
+                base_theta=float(base[2]),
+                lift=float(np.asarray(configuration["lift"]).reshape(-1)[0]),
+                arm=float(np.asarray(configuration["arm"]).reshape(-1)[0]),
+                wrist_yaw=float(wrist[0]),
+                wrist_pitch=float(wrist[1]),
+                wrist_roll=float(wrist[2]),
+            ),
+            TCP_FRAME,
+        )
+
+        pose = np.eye(4)
+        pose[:3, :3] = pose_se3.rotation
+        # Undo the URDF-vs-holonomic-base offset so callers get the pose MuJoCo
+        # would report. The offset is fixed in the base frame, so it rotates with
+        # the base yaw rather than being subtracted in world axes.
+        pose[:3, 3] = pose_se3.translation - R.from_euler("z", base[2]).as_matrix() @ self._offset
+        return pose
+
+    # =========================================================================
+    # Inverse kinematics
+    # =========================================================================
 
     def solve(
         self,
@@ -128,184 +267,203 @@ class StretchReachSolver:
         wrist_pitch: float = PITCH_HORIZONTAL,
         wrist_roll: float = 0.0,
         seed: dict[str, np.ndarray] | None = None,
-        dofs: tuple[str, ...] | None = None,
-        max_base_travel: float = 0.35,
+        approach_yaw: float | None = None,
+        yaw_spread: float = APPROACH_YAW_SPREAD_RAD,
+        yaw_samples: int = APPROACH_YAW_SAMPLES,
         tolerance: float = 5e-3,
-        max_iterations: int = 80,
-        step_damping: float = 1e-5,
+        max_iterations: int = 200,
+        step_damping: float = 1e-6,
     ) -> dict[str, np.ndarray] | None:
         """Joint targets that put the tool centre at `target_position`.
 
         Args:
-            base_pose: 4x4 world pose the base starts at. Yaw is preserved; the
-                position may move if `dofs` includes the base slides.
+            base_pose: 4x4 world pose the base starts at. Its position is
+                preserved exactly -- the library's local IK has no base
+                translation, so a solve can re-aim the robot but never drive it
+                somewhere else.
             target_position: world xyz the tool centre should reach.
             wrist_pitch: approach tilt, `PITCH_HORIZONTAL` or `PITCH_TOP_DOWN`.
             wrist_roll: spin of the fingers about the approach axis.
             seed: starting configuration keyed by move group. Seeding from the
                 robot's current pose keeps successive solves continuous, which
                 matters because a phase-by-phase policy re-solves every step.
-            dofs: which degrees of freedom to solve over. Defaults to
-                `TOP_DOWN_REACH_DOFS` for a top-down pitch and
-                `HORIZONTAL_REACH_DOFS` otherwise -- see the module docstring.
-            max_base_travel: cap, in metres, on how far the solve may slide the
-                base from `base_pose`.
+            approach_yaw: world heading the tool should approach along. Defaults
+                to the bearing from the base to the target, which is the
+                direction a grasp closes along when the robot is facing its work.
+                This is the *nominal* heading: the solver tries it first and then
+                works outwards through `yaw_spread`.
+            yaw_spread: how far either side of the nominal heading the grasp may
+                rotate. Zero pins the approach exactly, which costs the solver
+                its one redundant degree of freedom.
+            yaw_samples: how many headings to try across that spread.
             tolerance: position error, in metres, that counts as solved.
-            max_iterations: give up after this many damped least-squares steps.
+            max_iterations: cap on CLIK iterations.
             step_damping: Levenberg-Marquardt damping.
 
         Returns:
             `{"base": (3,), "lift": (1,), "arm": (1,), "wrist": (3,)}`, or None if
-            the target could not be reached within `max_iterations`.
+            the target could not be reached.
         """
-        solution = self._solve_from(
-            base_pose,
-            target_position,
-            wrist_pitch,
-            wrist_roll,
-            seed,
-            dofs,
-            max_base_travel,
-            tolerance,
-            max_iterations,
-            step_damping,
-        )
-        if solution is not None or seed is None:
-            return solution
+        base_pose = np.asarray(base_pose, dtype=float)
+        base_xy = base_pose[:2, 3]
+        base_yaw = yaw_of_pose(base_pose)
+        target_position = np.asarray(target_position, dtype=float).reshape(3)
 
-        # Retry with the wrist straightened. Damped least squares only ever walks
-        # downhill, so a wrist that starts turned away from the target sits in a
-        # local minimum: the yaw column points the wrong way and the step pushes
-        # it further round, into its joint limit, rather than back through zero.
-        # Measured on a stowed Stretch (wrist yaw 3.14, the pose its own
-        # keyframes call "stow"), a seeded solve reaches 0 of 27 test targets and
-        # this retry reaches all 27. Lift and arm keep the caller's values so the
-        # retry stays as continuous as it can.
-        straightened = {key: np.array(value, dtype=float) for key, value in seed.items()}
-        straightened["wrist"] = np.array([0.0, wrist_pitch, wrist_roll])
-        return self._solve_from(
-            base_pose,
-            target_position,
-            wrist_pitch,
-            wrist_roll,
-            straightened,
-            dofs,
-            max_base_travel,
-            tolerance,
-            max_iterations,
-            step_damping,
+        # Into the base frame, where the library solves, then onto the URDF's
+        # notion of the tool centre.
+        to_target = target_position - np.array([base_xy[0], base_xy[1], 0.0])
+        local_target_nominal = (
+            R.from_euler("z", -base_yaw).as_matrix() @ to_target + self._offset
         )
 
-    def _solve_from(
+        nominal_yaw = (
+            float(np.arctan2(local_target_nominal[1], local_target_nominal[0]))
+            if approach_yaw is None
+            else float(approach_yaw) - base_yaw
+        )
+
+        configuration = None
+        for candidate_yaw in _approach_yaw_candidates(nominal_yaw, yaw_spread, yaw_samples):
+            configuration = self._solve_at_yaw(
+                to_target,
+                base_xy,
+                base_yaw,
+                candidate_yaw,
+                wrist_pitch,
+                wrist_roll,
+                seed,
+                max_iterations,
+                step_damping,
+                tolerance,
+            )
+            if configuration is not None:
+                break
+        if configuration is None:
+            return None
+
+        # The solve is only trustworthy if the pose it claims survives a round
+        # trip through this module's own FK, which is the one the caller will
+        # compare against. A converged CLIK that lands somewhere else means a
+        # frame or convention has drifted, and a silently wrong grasp is worse
+        # than a refused one.
+        achieved = self.forward(configuration)[:3, 3]
+        error = float(np.linalg.norm(achieved - target_position))
+        if error > tolerance:
+            log.debug(
+                f"[stretch-kinematics] rejected solve {error:.4f}m from target "
+                f"(tolerance {tolerance:.4f}m)"
+            )
+            return None
+        return configuration
+
+    def _solve_at_yaw(
         self,
-        base_pose: np.ndarray,
-        target_position: np.ndarray,
+        to_target: np.ndarray,
+        base_xy: np.ndarray,
+        base_yaw: float,
+        candidate_yaw: float,
         wrist_pitch: float,
         wrist_roll: float,
         seed: dict[str, np.ndarray] | None,
-        dofs: tuple[str, ...] | None,
-        max_base_travel: float,
-        tolerance: float,
         max_iterations: int,
         step_damping: float,
+        tolerance: float,
     ) -> dict[str, np.ndarray] | None:
-        """One damped least-squares descent from a single starting configuration."""
-        if dofs is None:
-            dofs = (
-                TOP_DOWN_REACH_DOFS
-                if abs(wrist_pitch - PITCH_TOP_DOWN) < 0.3
-                else HORIZONTAL_REACH_DOFS
+        """Solve at one approach heading, correcting for where the base pivots.
+
+        The two models turn the base about different points: MuJoCo about the
+        holonomic base body, Pinocchio about the URDF root, and
+        `_tcp_offset_in_base()` is the ~7cm between them. A solve that turns the
+        base by `bt` therefore lands `|(I - Rz(bt)) @ offset|` away from where it
+        thinks it does -- 14.6mm at a third of a radian, which quietly exceeds a
+        15mm grasp tolerance and was enough on its own to make this solver score
+        *worse* than the position-only one it replaces.
+
+        The correction is exact once `bt` is known, so this iterates: solve, feed
+        the base rotation back into where the target sits, solve again. It
+        converges immediately because each pass uses the true rotation from the
+        last, and the caller's round-trip check is what finally accepts it.
+        """
+        rotate_into_world = R.from_euler("z", -base_yaw).as_matrix() @ to_target
+        base_rotation = 0.0
+
+        for _ in range(_BASE_PIVOT_CORRECTION_PASSES):
+            local_target = (
+                rotate_into_world + R.from_euler("z", base_rotation).as_matrix() @ self._offset
             )
-        columns = [_DOF_COLUMN[dof] for dof in dofs]
-        weights = np.array([_DOF_WEIGHT[dof] for dof in dofs])
-
-        start_xy = np.asarray(base_pose[:2, 3], dtype=float)
-        configuration = self._seed(base_pose, seed, wrist_pitch, wrist_roll)
-        target_position = np.asarray(target_position, dtype=float)
-
-        for _ in range(max_iterations):
-            self._apply(configuration)
-            error = (
-                target_position - self._view.get_move_group("gripper").leaf_frame_to_world[:3, 3]
+            solution = self._solve_local(
+                local_target,
+                grasp_orientation(candidate_yaw, wrist_pitch, wrist_roll),
+                seed,
+                max_iterations,
+                step_damping,
+                tolerance,
             )
-            if np.linalg.norm(error) < tolerance:
-                return {key: value.copy() for key, value in configuration.items()}
+            if solution is None:
+                return None
+            if abs(solution.base_theta - base_rotation) < 1e-6:
+                break
+            base_rotation = solution.base_theta
 
-            jacobian = self._view.get_jacobian("gripper", ["base", "lift", "arm", "wrist"])
-            jacobian = jacobian[:3, columns]
-            weighted = jacobian * weights
-            step = weights * (
-                jacobian.T
-                @ np.linalg.solve(weighted @ jacobian.T + step_damping * np.eye(3), error)
-            )
-            configuration = self._integrate(configuration, dofs, step, start_xy, max_base_travel)
-
-        return None
-
-    def _seed(
-        self,
-        base_pose: np.ndarray,
-        seed: dict[str, np.ndarray] | None,
-        wrist_pitch: float,
-        wrist_roll: float,
-    ) -> dict[str, np.ndarray]:
-        yaw = float(np.arctan2(base_pose[1, 0], base_pose[0, 0]))
-        base = np.array([base_pose[0, 3], base_pose[1, 3], yaw])
-        if seed is None:
-            lift, arm, wrist_yaw = 0.6, 0.1, 0.0
-        else:
-            lift = float(np.asarray(seed["lift"]).reshape(-1)[0])
-            arm = float(np.asarray(seed["arm"]).reshape(-1)[0])
-            wrist_yaw = float(np.asarray(seed["wrist"]).reshape(-1)[0])
         return {
-            "base": base,
-            "lift": np.array([lift]),
-            "arm": np.array([arm]),
-            "wrist": np.array([wrist_yaw, wrist_pitch, wrist_roll]),
+            "base": np.array([base_xy[0], base_xy[1], base_yaw + solution.base_theta]),
+            "lift": np.array([solution.lift]),
+            "arm": np.array([solution.arm]),
+            "wrist": np.array([solution.wrist_yaw, solution.wrist_pitch, solution.wrist_roll]),
         }
 
-    def _integrate(
+    def _solve_local(
         self,
-        configuration: dict[str, np.ndarray],
-        dofs: tuple[str, ...],
-        step: np.ndarray,
-        start_xy: np.ndarray,
-        max_base_travel: float,
-    ) -> dict[str, np.ndarray]:
-        updated = {key: value.copy() for key, value in configuration.items()}
-        for dof, delta in zip(dofs, step):
-            if dof == "base_x":
-                updated["base"][0] += delta
-            elif dof == "base_y":
-                updated["base"][1] += delta
-            elif dof == "base_theta":
-                updated["base"][2] += delta
-            elif dof == "lift":
-                updated["lift"][0] = np.clip(updated["lift"][0] + delta, *self._limits["lift"][0])
-            elif dof == "arm":
-                updated["arm"][0] = np.clip(updated["arm"][0] + delta, *self._limits["arm"][0])
-            elif dof == "wrist_yaw":
-                updated["wrist"][0] = np.clip(
-                    updated["wrist"][0] + delta, *self._limits["wrist"][0]
+        local_target: np.ndarray,
+        local_rotation: np.ndarray,
+        seed: dict[str, np.ndarray] | None,
+        max_iterations: int,
+        step_damping: float,
+        tolerance: float,
+    ):
+        """One IK call about the current base pose, with the library's noise contained.
+
+        `inverse_6dof_local` reports non-convergence by printing to stdout and
+        then raising. Neither is usable from a policy that re-solves every step
+        at 15Hz, so the prints go to a throwaway buffer and the raise becomes the
+        `None` this module's callers already handle.
+        """
+        guess = StretchJointPositions(
+            base_x=0.0,
+            base_y=0.0,
+            base_theta=0.0,
+            lift=0.6 if seed is None else float(np.asarray(seed["lift"]).reshape(-1)[0]),
+            arm=0.1 if seed is None else float(np.asarray(seed["arm"]).reshape(-1)[0]),
+            wrist_yaw=0.0 if seed is None else float(np.asarray(seed["wrist"]).reshape(-1)[0]),
+            wrist_pitch=0.0 if seed is None else float(np.asarray(seed["wrist"]).reshape(-1)[1]),
+            wrist_roll=0.0 if seed is None else float(np.asarray(seed["wrist"]).reshape(-1)[2]),
+        )
+        target_pose = pin.SE3(np.asarray(local_rotation, dtype=float), np.asarray(local_target))
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return self._kinematics.inverse_6dof_local(
+                    target_frame=TCP_FRAME,
+                    target_pose=target_pose,
+                    q_guess=guess,
+                    max_iter=max_iterations,
+                    eps=min(tolerance, 1e-3),
+                    damp=step_damping,
                 )
+        except (ValueError, RuntimeError) as failure:
+            log.debug(f"[stretch-kinematics] IK did not converge: {failure}")
+            return None
 
-        travel = updated["base"][:2] - start_xy
-        distance = float(np.linalg.norm(travel))
-        if distance > max_base_travel:
-            updated["base"][:2] = start_xy + travel * (max_base_travel / distance)
-        return updated
 
-    def _apply(self, configuration: dict[str, np.ndarray]) -> None:
-        base = configuration["base"]
-        pose = np.eye(4)
-        pose[:2, 3] = base[:2]
-        pose[:3, :3] = R.from_euler("z", base[2]).as_matrix()
-        self._view.base.pose = pose
-        self._view.get_move_group("lift").joint_pos = configuration["lift"]
-        self._view.get_move_group("arm").joint_pos = configuration["arm"]
-        self._view.get_move_group("wrist").joint_pos = configuration["wrist"]
-        mujoco.mj_kinematics(self._model, self._data)
-        mujoco.mj_comPos(self._model, self._data)
+def _approach_yaw_candidates(nominal: float, spread: float, samples: int) -> list[float]:
+    """Approach headings to try, nominal first and then alternating outwards."""
+    if spread <= 0.0 or samples <= 1:
+        return [nominal]
+    offsets = np.linspace(0.0, spread, samples // 2 + 1)[1:]
+    candidates = [nominal]
+    for offset in offsets:
+        candidates += [nominal + offset, nominal - offset]
+    return candidates
 
 
 def yaw_of_pose(pose: np.ndarray) -> float:
