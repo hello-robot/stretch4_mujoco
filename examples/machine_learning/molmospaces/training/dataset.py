@@ -105,7 +105,7 @@ def build_dataset(
             to the network. Order is part of the trained model's interface.
         successful_only: keep only trajectories the task judged successful. This
             is the whole point of behaviour cloning off a partial expert -- the
-            25%-ish of episodes the scripted policy actually completes are the
+            25%-ish of episodes the simple_ik policy actually completes are the
             demonstrations; the rest are counter-examples.
 
     Returns:
@@ -279,7 +279,7 @@ class StretchBCDataset:
         """Per-dimension mean and standard deviation of states and actions.
 
         Standard deviations are floored: several action dimensions are constant
-        in a scripted demonstration (the wrist never rolls, for instance), and
+        in a simple_ik demonstration (the wrist never rolls, for instance), and
         dividing by their true zero deviation would produce NaNs that only show
         up much later as a policy that outputs garbage.
         """

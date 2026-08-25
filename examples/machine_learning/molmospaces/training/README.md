@@ -1,6 +1,6 @@
 # Behaviour cloning a Stretch 4 policy
 
-Fits a small network from scratch to the scripted expert's successful episodes.
+Fits a small network from scratch to the simple_ik expert's successful episodes.
 The other road — fine-tuning a pretrained VLA — is `../finetuning/`.
 
 ```

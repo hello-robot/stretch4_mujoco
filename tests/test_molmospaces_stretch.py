@@ -663,7 +663,7 @@ def test_robot_carries_a_chase_camera_for_the_benchmark_viewer(compiled_robot):
     """
     # A concrete subclass: the shared base declares no policy_config, so it is
     # not instantiable on its own.
-    from examples.machine_learning.molmospaces.configs import StretchScriptedEvalConfig
+    from examples.machine_learning.molmospaces.configs import StretchSimpleIKEvalConfig
     from examples.machine_learning.molmospaces.stretch.robot import CHASE_CAMERA
 
     model, _, _ = compiled_robot
@@ -678,7 +678,7 @@ def test_robot_carries_a_chase_camera_for_the_benchmark_viewer(compiled_robot):
     # Close enough to stay out of the walls of the room the robot works in.
     assert np.linalg.norm(camera.pos[:2]) < 1.2
 
-    assert StretchScriptedEvalConfig().viewer_cam_dict == {"camera": f"{NAMESPACE}{CHASE_CAMERA}"}
+    assert StretchSimpleIKEvalConfig().viewer_cam_dict == {"camera": f"{NAMESPACE}{CHASE_CAMERA}"}
 
 
 def test_episode_starts_stowed():

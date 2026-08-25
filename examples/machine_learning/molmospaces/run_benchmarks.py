@@ -54,8 +54,8 @@ log = logging.getLogger(__name__)
 # Policy selector -> how to pick an eval config for a given benchmark.
 POLICY_CHOICES = (
     "baseline",
-    "scripted",
-    "scripted_top_down",
+    "simple_ik",
+    "simple_ik_top_down",
     "bc",
     "molmobot",
     "dummy",
@@ -81,13 +81,13 @@ def eval_config_for(policy: str, benchmark_key: str) -> str:
     """The eval config class name to run `policy` on `benchmark_key`.
 
     'baseline' is the only selector that varies by benchmark: navigation needs a
-    path planner and everything else needs the scripted manipulator.
+    path planner and everything else needs the simple_ik manipulator.
     """
     if policy == "baseline":
         return DEFAULT_BASELINE_CONFIGS[benchmark_key]
     return {
-        "scripted": "StretchScriptedEvalConfig",
-        "scripted_top_down": "StretchScriptedTopDownEvalConfig",
+        "simple_ik": "StretchSimpleIKEvalConfig",
+        "simple_ik_top_down": "StretchSimpleIKTopDownEvalConfig",
         "bc": "StretchBCEvalConfig",
         "molmobot": "StretchMolmoBotEvalConfig",
         "dummy": "StretchDummyEvalConfig",
@@ -199,7 +199,7 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "--policy",
     type=click.Choice(POLICY_CHOICES),
     default="baseline",
-    help="'baseline' picks the scripted expert for manipulation and the A* planner "
+    help="'baseline' picks the simple_ik expert for manipulation and the A* planner "
     "for navigation; the others force one policy everywhere.",
 )
 @click.option(

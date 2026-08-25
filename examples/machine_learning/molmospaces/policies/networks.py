@@ -166,7 +166,7 @@ class StretchBCNet(nn.Module):
     behaviour cloner usable at 15Hz: a single-step policy has to be re-queried
     every 66ms and drifts whenever two nearby observations imply opposite motions
     (the classic pause-at-the-grasp failure), whereas a chunk commits to a short
-    trajectory the way the scripted teacher does.
+    trajectory the way the simple_ik teacher does.
     """
 
     def __init__(

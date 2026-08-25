@@ -10,7 +10,7 @@ episode retargeting into MolmoSpaces' override registry.
 Every config here is addressable from MolmoSpaces' own entry point, e.g.
 
     python molmo_spaces/evaluation/eval_main.py \\
-        examples.machine_learning.molmospaces.configs:StretchScriptedEvalConfig \\
+        examples.machine_learning.molmospaces.configs:StretchSimpleIKEvalConfig \\
         --benchmark_dir <dir> --no_wandb
 
 though `run_benchmarks.py` is the more convenient way in.
@@ -137,18 +137,18 @@ class Stretch4BenchmarkEvalConfig(JsonBenchmarkEvalConfig):
         self.use_passive_viewer = viewer_requested()
 
 
-class StretchScriptedEvalConfig(Stretch4BenchmarkEvalConfig):
-    """The scripted expert: baseline scores, and the teacher for BC data."""
+class StretchSimpleIKEvalConfig(Stretch4BenchmarkEvalConfig):
+    """The simple ik expert: baseline scores, and the teacher for BC data."""
 
     policy_config: StretchSimpleIKPolicyConfig = StretchSimpleIKPolicyConfig()
 
     @property
     def tag(self) -> str:
-        return "stretch4_scripted"
+        return "stretch4_simple_ik"
 
 
-class StretchScriptedTopDownEvalConfig(StretchScriptedEvalConfig):
-    """The scripted expert reaching straight down instead of side-on.
+class StretchSimpleIKTopDownEvalConfig(StretchSimpleIKEvalConfig):
+    """The simple ik expert reaching straight down instead of side-on.
 
     Worth running as an ablation on the pick-family benchmarks: top-down clears
     clutter better, but Stretch has to creep its base to correct lateral error
@@ -159,7 +159,7 @@ class StretchScriptedTopDownEvalConfig(StretchScriptedEvalConfig):
 
     @property
     def tag(self) -> str:
-        return "stretch4_scripted_top_down"
+        return "stretch4_simple_ik_top_down"
 
 
 class StretchNavEvalConfig(Stretch4BenchmarkEvalConfig):
@@ -259,13 +259,13 @@ class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):
 # needs a path planner rather than a reach planner, so it does not share the
 # manipulation baseline.
 DEFAULT_BASELINE_CONFIGS: dict[str, str] = {
-    "pick": "StretchScriptedEvalConfig",
-    "pnp": "StretchScriptedEvalConfig",
-    "pnp_next_to": "StretchScriptedEvalConfig",
-    "pnp_color": "StretchScriptedEvalConfig",
-    "open": "StretchScriptedEvalConfig",
-    "close": "StretchScriptedEvalConfig",
-    "door_opening": "StretchScriptedEvalConfig",
+    "pick": "StretchSimpleIKTopDownEvalConfig",
+    "pnp": "StretchSimpleIKTopDownEvalConfig",
+    "pnp_next_to": "StretchSimpleIKTopDownEvalConfig",
+    "pnp_color": "StretchSimpleIKTopDownEvalConfig",
+    "open": "StretchSimpleIKEvalConfig",
+    "close": "StretchSimpleIKEvalConfig",
+    "door_opening": "StretchSimpleIKEvalConfig",
     "nav_to_obj": "StretchNavEvalConfig",
 }
 

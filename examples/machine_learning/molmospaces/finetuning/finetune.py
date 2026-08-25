@@ -243,7 +243,7 @@ def dataset_statistics(summary: DatasetSummary) -> dict[str, list[float]]:
     would be a second source of truth for the same numbers.
 
     Standard deviations are floored, for the reason `training/dataset.py` gives:
-    several action dimensions are constant in a scripted demonstration, and
+    several action dimensions are constant in a simple_ik demonstration, and
     normalising by a true zero produces NaNs that only surface much later as a
     policy emitting garbage.
     """

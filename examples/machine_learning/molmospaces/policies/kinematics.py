@@ -20,7 +20,7 @@ about +-0.25 rad of bearing off that axis: at 0.3 rad a position-only solve over
 `lift + arm + wrist yaw` finds 100% of targets, at 0.5 rad 70%, and at 0.785 rad
 none at all. A real Stretch does not stand still and stretch sideways -- it turns
 its base to point the arm. Letting the solver do the same is what makes targets
-off the axis reachable, and it is the single largest effect on whether a scripted
+off the axis reachable, and it is the single largest effect on whether a simple_ik
 grasp succeeds.
 
 **Grasp style pins pitch and roll, not yaw.** The tool's orientation factors

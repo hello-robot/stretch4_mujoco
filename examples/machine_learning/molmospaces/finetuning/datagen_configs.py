@@ -2,7 +2,7 @@
 Stretch 4 configs for MolmoSpaces' own data generation pipeline.
 
 A released benchmark's 1000-2000 episodes are *fixed*, and they are the test
-set: cloning the scripted expert over them measures memorisation, and there are
+set: cloning the simple_ik expert over them measures memorisation, and there are
 only a few thousand of them either way.
 
 MolmoSpaces' data generation pipeline is the source both learners here use
@@ -19,7 +19,7 @@ which is what this module populates. `generate_dataset.py` is a friendlier way
 in, and does the same thing.
 
 Each config is a MolmoSpaces datagen config with three substitutions -- Stretch's
-robot, Stretch's cameras, Stretch's scripted expert -- plus the one thing that
+robot, Stretch's cameras, Stretch's simple_ik expert -- plus the one thing that
 genuinely has to change beyond that: **where the robot gets placed.** The
 samplers put a Franka within 0.7m of the target because that is the Franka's
 reach; Stretch's tool cannot come closer than 0.39m to its own base axis and
@@ -171,7 +171,7 @@ class StretchDataGenMixin:
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
 
-        # The scripted expert is a demonstrator, not a policy under test: noise on
+        # The simple_ik expert is a demonstrator, not a policy under test: noise on
         # its actions is noise on the demonstrations. MolmoSpaces disables it on
         # every path where a planner drives the robot (`eval_main.py`,
         # `evaluation_configs.py`, `json_eval_task_sampler.py`) but not on the

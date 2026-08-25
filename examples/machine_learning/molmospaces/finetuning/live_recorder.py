@@ -1,7 +1,7 @@
 """
 Record teleoperated Stretch episodes from the live simulator, in MolmoSpaces format.
 
-`generate_dataset.py` gets demonstrations from the scripted expert, which is
+`generate_dataset.py` gets demonstrations from the simple_ik expert, which is
 fast, unbounded and limited to what the expert can plan. This is the other
 source: a person driving the robot in `examples/molmo_environment.py`, writing
 the *same* on-disk format, so both feed the same trainers with no branching

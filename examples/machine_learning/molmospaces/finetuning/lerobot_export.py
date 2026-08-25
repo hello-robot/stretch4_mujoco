@@ -133,7 +133,7 @@ recorded action is a zeroed no-op rather than anything the policy chose --
 *absolute* planar position means the world origin rather than "stay put". Left
 alone it encodes a 25-metre tool displacement into the first frame of every
 episode, which is enough to move the mean of any statistic computed over the
-dataset. 1.0m is far beyond anything a 15Hz step can command (the scripted
+dataset. 1.0m is far beyond anything a 15Hz step can command (the simple_ik
 expert's own per-solve cap is 0.35m), so the test cannot fire on a real command.
 """
 

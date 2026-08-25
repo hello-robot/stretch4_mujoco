@@ -227,7 +227,7 @@ SUPPORTED_BENCHMARK_KEYS = tuple(key for key, b in BENCHMARKS.items() if b.suppo
 """The benchmarks a Stretch run sweeps by default. See `Benchmark.supported`."""
 
 # Task families whose success criterion is reached by driving rather than by
-# manipulating. `run_benchmarks.py` and the scripted policy branch on this.
+# manipulating. `run_benchmarks.py` and the simple ik policy branch on this.
 NAVIGATION_BENCHMARK_KEYS = ("nav_to_obj",)
 
 
