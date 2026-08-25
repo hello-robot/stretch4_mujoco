@@ -37,6 +37,7 @@ from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
 )
 from examples.machine_learning.molmospaces.stretch.episode_overrides import (  # noqa: E402
     REACH_BAND_M,
+    TCP_MIN_REACH_M,
     retarget_base_pose,
     stretch_home_init_qpos,
 )
@@ -277,3 +278,299 @@ def test_state_encoding_matches_the_move_groups(compiled_robot):
     state = encode_state(view.get_qpos_dict())
     assert state.shape == (STATE_DIM,)
     assert state.dtype == np.float32
+
+
+# =============================================================================
+# Live-sim adapter: the contract between the benchmark robot and the simulator
+# =============================================================================
+
+
+def test_live_camera_mapping_matches_the_trained_camera_system():
+    """The live sim must render the same MJCF cameras the policy trained on."""
+    from examples.machine_learning.molmospaces.live_policy import CAMERA_FOR_TRAINED_NAME
+    from examples.machine_learning.molmospaces.stretch.config import (
+        HEAD_CAMERA,
+        HEAD_CAMERA_MJCF_NAME,
+        WRIST_CAMERA,
+        WRIST_CAMERA_MJCF_NAME,
+    )
+
+    assert CAMERA_FOR_TRAINED_NAME[HEAD_CAMERA].camera_name_in_mjcf == HEAD_CAMERA_MJCF_NAME
+    assert CAMERA_FOR_TRAINED_NAME[WRIST_CAMERA].camera_name_in_mjcf == WRIST_CAMERA_MJCF_NAME
+
+
+def test_simulator_status_encodes_the_same_state_as_the_robot_view():
+    """`read_state` and `encode_state` must agree, or a checkpoint silently degrades.
+
+    They read the same seven numbers out of two unrelated data structures --
+    `StatusStretchJoints` in the live sim, `get_qpos_dict()` in the benchmark --
+    and nothing at runtime would notice if their orders diverged.
+    """
+    from types import SimpleNamespace
+
+    from examples.machine_learning.molmospaces.live_policy import read_state
+
+    def joint(position: float):
+        return SimpleNamespace(pos=position, vel=0.0, effort=0.0)
+
+    status = SimpleNamespace(
+        lift=joint(0.61),
+        arm=joint(0.23),
+        wrist_yaw=joint(0.31),
+        wrist_pitch=joint(1.57),
+        wrist_roll=joint(-0.2),
+        gripper_right_finger=joint(0.44),
+        gripper_left_finger=joint(0.42),
+    )
+    equivalent_qpos = {
+        "base": [1.0, 2.0, 0.5],  # present in the robot view, absent from the state
+        "lift": [0.61],
+        "arm": [0.23],
+        "wrist": [0.31, 1.57, -0.2],
+        "gripper": [0.44, 0.42],
+    }
+    assert np.allclose(read_state(status), encode_state(equivalent_qpos))
+
+
+def test_absolute_base_target_becomes_a_holonomic_velocity():
+    """The benchmark base takes a pose; the omniwheel base takes a body-frame twist."""
+    from types import SimpleNamespace
+
+    from examples.machine_learning.molmospaces.live_policy import (
+        MAX_BASE_SPEED_MPS,
+        MAX_BASE_TURN_RADPS,
+        apply_action,
+    )
+
+    commands: dict[str, object] = {"joints": {}, "base": None}
+
+    sim = SimpleNamespace(
+        _move_to=lambda actuator, value: commands["joints"].__setitem__(actuator.name, value),
+        base=SimpleNamespace(
+            set_velocity=lambda vx, vy, w: commands.__setitem__("base", (vx, vy, w))
+        ),
+    )
+    targets = {
+        "base": np.array([0.0, 0.0, 0.0]),
+        "lift": np.array([0.8]),
+        "arm": np.array([0.3]),
+        "wrist": np.array([0.1, 0.2, 0.3]),
+        "gripper": np.array([0.5, 0.5]),
+    }
+
+    # Facing +y, asked to return to the origin from 0.1m ahead of it: that is
+    # 0.1m *backwards* in the base's own frame, and nothing sideways. The yaw
+    # target is a quarter turn away, which over one second is faster than the
+    # base is allowed to spin, so it comes back clipped.
+    commanded = apply_action(
+        sim, targets, base_xytheta=np.array([0.0, 0.1, np.pi / 2]), control_period_s=1.0
+    )
+    forward, left, turn = commands["base"]
+    assert forward == pytest.approx(-0.1, abs=1e-6)
+    assert left == pytest.approx(0.0, abs=1e-6)
+    assert turn == pytest.approx(-MAX_BASE_TURN_RADPS)
+    assert commands["joints"]["lift"] == pytest.approx(0.8)
+    assert commanded["base_forward"] == pytest.approx(-0.1, abs=1e-6)
+
+    # Sideways, and slow enough to pass through unclipped: facing +x and asked
+    # to move to +0.2m in world y is 0.2m to the left over two seconds.
+    apply_action(
+        sim,
+        {**targets, "base": np.array([0.0, 0.2, 0.1])},
+        base_xytheta=np.array([0.0, 0.0, 0.0]),
+        control_period_s=2.0,
+    )
+    forward, left, turn = commands["base"]
+    assert forward == pytest.approx(0.0, abs=1e-6)
+    assert left == pytest.approx(0.1, abs=1e-6)
+    assert turn == pytest.approx(0.05, abs=1e-6)
+
+    # A target far enough away to imply an absurd speed is clipped, not obeyed.
+    apply_action(
+        sim,
+        {**targets, "base": np.array([50.0, 0.0, 0.0])},
+        base_xytheta=np.array([0.0, 0.0, 0.0]),
+        control_period_s=0.066,
+    )
+    assert commands["base"][0] == pytest.approx(MAX_BASE_SPEED_MPS)
+
+
+def test_trained_policy_serves_a_chunk_before_re_querying(tmp_path):
+    """One network call should cover `execute_chunk_steps` control steps."""
+    import torch
+
+    from examples.machine_learning.molmospaces.policies.checkpoint import TrainedPolicy
+    from examples.machine_learning.molmospaces.policies.networks import (
+        ACTION_DIM,
+        StretchBCNet,
+    )
+
+    chunk_size = 4
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "model_state_dict": StretchBCNet(num_cameras=2, chunk_size=chunk_size).state_dict(),
+            "camera_names": ["head_camera", "wrist_camera"],
+            "chunk_size": chunk_size,
+            "normalisation": {
+                "state_mean": np.zeros(STATE_DIM).tolist(),
+                "state_std": np.ones(STATE_DIM).tolist(),
+                "action_mean": np.zeros(ACTION_DIM).tolist(),
+                "action_std": np.ones(ACTION_DIM).tolist(),
+            },
+        },
+        checkpoint,
+    )
+
+    policy = TrainedPolicy.load(checkpoint, device="cpu")
+    images = {name: np.zeros((48, 64, 3), np.uint8) for name in policy.camera_names}
+    state = np.zeros(STATE_DIM, np.float32)
+    base = np.zeros(3)
+
+    calls = 0
+    original_predict = policy.predict_chunk
+
+    def counting_predict(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_predict(*args, **kwargs)
+
+    policy.predict_chunk = counting_predict
+    for _ in range(chunk_size * 2):
+        targets = policy.act(images, state, base)
+        assert set(targets) == {"base", "lift", "arm", "wrist", "gripper"}
+    assert calls == 2, f"expected one network call per chunk of {chunk_size}, got {calls}"
+
+    # A missing camera is an error, not a silently zero-filled input.
+    policy.reset()
+    with pytest.raises(KeyError):
+        policy.act({"head_camera": images["head_camera"]}, state, base)
+
+
+# =============================================================================
+# Viewer camera
+# =============================================================================
+
+
+class _FakeViewerCamera:
+    """Stands in for `viewer.cam`, which only exists once a window is open."""
+
+    type = None
+    trackbodyid = None
+    distance = None
+    azimuth = None
+    elevation = None
+
+
+class _FakeViewer:
+    def __init__(self) -> None:
+        self.cam = _FakeViewerCamera()
+
+
+def test_viewer_camera_follows_the_robot(compiled_robot):
+    """A large scene needs the camera on the robot, not on the whole model."""
+    from stretch4_mujoco.mujoco_server_passive import MujocoServerPassive
+
+    model, _, _ = compiled_robot
+    server = MujocoServerPassive.__new__(MujocoServerPassive)
+    server.mjmodel = model
+
+    viewer = _FakeViewer()
+    MujocoServerPassive._track_body_with_viewer_camera(server, viewer, f"{NAMESPACE}base")
+
+    assert viewer.cam.type == mujoco.mjtCamera.mjCAMERA_TRACKING
+    assert viewer.cam.trackbodyid == model.body(f"{NAMESPACE}base").id
+    assert viewer.cam.distance > 0
+    assert viewer.cam.elevation < 0, "the camera should look down at the robot"
+
+
+def test_viewer_camera_survives_an_unknown_body(compiled_robot):
+    """A bad body name must not stop the simulator from starting."""
+    from stretch4_mujoco.mujoco_server_passive import MujocoServerPassive
+
+    model, _, _ = compiled_robot
+    server = MujocoServerPassive.__new__(MujocoServerPassive)
+    server.mjmodel = model
+
+    viewer = _FakeViewer()
+    MujocoServerPassive._track_body_with_viewer_camera(server, viewer, "no_such_body")
+    assert viewer.cam.type is None, "the camera should be left at Mujoco's default"
+
+
+def test_robot_carries_a_chase_camera_for_the_benchmark_viewer(compiled_robot):
+    """MolmoSpaces' --viewer can only be aimed via a fixed MJCF camera.
+
+    Without one it keeps Mujoco's whole-model framing, which on a benchmark
+    house -- loaded in its "ceiling" variant -- is a sealed building seen from
+    tens of metres away with the robot invisible inside it.
+    """
+    # A concrete subclass: the shared base declares no policy_config, so it is
+    # not instantiable on its own.
+    from examples.machine_learning.molmospaces.configs import StretchScriptedEvalConfig
+    from examples.machine_learning.molmospaces.stretch.robot import CHASE_CAMERA
+
+    model, _, _ = compiled_robot
+    camera = model.camera(f"{NAMESPACE}{CHASE_CAMERA}")
+
+    # Mounted on the holonomic base, so it follows the robot's yaw as well as
+    # its position -- which a tracking free camera would not do.
+    assert model.body(camera.bodyid.item()).name == f"{NAMESPACE}base"
+    # Aimed at the robot rather than by a hand-computed quaternion.
+    assert camera.mode == mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODYCOM
+    assert model.body(camera.targetbodyid.item()).name == f"{NAMESPACE}stretch4"
+    # Close enough to stay out of the walls of the room the robot works in.
+    assert np.linalg.norm(camera.pos[:2]) < 1.2
+
+    assert StretchScriptedEvalConfig().viewer_cam_dict == {"camera": f"{NAMESPACE}{CHASE_CAMERA}"}
+
+
+def test_episode_starts_stowed():
+    """An unstowed spawn puts the gripper inside whatever holds the target.
+
+    The base pose is a 0.55-0.90m standoff and an unstowed tool sits 0.567m in
+    front of the base, so the two coincide. Measured over eight MB-Pick episodes
+    that spawned the robot interpenetrating the scene five times, by up to 19cm.
+    """
+    from examples.machine_learning.molmospaces.stretch.episode_overrides import (
+        stretch_home_init_qpos,
+    )
+
+    init_qpos = stretch_home_init_qpos()
+    assert init_qpos["arm"] == [0.0], "the arm must start retracted"
+    # Turned away from straight ahead, so the tool is not out in front at all.
+    assert abs(init_qpos["wrist"][0]) > 1.5
+    # And the stowed tool has to clear the nearest standoff the retarget allows.
+    assert TCP_MIN_REACH_M < REACH_BAND_M[0]
+
+
+def test_reach_solver_unwinds_a_stowed_wrist(robot_config):
+    """Damped least squares alone cannot turn the wrist back through zero.
+
+    A wrist that starts turned away from the target sits in a local minimum: the
+    yaw column points the wrong way, so the step drives it further round into
+    its joint limit. Since Stretch now spawns stowed, every episode's first
+    reach starts there, and the retry from a straightened wrist is what makes it
+    solvable at all.
+    """
+    from examples.machine_learning.molmospaces.policies.kinematics import PITCH_HORIZONTAL
+
+    solver = StretchReachSolver(robot_config)
+    base_pose = planar_pose(0.0, 0.0, 0.0)
+    target = np.array([0.7, 0.0, 0.8])
+    stowed = {
+        "lift": np.array([0.35]),
+        "arm": np.array([0.0]),
+        "wrist": np.array([3.14, -0.4, 0.0]),
+    }
+
+    # Descending from the stowed wrist alone gets nowhere...
+    assert (
+        solver._solve_from(
+            base_pose, target, PITCH_HORIZONTAL, 0.0, stowed, None, 0.0, 5e-3, 80, 1e-5
+        )
+        is None
+    )
+    # ...but `solve` retries from a straightened wrist and reaches the target.
+    solution = solver.solve(base_pose, target, wrist_pitch=PITCH_HORIZONTAL, seed=stowed)
+    assert solution is not None
+    assert np.linalg.norm(solver.forward(solution)[:3, 3] - target) < 6e-3

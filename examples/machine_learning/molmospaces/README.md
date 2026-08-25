@@ -24,11 +24,15 @@ policies/
   kinematics.py         reach solving
   scripted.py           the scripted expert (baseline + BC teacher)
   networks.py           the BC network and the action/state encoding
+  checkpoint.py         loading and running a checkpoint, robot-stack agnostic
   bc_policy.py          the trained policy, as a MolmoSpaces InferencePolicy
 training/
   collect.py            roll out the expert, keep what worked
   dataset.py            HDF5 + MP4 rollouts -> training shards
   train_bc.py           fit the network, write a checkpoint
+report.py               a finished run -> captioned video, telemetry, summary
+telemetry.py            live Rerun streaming and recording
+live_policy.py          run a checkpoint in the interactive sim
 ```
 
 ## Setup
@@ -106,6 +110,11 @@ and MP4s.
 
 Enough to show the harness works end to end and to rank the task families;
 far too few episodes to quote as a score. Run a few hundred for that.
+
+These were measured *before* the stowed-spawn fix described under
+[The episode](#the-episode), so the manipulation rows understate the current
+baseline: MB-Pick has since measured 3/8 (37.5%) over eight episodes, against
+2/8 on the same episodes beforehand. Re-run the sweep for current numbers.
 
 | benchmark     | episodes | success |
 | ------------- | -------- | ------- |
@@ -210,6 +219,17 @@ object poses, the instruction and the success criteria untouched:
   0.55–0.90m reach band. Yaw is recomputed to point the base's +x axis — the axis
   the arm extends along — at the target.
 
+Stretch starts each episode **stowed** (arm retracted, lift low, wrist turned
+back), and that is load-bearing rather than tidy. A benchmark base pose is a
+0.55–0.90m standoff from the target, and an unstowed Stretch already has its tool
+0.57m out in front of the base at working height — so the gripper would spawn
+exactly where the object is, which in practice means inside the counter, cabinet
+or cistern the object sits on, with the robot jammed and unable to move. Measured
+over the first eight MB-Pick episodes, an unstowed spawn was interpenetrating the
+scene in five of them by up to 19cm; stowed, that is one in eight (two in twelve
+over a longer sample). The residual cases are episodes whose authored base pose
+is tight for a robot of Stretch's footprint.
+
 ### What the kinematics allow
 
 Stretch's manipulator is nearly Cartesian, so reaching decomposes: wrist pitch
@@ -226,6 +246,113 @@ styles are not equivalent:
   they only creep when nothing else will do.
 
 Run `--policy scripted_top_down` to compare them.
+
+## Watching a policy, and keeping proof
+
+Three different questions, three answers.
+
+**Watch an evaluation as it happens.** `--viewer` launches MuJoCo's passive
+viewer for each episode:
+
+```bash
+python -m examples.machine_learning.molmospaces.run_benchmarks \
+    --benchmark pick --episodes 5 --viewer
+```
+
+It forces single-worker, since eight workers would open eight windows.
+Internally it sets `STRETCH_MOLMOSPACES_VIEWER=1`, which the eval config reads --
+`run_evaluation()` builds the config from a class and takes no override, so an
+environment variable is the only injection point it leaves open.
+
+The view is a chase camera mounted on the robot's base, because MolmoSpaces'
+`setup_viewer` will only aim the viewer at a *fixed MJCF camera*
+(`viewer_cam_dict["camera"]`). Left alone it keeps MuJoCo's default framing of
+the whole model, and since benchmark houses load in their **ceiling** variant,
+that is a sealed building photographed from ~70m away with the robot invisible
+inside it. `Stretch4Robot._add_chase_camera()` mounts the camera; the offset was
+picked by ray-casting to the robot across six episodes, which showed anything
+much beyond a metre behind the robot is inside a wall every time. Roughly one
+episode in six still ends up with something between the camera and the robot;
+press `[` / `]` in the viewer to cycle to another camera, or Esc for the free
+camera. Set `viewer_cam_dict = {"camera": "robot_0/camera_center_link"}` on your
+eval config for the robot's own egocentric view instead.
+
+**Export proof of a run.** `report.py` turns MolmoSpaces' raw output — JSON blobs
+in HDF5 and unlabelled per-camera MP4s — into artifacts someone else can look at
+without this repository:
+
+```bash
+# after the fact, on any run directory
+python -m examples.machine_learning.molmospaces.report eval_output/stretch4/<run>
+
+# or as part of the run
+python -m examples.machine_learning.molmospaces.run_benchmarks --episodes 5 --report
+```
+
+Per episode you get a `.mp4` with the cameras tiled side by side and every frame
+captioned with the step, the outcome and the language instruction, plus a `.csv`
+of per-step joint positions, commanded targets, tool pose and base pose. Per run
+you get `summary.md` and `summary.json`.
+
+**Watch training.** `train_bc.py` writes `<checkpoint>_curves.png`,
+`_history.csv` and `_history.json` beside the checkpoint, rewritten every epoch
+so a run still going — or one that died — can be inspected.
+
+## Running a checkpoint in the live sim
+
+`run_benchmarks.py` scores a checkpoint headlessly on fixed episodes.
+`live_policy.py` runs the same checkpoint in the sim you can watch and interfere
+with: the MuJoCo viewer, a MolmoSpaces house, and Stretch's *real* omniwheel base
+rather than the benchmark's virtual holonomic one.
+
+```bash
+# drive manually, then hit SPACE to hand over to the policy
+python -m examples.machine_learning.molmospaces.live_policy \
+    --checkpoint checkpoints/stretch_manip.pt --dataset procthor-10k --house-index 0
+
+# the bundled room scene, no house download, policy running from the start,
+# streaming to Rerun and recording to disk
+python -m examples.machine_learning.molmospaces.live_policy \
+    --checkpoint checkpoints/stretch_manip.pt --scene default --autostart \
+    --rerun --record runs/live_demo
+```
+
+The viewer camera follows the robot rather than framing the whole house — a
+procthor house is ~30m across and not centred on the origin, so MuJoCo's default
+framing leaves the robot a few pixels wide, or off screen. Orbiting and zooming
+still work; the camera keeps a fixed world heading as the base turns.
+`examples/molmo_environment.py` does the same, and takes `--no-follow-robot` if
+you would rather see the whole floorplan.
+
+SPACE toggles the policy; while it is off you keep the full keyboard teleop, so
+you can put the robot somewhere interesting and then hand over. `--rerun` opens a
+viewer with both camera feeds beside time-series of every joint and every
+command; `--record` writes the same telemetry to `telemetry.csv` and the frames
+to per-camera MP4s.
+
+### Why one checkpoint runs on both robots
+
+The two robots differ in their base and in nothing else the policy sees.
+`StatusStretchJoints` and the MolmoSpaces move groups report the same seven
+proprioception numbers in the same units — the simulator's `arm.pos` is the
+tendon length, which is the total telescoping extension the move group reports,
+and the finger positions are raw URDF joint angles in both. So
+`policies/checkpoint.py` owns loading, normalisation, chunking and decoding for
+both paths, and neither `bc_policy.py` nor `live_policy.py` does any of it
+itself.
+
+The base is the exception, and it is why `networks.py` encodes the base action as
+a *relative* step in the base's own frame rather than as a world pose. In the
+benchmark that step becomes a holonomic joint target; in the live sim
+`apply_action()` divides it by the control period and issues it as a body-frame
+velocity to the three omniwheels, clipped so a bad prediction cannot launch the
+robot across the house.
+
+Two mismatches remain, and both are visible in the code rather than papered over:
+the live sim renders the head camera at 1280×964 and the benchmark at the
+episode's resolution, so the 112×112 the network sees is squashed slightly
+differently; and the live base tracks a velocity command rather than snapping to
+a position target, so it lags the benchmark base by a control step or two.
 
 ## Known limitations
 
@@ -251,3 +378,7 @@ Run `--policy scripted_top_down` to compare them.
   there is well below the pick family.
 - **One Stretch per scene.** The move-group lookups use fixed names under a
   single `robot_0/` namespace.
+- **The live sim has no task and no score.** `live_policy.py` runs the policy and
+  shows you what it does; it does not judge success, because a MolmoSpaces house
+  loaded this way carries no task specification. Use `run_benchmarks.py` for
+  numbers and the live sim for seeing.

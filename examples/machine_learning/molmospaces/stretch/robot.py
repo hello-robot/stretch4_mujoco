@@ -58,6 +58,11 @@ log = logging.getLogger(__name__)
 # the holonomic base.
 STRETCH_ROOT_BODY = "stretch4"
 
+# Name of the third-person viewer camera `_add_chase_camera()` mounts on the
+# base. Prefixed with the robot namespace in the compiled model, so the full name
+# is "robot_0/chase_camera".
+CHASE_CAMERA = "chase_camera"
+
 # Move groups whose command mode is configurable via `robot_config.command_mode`.
 # The gripper is always absolute position: relative finger commands make grasp
 # force impossible to hold.
@@ -313,3 +318,40 @@ class Stretch4Robot(Robot):
 
         attach_frame = base_body.add_frame(pos=[0, 0, 0], quat=[1, 0, 0, 0])
         attach_frame.attach_body(robot_spec.body(STRETCH_ROOT_BODY), prefix, "")
+
+        cls._add_chase_camera(base_body, prefix)
+
+    @classmethod
+    def _add_chase_camera(cls, base_body: mujoco.MjsBody, prefix: str) -> None:
+        """Add an over-the-shoulder camera that rides the base, for the viewer.
+
+        MolmoSpaces' `--viewer` (`data_generation/pipeline.py:setup_viewer`) leaves
+        Mujoco's default free camera alone unless the experiment config names a
+        *fixed MJCF camera* in `viewer_cam_dict["camera"]`. That default frames
+        the whole model, and a benchmark house is loaded in its "ceiling"
+        variant -- so what you get is a sealed building photographed from 70m
+        away, with the robot invisible inside it.
+
+        A fixed camera is the only kind that hook accepts, so the robot carries
+        one. Mounting it on the holonomic base body means it follows the robot
+        everywhere, including the yaw, which a `mjCAMERA_TRACKING` free camera
+        would not do.
+
+        The offset is close on purpose, and that was measured rather than
+        guessed. Casting a ray from candidate camera positions to the robot
+        across six benchmark episodes, anything about 1.5m or more behind the
+        robot was inside a wall in *every* one of them -- the retargeted base
+        pose puts Stretch close to the surface it is working at, which usually
+        means its back is close to something. Everything within roughly a metre
+        had a clear view in five of the six; the sixth was blocked at every
+        offset tried, so some episodes will just show a wall.
+
+        `TARGETBODYCOM` aims the camera at the robot's centre of mass rather
+        than at a hand-computed quaternion, so the framing survives retuning the
+        offset.
+        """
+        camera = base_body.add_camera(name=f"{prefix}{CHASE_CAMERA}")
+        camera.pos = [-1.0, -0.45, 1.9]
+        camera.mode = mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODYCOM
+        camera.targetbody = f"{prefix}{STRETCH_ROOT_BODY}"
+        camera.fovy = 60.0

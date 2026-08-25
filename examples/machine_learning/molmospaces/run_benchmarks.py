@@ -40,6 +40,7 @@ from examples.machine_learning.molmospaces.benchmarks import (
 )
 from examples.machine_learning.molmospaces.configs import (
     DEFAULT_BASELINE_CONFIGS,
+    VIEWER_ENV_VAR,
     qualified_config_name,
 )
 
@@ -222,6 +223,18 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     default=None,
     help="Where to write results. Defaults to eval_output/stretch4/<timestamp>.",
 )
+@click.option(
+    "--viewer",
+    is_flag=True,
+    help="Watch the evaluation in MuJoCo's passive viewer. Forces --num-workers 1.",
+)
+@click.option(
+    "--report/--no-report",
+    "want_report",
+    default=False,
+    help="After each benchmark, write captioned review videos, per-episode telemetry "
+    "CSVs and a summary. See report.py, which can also be run separately.",
+)
 @click.option("--list", "list_only", is_flag=True, help="List the benchmarks and exit.")
 def main(
     benchmark_keys: tuple[str, ...],
@@ -232,6 +245,8 @@ def main(
     task_horizon_steps: int | None,
     alternate: str | None,
     output_dir: Path | None,
+    viewer: bool,
+    want_report: bool,
     list_only: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -265,6 +280,12 @@ def main(
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+    if viewer:
+        os.environ[VIEWER_ENV_VAR] = "1"
+        if num_workers != 1:
+            click.secho("--viewer forces --num-workers 1.", fg="yellow")
+            num_workers = 1
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(output_dir) if output_dir else Path("eval_output") / "stretch4" / timestamp
     output_root.mkdir(parents=True, exist_ok=True)
@@ -283,10 +304,27 @@ def main(
         for key in keys
     ]
 
+    if want_report:
+        _write_reports(results)
+
     results_path = output_root / "results.csv"
     write_results_csv(results, results_path)
     click.echo("\n" + format_results_table(results) + "\n")
     click.secho(f"Wrote {results_path}", fg="green")
+
+
+def _write_reports(results: list[BenchmarkResult]) -> None:
+    """Render review videos and telemetry for every benchmark that produced any."""
+    from examples.machine_learning.molmospaces.report import build_report
+
+    for result in results:
+        if result.error or not result.output_dir:
+            continue
+        try:
+            build_report(Path(result.output_dir))
+            click.secho(f"Report for {result.benchmark}: {result.output_dir}/report", fg="green")
+        except Exception as error:  # noqa: BLE001 - reporting must not sink the run
+            log.error(f"[report] {result.benchmark} failed: {type(error).__name__}: {error}")
 
 
 def _print_benchmark_listing(keys: list[str]) -> None:

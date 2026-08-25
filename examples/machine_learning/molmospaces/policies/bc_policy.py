@@ -3,33 +3,28 @@ The behaviour-cloned Stretch policy, as a MolmoSpaces `InferencePolicy`.
 
 This is the "learned policy" half of the benchmark story: `training/collect.py`
 records the scripted expert, `training/train_bc.py` fits `StretchBCNet` to it,
-and this class loads the resulting checkpoint and runs it inside the same
-evaluation harness the expert was scored in.
+and this class runs the resulting checkpoint inside the same evaluation harness
+the expert was scored in.
 
-The checkpoint is self-describing -- it carries the observation normalisation
-statistics, the camera names and the chunk size the network was trained with --
-so a policy config only has to name a file. That matters because a chunk-size or
-normalisation mismatch does not raise; it just produces a policy that moves
-smoothly and accomplishes nothing.
+Everything about loading and running the checkpoint lives in
+`policies/checkpoint.py`, which knows nothing about MolmoSpaces. This class is
+only the adapter: it pulls images and proprioception out of a MolmoSpaces
+observation and robot view, and hands back per-move-group targets. `live_policy.py`
+is the same adapter written against `Stretch4MujocoSimulator` instead, and the
+two share `TrainedPolicy` precisely so a checkpoint cannot behave differently in
+the benchmark than it does in the live sim.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
-from examples.machine_learning.molmospaces.policies.networks import (
-    ACTION_DIM,
-    IMAGE_SIZE,
-    STATE_DIM,
-    StretchBCNet,
-    decode_action,
-    encode_state,
-)
+from examples.machine_learning.molmospaces.policies.checkpoint import TrainedPolicy
+from examples.machine_learning.molmospaces.policies.networks import decode_action, encode_state
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.policy.base_policy import InferencePolicy, PolicyFactory
 from molmo_spaces.utils.function_utils import make_lenient
@@ -82,14 +77,7 @@ class StretchBCPolicy(InferencePolicy):
 
     def __init__(self, config: "MlSpacesExpConfig", task: "BaseMujocoTask" = None) -> None:
         super().__init__(config, task)
-        self._model: StretchBCNet | None = None
-        self._pending_chunk: list[np.ndarray] = []
-        self._camera_names: list[str] = list(config.policy_config.camera_names)
-        self._state_mean = np.zeros(STATE_DIM, dtype=np.float32)
-        self._state_std = np.ones(STATE_DIM, dtype=np.float32)
-        self._action_mean = np.zeros(ACTION_DIM, dtype=np.float32)
-        self._action_std = np.ones(ACTION_DIM, dtype=np.float32)
-        self._execute_steps = 1
+        self._policy: TrainedPolicy | None = None
         self.prepare_model(config.policy_config.checkpoint_path)
 
     # =========================================================================
@@ -97,102 +85,62 @@ class StretchBCPolicy(InferencePolicy):
     # =========================================================================
 
     def prepare_model(self, model_name: str | None = None) -> None:
-        checkpoint_path = model_name or self.config.policy_config.checkpoint_path
+        policy_config = self.config.policy_config
+        checkpoint_path = model_name or policy_config.checkpoint_path
         if not checkpoint_path:
             raise ValueError(
                 "StretchBCPolicy needs a checkpoint. Pass --checkpoint_path, or set "
-                "checkpoint_path on the policy config. Train one with "
-                "`python -m examples.machine_learning.molmospaces.training.train_bc`."
+                "checkpoint_path on the policy config."
             )
-        path = Path(checkpoint_path)
-        if path.is_dir():
-            path = path / "checkpoint.pt"
-        if not path.exists():
-            raise FileNotFoundError(f"No BC checkpoint at {path}")
-
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        # The checkpoint's camera list is authoritative unless the config named
-        # one explicitly: the network's per-camera trunks are positional, so
-        # feeding them in a different order silently degrades the policy.
-        self._camera_names = self._camera_names or list(checkpoint["camera_names"])
-        if len(self._camera_names) != len(checkpoint["camera_names"]):
-            raise ValueError(
-                f"Checkpoint was trained on {len(checkpoint['camera_names'])} cameras "
-                f"{checkpoint['camera_names']} but the config asks for {self._camera_names}."
-            )
-
-        self._model = StretchBCNet(
-            num_cameras=len(self._camera_names),
-            chunk_size=int(checkpoint["chunk_size"]),
-        )
-        self._model.load_state_dict(checkpoint["model_state_dict"])
-        self._model.to(self.config.policy_config.device).eval()
-
-        normalisation = checkpoint["normalisation"]
-        self._state_mean = np.asarray(normalisation["state_mean"], dtype=np.float32)
-        self._state_std = np.asarray(normalisation["state_std"], dtype=np.float32)
-        self._action_mean = np.asarray(normalisation["action_mean"], dtype=np.float32)
-        self._action_std = np.asarray(normalisation["action_std"], dtype=np.float32)
-
-        configured = self.config.policy_config.execute_chunk_steps
-        self._execute_steps = int(configured or self._model.chunk_size)
-        log.info(
-            f"[stretch-bc] loaded {path} | cameras={self._camera_names} "
-            f"| chunk={self._model.chunk_size} executing {self._execute_steps}"
+        self._policy = TrainedPolicy.load(
+            checkpoint_path,
+            device=policy_config.device,
+            camera_names=list(policy_config.camera_names) or None,
+            execute_chunk_steps=policy_config.execute_chunk_steps,
         )
 
     def reset(self) -> None:
-        self._pending_chunk = []
+        self._policy.reset()
 
     # =========================================================================
     # InferencePolicy
     # =========================================================================
 
-    def obs_to_model_input(self, obs) -> tuple[torch.Tensor, torch.Tensor]:
+    def obs_to_model_input(self, obs) -> tuple[dict[str, np.ndarray], np.ndarray]:
         observation = obs[0] if isinstance(obs, list) else obs
-        images = np.stack([_preprocess_image(observation[name]) for name in self._camera_names])
-        state = encode_state(self.task.env.current_robot.robot_view.get_qpos_dict())
-        normalised_state = (state - self._state_mean) / self._state_std
+        robot_view = self.task.env.current_robot.robot_view
+        images = {name: observation[name] for name in self._policy.camera_names}
+        return images, encode_state(robot_view.get_qpos_dict())
 
-        device = self.config.policy_config.device
-        return (
-            torch.from_numpy(images).unsqueeze(0).to(device),
-            torch.from_numpy(normalised_state).unsqueeze(0).to(device),
-        )
-
-    @torch.no_grad()
     def inference_model(self, model_input) -> np.ndarray:
         images, state = model_input
-        chunk = self._model(images, state)[0].cpu().numpy()
-        return chunk * self._action_std + self._action_mean
+        return self._policy.predict_chunk(images, state)
 
     def model_output_to_action(self, model_output: np.ndarray) -> dict[str, Any]:
-        self._pending_chunk = list(model_output[: self._execute_steps])
-        return self._decode(self._pending_chunk.pop(0))
+        return decode_action(model_output[0], self._base_xytheta())
 
     def get_action(self, observation) -> dict[str, Any]:
-        """Serve from the pending chunk, re-querying the network when it runs out."""
-        if self._pending_chunk:
-            return self._decode(self._pending_chunk.pop(0))
-        return super().get_action(observation)
+        """One step, served from the current action chunk.
 
-    def _decode(self, action: np.ndarray) -> dict[str, Any]:
+        This overrides `InferencePolicy.get_action`'s
+        obs -> input -> inference -> action template rather than filling it in,
+        because the template runs the network every step and the whole point of
+        predicting a chunk is not to. `TrainedPolicy.act` owns that bookkeeping
+        (and does it identically for the live sim); building the observation is
+        cheap enough to do on every step regardless of whether it gets used.
+        """
+        images, state = self.obs_to_model_input(observation)
+        return self._policy.act(images, state, self._base_xytheta())
+
+    def _base_xytheta(self) -> np.ndarray:
         base_pose = self.task.env.current_robot.robot_view.base.pose
-        base_xytheta = np.array(
+        return np.array(
             [base_pose[0, 3], base_pose[1, 3], np.arctan2(base_pose[1, 0], base_pose[0, 0])]
         )
-        return decode_action(action, base_xytheta)
 
     def get_info(self) -> dict:
         info = super().get_info()
         info["policy"] = "stretch_bc"
-        info["checkpoint_path"] = self.config.policy_config.checkpoint_path
+        info["checkpoint_path"] = str(self._policy.checkpoint_path)
+        info["chunk_size"] = self._policy.chunk_size
         return info
-
-
-def _preprocess_image(image: np.ndarray) -> np.ndarray:
-    """(H, W, 3) uint8 -> (3, IMAGE_SIZE, IMAGE_SIZE) float32 in [0, 1]."""
-    import cv2
-
-    resized = cv2.resize(np.asarray(image), (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
-    return np.transpose(resized.astype(np.float32) / 255.0, (2, 0, 1))
