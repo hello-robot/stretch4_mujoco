@@ -1,25 +1,19 @@
 """
-Run a MolmoBot checkpoint on Stretch natively, with no remapping.
+Run a MolmoBot checkpoint on Stretch natively.
 
-`franka_remapping/vla_policy.py` exists because a policy trained on a Franka
-emits Franka joint angles. MolmoBot does not have to: its action space is
-configured *by move group*
-(`MolmoBot/olmo/data/synthmanip_presets.py` -- `franka_joint` is
+A policy trained on a Franka emits Franka joint angles, and nothing here
+translates those. MolmoBot does not have to: its action space is configured *by
+move group* (`MolmoBot/olmo/data/synthmanip_presets.py` -- `franka_joint` is
 `arm(7), gripper(1)`, `RBY1_full` is seven groups totalling 29), and its
 MolmoSpaces evaluation policy hands back an action dict keyed by move group,
 which is exactly the shape Stretch's controllers already take.
 
 So a MolmoBot checkpoint fine-tuned on Stretch's own move groups drives Stretch
-directly. The retarget is not merely unnecessary, it would be harmful -- there is
-no Franka anywhere in the loop to retarget from.
+directly, in the numbers it was trained on.
 
     # a checkpoint fine-tuned with finetuning/finetune.py --trainer molmobot
     python -m examples.machine_learning.molmospaces.run_benchmarks \\
         --policy molmobot --checkpoint /path/to/checkpoint --benchmark pick
-
-    # the released Franka-space model instead -- that one *does* need the remap
-    python -m examples.machine_learning.molmospaces.run_benchmarks \\
-        --policy vla --vla-host localhost --vla-port 8000 --benchmark pick
 
 This module is a thin adapter, not a reimplementation. MolmoBot's own
 `SynthVLAPolicy` does the work: it buffers an `action_horizon`-step prediction,
@@ -63,7 +57,7 @@ Ten numbers over five groups, from `Stretch4RobotView`. Must be identical to
 `finetuning/finetune.STRETCH_ACTION_SPEC`, which is what a checkpoint gets
 trained against; a mismatch would unpack the model's output vector into the
 wrong joints, and every joint after the first wrong group would be silently
-misassigned. Asserted equal in `tests/test_franka_remapping.py`.
+misassigned. Asserted equal in `tests/test_stretch_finetuning.py`.
 """
 
 MOLMOBOT_MODULES = (
@@ -116,9 +110,9 @@ class StretchMolmoBotPolicyConfig(BasePolicyConfig):
     """
     Cameras to feed, in order.
 
-    Stretch's own two, which is the whole advantage of fine-tuning over
-    remapping: the model sees the cameras it was trained on, rather than a head
-    camera standing in for two Franka shoulder views.
+    Stretch's own two, which is the whole advantage of fine-tuning: the model
+    sees the cameras it was trained on, rather than a head camera standing in for
+    the two fixed shoulder views a DROID-trained model expects.
     """
 
     action_move_group_names: list[str] = list(STRETCH_ACTION_SPEC)
@@ -221,9 +215,6 @@ class StretchMolmoBotPolicy(BasePolicy):
             "it on PYTHONPATH:\n"
             "  git clone https://github.com/allenai/MolmoBot\n"
             "  export PYTHONPATH=$PYTHONPATH:/path/to/MolmoBot/MolmoBot\n"
-            "To run the *released* Franka-space model (allenai/MolmoBot-DROID) instead, "
-            "serve it with MolmoBot's `launch_scripts/serve_molmo.py` and use "
-            "`--policy vla`, which retargets its Franka joints onto Stretch.\n"
             "Tried: " + "; ".join(f"{name} ({error})" for name, error in errors.items())
         )
 

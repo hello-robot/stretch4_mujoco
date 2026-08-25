@@ -1,8 +1,9 @@
 """
 The behaviour-cloned Stretch policy, as a MolmoSpaces `InferencePolicy`.
 
-This is the "learned policy" half of the benchmark story: `training/collect.py`
-records the scripted expert, `training/train_bc.py` fits `StretchBCNet` to it,
+This is the "learned policy" half of the benchmark story:
+`finetuning/generate_dataset.py` records the scripted expert,
+`training/collect.py` shards it and `training/train_bc.py` fits `StretchBCNet`,
 and this class runs the resulting checkpoint inside the same evaluation harness
 the expert was scored in.
 

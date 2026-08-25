@@ -12,11 +12,7 @@ Run Stretch 4 on the eight MolmoSpaces benchmark evaluations.
     python -m examples.machine_learning.molmospaces.run_benchmarks \
         --policy bc --checkpoint checkpoints/stretch_pick.pt --benchmark pick
 
-    # a Franka-space VLA server (pi0.5, DreamZero, MolmoBot-DROID), remapped onto Stretch
-    python -m examples.machine_learning.molmospaces.run_benchmarks \
-        --policy vla --vla-host localhost --vla-port 8000 --benchmark pick
-
-    # a MolmoBot checkpoint fine-tuned on Stretch's own move groups -- no remapping
+    # a MolmoBot checkpoint fine-tuned on Stretch's own move groups
     python -m examples.machine_learning.molmospaces.run_benchmarks \
         --policy molmobot --checkpoint /path/to/checkpoint --benchmark pick
 
@@ -50,9 +46,6 @@ from examples.machine_learning.molmospaces.configs import (
     DEFAULT_BASELINE_CONFIGS,
     MOLMOBOT_ACTION_TYPE_ENV_VAR,
     VIEWER_ENV_VAR,
-    VLA_HOST_ENV_VAR,
-    VLA_PORT_ENV_VAR,
-    VLA_PROTOCOL_ENV_VAR,
     qualified_config_name,
 )
 
@@ -64,7 +57,6 @@ POLICY_CHOICES = (
     "scripted",
     "scripted_top_down",
     "bc",
-    "vla",
     "molmobot",
     "dummy",
 )
@@ -97,7 +89,6 @@ def eval_config_for(policy: str, benchmark_key: str) -> str:
         "scripted": "StretchScriptedEvalConfig",
         "scripted_top_down": "StretchScriptedTopDownEvalConfig",
         "bc": "StretchBCEvalConfig",
-        "vla": "StretchFrankaVLAEvalConfig",
         "molmobot": "StretchMolmoBotEvalConfig",
         "dummy": "StretchDummyEvalConfig",
     }[policy]
@@ -226,27 +217,6 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "episodes and hours of wall clock.",
 )
 @click.option(
-    "--vla-host",
-    type=str,
-    default=None,
-    help="Inference server host for --policy vla. Defaults to the policy config's (localhost).",
-)
-@click.option(
-    "--vla-port",
-    type=int,
-    default=None,
-    help="Inference server port for --policy vla.",
-)
-@click.option(
-    "--vla-protocol",
-    type=click.Choice(["openpi", "dreamzero"]),
-    default=None,
-    help="Websocket protocol the --policy vla server speaks. 'openpi' (the default) "
-    "sends the observation as-is and resets by reconnecting, which is what MolmoBot's "
-    "and openpi's servers expect; 'dreamzero' adds the `endpoint` field its server "
-    "routes on.",
-)
-@click.option(
     "--molmobot-action-type",
     type=click.Choice(["joint_pos_rel", "joint_pos"]),
     default=None,
@@ -292,9 +262,6 @@ def main(
     policy: str,
     checkpoint: str | None,
     episodes: int | None,
-    vla_host: str | None,
-    vla_port: int | None,
-    vla_protocol: str | None,
     molmobot_action_type: str | None,
     num_workers: int,
     task_horizon_steps: int | None,
@@ -333,21 +300,12 @@ def main(
         raise click.UsageError(
             "--policy molmobot needs --checkpoint. Fine-tune one with "
             "`python -m examples.machine_learning.molmospaces.finetuning.finetune "
-            "--rollouts <run> --trainer molmobot`, or use --policy vla to remap the "
-            "released Franka-space model."
+            "--rollouts <run> --trainer molmobot`."
         )
-    if policy != "vla" and (vla_host or vla_port or vla_protocol):
-        raise click.UsageError("--vla-host/--vla-port/--vla-protocol only apply to --policy vla.")
     if policy != "molmobot" and molmobot_action_type:
         raise click.UsageError("--molmobot-action-type only applies to --policy molmobot.")
     if molmobot_action_type:
         os.environ[MOLMOBOT_ACTION_TYPE_ENV_VAR] = molmobot_action_type
-    if vla_host:
-        os.environ[VLA_HOST_ENV_VAR] = vla_host
-    if vla_port:
-        os.environ[VLA_PORT_ENV_VAR] = str(vla_port)
-    if vla_protocol:
-        os.environ[VLA_PROTOCOL_ENV_VAR] = vla_protocol
 
     # MolmoSpaces renders off-screen through EGL; without this a headless run
     # fails inside the camera manager rather than at startup.

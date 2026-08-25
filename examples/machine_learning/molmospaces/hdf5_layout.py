@@ -1,9 +1,11 @@
 """
 The MolmoSpaces trajectory format, as a writer and a repair kit.
 
-MolmoSpaces' rollout format is the pivot of this whole package. Its data
-generation pipeline writes it, `lerobot_export.py` reads it, and -- the reason
-this module exists -- MolmoBot's trainer reads it *directly*:
+MolmoSpaces' rollout format is the pivot of everything downstream of a rollout,
+which is why this module sits above both consumers rather than inside either.
+Its data generation pipeline writes it, `finetuning/lerobot_export.py` and
+`training/dataset.py` read it, and -- the reason this module exists beyond its
+patterns and codecs -- MolmoBot's trainer reads it *directly*:
 `MolmoBot/olmo/data/synthmanip_dataset.py` opens `{data_path}/{split}/house_*/*.h5`
 and pulls `obs/agent/qpos`, `actions/joint_pos_rel` (falling back to
 `actions/joint_pos`), `obs_scene["task_description"]` and

@@ -58,6 +58,30 @@ log = logging.getLogger(__name__)
 # the holonomic base.
 STRETCH_ROOT_BODY = "stretch4"
 
+# MJCF camera -> the hardware camera it stands for. Only cameras that appear here
+# get their mounting rotation corrected; everything else is left as the URDF
+# placed it.
+HARDWARE_CAMERA_EQUIVALENTS: dict[str, str] = {
+    "camera_center_link": "cam_nav_rgb_se4_center",
+    "camera_left_link": "cam_nav_rgb_se4_left",
+    "camera_right_link": "cam_nav_rgb_se4_right",
+}
+"""
+Which MJCF cameras correspond to which `StretchCameras` members.
+
+The gripper cameras are deliberately absent: their hardware settings carry
+`rotate_number_of_times=0`, so there is nothing to correct and no entry to keep
+in step.
+"""
+
+# One `np.rot90` step is a quarter turn of the image, which is the same picture
+# as a quarter turn of the camera about its own optical axis -- in the opposite
+# direction, since rotating the camera one way rotates the scene the other.
+# Verified by rendering both and differencing: a +90 degree camera rotation
+# reproduces `np.rot90(image, -1)` to a mean absolute pixel difference of 0.003,
+# against 7.62 for the other sign.
+_IMAGE_QUARTER_TURN_TO_CAMERA_RAD = -np.pi / 2
+
 # Name of the third-person viewer camera `_add_chase_camera()` mounts on the
 # base. Prefixed with the robot namespace in the compiled model, so the full name
 # is "robot_0/chase_camera".
@@ -199,12 +223,69 @@ class Stretch4Robot(Robot):
         for key in list(robot_spec.keys):
             robot_spec.delete(key)
 
+        cls._orient_cameras_to_hardware_convention(robot_spec)
+
         # Both the robot spec and any MolmoSpaces house call their root default
         # class "main". Compiling a merged spec with two of them is fine, but
         # serialising it back out produces a second unnamed <default> block that
         # MuJoCo then refuses to read. Renaming is cosmetic -- elements hold a
         # pointer to their default, not its name.
         robot_spec.default.name = "stretch_main"
+
+    @classmethod
+    def _orient_cameras_to_hardware_convention(cls, robot_spec: MjSpec) -> None:
+        """Turn the head cameras upright, the way the robot's own driver does.
+
+        Stretch 4's head cameras are physically mounted rotated, and every
+        consumer of the real robot sees that undone before it sees pixels:
+        `StatusStretchCamera.get_camera_data()` applies
+        `np.rot90(data, rotate_number_of_times)` with `auto_rotate` defaulting to
+        True. The centre camera's setting is -1, a quarter turn clockwise.
+
+        Nothing was undoing it in simulation. The MJCF cameras come straight off
+        the URDF's physical mounting, and neither MolmoSpaces' camera manager nor
+        anything in this repository rotates the result -- so a policy trained on
+        generated data saw the head view a quarter turn away from what the same
+        policy meets on hardware. That is a sim-to-real break on its own, and it
+        also feeds rotated images to vision backbones pretrained on upright ones
+        and scrambles the left/right/above language grounding these tasks are
+        written in.
+
+        Correcting it on the camera rather than on the pixels means the render
+        comes out upright to begin with: no per-frame array work, depth and RGB
+        stay consistent, and every consumer of the model -- benchmark evaluation,
+        data generation, the live recorder, the viewer -- gets it without having
+        to know. The two are equivalent here because the render is square with a
+        symmetric field of view; on a non-square image they would not be, and
+        this would have to move back to the pixels.
+
+        The rotation is read from `StretchCameras` rather than restated, so the
+        simulator cannot drift away from the hardware convention.
+        """
+        from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+
+        cameras = {camera.name: camera for camera in robot_spec.cameras}
+        for mjcf_name, hardware_name in HARDWARE_CAMERA_EQUIVALENTS.items():
+            camera = cameras.get(mjcf_name)
+            if camera is None:
+                log.warning(
+                    f"[stretch] MJCF has no camera {mjcf_name!r}; its mounting rotation "
+                    "cannot be corrected and its view will be rotated relative to hardware."
+                )
+                continue
+
+            settings = StretchCameras[hardware_name].initial_camera_settings
+            quarter_turns = settings.rotate_number_of_times
+            if not quarter_turns:
+                continue
+
+            mounting = R.from_quat(np.asarray(camera.quat, dtype=float), scalar_first=True)
+            correction = R.from_euler("z", quarter_turns * _IMAGE_QUARTER_TURN_TO_CAMERA_RAD)
+            camera.quat = (mounting * correction).as_quat(scalar_first=True)
+            log.debug(
+                f"[stretch] {mjcf_name}: applied {quarter_turns} quarter turn(s) to match "
+                f"{hardware_name}'s auto_rotate convention"
+            )
 
     @classmethod
     def add_robot_to_scene(

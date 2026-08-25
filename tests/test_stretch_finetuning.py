@@ -20,7 +20,7 @@ pytest.importorskip("mujoco")
 pytest.importorskip("molmo_spaces")
 pytest.importorskip("h5py")
 
-from examples.machine_learning.molmospaces.finetuning import hdf5_layout  # noqa: E402
+from examples.machine_learning.molmospaces import hdf5_layout  # noqa: E402
 from examples.machine_learning.molmospaces.finetuning.live_recorder import (  # noqa: E402
     TRAINED_CAMERA_MJCF_NAMES,
     LiveDatasetRecorder,
@@ -32,6 +32,7 @@ from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
     HEAD_CAMERA_MJCF_NAME,
     WRIST_CAMERA,
     WRIST_CAMERA_MJCF_NAME,
+    Stretch4RobotConfig,
 )
 
 # =============================================================================
@@ -395,7 +396,6 @@ def test_molmobot_policy_says_how_to_install_molmobot():
     message = str(error.value)
     assert "git clone https://github.com/allenai/MolmoBot" in message
     assert "PYTHONPATH" in message
-    assert "--policy vla" in message, "should point at the remapping for the released model"
 
 
 def test_molmobot_eval_config_defaults_to_the_trained_action_type():
@@ -405,3 +405,84 @@ def test_molmobot_eval_config_defaults_to_the_trained_action_type():
     config = StretchMolmoBotEvalConfig()
     assert config.policy_config.action_type == MOLMOBOT_ACTION_TYPES[0] == "joint_pos_rel"
     assert config.tag == "stretch4_molmobot"
+
+
+# =============================================================================
+# The LeRobot export, and the datagen configs that feed it
+# =============================================================================
+
+
+def test_only_the_native_action_space_is_exportable():
+    """The Franka-space export is gone; nothing may quietly accept it again."""
+    from examples.machine_learning.molmospaces.finetuning.lerobot_export import ACTION_SPACES
+
+    assert ACTION_SPACES == ("stretch",)
+
+
+def test_datagen_configs_substitute_stretch_and_widen_the_standoff():
+    """Every registered datagen config must place the robot where Stretch works."""
+    from examples.machine_learning.molmospaces.finetuning import datagen_configs as configs
+    from examples.machine_learning.molmospaces.stretch.episode_overrides import REACH_BAND_M
+
+    for task, class_name in configs.DATAGEN_CONFIGS.items():
+        config = getattr(configs, class_name)()
+        assert isinstance(config.robot_config, Stretch4RobotConfig), task
+        assert type(config.camera_config).__name__ == "Stretch4CameraSystem", task
+        assert type(config.policy_config).__name__ == "StretchSimpleIKPolicyConfig", task
+        sampler = config.task_sampler_config
+        assert tuple(sampler.base_pose_sampling_radius_range) == tuple(REACH_BAND_M), task
+        assert sampler.robot_safety_radius == configs.STRETCH_BASE_SAFETY_RADIUS_M, task
+
+
+def test_export_feature_names_describe_one_gripper():
+    """Stretch has one commanded gripper DOF; the names must not imply two."""
+    from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
+        GRIPPER_CHANNEL_NAMES,
+        STRETCH_ACTION_NAMES,
+        STRETCH_STATE_NAMES,
+    )
+    from examples.machine_learning.molmospaces.policies.networks import ACTION_DIM, STATE_DIM
+
+    assert GRIPPER_CHANNEL_NAMES[0] == "stretch_gripper"
+    # The names are `policies/networks.py`'s encoding, so they have to be exactly
+    # as wide as it is or the dataset metadata lies.
+    assert len(STRETCH_STATE_NAMES) == STATE_DIM
+    assert len(STRETCH_ACTION_NAMES) == ACTION_DIM
+
+
+def test_implausible_base_commands_are_replaced_not_encoded():
+    """Step 0's recorded no-op base command is the world origin, not "stay put".
+
+    Left alone it encodes a 25-metre tool displacement into the first frame of
+    every episode. The threshold has to be well clear of any real command.
+    """
+    from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
+        IMPLAUSIBLE_BASE_COMMAND_M,
+    )
+
+    assert IMPLAUSIBLE_BASE_COMMAND_M > 0.35, "must not fire on a real base solve"
+    assert IMPLAUSIBLE_BASE_COMMAND_M < 5.0, "must still catch a zeroed no-op"
+
+
+def test_export_encoder_matches_the_bc_encoding():
+    """The export must not fork the encoding the BC trainer uses."""
+    from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
+        _StretchSpaceEncoder,
+    )
+    from examples.machine_learning.molmospaces.policies.networks import (
+        ACTION_DIM,
+        STATE_DIM,
+        encode_state,
+    )
+
+    encoder = _StretchSpaceEncoder()
+    qpos = {
+        "base": np.array([1.0, 2.0, 0.3]),
+        "lift": np.array([0.6]),
+        "arm": np.array([0.2]),
+        "wrist": np.array([0.1, 0.2, 0.3]),
+        "gripper": np.array([0.4, 0.4]),
+    }
+    assert encoder.state_dim == STATE_DIM
+    assert encoder.action_dim == ACTION_DIM
+    assert np.allclose(encoder.state(qpos), encode_state(qpos))

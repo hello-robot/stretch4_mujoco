@@ -4,8 +4,8 @@ Retarget a MolmoSpaces benchmark episode from its authoring robot onto Stretch 4
 Every episode in `molmospaces-bench-v1`/`-v2` was generated with a Franka Droid
 (65k episodes) or an RBY1 (40k), and freezes robot-specific facts into the JSON:
 a `robot.init_qpos` keyed by *that* robot's move groups, a `cameras` list of
-Franka-mounted extrinsics, and a `task.robot_base_pose` chosen so that robot's
-workspace covered the target.
+extrinsics mounted on that robot's bodies, and a `task.robot_base_pose` chosen so
+its workspace covered the target.
 
 MolmoSpaces has a hook for exactly this -- `EvalRuntimeParams.robot_override_fn`,
 invoked by `JsonEvalTaskSampler.__init__` after it has built the recorded camera
@@ -22,12 +22,10 @@ Three things get rewritten:
 
 The base pose is the only interesting one; see `retarget_base_pose()`.
 
-The override also *records* what it is about to overwrite, via
-`episode_frame.record()`. Rewriting the base pose and the start configuration is
-what makes the episode runnable, but those two numbers are also the frame a
-Franka-space policy's actions are expressed in -- so `action_remap.py` needs
-them, and this is the last moment they exist. Nothing else in the retarget
-depends on the recording, and a policy that does not care simply never reads it.
+This is scene and spawn adaptation, not a translation of the authoring robot's
+*actions*: nothing here converts one robot's joint vector into another's. Every
+policy path -- the scripted expert, a BC checkpoint, a MolmoBot fine-tune --
+drives Stretch's own move groups directly and goes through this same override.
 """
 
 import logging
@@ -35,8 +33,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from examples.machine_learning.molmospaces.franka_remapping import episode_frame
-from examples.machine_learning.molmospaces.franka_remapping.franka_arm import HOME_QPOS
 from examples.machine_learning.molmospaces.stretch.config import (
     Stretch4CameraSystem,
     Stretch4RobotConfig,
@@ -187,21 +183,20 @@ def _yaw_of(pose7: list[float]) -> float:
     return float(np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)))
 
 
-def _apply_stretch_overrides(
+def stretch_episode_override(
     episode_spec: EpisodeSpec,
     exp_config: "MlSpacesExpConfig",
 ) -> None:
-    """The retarget proper: cameras, start configuration, base pose.
+    """The registered `robot_override_fn`: cameras, start configuration, base pose.
 
-    Called by `stretch_episode_override()`, which is the registered hook. Split
-    out so the recording of the authoring arm's frame can bracket it.
+    See the module docstring.
     """
     episode_spec.robot.robot_name = "stretch4"
     episode_spec.robot.init_qpos = stretch_home_init_qpos()
 
-    # The recorded Franka cameras are mounted on bodies ("robot_0/fr3_link0",
-    # "robot_0/gripper/base") that do not exist in a Stretch scene, so they are
-    # replaced wholesale rather than adjusted.
+    # The recorded authoring-robot cameras are mounted on bodies
+    # ("robot_0/fr3_link0", "robot_0/gripper/base") that do not exist in a
+    # Stretch scene, so they are replaced wholesale rather than adjusted.
     #
     # This has to mutate the camera system in place rather than assign a fresh
     # one over `exp_config.camera_config`. `JsonEvalTaskSampler` keeps its own
@@ -216,52 +211,3 @@ def _apply_stretch_overrides(
     exp_config.camera_config.img_resolution = stretch_cameras.img_resolution
 
     retarget_base_pose(episode_spec.task)
-
-
-def stretch_episode_override(
-    episode_spec: EpisodeSpec,
-    exp_config: "MlSpacesExpConfig",
-) -> None:
-    """See the module docstring. Split so the recording reads in order."""
-    authoring_base_pose = episode_frame.pose_from_position_quaternion(
-        episode_spec.task["robot_base_pose"]
-    )
-    authoring_qpos = _authoring_arm_qpos(episode_spec)
-    authoring_robot = episode_spec.robot.robot_name
-
-    _apply_stretch_overrides(episode_spec, exp_config)
-
-    episode_frame.record(
-        episode_frame.FrankaEpisodeFrame(
-            base_pose=authoring_base_pose,
-            init_qpos=authoring_qpos,
-            stretch_base_pose=episode_frame.pose_from_position_quaternion(
-                episode_spec.task["robot_base_pose"]
-            ),
-            robot_name=authoring_robot,
-            metadata={
-                "source": "benchmark_episode",
-                "task_cls": episode_spec.task.get("task_cls"),
-                "house_index": getattr(episode_spec, "house_index", None),
-            },
-        )
-    )
-
-
-def _authoring_arm_qpos(episode_spec: EpisodeSpec) -> np.ndarray:
-    """The authoring arm's seven start joint angles, or the Franka's home pose.
-
-    An RBY1-authored episode keys `init_qpos` by that robot's two-armed move
-    groups, so there is no seven-vector to read; the Franka home pose stands in.
-    A nested `[[...]]` is accepted because `cap_robot_eval_override` writes the
-    arm entry that way and an episode may have been produced with it.
-    """
-    arm = episode_spec.robot.init_qpos.get("arm") if episode_spec.robot.init_qpos else None
-    values = np.asarray(arm, dtype=float).reshape(-1) if arm is not None else np.array([])
-    if values.size < 7:
-        log.info(
-            f"Episode's authoring robot {episode_spec.robot.robot_name!r} has no 7-joint arm "
-            "configuration to read; using the Franka home pose as the handover target."
-        )
-        return HOME_QPOS.copy()
-    return values[:7]

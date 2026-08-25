@@ -33,7 +33,7 @@ from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
 
 # Names of the two Stretch MJCF cameras this integration exposes to policies.
 # The benchmark episodes name Franka cameras ("wrist_camera", "exo_camera_1",
-# ...), which is one of the things `franka_remapping/episode_overrides.py` rewrites.
+# ...), which is one of the things `episode_overrides.py` rewrites.
 HEAD_CAMERA = "head_camera"
 WRIST_CAMERA = "wrist_camera"
 

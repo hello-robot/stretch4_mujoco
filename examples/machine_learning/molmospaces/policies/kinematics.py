@@ -187,7 +187,7 @@ def _kinematics():
     """The library's solver, built once per process.
 
     Constructing it parses the URDF and compiles two Pinocchio models, which is
-    far too expensive to repeat for every `StretchScriptedPolicy` -- and it is
+    far too expensive to repeat for every `StretchSimpleIKPolicy` -- and it is
     stateless, so there is nothing to keep separate between them.
     """
     return StretchKinematics()
