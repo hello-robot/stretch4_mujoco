@@ -12,17 +12,16 @@ Three trainers, and the choice decides what the data has to look like:
     rollouts `generate_dataset.py` produced.
 
     Better than that, MolmoBot's action space is configurable *by move group*
-    (`--action_move_groups`, `--camera_names`), so a Stretch fine-tune needs no
-    remapping either -- it can learn Stretch's own ten-dimensional move-group
-    action directly, and `SynthVLAPolicy` hands MolmoSpaces back an action dict
-    keyed by move group, which is exactly what Stretch's controllers take. The
-    Franka remapping in `../franka_remapping/` is for running a checkpoint that
-    was *trained* on a Franka action spec, like `allenai/MolmoBot-DROID`.
+    (`--action_move_groups`, `--camera_names`), so it learns Stretch's own
+    ten-dimensional move-group action directly, and `SynthVLAPolicy` hands
+    MolmoSpaces back an action dict keyed by move group, which is exactly what
+    Stretch's controllers take.
 
 `openpi` / `lerobot`
     These want a LeRobot dataset, so they take the output of
-    `lerobot_export.py`. `--action-space franka` is what makes a DROID-pretrained
-    pi0.5 checkpoint useful as a starting point; see that module.
+    `lerobot_export.py`. Its actions are Stretch's own ten numbers, so a
+    pretrained checkpoint contributes its vision and language weights but its
+    action head is re-learned; see that module.
 
 What this script actually does, in either case: check the data, do the two
 mechanical preparation steps MolmoBot needs (fill in the video paths MolmoSpaces'
@@ -87,8 +86,8 @@ STRETCH_CAMERA_NAMES = ["head_camera", "wrist_camera"]
 """
 Cameras to train on, in the order MolmoBot should take them.
 
-These are the names `Stretch4CameraSystem` records under, so they match both the
-generated rollouts and `franka_remapping/vla_policy.py`. `head_camera` is the
+These are the names `Stretch4CameraSystem` records under, so they match the
+generated rollouts. `head_camera` is the
 *centre* camera of Stretch 4's fixed three-camera head (MJCF
 `camera_center_link`, 1.62m up, pitched 35 degrees down); the left/right stereo
 pair look 47 degrees down and are not used.
@@ -107,19 +106,6 @@ key is absent. Both are written by the generated rollouts and by
 `live_recorder.py`, so either works -- but the serving side has to be told the
 same one, or the arm treats absolute targets as deltas.
 """
-
-IK_ERROR_REFUSAL_M = 0.02
-"""
-Mean virtual-Franka IK error above which a `franka`-space dataset is rejected.
-
-20mm. Below that the Franka-space encoding is reproducing the recorded Stretch
-motions (a clean export measures well under 1mm); above it, a material fraction
-of the demonstrations were in poses the virtual arm could not reach, so the
-exported actions describe motions that did not happen. Only applies to the
-LeRobot trainers -- a `molmobot` fine-tune never goes through a Franka frame,
-which is the main reason to prefer it. `--force` overrides.
-"""
-
 
 # =============================================================================
 # Reading what is on disk
@@ -142,23 +128,8 @@ class DatasetSummary:
     fps: float
     video_keys: list[str] = field(default_factory=list)
     tasks: list[str] = field(default_factory=list)
-    mean_ik_error_m: float = 0.0
     splits: dict[str, int] = field(default_factory=dict)
     """Houses per split. MolmoSpaces datasets only."""
-
-    @property
-    def frame_source(self) -> str:
-        """Which `FRAME_SOURCES` value an evaluation of this dataset must use.
-
-        A `franka`-space LeRobot export encodes tool poses relative to the
-        virtual arm mounted on Stretch itself, so a model fine-tuned on it emits
-        actions in that frame and has to be evaluated in it. A MolmoSpaces
-        dataset in Stretch's own move groups never goes through a Franka frame,
-        so the question does not arise -- and that is the point of preferring it.
-        """
-        if self.kind == "molmospaces":
-            return "n/a (native Stretch move groups; no remapping)"
-        return "mast" if self.action_space == "franka" else "n/a"
 
 
 def read_lerobot_dataset(root: Path) -> DatasetSummary:
@@ -188,7 +159,6 @@ def read_lerobot_dataset(root: Path) -> DatasetSummary:
             key for key, feature in info["features"].items() if feature.get("dtype") == "video"
         ],
         tasks=export.get("tasks", []),
-        mean_ik_error_m=float(export.get("mean_shadow_ik_error_m", 0.0)),
     )
 
 
@@ -221,7 +191,7 @@ def prepare_molmospaces_dataset(
         link: symlink houses into the split rather than copying them.
         fps: frame rate the rollouts were recorded at, for the report.
     """
-    from examples.machine_learning.molmospaces.finetuning.hdf5_layout import (
+    from examples.machine_learning.molmospaces.hdf5_layout import (
         arrange_train_val_split,
         count_trajectories,
         ensure_sensor_data_paths,
@@ -338,10 +308,7 @@ def write_trainer_config(
             "learning_rate": learning_rate,
         },
         "output_dir": str(output_dir),
-        "evaluation": {
-            "frame_source": summary.frame_source,
-            "command": _evaluation_command(summary, trainer),
-        },
+        "evaluation": {"command": _evaluation_command(summary, trainer)},
     }
     if summary.kind == "molmospaces":
         config["action"] = {
@@ -458,9 +425,16 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
             "python -m examples.machine_learning.molmospaces.run_benchmarks "
             "--policy molmobot --checkpoint <checkpoint> --benchmark pick"
         )
+    # There is no `--policy` for an openpi or LeRobot checkpoint: those trainers
+    # serve their own inference protocols, and the policy adapter that used to
+    # bridge one (`--policy vla`) only existed to remap Franka-space actions and
+    # went with the rest of the remapping. A checkpoint trained on Stretch's move
+    # groups needs a MolmoSpaces `InferencePolicy` that speaks its trainer's
+    # protocol -- `policies/molmobot_policy.py` is the pattern to copy.
     return (
-        "python -m examples.machine_learning.molmospaces.run_benchmarks "
-        "--policy vla --vla-host localhost --vla-port 8000 --benchmark pick"
+        f"(no scorer in this repo for a {trainer} checkpoint -- add an "
+        "InferencePolicy for its serving protocol, as policies/molmobot_policy.py "
+        "does for MolmoBot, or fine-tune with --trainer molmobot instead)"
     )
 
 
@@ -503,7 +477,9 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     default=None,
     help="Checkpoint to fine-tune from. Defaults to '8b' for molmobot (its base "
     "model) and 'pi05_droid' otherwise. Pass a MolmoBot checkpoint path, or "
-    "'allenai/MolmoBot-DROID' to start from the released Franka model.",
+    "'allenai/MolmoBot-DROID' to start from the released Franka-space model -- its "
+    "vision and language weights carry over, its action head is re-learned on "
+    "Stretch's move groups.",
 )
 @click.option(
     "--output-dir",
@@ -540,12 +516,6 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     default=False,
     help="Execute the training command instead of printing it. Off by default.",
 )
-@click.option(
-    "--force",
-    is_flag=True,
-    help=f"Launch even if a franka-space dataset's virtual-arm IK error exceeds "
-    f"{IK_ERROR_REFUSAL_M * 1000:.0f}mm.",
-)
 def main(
     rollouts: Path | None,
     dataset: Path | None,
@@ -561,7 +531,6 @@ def main(
     steps: int,
     learning_rate: float,
     run: bool,
-    force: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -579,7 +548,7 @@ def main(
     if trainer != "molmobot" and dataset is None:
         raise click.UsageError(
             f"--trainer {trainer} needs a LeRobot dataset, so pass --dataset. Build one with "
-            "`generate_dataset.py --action-space franka`."
+            "`generate_dataset.py`."
         )
 
     base_checkpoint = base_checkpoint or ("8b" if trainer == "molmobot" else "pi05_droid")
@@ -591,7 +560,6 @@ def main(
     output_dir = Path(output_dir) if output_dir else summary.root.parent / "checkpoints"
 
     _print_summary(summary)
-    _refuse_bad_encoding(summary, force)
 
     config_path = write_trainer_config(
         summary=summary,
@@ -629,13 +597,6 @@ def main(
     click.echo("")
     click.secho("Then score the checkpoint:", bold=True)
     click.echo("  " + _evaluation_command(summary, trainer))
-    if summary.kind == "lerobot" and summary.action_space == "franka":
-        click.echo(
-            f"  ... with the policy config's frame_source set to {summary.frame_source!r}, "
-            "the frame this dataset was exported in.\n"
-            "      (StretchFrankaVLAEvalConfig.policy_config.frame_source; see "
-            "franka_remapping/action_remap.FRAME_SOURCES.)"
-        )
     if summary.kind == "molmospaces":
         click.echo(
             f"  ... serving it with `--action-type {action_type}`, matching what it was "
@@ -680,25 +641,6 @@ def _print_summary(summary: DatasetSummary) -> None:
         f"  images: {', '.join(summary.video_keys)}\n"
         f"  {len(summary.tasks)} distinct instructions"
     )
-    if summary.action_space == "franka":
-        click.echo(f"  virtual-arm IK error: {summary.mean_ik_error_m * 1000:.2f}mm mean")
-
-
-def _refuse_bad_encoding(summary: DatasetSummary, force: bool) -> None:
-    if summary.kind != "lerobot" or summary.action_space != "franka":
-        return
-    if summary.mean_ik_error_m <= IK_ERROR_REFUSAL_M:
-        return
-    message = (
-        f"This dataset's Franka-space encoding has a mean IK error of "
-        f"{summary.mean_ik_error_m * 1000:.0f}mm, over the "
-        f"{IK_ERROR_REFUSAL_M * 1000:.0f}mm limit. The exported actions are not the motions "
-        "that were recorded. Re-export with --action-space stretch, or use --trainer "
-        "molmobot, which trains on Stretch's move groups and needs no Franka frame at all."
-    )
-    if not force:
-        raise click.ClickException(message + " Pass --force to launch anyway.")
-    click.secho("WARNING: " + message, fg="yellow")
 
 
 if __name__ == "__main__":

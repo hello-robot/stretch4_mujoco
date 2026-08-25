@@ -10,7 +10,7 @@ downstream.
     python -m examples.molmo_environment --dataset procthor-10k --house-index 0 \\
         --keyboard --record_dataset data/teleop_pick --record-task "pick up the mug"
 
-Everything about the format is in `hdf5_layout.py`; this module is about the two
+Everything about the format is in `../hdf5_layout.py`; this module is about the two
 things live recording has to decide for itself.
 
 **What counts as the action.** A teleop session has no commanded target vector
@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-from examples.machine_learning.molmospaces.finetuning.hdf5_layout import (
+from examples.machine_learning.molmospaces.hdf5_layout import (
     encode_json_blob,
     encode_video_path,
     video_filename,
@@ -59,7 +59,7 @@ The camera names a trained policy uses, and the MJCF cameras behind them.
 
 Duplicated from `stretch/config.py`'s `HEAD_CAMERA_MJCF_NAME` and
 `WRIST_CAMERA_MJCF_NAME` -- and asserted equal to them in
-`tests/test_franka_remapping.py` -- so that recording a dataset does not drag
+`tests/test_stretch_finetuning.py` -- so that recording a dataset does not drag
 the MolmoSpaces dependency into `examples/molmo_environment.py`, which runs
 happily on a bare `--scene`.
 
@@ -157,8 +157,8 @@ class LiveDatasetRecorder:
 
     The output is laid out exactly as a generated run -- `house_teleop_NNN/`
     holding `trajectories.h5` plus one MP4 per camera per episode -- so
-    `hdf5_layout.arrange_train_val_split()`, `lerobot_export.py` and MolmoBot's
-    trainer all read it without knowing where it came from.
+    `arrange_train_val_split()`, `lerobot_export.py` and MolmoBot's trainer all
+    read it without knowing where it came from.
 
     Args:
         output_dir: root to write the rollout directory under.

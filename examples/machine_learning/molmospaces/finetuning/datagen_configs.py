@@ -1,13 +1,13 @@
 """
 Stretch 4 configs for MolmoSpaces' own data generation pipeline.
 
-`training/collect.py` already produces demonstrations, by rolling the scripted
-expert over the 1000-2000 *fixed* episodes of a released benchmark. That is the
-right data for measuring imitation and the wrong data for fine-tuning a VLA:
-those same episodes are the test set, and there are only a few thousand of them.
+A released benchmark's 1000-2000 episodes are *fixed*, and they are the test
+set: cloning the scripted expert over them measures memorisation, and there are
+only a few thousand of them either way.
 
-MolmoSpaces' data generation pipeline is the other source. It samples tasks
-procedurally -- pick a house, pick an object, place the robot, plan, roll out --
+MolmoSpaces' data generation pipeline is the source both learners here use
+instead -- `training/` for behaviour cloning, `finetuning/` for a VLA. It samples
+tasks procedurally -- pick a house, pick an object, place the robot, plan, roll out --
 so it is unbounded, drawn from the training splits, and can be pointed at
 `procthor-10k`, `procthor-objaverse` or `holodeck-objaverse`. Its entry point
 resolves config classes out of a registry by name:
@@ -25,7 +25,7 @@ samplers put a Franka within 0.7m of the target because that is the Franka's
 reach; Stretch's tool cannot come closer than 0.39m to its own base axis and
 cannot go past 0.99m, so a Franka standoff is frequently a pose Stretch cannot
 work from at all. `STRETCH_PLACEMENT` widens those constraints to the same band
-`franka_remapping/episode_overrides.py` retargets benchmark episodes into, so
+`stretch/episode_overrides.py` retargets benchmark episodes into, so
 generated and retargeted episodes present the robot with the same geometry.
 """
 
@@ -34,8 +34,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from examples.machine_learning.molmospaces.franka_remapping.episode_overrides import REACH_BAND_M
-from examples.machine_learning.molmospaces.policies.scripted import StretchScriptedPolicyConfig
+from examples.machine_learning.molmospaces.stretch.episode_overrides import REACH_BAND_M
+from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicyConfig
 from examples.machine_learning.molmospaces.stretch.config import (
     Stretch4CameraSystem,
     Stretch4RobotConfig,
@@ -65,11 +65,30 @@ it; 0.3m is what `NavToObjTaskSamplerConfig` already uses for the same robot
 footprint problem, so it is the value with precedent rather than a new guess.
 """
 
+STRETCH_PLACEMENT_ROTATION_RANGE_RAD = 0.25
+"""
+How far the sampler may randomise the base yaw after aiming it at the target.
+
+The object-manipulation samplers default to 45 degrees, which costs a Franka on
+a pedestal nothing. Stretch's arm extends along its base's +x axis, so a base
+turned 45 degrees away from the object is a base whose arm points 45 degrees
+away from it -- and while the reach solver can now turn the base back (see
+`policies/kinematics.py`), starting it aimed elsewhere just spends the episode's
+step budget undoing the sampler's randomisation.
+
+0.25 rather than zero: with no yaw freedom at all the sampler has one fewer
+dimension to search for a collision-free pose, and a cluttered house then fails
+placement outright -- measured, a test house was abandoned after ten consecutive
+`RobotPlacementError`s. 0.25 is the value MolmoSpaces itself uses for its tighter
+samplers (`task_sampler_configs.py`).
+"""
+
 STRETCH_PLACEMENT: dict[str, object] = {
     "base_pose_sampling_radius_range": REACH_BAND_M,
     "max_robot_to_obj_dist": REACH_BAND_M[1],
     "max_robot_to_target_dist": REACH_BAND_M[1],
     "robot_safety_radius": STRETCH_BASE_SAFETY_RADIUS_M,
+    "robot_placement_rotation_range_rad": STRETCH_PLACEMENT_ROTATION_RANGE_RAD,
 }
 """
 Task-sampler fields to overwrite so the robot is placed where Stretch can work.
@@ -110,7 +129,7 @@ class StretchDataGenMixin:
     # Stretch camera system against.
     camera_config: CameraSystemConfig = Stretch4CameraSystem()
 
-    policy_config: BasePolicyConfig = StretchScriptedPolicyConfig()
+    policy_config: BasePolicyConfig = StretchSimpleIKPolicyConfig()
 
     apply_stretch_placement: bool = True
     """
@@ -140,6 +159,16 @@ class StretchDataGenMixin:
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
+
+        # The scripted expert is a demonstrator, not a policy under test: noise on
+        # its actions is noise on the demonstrations. MolmoSpaces disables it on
+        # every path where a planner drives the robot (`eval_main.py`,
+        # `evaluation_configs.py`, `json_eval_task_sampler.py`) but not on the
+        # datagen path, where it defaults to on -- up to 2cm of TCP noise against
+        # this expert's 3cm arrival tolerance.
+        if self.robot_config.action_noise_config is not None:
+            self.robot_config.action_noise_config.enabled = False
+
         if not self.apply_stretch_placement:
             return
         sampler_config = self.task_sampler_config

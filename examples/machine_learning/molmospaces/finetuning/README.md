@@ -1,20 +1,24 @@
 # Fine-tuning a VLA on Stretch 4
 
-`../franka_remapping/` translates a Franka-trained model's numbers for Stretch.
-It does that well — the arm retargets to a few millimetres — but it cannot touch
-the other half of the mismatch: the model has never seen a Stretch head camera,
-and no amount of kinematics fixes a viewpoint. This is the other road.
+A model trained on a Franka emits Franka joint angles, and nothing in this repo
+translates them any more — see *Why a Franka-space model is not simply remapped*
+in [`../README.md`](../README.md). The half of the mismatch that killed the
+attempt is the half kinematics cannot reach anyway: the model has never seen a
+Stretch head camera, and no retarget fixes a viewpoint. So teach it Stretch.
 
 ```
 datagen_configs.py   Stretch versions of MolmoSpaces' data generation configs
 generate_dataset.py  run them, then optionally export -- one command
 live_recorder.py     record teleop demonstrations from examples/molmo_environment.py
-hdf5_layout.py       the MolmoSpaces trajectory format: writer, repair kit, splits
 lerobot_export.py    rollouts -> a LeRobot v2.1 dataset (for openpi / LeRobot)
 finetune.py          check the data, prepare it, write the trainer config, launch
 ```
 
-## MolmoBot needs no conversion, and no remapping
+The trajectory format itself is `../hdf5_layout.py`, one level up because
+`../training/` reads it too. Behaviour cloning a small net from scratch is that
+other road: [`../training/README.md`](../training/README.md).
+
+## MolmoBot needs no conversion
 
 [MolmoBot](https://github.com/allenai/MolmoBot) trains **directly on MolmoSpaces
 trajectories**. `MolmoBot/olmo/data/synthmanip_dataset.py` opens
@@ -23,8 +27,7 @@ trajectories**. `MolmoBot/olmo/data/synthmanip_dataset.py` opens
 `obs/sensor_data/{camera}` — which is exactly what `generate_dataset.py` writes.
 
 And its action space is configured **by move group**: `--action_move_groups`,
-`--camera_names`, `action_spec`. So a Stretch fine-tune does not go through a
-Franka at all. It learns Stretch's own ten numbers —
+`--camera_names`, `action_spec`. So it learns Stretch's own ten numbers —
 
 | group | dims |
 | --- | --- |
@@ -66,7 +69,7 @@ MolmoBot dataset, both easy to miss:
   (`prepare_episode_for_saving(remove_sensors_if_save_dir=True)`), so its saver
   writes that group empty *even though the MP4s are in the same directory*.
   MolmoBot reads the video filename out of it, so every trajectory would look
-  image-less. `hdf5_layout.ensure_sensor_data_paths()` fills it in from the
+  image-less. `../hdf5_layout.py`'s `ensure_sensor_data_paths()` fills it in from the
   videos that are already there, under the name the saver itself would have
   used.
 - **The houses are flat.** MolmoBot wants `train/` and `val/`;
@@ -81,33 +84,25 @@ trainer reads.
 ## The other trainers, and the LeRobot export
 
 openpi (pi0/pi0.5) and LeRobot want a LeRobot dataset, so they take
-`lerobot_export.py`'s output. There the action space is a real decision:
+`lerobot_export.py`'s output. It writes one action space, Stretch's own:
 
-| | `franka` (default) | `stretch` |
-| --- | --- | --- |
-| dimensions | 8 (7 arm joints + gripper) | 10 (base step, lift, arm, wrist, gripper) |
-| model's action head | reused as-is | reshaped and re-learned |
-| pretrained weights | meaningful from step 0 | partly wasted |
-| drives the base | no | yes |
-| encoding fidelity | 0.5mm mean on expert rollouts | exact |
+| | `stretch` |
+| --- | --- |
+| dimensions | 10 (base step, lift, arm, wrist, gripper) |
+| model's action head | reshaped and re-learned |
+| pretrained weights | vision and language carry over; the head does not |
+| drives the base | yes |
+| encoding fidelity | exact — it is what was recorded |
 
-`franka` runs `../franka_remapping/` **backwards**: Stretch's recorded tool poses
-become virtual-Franka joints. The forward and reverse maps being the same code is
-the point — whatever the retarget cannot express, the training data does not
-contain either, so the model is never trained to ask for something the robot
-cannot do. `ExportMetadata.mean_shadow_ik_error_m` reports the residual per
-dataset, and `finetune.py` refuses to launch above 20mm.
-
-**The frame trap** applies only to this path. A `franka` export encodes against a
-*virtual* Franka mounted on Stretch itself (`MAST_MOUNT_FORWARD_M`,
-`MAST_MOUNT_HEIGHT_M` — 0.20m forward and 0.20m up, chosen by workspace overlap:
-it leaves 69% of Stretch's tool workspace reachable by the virtual arm, the best
-of a grid over 0.00–0.24m forward and 0.15–0.45m up). Benchmark evaluation
-defaults to the *authoring* Franka's recorded frame, because for a pretrained
-checkpoint that is the faithful one. Fine-tune on one and evaluate in the other
-and the arm reaches consistently short, with nothing in the logs to say so — so
-set the policy config's `frame_source="mast"`. `finetune.py` prints it. A
-`molmobot` fine-tune has no frame to get wrong.
+There used to be a `franka` default here, an 8-dimensional encoding that ran the
+Franka remapping backwards so a DROID-pretrained checkpoint could keep its action
+head. It is gone with the rest of the remapping. What it cost was invisible from
+the outside: every recorded pose the virtual arm could not reach was quietly
+replaced by the nearest one it could, the encoding was pinned to a *virtual*
+Franka mounted on Stretch's mast rather than to the authoring arm, and evaluating
+against the wrong frame of the two made the arm reach consistently short with
+nothing in the logs to say why. A re-learned action head wants more data. It does
+not want a debugging session.
 
 ## Where the demonstrations come from
 
@@ -130,7 +125,7 @@ One thing beyond the substitution has to change: **where the robot is placed.**
 The samplers put a Franka within 0.7m of the target because that is a Franka's
 reach; Stretch's tool cannot come closer than 0.39m to its own base axis or go
 past 0.99m. `STRETCH_PLACEMENT` widens those fields to the same 0.55–0.90m band
-`../franka_remapping/episode_overrides.py` retargets benchmark episodes into.
+`../stretch/episode_overrides.py` retargets benchmark episodes into.
 
 (`robot_object_z_offset` is deliberately *not* in that set. The samplers use it
 to lift a Franka's base to a workable height, which is meaningless for Stretch —
@@ -169,8 +164,8 @@ above the floor and 0.086m ahead of the base axis, looking forward and 35° down
 
 The head also carries `camera_left_link` and `camera_right_link`, the stereo
 pair, 7.5cm either side and pitched 47° down. Nothing here uses them. Stretch 4's
-head has no pan/tilt joint, so all three are rigid to the base yaw — which is why
-the yaw split in `../franka_remapping/pose_solver.py` moves the view at all.
+head has no pan/tilt joint, so all three are rigid to the base yaw: anything that
+turns the base turns the view with it.
 
 `wrist_camera` is `gripper_camera_left_rgb`, on the wrist, looking straight along
 the arm.

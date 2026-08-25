@@ -14,27 +14,21 @@ consumes that layout but MolmoSpaces. VLA trainers -- openpi, LeRobot's own,
 anything built on `LeRobotDataset` -- consume the LeRobot format, so this
 converts.
 
-The interesting decision is what the *action space* should be, and there are two
-defensible answers. Both are implemented, `--action-space` picks:
+Everything is exported in `stretch` space: Stretch's own 10-dimensional
+move-group vector, the encoding in `policies/networks.py`. The policy drives the
+robot's own joints directly, including its base, so nothing about the recorded
+motion is lost in translation and nothing has to be translated back at
+evaluation time.
 
-`franka` (default)
-    The same 8-dimensional Franka joint space the pretrained model already
-    speaks: seven arm joints plus a gripper scalar. Stretch's recorded tool
-    poses are run backwards through `franka_remapping/` -- tool pose to virtual
-    Franka joints -- so the numbers are Franka numbers describing Stretch
-    motions. Fine-tuning on this needs no surgery on the model's action head,
-    the pretrained weights start from something meaningful, and at evaluation
-    the *same* remapper turns the outputs back into Stretch commands. The
-    forward and reverse maps being the same code is the point: whatever the
-    retarget cannot express, the fine-tuning data does not contain either, so
-    the model is never trained to ask for something the robot cannot do.
-
-`stretch`
-    Stretch's own 10-dimensional move-group vector, the encoding in
-    `policies/networks.py`. Nothing is lost to a retarget and the policy drives
-    the robot directly, including its base. But the action head has to be
-    reshaped and re-learned, so it wants far more data -- this is the option for
-    training a Stretch policy, not for fine-tuning a Franka one.
+This used to offer a second `franka` space, which re-encoded each recorded tool
+pose as the joints of a virtual Franka bolted to Stretch's mast, so that a
+DROID-pretrained model could keep its 8-dimensional action head. That is gone.
+It bought a warm-started head at the cost of a coordinate frame nobody could
+see: the encoding silently dropped every pose the virtual arm could not reach,
+it had to be paired with a matching `frame_source` at evaluation or the arm
+reached consistently short with nothing in the logs to say so, and the two
+robots' workspaces only overlap by about two thirds in the first place. Training
+the head from scratch on numbers that mean what they say is the cheaper mistake.
 
 The output targets **LeRobot dataset format v2.1**: parquet per episode under
 `data/`, MP4 per camera per episode under `videos/`, and JSON metadata under
@@ -50,34 +44,29 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from examples.machine_learning.molmospaces.franka_remapping.episode_frame import (
-    default_frame_for,
+from examples.machine_learning.molmospaces.hdf5_layout import (
+    TRAJECTORY_FILE_PATTERN,
+    TRAJECTORY_KEY_PATTERN,
+    decode_json_blob,
+    video_filename,
 )
-from examples.machine_learning.molmospaces.franka_remapping.franka_arm import FrankaArm
-from examples.machine_learning.molmospaces.franka_remapping.pose_solver import StretchPoseSolver
 from examples.machine_learning.molmospaces.policies.networks import (
     ACTION_DIM,
     STATE_DIM,
     encode_action,
     encode_state,
 )
-from examples.machine_learning.molmospaces.stretch.config import (
-    HEAD_CAMERA,
-    WRIST_CAMERA,
-    Stretch4RobotConfig,
-)
-from examples.machine_learning.molmospaces.stretch.robot_view import StretchGripperGroup
+from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA
 
 log = logging.getLogger(__name__)
 
-ACTION_SPACES = ("franka", "stretch")
+ACTION_SPACES = ("stretch",)
 
 CODEBASE_VERSION = "v2.1"
 """The LeRobot dataset format version the layout below targets."""
@@ -93,8 +82,6 @@ CAMERA_FEATURE_NAMES = {
     WRIST_CAMERA: "observation.images.wrist",
 }
 """MolmoSpaces camera name -> LeRobot feature key."""
-
-FRANKA_STATE_NAMES = [f"franka_joint_{i + 1}" for i in range(7)] + ["stretch_gripper"]
 
 GRIPPER_CHANNEL_NAMES = ["stretch_gripper", "stretch_gripper_mirror"]
 """
@@ -133,9 +120,6 @@ STRETCH_ACTION_NAMES = [
     "wrist_roll",
 ] + GRIPPER_CHANNEL_NAMES
 
-_TRAJECTORY_FILE_PATTERN = re.compile(r"^trajectories(?P<suffix>.*)\.h5$")
-_TRAJECTORY_KEY_PATTERN = re.compile(r"^traj_(?P<index>\d+)$")
-
 METADATA_FILENAME = "stretch_export.json"
 
 IMPLAUSIBLE_BASE_COMMAND_M = 1.0
@@ -171,83 +155,16 @@ class ExportMetadata:
     skipped_missing_video: int = 0
     replaced_base_commands: int = 0
     """Frames whose recorded base command was unusable; see `IMPLAUSIBLE_BASE_COMMAND_M`."""
-    mean_shadow_ik_error_m: float = 0.0
-    """
-    Average tool-position error of the virtual Franka's IK, over every exported frame.
-
-    Only meaningful for `--action-space franka`, and worth reading before
-    training on the result: it is how much of Stretch's actual motion the
-    Franka-space encoding failed to represent. Millimetres are fine.
-    Centimetres mean the demonstrations spent significant time in poses the
-    virtual arm cannot reach, and the exported actions are not the motions that
-    were recorded.
-    """
-
     def write(self, directory: Path) -> None:
         (directory / METADATA_FILENAME).write_text(json.dumps(asdict(self), indent=2))
-
-
-class _FrankaSpaceEncoder:
-    """Encodes Stretch state and commanded actions as virtual Franka joints.
-
-    One instance per episode, because the virtual arm's frame is pinned to where
-    the episode *started*. That is deliberate and it has to match the evaluation
-    side: `action_remap.FrankaActionRemapper` also pins its frame once per
-    episode, so a base motion appears as a tool motion in the Franka frame in
-    both directions. Re-deriving the frame per step instead would bolt the
-    virtual arm to the moving base, and the model would be trained on a
-    coordinate system it is not evaluated in.
-    """
-
-    state_dim = 8
-    action_dim = 8
-    state_names = FRANKA_STATE_NAMES
-    action_names = FRANKA_STATE_NAMES
-
-    def __init__(self, franka: FrankaArm, solver: StretchPoseSolver, base_pose: np.ndarray) -> None:
-        self._franka = franka
-        self._solver = solver
-        self._frame = default_frame_for(base_pose)
-        self._state_seed = franka.clip(self._frame.init_qpos)
-        self._action_seed = self._state_seed.copy()
-        self.ik_errors: list[float] = []
-
-    def state(self, qpos: dict, tool_pose_world: np.ndarray) -> np.ndarray:
-        solution = self._franka.inverse(
-            self._frame.tool_pose_from_world(tool_pose_world), seed=self._state_seed
-        )
-        self._state_seed = solution.qpos
-        self.ik_errors.append(solution.position_error)
-        return np.append(solution.qpos, _stretch_gripper_closedness(qpos["gripper"])).astype(
-            np.float32
-        )
-
-    def action(self, commanded: dict, base_xytheta: np.ndarray) -> np.ndarray:
-        del base_xytheta  # the commanded base pose is already absolute and world-framed
-        tool_pose_world = self._solver.forward(
-            {
-                "base": np.asarray(commanded["base"], dtype=float).reshape(-1)[:3],
-                "lift": np.asarray(commanded["lift"], dtype=float).reshape(-1)[:1],
-                "arm": np.asarray(commanded["arm"], dtype=float).reshape(-1)[:1],
-                "wrist": np.asarray(commanded["wrist"], dtype=float).reshape(-1)[:3],
-            }
-        )
-        solution = self._franka.inverse(
-            self._frame.tool_pose_from_world(tool_pose_world), seed=self._action_seed
-        )
-        self._action_seed = solution.qpos
-        self.ik_errors.append(solution.position_error)
-        return np.append(solution.qpos, _stretch_gripper_closedness(commanded["gripper"])).astype(
-            np.float32
-        )
 
 
 class _StretchSpaceEncoder:
     """Encodes state and actions in Stretch's own move-group vector.
 
-    A thin adapter over `policies/networks.py` so both spaces present the same
-    interface here; the encoding itself is shared with the behaviour-cloning
-    trainer rather than duplicated, which is the only way the two stay in step.
+    A thin named wrapper over `policies/networks.py`: the encoding itself is
+    shared with the behaviour-cloning trainer rather than duplicated, which is
+    the only way the two stay in step.
     """
 
     state_dim = STATE_DIM
@@ -255,12 +172,7 @@ class _StretchSpaceEncoder:
     state_names = STRETCH_STATE_NAMES
     action_names = STRETCH_ACTION_NAMES
 
-    def __init__(self, *args, **kwargs) -> None:
-        del args, kwargs
-        self.ik_errors: list[float] = []
-
-    def state(self, qpos: dict, tool_pose_world: np.ndarray) -> np.ndarray:
-        del tool_pose_world
+    def state(self, qpos: dict) -> np.ndarray:
         return encode_state(qpos)
 
     def action(self, commanded: dict, base_xytheta: np.ndarray) -> np.ndarray:
@@ -270,11 +182,10 @@ class _StretchSpaceEncoder:
 def export_lerobot_dataset(
     rollout_dirs: list[Path],
     output_dir: Path,
-    action_space: str = "franka",
+    action_space: str = "stretch",
     successful_only: bool = True,
     fps: float = 15.0,
     camera_names: tuple[str, ...] = (HEAD_CAMERA, WRIST_CAMERA),
-    robot_config=None,
     validate: bool = False,
 ) -> ExportMetadata:
     """Convert recorded rollouts into a LeRobot-format dataset.
@@ -284,14 +195,12 @@ def export_lerobot_dataset(
             are pooled, which is how task families are mixed into one dataset.
         output_dir: dataset root. Created; existing contents are left alone
             except for files this writes.
-        action_space: `franka` or `stretch`. See the module docstring.
+        action_space: only `stretch`. See the module docstring.
         successful_only: keep only trajectories the task judged successful.
         fps: frame rate to record in the metadata. Must match the rate the
             rollouts were recorded at (`policy_dt_ms`), or every timestamp in
             the dataset is wrong.
         camera_names: MolmoSpaces cameras to include, in `CAMERA_FEATURE_NAMES`.
-        robot_config: robot config for the Stretch forward kinematics. Defaults
-            to `Stretch4RobotConfig()`; only used by the `franka` space.
         validate: after writing, try to open the result with an installed
             `lerobot` and report what it says.
 
@@ -306,13 +215,7 @@ def export_lerobot_dataset(
     output_dir = Path(output_dir)
     (output_dir / "meta").mkdir(parents=True, exist_ok=True)
 
-    franka = FrankaArm() if action_space == "franka" else None
-    solver = (
-        StretchPoseSolver(robot_config or Stretch4RobotConfig())
-        if action_space == "franka"
-        else None
-    )
-    encoder_cls = _FrankaSpaceEncoder if action_space == "franka" else _StretchSpaceEncoder
+    encoder_cls = _StretchSpaceEncoder
 
     metadata = ExportMetadata(
         action_space=action_space,
@@ -325,18 +228,17 @@ def export_lerobot_dataset(
     task_indices: dict[str, int] = {}
     episode_records: list[dict] = []
     episode_stats: list[dict] = []
-    all_ik_errors: list[float] = []
 
     for rollout_dir in rollout_dirs:
         for h5_path in sorted(Path(rollout_dir).rglob("trajectories*.h5")):
-            match = _TRAJECTORY_FILE_PATTERN.match(h5_path.name)
+            match = TRAJECTORY_FILE_PATTERN.match(h5_path.name)
             if match is None:
                 continue
             batch_suffix = match.group("suffix")
 
             with h5py.File(h5_path, "r") as h5_file:
                 for traj_key in sorted(h5_file.keys()):
-                    key_match = _TRAJECTORY_KEY_PATTERN.match(traj_key)
+                    key_match = TRAJECTORY_KEY_PATTERN.match(traj_key)
                     if key_match is None:
                         continue
                     trajectory = h5_file[traj_key]
@@ -348,11 +250,7 @@ def export_lerobot_dataset(
                     episode_index = metadata.num_episodes
                     episode = _build_episode(
                         trajectory=trajectory,
-                        encoder=encoder_cls(
-                            franka,
-                            solver,
-                            _base_pose_matrix(trajectory["obs/extra/robot_base_pose"][0]),
-                        ),
+                        encoder=encoder_cls(),
                         fps=fps,
                     )
                     if episode is None:
@@ -396,7 +294,6 @@ def export_lerobot_dataset(
                     metadata.num_episodes += 1
                     metadata.num_frames += episode["length"]
                     metadata.replaced_base_commands += episode["replaced_base_commands"]
-                    all_ik_errors.extend(episode["ik_errors"])
                     log.info(
                         f"[export] {h5_path.parent.name}/{traj_key} -> "
                         f"episode_{episode_index:06d} ({episode['length']} frames)"
@@ -411,7 +308,6 @@ def export_lerobot_dataset(
         )
 
     metadata.tasks = sorted(task_indices, key=task_indices.get)
-    metadata.mean_shadow_ik_error_m = float(np.mean(all_ik_errors)) if all_ik_errors else 0.0
     _write_metadata(output_dir, metadata, task_indices, episode_records, episode_stats)
     metadata.write(output_dir / "meta")
 
@@ -423,11 +319,6 @@ def export_lerobot_dataset(
         log.info(
             f"[export] replaced {metadata.replaced_base_commands} unusable base commands with "
             f"hold-position; see IMPLAUSIBLE_BASE_COMMAND_M."
-        )
-    if action_space == "franka":
-        log.info(
-            f"[export] virtual Franka IK error {metadata.mean_shadow_ik_error_m * 1000:.1f}mm "
-            "on average; see ExportMetadata.mean_shadow_ik_error_m."
         )
     if validate:
         _validate_with_lerobot(output_dir)
@@ -448,15 +339,14 @@ def _build_episode(trajectory, encoder, fps: float) -> dict | None:
     qpos_rows = trajectory["obs/agent/qpos"][:]
     action_rows = trajectory["actions/joint_pos"][:]
     base_poses = trajectory["obs/extra/robot_base_pose"][:]
-    tcp_poses = trajectory["obs/extra/tcp_pose"][:]
     successes = trajectory["success"][:]
     num_steps = len(qpos_rows)
 
     states, actions, valid = [], [], []
     replaced_base_commands = 0
     for step in range(num_steps):
-        qpos = _decode_json_blob(qpos_rows[step])
-        commanded = _decode_json_blob(action_rows[step])
+        qpos = decode_json_blob(qpos_rows[step])
+        commanded = decode_json_blob(action_rows[step])
         if not commanded:
             # A no-op step: the policy returned {} because its plan was
             # exhausted. There is no action to imitate here.
@@ -473,16 +363,11 @@ def _build_episode(trajectory, encoder, fps: float) -> dict | None:
             replaced_base_commands += 1
 
         base_pose = _base_pose_matrix(base_poses[step])
-        # `tcp_pose` is recorded in the robot's *base* frame (verified against
-        # the compiled model: at lift 0.6 / arm 0.1 / wrist 0 it reads
-        # (0.567, -0.087, 0.835), which is the tool's offset from the base
-        # origin, not a world position).
-        tool_pose_world = base_pose @ _pose_matrix(tcp_poses[step])
         base_xytheta = np.array(
             [base_pose[0, 3], base_pose[1, 3], np.arctan2(base_pose[1, 0], base_pose[0, 0])]
         )
 
-        states.append(encoder.state(qpos, tool_pose_world))
+        states.append(encoder.state(qpos))
         actions.append(encoder.action(merged, base_xytheta))
         valid.append(step)
 
@@ -499,7 +384,6 @@ def _build_episode(trajectory, encoder, fps: float) -> dict | None:
         "timestamp": (np.arange(length, dtype=np.float32) / float(fps)),
         "success": np.asarray([bool(successes[step]) for step in valid], dtype=bool),
         "source_steps": np.asarray(valid, dtype=np.int64),
-        "ik_errors": list(encoder.ik_errors),
         "replaced_base_commands": replaced_base_commands,
     }
 
@@ -525,7 +409,7 @@ def _copy_videos(
     """
     copied: dict[str, Path] = {}
     for camera in camera_names:
-        source = episode_dir / f"episode_{source_episode_index:08d}_{camera}{batch_suffix}.mp4"
+        source = episode_dir / video_filename(source_episode_index, camera, batch_suffix)
         if not source.exists():
             log.warning(f"[export] missing video {source}; skipping episode")
             return None
@@ -671,8 +555,7 @@ def _write_metadata(
 
 
 def _encoder_names(action_space: str) -> tuple[list[str], list[str]]:
-    if action_space == "franka":
-        return FRANKA_STATE_NAMES, FRANKA_STATE_NAMES
+    del action_space  # only `stretch` remains; kept so the metadata writer reads in order
     return STRETCH_STATE_NAMES, STRETCH_ACTION_NAMES
 
 
@@ -702,11 +585,6 @@ def _validate_with_lerobot(output_dir: Path) -> None:
 # =============================================================================
 # HDF5 helpers
 # =============================================================================
-
-
-def _decode_json_blob(row: np.ndarray) -> dict:
-    """MolmoSpaces stores dict observations as NUL-padded UTF-8 in a uint8 row."""
-    return json.loads(bytes(row).rstrip(b"\x00").decode("utf-8"))
 
 
 def _decode_scene(trajectory) -> dict:
@@ -744,20 +622,8 @@ def _base_pose_matrix(pose7: np.ndarray) -> np.ndarray:
 
     The recorded z is dropped because Stretch's base *is* on the floor: the
     holonomic base group only ever reads x, y and yaw, so a nonzero recorded z
-    is noise from the sampler rather than a height the robot was at, and
-    carrying it into the virtual Franka's mount would shift every tool pose in
-    the episode by it.
+    is noise from the sampler rather than a height the robot was at.
     """
     pose = _pose_matrix(pose7)
     pose[2, 3] = 0.0
     return pose
-
-
-def _stretch_gripper_closedness(gripper_qpos) -> float:
-    """Stretch's gripper opening -> the [0, 1] closedness a VLA speaks.
-
-    Averages the mirrored MJCF finger pair; Stretch has one gripper DOF. See
-    `GRIPPER_CHANNEL_NAMES`.
-    """
-    opening = float(np.mean(np.asarray(gripper_qpos, dtype=float).reshape(-1)[:2]))
-    return float(np.clip(1.0 - opening / StretchGripperGroup.OPEN_JOINT_POS, 0.0, 1.0))

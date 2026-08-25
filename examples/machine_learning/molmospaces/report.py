@@ -24,17 +24,18 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import click
 import numpy as np
 
-log = logging.getLogger(__name__)
+from examples.machine_learning.molmospaces.hdf5_layout import (
+    TRAJECTORY_FILE_PATTERN,
+    TRAJECTORY_KEY_PATTERN,
+)
 
-_TRAJECTORY_FILE_PATTERN = re.compile(r"^trajectories(?P<suffix>.*)\.h5$")
-_TRAJECTORY_KEY_PATTERN = re.compile(r"^traj_(?P<index>\d+)$")
+log = logging.getLogger(__name__)
 
 CAPTION_HEIGHT_PX = 64
 CAPTION_COLOUR_SUCCESS = (90, 200, 90)
@@ -57,7 +58,13 @@ class EpisodeReport:
 
 
 def decode_json_blob(row: np.ndarray) -> dict:
-    """MolmoSpaces stores dict observations as NUL-padded UTF-8 in a uint8 row."""
+    """`hdf5_layout.decode_json_blob()`, but lenient.
+
+    Deliberately not the shared one: a report is written *about* a run that has
+    already happened, often to find out why it went wrong, so one unparseable
+    blob should cost that field rather than the whole report. The strict version
+    is right on the paths that feed a trainer, where silence is the failure.
+    """
     text = bytes(row).rstrip(b"\x00").decode("utf-8", "replace")
     try:
         return json.loads(text)
@@ -92,7 +99,7 @@ def build_report(
 
     reports: list[EpisodeReport] = []
     for h5_path in sorted(run_dir.rglob("trajectories*.h5")):
-        match = _TRAJECTORY_FILE_PATTERN.match(h5_path.name)
+        match = TRAJECTORY_FILE_PATTERN.match(h5_path.name)
         if match is None:
             continue
         batch_suffix = match.group("suffix")
@@ -100,7 +107,7 @@ def build_report(
 
         with h5py.File(h5_path, "r") as h5_file:
             for traj_key in sorted(h5_file.keys()):
-                key_match = _TRAJECTORY_KEY_PATTERN.match(traj_key)
+                key_match = TRAJECTORY_KEY_PATTERN.match(traj_key)
                 if key_match is None:
                     continue
                 if max_episodes is not None and len(reports) >= max_episodes:

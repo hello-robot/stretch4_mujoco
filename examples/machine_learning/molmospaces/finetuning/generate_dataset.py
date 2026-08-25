@@ -176,10 +176,9 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
 @click.option(
     "--action-space",
     type=click.Choice(ACTION_SPACES),
-    default="franka",
-    help="Action/state space to export in. 'franka' keeps a Franka-space VLA's own "
-    "8-dim interface (so its action head needs no surgery); 'stretch' is the "
-    "native 10-dim move-group vector. See lerobot_export.py.",
+    default="stretch",
+    help="Action/state space to export in. Only 'stretch', the native 10-dim "
+    "move-group vector. See lerobot_export.py.",
 )
 @click.option(
     "--scene-dataset",

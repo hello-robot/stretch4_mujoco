@@ -2,7 +2,7 @@
 The behaviour-cloning network, and the action/state encoding it is trained on.
 
 The encoding is defined here rather than in the trainer or the policy because
-all three have to agree on it exactly: `training/collect.py` writes it,
+all three have to agree on it exactly: `training/dataset.py` writes it,
 `training/train_bc.py` fits it, and `policies/bc_policy.py` reads it back at
 evaluation time. Getting it wrong is silent -- the policy runs and does nothing
 useful -- so there is one definition and everyone imports it.

@@ -1,15 +1,12 @@
 """
 Turn recorded MolmoSpaces trajectories into behaviour-cloning training data.
 
-MolmoSpaces writes a rollout as one HDF5 file per house plus side-car MP4s:
-
-    <run>/house_1024/trajectories_batch_1_of_1.h5
-    <run>/house_1024/episode_00000000_head_camera_batch_1_of_1.mp4
-    <run>/house_1024/episode_00000000_wrist_camera_batch_1_of_1.mp4
-
-with `traj_<k>` inside the HDF5 corresponding to `episode_<k:08d>_*` beside it.
+The input is a MolmoSpaces rollout directory -- whatever
+`finetuning/generate_dataset.py` produced -- whose format is described by
+`../hdf5_layout.py`, which this module borrows its patterns and decoders from.
 Per-step robot state and commanded actions live in the HDF5 as JSON blobs
-(`obs/agent/qpos`, `actions/joint_pos`), and the images live only in the videos.
+(`obs/agent/qpos`, `actions/joint_pos`); the images live only in the side-car
+MP4s.
 
 Training directly off that layout would mean re-decoding an MP4 for every
 minibatch, so `build_dataset()` does the decoding once: it keeps only the
@@ -22,12 +19,17 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from examples.machine_learning.molmospaces.hdf5_layout import (
+    TRAJECTORY_FILE_PATTERN,
+    TRAJECTORY_KEY_PATTERN,
+    decode_json_blob,
+    video_filename,
+)
 from examples.machine_learning.molmospaces.policies.networks import (
     ACTION_DIM,
     IMAGE_SIZE,
@@ -37,9 +39,6 @@ from examples.machine_learning.molmospaces.policies.networks import (
 )
 
 log = logging.getLogger(__name__)
-
-_TRAJECTORY_FILE_PATTERN = re.compile(r"^trajectories(?P<suffix>.*)\.h5$")
-_TRAJECTORY_KEY_PATTERN = re.compile(r"^traj_(?P<index>\d+)$")
 
 METADATA_FILENAME = "dataset_meta.json"
 
@@ -61,11 +60,6 @@ class DatasetMetadata:
     @classmethod
     def read(cls, directory: Path) -> "DatasetMetadata":
         return cls(**json.loads((directory / METADATA_FILENAME).read_text()))
-
-
-def _decode_json_blob(row: np.ndarray) -> dict:
-    """MolmoSpaces stores dict observations as NUL-padded UTF-8 in a uint8 row."""
-    return json.loads(bytes(row).rstrip(b"\x00").decode("utf-8"))
 
 
 def _read_video(path: Path, num_frames: int) -> np.ndarray:
@@ -125,14 +119,14 @@ def build_dataset(
 
     for run_dir in run_dirs:
         for h5_path in sorted(Path(run_dir).rglob("trajectories*.h5")):
-            match = _TRAJECTORY_FILE_PATTERN.match(h5_path.name)
+            match = TRAJECTORY_FILE_PATTERN.match(h5_path.name)
             if match is None:
                 continue
             batch_suffix = match.group("suffix")
 
             with h5py.File(h5_path, "r") as h5_file:
                 for traj_key in sorted(h5_file.keys()):
-                    key_match = _TRAJECTORY_KEY_PATTERN.match(traj_key)
+                    key_match = TRAJECTORY_KEY_PATTERN.match(traj_key)
                     if key_match is None:
                         continue
                     episode_index = int(key_match.group("index"))
@@ -183,7 +177,7 @@ def _build_shard(
 
     videos = []
     for camera in camera_names:
-        video_path = episode_dir / f"episode_{episode_index:08d}_{camera}{batch_suffix}.mp4"
+        video_path = episode_dir / video_filename(episode_index, camera, batch_suffix)
         if not video_path.exists():
             log.warning(f"[dataset] missing video {video_path}; skipping trajectory")
             return None
@@ -194,8 +188,8 @@ def _build_shard(
     valid = np.zeros(num_steps, dtype=bool)
 
     for step in range(num_steps):
-        qpos = _decode_json_blob(qpos_rows[step])
-        commanded = _decode_json_blob(action_rows[step])
+        qpos = decode_json_blob(qpos_rows[step])
+        commanded = decode_json_blob(action_rows[step])
         if not commanded:
             # A no-op step: the policy returned {} (its plan was exhausted, or it
             # had nothing to say). There is no action to imitate here.

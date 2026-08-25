@@ -18,6 +18,7 @@ mujoco = pytest.importorskip("mujoco")
 pytest.importorskip("molmo_spaces")
 
 from mujoco import MjSpec  # noqa: E402
+from scipy.spatial.transform import Rotation as R  # noqa: E402
 
 from examples.machine_learning.molmospaces.policies.kinematics import (  # noqa: E402
     PITCH_HORIZONTAL,
@@ -35,7 +36,7 @@ from examples.machine_learning.molmospaces.policies.networks import (  # noqa: E
 from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
     Stretch4RobotConfig,
 )
-from examples.machine_learning.molmospaces.franka_remapping.episode_overrides import (  # noqa: E402
+from examples.machine_learning.molmospaces.stretch.episode_overrides import (  # noqa: E402
     REACH_BAND_M,
     TCP_MIN_REACH_M,
     retarget_base_pose,
@@ -184,21 +185,120 @@ def test_horizontal_reach_solves_without_moving_the_base(robot_config):
     assert solved >= 24, f"only {solved}/27 in-band targets solved"
 
 
-def test_top_down_reach_recruits_the_base(robot_config):
-    """Reaching straight down has no wrist-driven lateral freedom."""
+def test_reach_solver_turns_the_base_but_never_drives_it(robot_config):
+    """Base yaw is the lateral freedom Stretch has; base translation is not.
+
+    The arm extends along the base's +x axis and the wrist yaw sweeps a narrow
+    band either side of it, so a target more than about a quarter radian off that
+    axis is out of reach unless the robot turns to face it. The library's local
+    IK turns the base and cannot translate it, which is exactly the right pair of
+    permissions: re-aiming is free, wandering across the room is not.
+    """
+    solver = StretchReachSolver(robot_config)
+    base_pose = planar_pose(1.0, 2.0, 0.4)
+    # Well off the base's axis -- the old position-only solver reached 6.5% of
+    # these; it is the base rotation that makes them solvable.
+    bearing = 0.4 + 0.65
+    target = np.array([1.0 + 0.75 * np.cos(bearing), 2.0 + 0.75 * np.sin(bearing), 0.8])
+
+    solution = solver.solve(base_pose, target, wrist_pitch=PITCH_HORIZONTAL)
+    assert solution is not None
+    assert np.linalg.norm(solver.forward(solution)[:3, 3] - target) < 6e-3
+    assert np.allclose(solution["base"][:2], [1.0, 2.0], atol=1e-9), "the base must not translate"
+    assert abs(solution["base"][2] - 0.4) > 1e-2, "the base should have turned to face the target"
+
+
+def test_top_down_reach_is_solvable(robot_config):
+    """Reaching straight down has no wrist-driven lateral freedom of its own."""
     solver = StretchReachSolver(robot_config)
     base_pose = planar_pose(0.0, 0.0, 0.0)
     target = np.array([0.65, 0.25, 0.8])
 
-    without_base = solver.solve(
-        base_pose, target, wrist_pitch=PITCH_TOP_DOWN, dofs=("lift", "arm", "wrist_yaw")
-    )
-    assert without_base is None
+    solution = solver.solve(base_pose, target, wrist_pitch=PITCH_TOP_DOWN)
+    assert solution is not None
+    assert np.linalg.norm(solver.forward(solution)[:3, 3] - target) < 6e-3
 
-    with_base = solver.solve(base_pose, target, wrist_pitch=PITCH_TOP_DOWN)
-    assert with_base is not None
-    assert np.linalg.norm(solver.forward(with_base)[:3, 3] - target) < 6e-3
-    assert np.linalg.norm(with_base["base"][:2]) > 1e-3
+
+def test_stretch_wrist_is_a_zyx_euler_triple(robot_config):
+    """`R_tcp = Rz(base_yaw + wrist_yaw) Ry(pitch) Rx(roll)` in the base frame, exactly.
+
+    The measurement `policies/kinematics.py` rests on: it is what lets
+    `grasp_orientation()` build a target orientation from a grasp style by
+    writing the Euler angles down instead of solving for them, and what makes the
+    solver's split of a heading between base yaw and wrist yaw orientation-
+    preserving. If the wrist's MJCF axes or joint order ever change, this is the
+    test that should fail first.
+    """
+    solver = StretchReachSolver(robot_config)
+    rng = np.random.default_rng(0)
+    wrist_limits = solver.joint_limits["wrist"]
+    base_yaw = 0.7
+
+    worst = 0.0
+    for _ in range(50):
+        wrist = rng.uniform(wrist_limits[:, 0], wrist_limits[:, 1])
+        pose = solver.forward(
+            {
+                "base": np.array([0.3, -0.2, base_yaw]),
+                "lift": np.array([0.5]),
+                "arm": np.array([0.2]),
+                "wrist": wrist,
+            }
+        )
+        in_base_frame = R.from_euler("z", base_yaw).as_matrix().T @ pose[:3, :3]
+        predicted = R.from_euler("ZYX", wrist).as_matrix()
+        worst = max(worst, float(np.abs(in_base_frame - predicted).max()))
+
+    assert worst < 1e-9, f"wrist is not a ZYX triple; worst deviation {worst}"
+
+
+def test_forward_kinematics_matches_the_mujoco_model(robot_config):
+    """The Pinocchio FK must agree with the model MolmoSpaces actually steps.
+
+    The two disagree by a fixed ~7cm translation unless the base-frame offset is
+    applied (MuJoCo poses the robot by a virtual holonomic base body wrapped
+    around the URDF root). A silent regression here would put that error into
+    every grasp, so it is asserted rather than assumed.
+    """
+    import mujoco
+    from mujoco import MjSpec
+
+    from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
+
+    solver = StretchReachSolver(robot_config)
+
+    spec = MjSpec()
+    robot_config.robot_cls.add_robot_to_scene(
+        robot_config,
+        spec,
+        prefix=robot_config.robot_namespace,
+        pos=[0.0, 0.0, 0.0],
+        quat=[1.0, 0.0, 0.0, 0.0],
+        strip_meshes=True,
+    )
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    view = Stretch4RobotView(data, robot_config.robot_namespace)
+
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        configuration = {
+            "base": np.array(
+                [rng.uniform(-2, 2), rng.uniform(-2, 2), rng.uniform(-np.pi, np.pi)]
+            ),
+            "lift": np.array([rng.uniform(0.0, 1.2)]),
+            "arm": np.array([rng.uniform(0.0, 0.52)]),
+            "wrist": np.array(
+                [rng.uniform(-1.1, 4.2), rng.uniform(-1.1, 1.5), rng.uniform(-1.4, 1.1)]
+            ),
+        }
+        view.base.pose = planar_pose(*configuration["base"])
+        for group in ("lift", "arm", "wrist"):
+            view.get_move_group(group).joint_pos = configuration[group]
+        mujoco.mj_kinematics(model, data)
+
+        expected = np.asarray(view.get_move_group("gripper").leaf_frame_to_world[:3, 3])
+        assert np.linalg.norm(solver.forward(configuration)[:3, 3] - expected) < 1e-9
 
 
 def test_home_init_qpos_omits_the_base():
@@ -251,6 +351,63 @@ def test_retarget_keeps_an_already_reachable_standoff():
     }
     retarget_base_pose(task)
     assert task["robot_base_pose"][:2] == [0.7, 0.0]
+
+
+def test_the_override_rewrites_the_robot_and_leaves_the_task_alone():
+    """The registered hook, end to end: robot, cameras and spawn, nothing else.
+
+    What is being scored has to survive the retarget untouched -- the instruction
+    and the object poses are the benchmark -- while everything keyed to the
+    authoring robot has to be gone by the time the task sampler is built.
+    """
+    from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
+
+    from examples.machine_learning.molmospaces.configs import StretchDummyEvalConfig
+    from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA
+    from examples.machine_learning.molmospaces.stretch.episode_overrides import (
+        stretch_episode_override,
+    )
+
+    spec = EpisodeSpec(
+        house_index=101,
+        scene_dataset="procthor-objaverse",
+        data_split="val",
+        robot={
+            "robot_name": "franka_droid",
+            "init_qpos": {"arm": [0.07, -0.92, -0.13, -2.50, -0.21, 1.41, 0.83]},
+        },
+        img_resolution=[624, 352],
+        cameras=[],
+        language={"task_description": "pick up the mug"},
+        task={
+            "task_cls": "molmo_spaces.tasks.pick_task.PickTask",
+            # 0.2m from the target: far too close for Stretch, so the retarget
+            # has to move it.
+            "robot_base_pose": [12.0, 22.5, 0.17, 1.0, 0.0, 0.0, 0.0],
+            "pickup_obj_start_pose": [12.2, 22.5, 1.12, 1.0, 0.0, 0.0, 0.0],
+        },
+    )
+    # Any concrete eval config: the override only touches the camera system.
+    exp_config = StretchDummyEvalConfig()
+
+    stretch_episode_override(spec, exp_config)
+
+    assert spec.robot.robot_name == "stretch4"
+    assert "arm" in spec.robot.init_qpos and "base" not in spec.robot.init_qpos
+    assert spec.robot.init_qpos["arm"] == [0.0], "the arm must start stowed"
+    # Stretch's own cameras, at the episode's resolution.
+    assert [camera.name for camera in exp_config.camera_config.cameras] == [
+        HEAD_CAMERA,
+        WRIST_CAMERA,
+    ]
+    assert tuple(exp_config.camera_config.img_resolution) == (624, 352)
+    # The spawn moved into the reach band, and nothing else about the task did.
+    base_xy = np.array(spec.task["robot_base_pose"][:2])
+    target_xy = np.array(spec.task["pickup_obj_start_pose"][:2])
+    assert REACH_BAND_M[0] <= np.linalg.norm(base_xy - target_xy) <= REACH_BAND_M[1]
+    assert spec.task["robot_base_pose"][2] == 0.0
+    assert spec.task["pickup_obj_start_pose"] == [12.2, 22.5, 1.12, 1.0, 0.0, 0.0, 0.0]
+    assert spec.language.task_description == "pick up the mug"
 
 
 def test_action_encoding_round_trips():
@@ -531,10 +688,6 @@ def test_episode_starts_stowed():
     front of the base, so the two coincide. Measured over eight MB-Pick episodes
     that spawned the robot interpenetrating the scene five times, by up to 19cm.
     """
-    from examples.machine_learning.molmospaces.franka_remapping.episode_overrides import (
-        stretch_home_init_qpos,
-    )
-
     init_qpos = stretch_home_init_qpos()
     assert init_qpos["arm"] == [0.0], "the arm must start retracted"
     # Turned away from straight ahead, so the tool is not out in front at all.
@@ -544,16 +697,13 @@ def test_episode_starts_stowed():
 
 
 def test_reach_solver_unwinds_a_stowed_wrist(robot_config):
-    """Damped least squares alone cannot turn the wrist back through zero.
+    """A solve seeded from the stow pose still has to reach forwards.
 
-    A wrist that starts turned away from the target sits in a local minimum: the
-    yaw column points the wrong way, so the step drives it further round into
-    its joint limit. Since Stretch now spawns stowed, every episode's first
-    reach starts there, and the retry from a straightened wrist is what makes it
-    solvable at all.
+    Stretch spawns stowed -- wrist yawed right round to 3.14 -- so every
+    episode's first reach starts from a configuration pointing away from the
+    target. A gradient solver seeded there walks into its joint limit instead of
+    back through zero, which is why the library retries from a neutral guess.
     """
-    from examples.machine_learning.molmospaces.policies.kinematics import PITCH_HORIZONTAL
-
     solver = StretchReachSolver(robot_config)
     base_pose = planar_pose(0.0, 0.0, 0.0)
     target = np.array([0.7, 0.0, 0.8])
@@ -563,14 +713,187 @@ def test_reach_solver_unwinds_a_stowed_wrist(robot_config):
         "wrist": np.array([3.14, -0.4, 0.0]),
     }
 
-    # Descending from the stowed wrist alone gets nowhere...
-    assert (
-        solver._solve_from(
-            base_pose, target, PITCH_HORIZONTAL, 0.0, stowed, None, 0.0, 5e-3, 80, 1e-5
-        )
-        is None
-    )
-    # ...but `solve` retries from a straightened wrist and reaches the target.
     solution = solver.solve(base_pose, target, wrist_pitch=PITCH_HORIZONTAL, seed=stowed)
     assert solution is not None
     assert np.linalg.norm(solver.forward(solution)[:3, 3] - target) < 6e-3
+
+
+def test_grasp_style_fixes_the_approach_axis(robot_config):
+    """Grasp style fixes how the tool is tilted, which is what a grasp cares about.
+
+    `R_tcp = Rz(base_yaw + wrist_yaw) @ Ry(pitch) @ Rx(roll)` holds exactly for
+    Stretch, so the pitch a solve comes back with is the pitch it was asked for.
+    Roll is only pinned away from `PITCH_TOP_DOWN`: at pitch pi/2 the yaw and roll
+    axes line up and the pair is degenerate, so the solver may trade one against
+    the other and still produce exactly the requested orientation. The invariant
+    that survives both cases is the direction the tool closes along.
+    """
+    solver = StretchReachSolver(robot_config)
+    base_pose = planar_pose(0.0, 0.0, 0.0)
+    target = np.array([0.72, 0.1, 0.85])
+
+    for pitch in (PITCH_HORIZONTAL, PITCH_TOP_DOWN):
+        for roll in (0.0, 0.4):
+            solution = solver.solve(base_pose, target, wrist_pitch=pitch, wrist_roll=roll)
+            assert solution is not None, f"no solution for pitch={pitch} roll={roll}"
+            assert abs(solution["wrist"][1] - pitch) < 1e-3, f"pitch drifted for {pitch}/{roll}"
+
+            approach = solver.forward(solution)[:3, 0]
+            if pitch == PITCH_TOP_DOWN:
+                assert np.allclose(approach, [0.0, 0.0, -1.0], atol=1e-3)
+            else:
+                assert abs(approach[2]) < 1e-3, "a horizontal grasp must close level"
+                assert abs(solution["wrist"][2] - roll) < 1e-3, "roll is pinned away from lock"
+
+
+def _grasp_check_policy(monkeypatch, drift, tolerance=0.05):
+    """A `StretchSimpleIKPolicy` stub wired only for the grasp-follow check.
+
+    Builds nothing and simulates nothing: the check is a comparison between two
+    tool-to-object offsets, so the test supplies those directly and asserts on
+    the verdict rather than on a whole rollout.
+    """
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+    policy._grasp_offset = np.array([0.0, 0.0, -0.02])
+    policy._grasp_lost = False
+
+    class _PolicyConfig:
+        grasp_slip_tolerance_m = tolerance
+
+    class _Config:
+        policy_config = _PolicyConfig()
+
+    policy.config = _Config()
+    monkeypatch.setattr(
+        StretchSimpleIKPolicy,
+        "_tool_to_object_offset",
+        lambda self, tool: np.array([0.0, 0.0, -0.02]) + drift,
+    )
+    return policy
+
+
+def test_grasp_is_held_when_the_object_rides_with_the_tool(monkeypatch):
+    policy = _grasp_check_policy(monkeypatch, drift=np.array([0.002, 0.0, 0.003]))
+    assert policy._grasp_still_held(np.zeros(3)) is True
+
+
+def test_grasp_is_lost_when_the_object_stays_behind(monkeypatch):
+    """The failure this exists to catch: the arm lifts, the object does not."""
+    policy = _grasp_check_policy(monkeypatch, drift=np.array([0.0, 0.0, -0.18]))
+    assert policy._grasp_still_held(np.zeros(3)) is False
+
+
+def test_grasp_check_passes_when_there_is_nothing_to_check(monkeypatch):
+    """A task with no pickup object must not be failed by a pick-specific check."""
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
+
+    policy = _grasp_check_policy(monkeypatch, drift=np.array([0.0, 0.0, -0.18]))
+    policy._grasp_offset = None
+    assert policy._grasp_still_held(np.zeros(3)) is True
+
+    policy._grasp_offset = np.array([0.0, 0.0, -0.02])
+    monkeypatch.setattr(
+        StretchSimpleIKPolicy, "_tool_to_object_offset", lambda self, tool: None
+    )
+    assert policy._grasp_still_held(np.zeros(3)) is True
+
+
+def test_lift_waypoint_is_the_one_that_verifies_the_grasp():
+    """The plan must actually carry the flags the check keys off."""
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import Waypoint
+
+    closing = Waypoint(
+        position=np.zeros(3),
+        wrist_pitch=0.0,
+        gripper_open=False,
+        label="close",
+        establishes_grasp=True,
+    )
+    lifting = Waypoint(
+        position=np.zeros(3),
+        wrist_pitch=0.0,
+        gripper_open=False,
+        label="lift",
+        verify_grasp=True,
+    )
+    assert closing.establishes_grasp and not closing.verify_grasp
+    assert lifting.verify_grasp and not lifting.establishes_grasp
+    # Everything else must default to not participating.
+    plain = Waypoint(position=np.zeros(3), wrist_pitch=0.0, gripper_open=True, label="reach")
+    assert not plain.establishes_grasp and not plain.verify_grasp
+
+
+def test_head_camera_renders_upright(robot_config):
+    """The head camera must match the orientation hardware delivers.
+
+    Stretch 4's head cameras are mounted rotated and the robot's own driver
+    undoes it (`StatusStretchCamera.get_camera_data` applies
+    `np.rot90(data, rotate_number_of_times)` by default). Simulation has to agree,
+    or a policy trained here meets a quarter-turned world on the real robot.
+
+    Asserted on a rendered image rather than on the quaternion, because the
+    quaternion is the thing that could be right in the wrong direction.
+    """
+    import mujoco
+    from mujoco import MjSpec
+
+    from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
+
+    spec = MjSpec()
+    spec.worldbody.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_PLANE, size=[6, 6, 0.1], rgba=[0.5, 0.5, 0.5, 1]
+    )
+    # A post that is unambiguously vertical in the world.
+    post = spec.worldbody.add_body(pos=[1.4, 0.0, 0.9])
+    post.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.06, 0.06, 0.9], rgba=[1, 0, 0, 1])
+
+    robot_config.robot_cls.add_robot_to_scene(
+        robot_config,
+        spec,
+        prefix=robot_config.robot_namespace,
+        pos=[0.0, 0.0, 0.0],
+        quat=[1.0, 0.0, 0.0, 0.0],
+        strip_meshes=False,
+    )
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    view = Stretch4RobotView(data, robot_config.robot_namespace)
+    view.get_move_group("lift").joint_pos = np.array([0.7])
+    view.get_move_group("arm").joint_pos = np.array([0.3])
+    view.get_move_group("wrist").joint_pos = np.zeros(3)
+    mujoco.mj_forward(model, data)
+
+    renderer = mujoco.Renderer(model, 224, 224)
+    renderer.update_scene(data, camera=f"{robot_config.robot_namespace}camera_center_link")
+    image = renderer.render()
+
+    red = (
+        (image[:, :, 0].astype(int) > 90)
+        & (image[:, :, 1].astype(int) < 60)
+        & (image[:, :, 2].astype(int) < 60)
+    )
+    assert red.sum() > 20, "the post should be in view"
+    rows = np.where(red.any(axis=1))[0]
+    columns = np.where(red.any(axis=0))[0]
+    height = rows.max() - rows.min() + 1
+    width = columns.max() - columns.min() + 1
+    assert height > width, (
+        f"a vertical post renders {height}px tall x {width}px wide -- the head camera is still "
+        "rotated relative to what the hardware driver produces"
+    )
+
+
+def test_gripper_cameras_are_left_alone(robot_config):
+    """Only cameras the hardware rotates get rotated; the wrist ones do not."""
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+
+    from examples.machine_learning.molmospaces.stretch.robot import HARDWARE_CAMERA_EQUIVALENTS
+
+    assert "gripper_camera_left_rgb" not in HARDWARE_CAMERA_EQUIVALENTS
+    for hardware_name in HARDWARE_CAMERA_EQUIVALENTS.values():
+        settings = StretchCameras[hardware_name].initial_camera_settings
+        assert settings.rotate_number_of_times != 0, (
+            f"{hardware_name} needs no correction and should not be listed"
+        )
