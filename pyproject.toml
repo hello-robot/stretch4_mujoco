@@ -9,7 +9,6 @@ dependencies = [
     "click>=8.1.8",
     "hello-robot-stretch-urdf>=0.1.0",
     "hello-robot-stretch4-urdf>=2026.5.6",
-    "inputs>=0.5",
     "matplotlib>=3.10.1",
     "mujoco~=3.5.0",
     "numpy==2.2.5",
@@ -18,6 +17,10 @@ dependencies = [
     "rerun-sdk>=0.23.1",
     "yourdfpy",
     "urdf2mjcf>=0.2.39",
+    "pin>=4.1.0",
+    "coal>=3.0.3",
+    "evdev>=1.9.3",
+    "hello-robot-stretch4-flying-gripper>=2026.7.2",
 ]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},
