@@ -21,6 +21,7 @@ dependencies = [
     "coal>=3.0.3",
     "evdev>=1.9.3",
     "hello-robot-stretch4-flying-gripper>=2026.7.2",
+    "hello-robot-stretch4-kinematics",
 ]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},
@@ -48,6 +49,7 @@ line-length = 100
 
 [tool.uv.sources]
 molmo-spaces = { git = "https://github.com/allenai/molmospaces.git" }
+hello-robot-stretch4-kinematics = { git = "https://github.com/hello-robot/stretch4_kinematics.git" }
 
 [project.optional-dependencies]
 dev = [

@@ -74,8 +74,10 @@ class Waypoint:
         settle_steps: extra policy steps to hold once the position is reached,
             for motions whose effect is not visible in the tool pose -- closing
             the fingers being the obvious one.
-        max_base_travel: how far this waypoint may drive the base. Reaching and
-            grasping should not move the robot; dragging a drawer open has to.
+        turn_base: whether the solver may re-aim the base to reach this point.
+            Stretch's arm has almost no lateral authority of its own, so turning
+            the base is how it reaches anything off its +x axis; the solver
+            cannot translate the base, only rotate it.
         tolerance: arrival threshold in metres.
     """
 
@@ -84,7 +86,7 @@ class Waypoint:
     gripper_open: bool
     label: str
     settle_steps: int = 0
-    max_base_travel: float = 0.0
+    turn_base: bool = True
     tolerance: float = 0.03
 
 
@@ -130,15 +132,6 @@ class StretchScriptedPolicyConfig(BasePolicyConfig):
     """How finely to sample the articulation arc. More waypoints hold the grasp
     better but spend more of the episode's step budget."""
 
-    grasp_base_assist_m: float = 0.12
-    """
-    How far the base may inch forward to close the last of the distance to a
-    grasp. `franka_remapping/episode_overrides.py` aims for the middle of Stretch's reach
-    band, but a pick-and-place base pose is a compromise between two targets and
-    can leave either of them marginal; a hand's breadth of base motion recovers
-    those without meaningfully changing where the robot stands.
-    """
-
     reach_tolerance_m: float = 0.03
     gripper_settle_steps: int = 8
     max_steps_per_waypoint: int = 45
@@ -163,7 +156,6 @@ class StretchScriptedPolicy(BasePolicy):
         super().__init__(config, task)
         self._solver = StretchReachSolver(config.robot_config)
         self._plan: list[Waypoint] | None = None
-        self._plan_origin_xy: np.ndarray | None = None
         self._waypoint_index = 0
         self._steps_in_waypoint = 0
         self._settled_steps = 0
@@ -174,7 +166,6 @@ class StretchScriptedPolicy(BasePolicy):
 
     def reset(self) -> None:
         self._plan = None
-        self._plan_origin_xy = None
         self._waypoint_index = 0
         self._steps_in_waypoint = 0
         self._settled_steps = 0
@@ -191,9 +182,6 @@ class StretchScriptedPolicy(BasePolicy):
         del observation  # this policy reads privileged state, not sensors
 
         if self._plan is None:
-            self._plan_origin_xy = np.asarray(
-                self.task.env.current_robot.robot_view.base.pose[:2, 3], dtype=float
-            )
             self._plan = self._build_plan()
             log.info(
                 f"[stretch-scripted] planned {len(self._plan)} waypoints: "
@@ -234,7 +222,6 @@ class StretchScriptedPolicy(BasePolicy):
             wrist_pitch=waypoint.wrist_pitch,
             wrist_roll=0.0,
             seed=current,
-            max_base_travel=self._remaining_base_budget(waypoint, base_pose),
             tolerance=policy_config.reach_tolerance_m * 0.5,
         )
         if solution is None:
@@ -247,24 +234,8 @@ class StretchScriptedPolicy(BasePolicy):
         action["lift"] = solution["lift"]
         action["arm"] = solution["arm"]
         action["wrist"] = solution["wrist"]
-        action["base"] = (
-            solution["base"] if waypoint.max_base_travel > 0.0 else current["base"].copy()
-        )
+        action["base"] = solution["base"] if waypoint.turn_base else current["base"].copy()
         return action
-
-    def _remaining_base_budget(self, waypoint: Waypoint, base_pose: np.ndarray) -> float:
-        """How much further this waypoint may drive the base.
-
-        The solver caps travel relative to the base pose it is handed, and it is
-        handed the *live* pose every step -- so an uncapped-per-step budget would
-        let the base creep a full allowance per policy step and wander off across
-        the house. Budgeting against the pose the plan started from keeps the
-        total displacement bounded by `Waypoint.max_base_travel`.
-        """
-        if waypoint.max_base_travel <= 0.0 or self._plan_origin_xy is None:
-            return 0.0
-        travelled = float(np.linalg.norm(np.asarray(base_pose[:2, 3]) - self._plan_origin_xy))
-        return max(0.0, waypoint.max_base_travel - travelled)
 
     def _advance(self, waypoint: Waypoint, robot_view) -> None:
         """Move to the next waypoint once this one is reached, settled or timed out."""
@@ -334,7 +305,6 @@ class StretchScriptedPolicy(BasePolicy):
                 wrist_pitch=pitch,
                 gripper_open=True,
                 label="reach",
-                max_base_travel=policy_config.grasp_base_assist_m,
                 tolerance=policy_config.reach_tolerance_m,
             ),
             Waypoint(
@@ -371,7 +341,6 @@ class StretchScriptedPolicy(BasePolicy):
                 # Carrying an object across the workspace is the one manipulation
                 # motion whose span routinely exceeds the arm's, so allow the
                 # base to help here even though the grasp phases may not.
-                max_base_travel=0.3,
                 tolerance=policy_config.reach_tolerance_m * 1.5,
             ),
             Waypoint(
@@ -380,7 +349,6 @@ class StretchScriptedPolicy(BasePolicy):
                 gripper_open=True,
                 label="release",
                 settle_steps=policy_config.gripper_settle_steps,
-                max_base_travel=0.3,
                 tolerance=policy_config.reach_tolerance_m * 1.5,
             ),
             Waypoint(
@@ -388,7 +356,6 @@ class StretchScriptedPolicy(BasePolicy):
                 wrist_pitch=pitch,
                 gripper_open=True,
                 label="retreat",
-                max_base_travel=0.3,
                 tolerance=policy_config.reach_tolerance_m * 2.0,
             ),
         ]
@@ -446,7 +413,6 @@ class StretchScriptedPolicy(BasePolicy):
                     label=f"actuate_{index}",
                     # A drawer or door is dragged mostly by driving the base;
                     # the arm's 0.52m of travel cannot cover a full swing.
-                    max_base_travel=policy_config.articulation_travel_m + 0.2,
                     tolerance=policy_config.reach_tolerance_m * 2.0,
                 )
             )
