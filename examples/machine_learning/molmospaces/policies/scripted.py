@@ -133,7 +133,7 @@ class StretchScriptedPolicyConfig(BasePolicyConfig):
     grasp_base_assist_m: float = 0.12
     """
     How far the base may inch forward to close the last of the distance to a
-    grasp. `stretch/episode_overrides.py` aims for the middle of Stretch's reach
+    grasp. `franka_remapping/episode_overrides.py` aims for the middle of Stretch's reach
     band, but a pick-and-place base pose is a compromise between two targets and
     can leave either of them marginal; a hand's breadth of base motion recovers
     those without meaningfully changing where the robot stands.

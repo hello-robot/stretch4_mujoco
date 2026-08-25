@@ -35,7 +35,7 @@ from examples.machine_learning.molmospaces.policies.networks import (  # noqa: E
 from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
     Stretch4RobotConfig,
 )
-from examples.machine_learning.molmospaces.stretch.episode_overrides import (  # noqa: E402
+from examples.machine_learning.molmospaces.franka_remapping.episode_overrides import (  # noqa: E402
     REACH_BAND_M,
     TCP_MIN_REACH_M,
     retarget_base_pose,
@@ -531,7 +531,7 @@ def test_episode_starts_stowed():
     front of the base, so the two coincide. Measured over eight MB-Pick episodes
     that spawned the robot interpenetrating the scene five times, by up to 19cm.
     """
-    from examples.machine_learning.molmospaces.stretch.episode_overrides import (
+    from examples.machine_learning.molmospaces.franka_remapping.episode_overrides import (
         stretch_home_init_qpos,
     )
 

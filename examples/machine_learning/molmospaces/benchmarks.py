@@ -24,7 +24,7 @@ suite exist for a family, the harder one is the default and the easier one is
 available as an alternate -- see `Benchmark.alternates`.
 
 The episodes themselves were authored for a Franka Droid or an RBY1;
-`stretch/episode_overrides.py` retargets each one onto Stretch 4 at load time.
+`franka_remapping/episode_overrides.py` retargets each one onto Stretch 4 at load time.
 """
 
 from __future__ import annotations

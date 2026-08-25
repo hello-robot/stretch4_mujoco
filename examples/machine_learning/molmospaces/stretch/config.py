@@ -33,7 +33,7 @@ from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
 
 # Names of the two Stretch MJCF cameras this integration exposes to policies.
 # The benchmark episodes name Franka cameras ("wrist_camera", "exo_camera_1",
-# ...), which is one of the things `episode_overrides.py` rewrites.
+# ...), which is one of the things `franka_remapping/episode_overrides.py` rewrites.
 HEAD_CAMERA = "head_camera"
 WRIST_CAMERA = "wrist_camera"
 
@@ -119,20 +119,8 @@ class Stretch4RobotConfig(BaseRobotConfig):
 
     # base: (x, y, theta); lift: mast height; arm: total telescoping extension;
     # wrist: (yaw, pitch, roll); gripper: (right finger, left finger).
-    #
-    # This is the pose Stretch's own `keyframes.xml` calls "stow": arm retracted,
-    # lift low, wrist turned back so the gripper tucks in beside the mast.
-    #
-    # It is not merely tidy, it is what makes the benchmark episodes start
-    # legally. A benchmark base pose is a standoff of 0.55-0.90m from the target
-    # object, and an *unstowed* Stretch already has its tool 0.57m out in front
-    # of the base at working height -- so the gripper spawns exactly where the
-    # object is, which in practice means inside the counter, cabinet or cistern
-    # the object is sitting on. Measured over the first eight MB-Pick episodes,
-    # an unstowed spawn was interpenetrating the scene in five of them, by up to
-    # 19cm, and the robot simply cannot move from there. Stowed, that drops to
-    # one of eight.
     init_qpos: dict[str, list[float]] = {
+        # This is the "stow" pose in `keyframes.xml`
         "base": [0.0, 0.0, 0.0],
         "lift": [0.35],
         "arm": [0.0],

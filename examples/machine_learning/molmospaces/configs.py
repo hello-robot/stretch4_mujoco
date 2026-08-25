@@ -22,6 +22,9 @@ import logging
 import os
 
 from examples.machine_learning.molmospaces.policies.bc_policy import StretchBCPolicyConfig
+from examples.machine_learning.molmospaces.policies.molmobot_policy import (
+    StretchMolmoBotPolicyConfig,
+)
 from examples.machine_learning.molmospaces.policies.scripted import StretchScriptedPolicyConfig
 from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA,
@@ -30,8 +33,11 @@ from examples.machine_learning.molmospaces.stretch.config import (
     Stretch4RobotConfig,
 )
 from examples.machine_learning.molmospaces.stretch.robot import CHASE_CAMERA
-from examples.machine_learning.molmospaces.stretch.episode_overrides import (
+from examples.machine_learning.molmospaces.franka_remapping.episode_overrides import (
     stretch_episode_override,
+)
+from examples.machine_learning.molmospaces.franka_remapping.vla_policy import (
+    FrankaVLAPolicyConfig,
 )
 from molmo_spaces.configs.camera_configs import CameraSystemConfig
 from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig, DummyPolicyConfig
@@ -57,6 +63,30 @@ constructs the experiment config itself, from a class, and exposes no hook for
 overriding a field on it -- so the config has to read the request from
 somewhere the caller can reach. `run_benchmarks.py --viewer` sets this. Workers
 inherit it, which is why that flag also forces single-worker.
+"""
+
+
+MOLMOBOT_ACTION_TYPE_ENV_VAR = "STRETCH_MOLMOSPACES_MOLMOBOT_ACTION_TYPE"
+"""
+Which action type a `--policy molmobot` checkpoint was trained with.
+
+Same injection route as the viewer and the VLA host, and for the same reason:
+`run_evaluation()` builds the config from a class. Unlike those, this one has a
+correct-by-default value (`joint_pos_rel`, MolmoBot's own default), so it only
+needs setting for a checkpoint trained the other way.
+"""
+
+VLA_HOST_ENV_VAR = "STRETCH_MOLMOSPACES_VLA_HOST"
+VLA_PORT_ENV_VAR = "STRETCH_MOLMOSPACES_VLA_PORT"
+VLA_PROTOCOL_ENV_VAR = "STRETCH_MOLMOSPACES_VLA_PROTOCOL"
+"""
+Where `StretchFrankaVLAEvalConfig` should look for its inference server.
+
+Environment variables for the same reason as `VIEWER_ENV_VAR`: `run_evaluation()`
+constructs the experiment config from a class and exposes no hook for setting a
+field on it, and unlike `--checkpoint_path` there is no existing argument that
+carries a host and port. `run_benchmarks.py --vla-host/--vla-port` set these,
+and workers inherit them.
 """
 
 
@@ -201,6 +231,66 @@ class StretchBCEvalConfig(Stretch4BenchmarkEvalConfig):
     @property
     def tag(self) -> str:
         return "stretch4_bc"
+
+
+class StretchFrankaVLAEvalConfig(Stretch4BenchmarkEvalConfig):
+    """A Franka-space VLA, remapped onto Stretch by `franka_remapping/`.
+
+    The policy connects to an inference server rather than loading weights, so
+    there is nothing to pass on the command line except where that server is:
+    `run_benchmarks.py --policy vla --vla-host <host> --vla-port <port>`, which
+    reaches this config through `VLA_HOST_ENV_VAR` / `VLA_PORT_ENV_VAR` for the
+    same reason `--viewer` does -- `run_evaluation()` builds the config from a
+    class and has no hook for overriding a field on it.
+
+    Everything about *how* the remap behaves is a field on the policy config;
+    see `franka_remapping/vla_policy.py`.
+    """
+
+    policy_config: FrankaVLAPolicyConfig = FrankaVLAPolicyConfig()
+
+    @property
+    def tag(self) -> str:
+        return "stretch4_franka_vla"
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        host = os.environ.get(VLA_HOST_ENV_VAR)
+        port = os.environ.get(VLA_PORT_ENV_VAR)
+        protocol = os.environ.get(VLA_PROTOCOL_ENV_VAR)
+        if host:
+            self.policy_config.remote_config["host"] = host
+        if port:
+            self.policy_config.remote_config["port"] = int(port)
+        if protocol:
+            self.policy_config.remote_config["include_endpoint"] = protocol == "dreamzero"
+
+
+class StretchMolmoBotEvalConfig(Stretch4BenchmarkEvalConfig):
+    """A MolmoBot checkpoint driving Stretch natively, with no remapping.
+
+    For a checkpoint fine-tuned on Stretch's own move groups -- see
+    `finetuning/finetune.py --trainer molmobot`. MolmoBot's action space is
+    configured by move group, so there is no Franka in the loop to retarget
+    from; `policies/molmobot_policy.py` supplies Stretch's spec and delegates to
+    MolmoBot's `SynthVLAPolicy`.
+
+    The *released* `allenai/MolmoBot-DROID` is a different case: it was trained
+    on the `franka_joint` action spec, so it emits seven Franka arm joints and
+    needs `StretchFrankaVLAEvalConfig` instead.
+    """
+
+    policy_config: StretchMolmoBotPolicyConfig = StretchMolmoBotPolicyConfig()
+
+    @property
+    def tag(self) -> str:
+        return "stretch4_molmobot"
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        action_type = os.environ.get(MOLMOBOT_ACTION_TYPE_ENV_VAR)
+        if action_type:
+            self.policy_config.action_type = action_type
 
 
 class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):
