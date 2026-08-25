@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 from pathlib import Path
@@ -118,10 +119,20 @@ def train(
             else train_loss
         )
         schedule.step()
-        history.append({"epoch": epoch, "train": train_loss, "validation": validation_loss})
+        history.append(
+            {
+                "epoch": epoch,
+                "train": train_loss,
+                "validation": validation_loss,
+                "learning_rate": schedule.get_last_lr()[0],
+            }
+        )
         log.info(
             f"[train] epoch {epoch + 1}/{epochs} train={train_loss:.5f} val={validation_loss:.5f}"
         )
+        # Written every epoch, not at the end, so a run that is still going (or
+        # that dies) can still be inspected.
+        _write_training_artifacts(output_path, history)
 
         if validation_loss < best_validation:
             best_validation = validation_loss
@@ -129,11 +140,49 @@ def train(
                 output_path, model, dataset, chunk_size, statistics, epoch, validation_loss
             )
 
-    (output_path.parent / f"{output_path.stem}_history.json").write_text(
-        json.dumps(history, indent=2)
-    )
     log.info(f"[train] best validation loss {best_validation:.5f}; checkpoint at {output_path}")
+    log.info(f"[train] curves at {output_path.parent / (output_path.stem + '_curves.png')}")
     return output_path
+
+
+def _write_training_artifacts(output_path: Path, history: list[dict]) -> None:
+    """Dump the loss history as JSON, CSV and a plot, beside the checkpoint.
+
+    Three formats because they are read by three different things: the JSON by
+    code, the CSV by a spreadsheet, and the PNG by a person who wants to see at
+    a glance whether the run converged or diverged.
+    """
+    stem = output_path.stem
+    directory = output_path.parent
+    (directory / f"{stem}_history.json").write_text(json.dumps(history, indent=2))
+
+    with (directory / f"{stem}_history.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(history[0]))
+        writer.writeheader()
+        writer.writerows(history)
+
+    try:
+        import matplotlib
+
+        # No display during training, and on a headless box the default backend
+        # fails at import rather than at draw time.
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    epochs = [entry["epoch"] + 1 for entry in history]
+    figure, axis = plt.subplots(figsize=(7, 4))
+    axis.plot(epochs, [entry["train"] for entry in history], label="train")
+    axis.plot(epochs, [entry["validation"] for entry in history], label="validation")
+    axis.set_xlabel("epoch")
+    axis.set_ylabel("smooth L1 loss (normalised actions)")
+    axis.set_title(stem)
+    axis.grid(alpha=0.3)
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(directory / f"{stem}_curves.png", dpi=120)
+    plt.close(figure)
 
 
 class _Normaliser:

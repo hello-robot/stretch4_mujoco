@@ -120,16 +120,24 @@ class Stretch4RobotConfig(BaseRobotConfig):
     # base: (x, y, theta); lift: mast height; arm: total telescoping extension;
     # wrist: (yaw, pitch, roll); gripper: (right finger, left finger).
     #
-    # The lift starts at roughly counter height and the arm barely extended,
-    # which is the pose Stretch's own `keyframes.xml` calls "home". Wrist yaw is
-    # zero, i.e. the gripper points along the arm's own extension direction, and
-    # the fingers start open so the first grasp does not have to open them.
+    # This is the pose Stretch's own `keyframes.xml` calls "stow": arm retracted,
+    # lift low, wrist turned back so the gripper tucks in beside the mast.
+    #
+    # It is not merely tidy, it is what makes the benchmark episodes start
+    # legally. A benchmark base pose is a standoff of 0.55-0.90m from the target
+    # object, and an *unstowed* Stretch already has its tool 0.57m out in front
+    # of the base at working height -- so the gripper spawns exactly where the
+    # object is, which in practice means inside the counter, cabinet or cistern
+    # the object is sitting on. Measured over the first eight MB-Pick episodes,
+    # an unstowed spawn was interpenetrating the scene in five of them, by up to
+    # 19cm, and the robot simply cannot move from there. Stowed, that drops to
+    # one of eight.
     init_qpos: dict[str, list[float]] = {
         "base": [0.0, 0.0, 0.0],
-        "lift": [0.6],
-        "arm": [0.1],
-        "wrist": [0.0, 0.0, 0.0],
-        "gripper": [0.5, 0.5],
+        "lift": [0.35],
+        "arm": [0.0],
+        "wrist": [3.14, -0.4, 0.0],
+        "gripper": [0.0, 0.0],
     }
     init_qpos_noise_range: dict[str, list[float]] | None = None
 

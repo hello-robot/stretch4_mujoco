@@ -19,6 +19,7 @@ though `run_benchmarks.py` is the more convenient way in.
 from __future__ import annotations
 
 import logging
+import os
 
 from examples.machine_learning.molmospaces.policies.bc_policy import StretchBCPolicyConfig
 from examples.machine_learning.molmospaces.policies.scripted import StretchScriptedPolicyConfig
@@ -28,6 +29,7 @@ from examples.machine_learning.molmospaces.stretch.config import (
     Stretch4CameraSystem,
     Stretch4RobotConfig,
 )
+from examples.machine_learning.molmospaces.stretch.robot import CHASE_CAMERA
 from examples.machine_learning.molmospaces.stretch.episode_overrides import (
     stretch_episode_override,
 )
@@ -44,6 +46,22 @@ from molmo_spaces.tasks.nav_task import NavToObjTask
 from molmo_spaces.tasks.nav_task_sampler import NavToObjTaskSampler
 
 log = logging.getLogger(__name__)
+
+
+VIEWER_ENV_VAR = "STRETCH_MOLMOSPACES_VIEWER"
+"""
+Set to "1" to launch MuJoCo's passive viewer during evaluation.
+
+An environment variable rather than an argument because `run_evaluation()`
+constructs the experiment config itself, from a class, and exposes no hook for
+overriding a field on it -- so the config has to read the request from
+somewhere the caller can reach. `run_benchmarks.py --viewer` sets this. Workers
+inherit it, which is why that flag also forces single-worker.
+"""
+
+
+def viewer_requested() -> bool:
+    return os.environ.get(VIEWER_ENV_VAR, "") not in ("", "0", "false", "False")
 
 
 def register_stretch_episode_override() -> None:
@@ -87,9 +105,22 @@ class Stretch4BenchmarkEvalConfig(JsonBenchmarkEvalConfig):
 
     end_on_success: bool = True
 
+    # What `--viewer` points the camera at. `setup_viewer` in MolmoSpaces'
+    # rollout pipeline only accepts a fixed MJCF camera here, and without one it
+    # leaves Mujoco's default framing of the whole model -- which for a benchmark
+    # house, loaded in its "ceiling" variant, is a sealed building seen from 70m
+    # away with the robot invisible inside. `Stretch4Robot` mounts this camera on
+    # the base for exactly this purpose; see `_add_chase_camera()`. Swap in
+    # "robot_0/camera_center_link" for the robot's own egocentric view.
+    viewer_cam_dict: dict = {"camera": f"{Stretch4RobotConfig().robot_namespace}{CHASE_CAMERA}"}
+
     @property
     def tag(self) -> str:
         return "stretch4_benchmark_eval"
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        self.use_passive_viewer = viewer_requested()
 
 
 class StretchScriptedEvalConfig(Stretch4BenchmarkEvalConfig):

@@ -422,6 +422,13 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
 )
 @click.option("--write-to-file", type=str, default=None, help="Write the combined scene XML here")
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
+@click.option(
+    "--follow-robot/--no-follow-robot",
+    default=True,
+    help="Point the viewer camera at the robot and keep it there as it drives. On "
+    "by default because a house is large and not centred on the origin, so MuJoCo's "
+    "default framing of the whole scene leaves the robot a few pixels across.",
+)
 @click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
 @click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
 @click.option("--lidar", is_flag=True, help="Show the lidar point cloud in Rerun")
@@ -449,6 +456,7 @@ def main(
     match_solver_options: bool,
     write_to_file: str | None,
     headless: bool,
+    follow_robot: bool,
     keyboard: bool,
     gamepad: bool,
     lidar: bool,
@@ -480,7 +488,10 @@ def main(
         cameras_to_use=cameras_to_use,
         camera_hz=10.0 if lidar else 30.0,
     )
-    sim.start(headless=headless)
+    sim.start(
+        headless=headless,
+        viewer_track_body=STRETCH_ROOT_BODY if follow_robot else None,
+    )
 
     if lidar or not opencv:
         # With --opencv the frames go to OpenCV windows, so Rerun shouldn't lay

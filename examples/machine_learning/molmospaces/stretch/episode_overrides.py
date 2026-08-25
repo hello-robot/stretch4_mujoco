@@ -70,6 +70,11 @@ _MANIPULATION_TARGET_POSE_FIELDS = (
 def stretch_home_init_qpos() -> dict[str, list[float]]:
     """Per-move-group start pose to write over the episode's Franka/RBY1 one.
 
+    Stretch starts *stowed*. That is load-bearing, not cosmetic: see the comment
+    on `Stretch4RobotConfig.init_qpos`. An unstowed Stretch has its tool 0.57m in
+    front of the base, which is inside the reach band the base pose is placed
+    at, so it spawns embedded in whatever the target object is sitting on.
+
     Taken from `Stretch4RobotConfig.init_qpos` so there is a single definition of
     where Stretch starts an episode. The base entry is dropped: the base is
     placed from `task.robot_base_pose`, and leaving a zeroed base pose in

@@ -23,3 +23,6 @@ MUJOCO_LOG.TXT
 # Temp runtime XML
 stretch_temp_abs.xml
 .DS_Store
+
+# Default output directory for examples/machine_learning/molmospaces/run_benchmarks.py
+eval_output/

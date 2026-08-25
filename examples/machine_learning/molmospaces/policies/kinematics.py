@@ -158,6 +158,58 @@ class StretchReachSolver:
             `{"base": (3,), "lift": (1,), "arm": (1,), "wrist": (3,)}`, or None if
             the target could not be reached within `max_iterations`.
         """
+        solution = self._solve_from(
+            base_pose,
+            target_position,
+            wrist_pitch,
+            wrist_roll,
+            seed,
+            dofs,
+            max_base_travel,
+            tolerance,
+            max_iterations,
+            step_damping,
+        )
+        if solution is not None or seed is None:
+            return solution
+
+        # Retry with the wrist straightened. Damped least squares only ever walks
+        # downhill, so a wrist that starts turned away from the target sits in a
+        # local minimum: the yaw column points the wrong way and the step pushes
+        # it further round, into its joint limit, rather than back through zero.
+        # Measured on a stowed Stretch (wrist yaw 3.14, the pose its own
+        # keyframes call "stow"), a seeded solve reaches 0 of 27 test targets and
+        # this retry reaches all 27. Lift and arm keep the caller's values so the
+        # retry stays as continuous as it can.
+        straightened = {key: np.array(value, dtype=float) for key, value in seed.items()}
+        straightened["wrist"] = np.array([0.0, wrist_pitch, wrist_roll])
+        return self._solve_from(
+            base_pose,
+            target_position,
+            wrist_pitch,
+            wrist_roll,
+            straightened,
+            dofs,
+            max_base_travel,
+            tolerance,
+            max_iterations,
+            step_damping,
+        )
+
+    def _solve_from(
+        self,
+        base_pose: np.ndarray,
+        target_position: np.ndarray,
+        wrist_pitch: float,
+        wrist_roll: float,
+        seed: dict[str, np.ndarray] | None,
+        dofs: tuple[str, ...] | None,
+        max_base_travel: float,
+        tolerance: float,
+        max_iterations: int,
+        step_damping: float,
+    ) -> dict[str, np.ndarray] | None:
+        """One damped least-squares descent from a single starting configuration."""
         if dofs is None:
             dofs = (
                 TOP_DOWN_REACH_DOFS

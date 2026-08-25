@@ -121,7 +121,14 @@ baseline and a behaviour-cloning training pipeline.
 
 ```
 uv run python -m examples.machine_learning.molmospaces.run_benchmarks --list
-uv run python -m examples.machine_learning.molmospaces.run_benchmarks --episodes 5
+uv run python -m examples.machine_learning.molmospaces.run_benchmarks --episodes 5 --viewer --report
+```
+
+Run a trained checkpoint in the interactive sim, SPACE to hand over from teleop:
+
+```
+uv run python -m examples.machine_learning.molmospaces.live_policy \
+    --checkpoint checkpoints/stretch_manip.pt --scene default --rerun
 ```
 
 ## Writing Code

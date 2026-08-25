@@ -114,7 +114,11 @@ class StretchMujocoSimulator:
         return StretchCameras.rgb_stretch3()
 
     def start(
-        self, show_viewer_ui: bool = False, headless: bool = False, use_passive_viewer: bool = True
+        self,
+        show_viewer_ui: bool = False,
+        headless: bool = False,
+        use_passive_viewer: bool = True,
+        viewer_track_body: str | None = None,
     ) -> None:
         """
         Start the simulator
@@ -123,6 +127,12 @@ class StretchMujocoSimulator:
             show_viewer_ui: bool, whether to show the Mujoco viewer UI
             headless: bool, whether to run the simulation in headless mode
             use_passive_viewer: bool, to use the passive or managed mujoco UI viewer.
+            viewer_track_body: name of a body for the viewer camera to follow,
+                e.g. "stretch4". Worth setting in a large scene, where Mujoco's
+                default framing of the whole model leaves the robot a few pixels
+                across. Only the passive viewer honours it; the managed viewer
+                gives no handle to configure. You can still orbit and zoom
+                normally afterwards.
         """
         self.is_stop_called = False
 
@@ -154,6 +164,7 @@ class StretchMujocoSimulator:
                 self._cameras_to_use,
                 self._start_translation,
                 self._start_rotation_quat,
+                viewer_track_body,
             ),
             daemon=False,  # We're gonna handle terminating this in stop_mujoco_process()
         )
