@@ -7,6 +7,10 @@ One command for the whole data half of the pipeline:
     python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
         --task debug
 
+    # the same, watched live in MuJoCo's viewer rather than read off a log
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
+        --task debug --output-dir data/stretch_debug --no-export --visualize
+
     # a real run: 2000 pick episodes across procthor-objaverse, 8 workers
     python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
         --task pick --episodes 2000 --num-workers 8 --output-dir data/stretch_pick
@@ -64,6 +68,7 @@ def generate_rollouts(
     data_split: str | None = None,
     houses: int | None = None,
     seed: int | None = None,
+    visualize: bool = False,
 ) -> Path:
     """Run the data generation pipeline for one task family.
 
@@ -81,6 +86,8 @@ def generate_rollouts(
             contributes a handful of episodes rather than hundreds, which is
             what keeps the scene distribution wide.
         seed: task-sampling seed.
+        visualize: watch the rollouts in MuJoCo's passive viewer. Requires
+            `num_workers == 1` -- see `main()`.
 
     Returns:
         The directory the pipeline actually wrote to.
@@ -102,6 +109,7 @@ def generate_rollouts(
         config.seed = seed
     config.num_workers = num_workers
     config.use_wandb = False
+    config.use_passive_viewer = visualize
 
     if episodes is not None:
         _spread_episodes(config, episodes, houses)
@@ -200,6 +208,12 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
     help="Include episodes the task judged unsuccessful. Off by default: a partial "
     "expert's failures are counter-examples, not demonstrations.",
 )
+@click.option(
+    "--visualize",
+    is_flag=True,
+    help="Watch each episode live in MuJoCo's passive viewer, from the robot's "
+    "chase camera. Forces --num-workers 1.",
+)
 @click.option("--export/--no-export", "want_export", default=True, help="Run the export stage.")
 @click.option(
     "--fps", type=float, default=15.0, help="Frame rate to record in the dataset metadata."
@@ -216,15 +230,25 @@ def main(
     houses: int | None,
     seed: int | None,
     keep_failures: bool,
+    visualize: bool,
     want_export: bool,
     fps: float,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     # MolmoSpaces renders off-screen through EGL; without this a headless run
-    # fails inside the camera manager rather than at startup.
+    # fails inside the camera manager rather than at startup. The passive viewer
+    # is unaffected -- it is the C++ `simulate` app, which brings its own GLFW
+    # window regardless of what the offscreen camera renderer is using.
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+    if visualize and num_workers != 1:
+        # `ParallelRolloutRunner.run()` only stays in the main process for a
+        # single worker; above that the rollouts happen in spawned processes,
+        # where a viewer window would be launched per worker if it opened at all.
+        click.secho("--visualize forces --num-workers 1.", fg="yellow")
+        num_workers = 1
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -243,6 +267,7 @@ def main(
                 data_split=data_split,
                 houses=houses,
                 seed=seed,
+                visualize=visualize,
             )
             for task in tasks
         ]

@@ -40,6 +40,7 @@ from examples.machine_learning.molmospaces.stretch.config import (
     Stretch4CameraSystem,
     Stretch4RobotConfig,
 )
+from examples.machine_learning.molmospaces.stretch.robot import CHASE_CAMERA
 from molmo_spaces.configs.base_open_task_configs import ClosingBaseConfig, OpeningBaseConfig
 from molmo_spaces.configs.base_pick_and_place_color_configs import PickAndPlaceColorDataGenConfig
 from molmo_spaces.configs.base_pick_and_place_configs import PickAndPlaceDataGenConfig
@@ -130,6 +131,16 @@ class StretchDataGenMixin:
     camera_config: CameraSystemConfig = Stretch4CameraSystem()
 
     policy_config: BasePolicyConfig = StretchSimpleIKPolicyConfig()
+
+    # Where `generate_dataset.py --visualize` points the passive viewer. The same
+    # camera `Stretch4BenchmarkEvalConfig` uses, and for the same reason:
+    # `setup_viewer` in MolmoSpaces' rollout pipeline only accepts a *fixed* MJCF
+    # camera here, and the datagen bases leave this as free-camera parameters it
+    # ignores -- which frames the whole model, i.e. a sealed procthor house seen
+    # from 70m away with the robot invisible inside it. `Stretch4Robot` mounts
+    # this camera on the base for exactly this purpose; see `_add_chase_camera()`.
+    # Swap in "robot_0/camera_center_link" for the robot's own egocentric view.
+    viewer_cam_dict: dict = {"camera": f"{Stretch4RobotConfig().robot_namespace}{CHASE_CAMERA}"}
 
     apply_stretch_placement: bool = True
     """
