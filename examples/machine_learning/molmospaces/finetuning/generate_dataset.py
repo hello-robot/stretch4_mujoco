@@ -54,6 +54,7 @@ from typing import Any
 
 import click
 import mujoco
+import numpy as np
 
 from examples.machine_learning.molmospaces.finetuning.datagen_configs import (
     DATAGEN_CONFIGS,
@@ -69,10 +70,462 @@ from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
 log = logging.getLogger(__name__)
 
 
+class StretchRerunVisualizer:
+    """Streams 3D robot meshes, object meshes, and coordinate frames to Rerun."""
+
+    def __init__(self, spawn: bool = True):
+        self._spawn = spawn
+        self._initialized = False
+        self._logged_meshes: set[str] = set()
+
+    def start_episode(self, episode_seed: int, task: Any) -> None:
+        """Starts a new Rerun recording for each episode."""
+        try:
+            import uuid
+            import rerun as rr
+            import rerun.blueprint as rrb
+
+            rec_id = f"episode_{episode_seed}_{uuid.uuid4().hex[:8]}"
+            app_id = "Stretch4 Datagen"
+
+            blueprint = rrb.Blueprint(
+                rrb.Spatial3DView(origin="world", name="3D Scene"),
+                collapse_panels=True,
+            )
+
+            if not self._initialized:
+                rr.init(app_id, recording_id=rec_id, spawn=self._spawn, default_blueprint=blueprint)
+                if self._spawn:
+                    try:
+                        rr.spawn(memory_limit="4GB")
+                    except Exception:
+                        pass
+                self._initialized = True
+            else:
+                rr.init(app_id, recording_id=rec_id, spawn=False, default_blueprint=blueprint)
+
+            try:
+                rr.send_blueprint(blueprint)
+            except Exception as e:
+                log.debug(f"Could not send Rerun blueprint: {e}")
+
+            rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+            self._logged_meshes.clear()
+
+            pickup_obj_name = self._get_pickup_object_name(task)
+            if hasattr(task, "env") and hasattr(task.env, "current_model"):
+                self.setup_meshes(task.env.current_model, pickup_obj_name)
+        except Exception as e:
+            log.warning(f"Failed to start Rerun episode recording: {e}")
+
+    @staticmethod
+    def _get_pickup_object_name(task: Any) -> str | None:
+        if hasattr(task, "get_task_objects"):
+            try:
+                objs = task.get_task_objects()
+                if isinstance(objs, dict):
+                    for k in ["pickup_obj", "target_obj", "pickup_object", "target_object", "manipulated_object"]:
+                        if k in objs and objs[k]:
+                            return str(objs[k])
+            except Exception:
+                pass
+        if hasattr(task, "config") and hasattr(task.config, "task_config"):
+            tc = task.config.task_config
+            for k in ["pickup_obj_name", "target_obj_name", "object_name"]:
+                val = getattr(tc, k, None)
+                if val:
+                    return str(val)
+        for attr in ["target_obj_name", "pickup_obj_name", "target_object"]:
+            val = getattr(task, attr, None)
+            if val and isinstance(val, str):
+                return val
+        return None
+
+    @staticmethod
+    def _get_object_body_ids(model: Any, pickup_obj_name: str | None) -> set[int]:
+        """Finds all body IDs belonging to the manipulated object and its children."""
+        if not pickup_obj_name:
+            return set()
+        root_ids = set()
+        for b_id in range(1, model.nbody):  # Skip body 0 (world)
+            b_name = model.body(b_id).name
+            if "robot_0" in b_name:
+                continue
+            if (
+                pickup_obj_name == b_name
+                or b_name.startswith(f"{pickup_obj_name}_")
+                or b_name.startswith(f"{pickup_obj_name}|")
+                or (
+                    pickup_obj_name in b_name
+                    and not any(
+                        k in b_name.lower()
+                        for k in [
+                            "wall",
+                            "floor",
+                            "room",
+                            "house",
+                            "ceiling",
+                            "counter",
+                            "table",
+                            "chair",
+                            "sofa",
+                            "bed",
+                            "shelf",
+                        ]
+                    )
+                )
+            ):
+                root_ids.add(b_id)
+
+        descendants = set(root_ids)
+        parent_ids = model.body_parentid
+        queue = list(root_ids)
+        while queue:
+            curr = queue.pop(0)
+            for i, pid in enumerate(parent_ids):
+                if i > 0 and pid == curr and i not in descendants:
+                    b_name = model.body(i).name
+                    if "robot_0" not in b_name:
+                        descendants.add(i)
+                        queue.append(i)
+        return descendants
+
+    def setup_meshes(self, model: Any, pickup_obj_name: str | None) -> None:
+        if not self._initialized:
+            return
+        import rerun as rr
+        from scipy.spatial.transform import Rotation as R
+
+        def _build_mesh3d(g: int, verts_local: np.ndarray, faces: np.ndarray, is_robot: bool) -> Any:
+            g_mesh = model.geom_dataid[g] if hasattr(model, "geom_dataid") else -1
+            uvs = None
+            tex_img = None
+
+            if g_mesh >= 0 and hasattr(model, "mesh_texcoordadr") and hasattr(model, "mesh_texcoord"):
+                texadr = int(model.mesh_texcoordadr[g_mesh])
+                texnum = int(model.mesh_texcoordnum[g_mesh])
+                if texnum > 0:
+                    uvs = model.mesh_texcoord[texadr : texadr + texnum]
+
+            mat_id = int(model.geom_matid[g]) if hasattr(model, "geom_matid") else -1
+            if mat_id >= 0 and hasattr(model, "mat_texid") and hasattr(model, "tex_data"):
+                tex_ids = model.mat_texid[mat_id]
+                tex_id = -1
+                for tid in tex_ids:
+                    if int(tid) >= 0:
+                        tex_id = int(tid)
+                        break
+                if 0 <= tex_id < model.ntex and uvs is not None and len(uvs) == len(verts_local):
+                    w = int(model.tex_width[tex_id])
+                    h = int(model.tex_height[tex_id])
+                    adr = int(model.tex_adr[tex_id])
+                    tex_img = model.tex_data[adr : adr + w * h * 3].reshape(h, w, 3)
+
+            if tex_img is not None and uvs is not None:
+                return rr.Mesh3D(
+                    vertex_positions=verts_local,
+                    triangle_indices=faces,
+                    vertex_texcoords=uvs,
+                    albedo_texture=tex_img,
+                )
+
+            rgba = None
+            if mat_id >= 0 and hasattr(model, "mat_rgba"):
+                mat_rgba = model.mat_rgba[mat_id]
+                if not np.allclose(mat_rgba[:3], 1.0) and not np.allclose(mat_rgba[:3], 0.5):
+                    rgba = (mat_rgba * 255).astype(np.uint8).tolist()
+
+            if rgba is None and hasattr(model, "geom_rgba"):
+                geom_rgba = model.geom_rgba[g]
+                if is_robot or not np.allclose(geom_rgba[:3], 0.5):
+                    rgba = (geom_rgba * 255).astype(np.uint8).tolist()
+
+            if rgba is None:
+                rgba = [220, 225, 235, 255] if is_robot else [225, 120, 50, 255]
+
+            return rr.Mesh3D(
+                vertex_positions=verts_local,
+                triangle_indices=faces,
+                albedo_factor=rgba,
+            )
+
+        # 1. Stretch 4 robot meshes (from stretch4_urdf)
+        robot_visual_links = set()
+        for g in range(model.ngeom):
+            b_id = model.geom_bodyid[g]
+            b_name = model.body(b_id).name
+            g_mesh = model.geom_dataid[g]
+            if "robot_0" in b_name and g_mesh >= 0:
+                mesh_name = model.mesh(g_mesh).name
+                if "collision" not in mesh_name:
+                    robot_visual_links.add(b_name)
+
+        for g in range(model.ngeom):
+            b_id = model.geom_bodyid[g]
+            b_name = model.body(b_id).name
+            g_mesh = model.geom_dataid[g]
+
+            geom_key = f"robot/{b_name}/{g}"
+            if "robot_0" in b_name and g_mesh >= 0:
+                mesh_name = model.mesh(g_mesh).name
+                if "collision" in mesh_name and b_name in robot_visual_links:
+                    continue
+
+                if geom_key not in self._logged_meshes:
+                    vertadr = int(model.mesh_vertadr[g_mesh])
+                    vertnum = int(model.mesh_vertnum[g_mesh])
+                    faceadr = int(model.mesh_faceadr[g_mesh])
+                    facenum = int(model.mesh_facenum[g_mesh])
+                    verts = model.mesh_vert[vertadr : vertadr + vertnum].astype(np.float32)
+                    faces = model.mesh_face[faceadr : faceadr + facenum].astype(np.uint32)
+
+                    rot = R.from_quat(model.geom_quat[g], scalar_first=True)
+                    verts_local = rot.apply(verts) + model.geom_pos[g]
+
+                    mesh_3d = _build_mesh3d(g, verts_local, faces, is_robot=True)
+                    b_key = b_name.replace("/", "_")
+                    rr.log(
+                        f"world/robot/{b_key}/geom_{g}",
+                        mesh_3d,
+                        static=True,
+                    )
+                    self._logged_meshes.add(geom_key)
+
+        # 2. Manipulated object meshes & primitives from MolmoSpaces scene assets
+        obj_body_ids = self._get_object_body_ids(model, pickup_obj_name)
+        obj_geoms = [g for g in range(model.ngeom) if model.geom_bodyid[g] in obj_body_ids]
+        has_visual_mesh = any(
+            model.geom_dataid[g] >= 0
+            and "collision" not in model.mesh(model.geom_dataid[g]).name
+            for g in obj_geoms
+            if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH
+        )
+
+        for g in obj_geoms:
+            b_id = model.geom_bodyid[g]
+            b_name = model.body(b_id).name
+            g_type = model.geom_type[g]
+            g_mesh = model.geom_dataid[g]
+            mesh_name = model.mesh(g_mesh).name if g_mesh >= 0 else ""
+
+            if has_visual_mesh and ("collision" in mesh_name or g_mesh < 0):
+                continue
+
+            obj_geom_key = f"object/{b_name}/{g}"
+            if obj_geom_key not in self._logged_meshes:
+                b_key = b_name.replace("/", "_")
+                if g_type == mujoco.mjtGeom.mjGEOM_MESH and g_mesh >= 0:
+                    vertadr = int(model.mesh_vertadr[g_mesh])
+                    vertnum = int(model.mesh_vertnum[g_mesh])
+                    faceadr = int(model.mesh_faceadr[g_mesh])
+                    facenum = int(model.mesh_facenum[g_mesh])
+                    verts = model.mesh_vert[vertadr : vertadr + vertnum].astype(np.float32)
+                    faces = model.mesh_face[faceadr : faceadr + facenum].astype(np.uint32)
+
+                    rot = R.from_quat(model.geom_quat[g], scalar_first=True)
+                    verts_local = rot.apply(verts) + model.geom_pos[g]
+
+                    mesh_3d = _build_mesh3d(g, verts_local, faces, is_robot=False)
+                    rr.log(
+                        f"world/object/{b_key}/geom_{g}",
+                        mesh_3d,
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_BOX:
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [225, 120, 50, 255]
+                    rr.log(
+                        f"world/object/{b_key}/geom_{g}",
+                        rr.Boxes3D(
+                            half_sizes=[model.geom_size[g]],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type in (mujoco.mjtGeom.mjGEOM_SPHERE, mujoco.mjtGeom.mjGEOM_ELLIPSOID):
+                    s = float(model.geom_size[g][0])
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [225, 120, 50, 255]
+                    rr.log(
+                        f"world/object/{b_key}/geom_{g}",
+                        rr.Ellipsoids3D(
+                            half_sizes=[[s, s, s]],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                    r = float(model.geom_size[g][0])
+                    h = float(model.geom_size[g][1]) * 2
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [225, 120, 50, 255]
+                    rr.log(
+                        f"world/object/{b_key}/geom_{g}",
+                        rr.Cylinders3D(
+                            radii=[r],
+                            lengths=[h],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                    r = float(model.geom_size[g][0])
+                    h = float(model.geom_size[g][1]) * 2
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [225, 120, 50, 255]
+                    rr.log(
+                        f"world/object/{b_key}/geom_{g}",
+                        rr.Capsules3D(
+                            radii=[r],
+                            lengths=[h],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                self._logged_meshes.add(obj_geom_key)
+
+    def log_step(
+        self,
+        step_idx: int,
+        task: Any,
+        observation: Any = None,
+    ) -> None:
+        if not self._initialized:
+            return
+        try:
+            import rerun as rr
+
+            model = task.env.current_model
+            data = task.env.mj_datas[task.env.current_batch_index]
+            pickup_obj_name = self._get_pickup_object_name(task)
+            obj_body_ids = self._get_object_body_ids(model, pickup_obj_name)
+
+            rr.set_time("step", sequence=int(step_idx))
+            if hasattr(data, "time") and data.time is not None:
+                rr.set_time("sim_time", duration=float(data.time))
+
+            # Update body transforms for Stretch robot and manipulated object
+            for b_id in range(model.nbody):
+                b_name = model.body(b_id).name
+                b_key = b_name.replace("/", "_")
+                if "robot_0" in b_name:
+                    pos = data.xpos[b_id]
+                    mat = data.xmat[b_id].reshape(3, 3)
+                    rr.log(f"world/robot/{b_key}", rr.Transform3D(translation=pos, mat3x3=mat))
+                elif b_id in obj_body_ids:
+                    pos = data.xpos[b_id]
+                    mat = data.xmat[b_id].reshape(3, 3)
+                    rr.log(f"world/object/{b_key}", rr.Transform3D(translation=pos, mat3x3=mat))
+
+            # Coordinate frame axes config
+            axis_len = 0.08
+            axes_vectors = [[axis_len, 0.0, 0.0], [0.0, axis_len, 0.0], [0.0, 0.0, axis_len]]
+            axes_colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+            axes_labels = ["X", "Y", "Z"]
+
+            # 1. Wrist Center frame
+            wrist_bodies = [
+                "robot_0/wrist_roll_link",
+                "robot_0/wrist_pitch_link",
+                "robot_0/wrist_yaw_link",
+                "robot_0/wrist_link",
+                "robot_0/tool_attachment_site_link",
+            ]
+            for wb in wrist_bodies:
+                try:
+                    w_id = model.body(wb).id
+                    pos = data.xpos[w_id]
+                    mat = data.xmat[w_id].reshape(3, 3)
+                    rr.log("world/frames/wrist_center", rr.Transform3D(translation=pos, mat3x3=mat))
+                    rr.log("world/frames/wrist_center/axes", rr.Arrows3D(vectors=axes_vectors, colors=axes_colors, labels=axes_labels, show_labels=True))
+                    rr.log("world/frames/wrist_center/label", rr.Points3D(positions=[[0.0, 0.0, 0.0]], radii=[0.005], colors=[[255, 255, 255]], labels=["Wrist Center"], show_labels=True))
+                    break
+                except Exception:
+                    pass
+
+            # 2. Tool Center frame
+            tool_bodies = [
+                "robot_0/grasp_center_link",
+                "robot_0/quick_connect_interface_link",
+                "robot_0/tool_attachment_site_link",
+            ]
+            for tb in tool_bodies:
+                try:
+                    t_id = model.body(tb).id
+                    pos = data.xpos[t_id]
+                    mat = data.xmat[t_id].reshape(3, 3)
+                    rr.log("world/frames/tool_center", rr.Transform3D(translation=pos, mat3x3=mat))
+                    rr.log("world/frames/tool_center/axes", rr.Arrows3D(vectors=axes_vectors, colors=axes_colors, labels=axes_labels, show_labels=True))
+                    rr.log("world/frames/tool_center/label", rr.Points3D(positions=[[0.0, 0.0, 0.0]], radii=[0.005], colors=[[255, 255, 255]], labels=["Tool Center"], show_labels=True))
+                    break
+                except Exception:
+                    pass
+
+            # 3. Object frame
+            if obj_body_ids:
+                # Use root-most body in obj_body_ids
+                root_obj_id = min(obj_body_ids)
+                pos = data.xpos[root_obj_id]
+                mat = data.xmat[root_obj_id].reshape(3, 3)
+                rr.log("world/frames/object", rr.Transform3D(translation=pos, mat3x3=mat))
+                rr.log("world/frames/object/axes", rr.Arrows3D(vectors=axes_vectors, colors=axes_colors, labels=axes_labels, show_labels=True))
+                rr.log("world/frames/object/label", rr.Points3D(positions=[[0.0, 0.0, 0.0]], radii=[0.005], colors=[[255, 255, 255]], labels=[f"Object: {pickup_obj_name}" if pickup_obj_name else "Object"], show_labels=True))
+
+            # 4. Optional Camera feeds
+            if observation is not None:
+                obs_dict = observation[0] if isinstance(observation, list) and observation else observation
+                if isinstance(obs_dict, dict):
+                    for cam_name in ["head_camera", "wrist_camera", "chase_camera"]:
+                        if cam_name in obs_dict and obs_dict[cam_name] is not None:
+                            img = obs_dict[cam_name]
+                            if hasattr(img, "ndim") and img.ndim == 3:
+                                rr.log(f"world/cameras/{cam_name}", rr.Image(img))
+        except Exception as e:
+            log.debug(f"Error logging to Rerun: {e}")
+
+
+def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
+    """Configures MuJoCo passive viewer in free camera mode snapped to the robot."""
+    if viewer is None:
+        return
+    try:
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        viewer.cam.fixedcamid = -1
+
+        robot_pos = None
+        if hasattr(task, "env") and hasattr(task.env, "current_model") and hasattr(task.env, "mj_datas"):
+            m = task.env.current_model
+            d = task.env.mj_datas[task.env.current_batch_index]
+            for candidate in ["robot_0/base_link", "robot_0/base", "base_link", "robot_0/lift_link"]:
+                try:
+                    bid = m.body(candidate).id
+                    robot_pos = d.xpos[bid]
+                    break
+                except Exception:
+                    pass
+
+        if robot_pos is None and hasattr(task, "robot") and task.robot:
+            base_pose = getattr(task.robot, "base_pose", None)
+            if base_pose is not None:
+                robot_pos = base_pose[:3]
+
+        if robot_pos is not None:
+            viewer.cam.lookat[0] = float(robot_pos[0])
+            viewer.cam.lookat[1] = float(robot_pos[1])
+            viewer.cam.lookat[2] = float(robot_pos[2]) + 0.6
+            viewer.cam.distance = 2.5
+            viewer.cam.elevation = -20.0
+            viewer.cam.azimuth = 135.0
+    except Exception as e:
+        log.warning(f"Failed to snap free camera to robot: {e}")
+
+
 class StretchRolloutRunner(ParallelRolloutRunner):
-    """ParallelRolloutRunner with optional simulation slowdown for viewer visualization."""
+    """ParallelRolloutRunner with free camera snapping, simulation slowdown, and Rerun 3D viz."""
 
     slow_rate: float | None = None
+    visualize: bool = False
+    rerun_visualizer: StretchRerunVisualizer | None = None
 
     @staticmethod
     def run_single_rollout(
@@ -94,6 +547,17 @@ class StretchRolloutRunner(ParallelRolloutRunner):
                 except ValueError:
                     slow_rate = None
 
+        visualize = StretchRolloutRunner.visualize or viewer is not None
+        if not visualize and os.environ.get("STRETCH_DATAGEN_VISUALIZE") == "1":
+            visualize = True
+
+        rerun_viz = None
+        if visualize:
+            if StretchRolloutRunner.rerun_visualizer is None:
+                StretchRolloutRunner.rerun_visualizer = StretchRerunVisualizer(spawn=True)
+            rerun_viz = StretchRolloutRunner.rerun_visualizer
+            rerun_viz.start_episode(episode_seed, task)
+
         if profiler is not None:
             profiler.start("rollout")
         if datagen_profiler is not None:
@@ -106,7 +570,11 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             datagen_profiler.end("rollout_reset")
 
         if viewer is not None:
+            snap_free_camera_to_robot(viewer, task)
             viewer.sync()
+
+        if rerun_viz is not None:
+            rerun_viz.log_step(0, task, observation)
 
         try:
             task.env.current_model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
@@ -162,12 +630,15 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             if datagen_profiler is not None:
                 datagen_profiler.end("task_step")
 
+            if viewer is not None:
+                viewer.sync()
+
+            if rerun_viz is not None:
+                rerun_viz.log_step(step_count, task, observation)
+
             # Add termination if succ
             if end_on_success and "success" in infos[0] and infos[0]["success"]:
                 break
-
-            if viewer is not None:
-                viewer.sync()
 
             if slow_rate is not None and slow_rate > 0:
                 t_sim_end = (
@@ -260,6 +731,12 @@ def generate_rollouts(
     config.output_dir = Path(output_dir) / task
     config.output_dir.mkdir(parents=True, exist_ok=True)
     config.save_config()
+
+    StretchRolloutRunner.visualize = visualize
+    if visualize:
+        os.environ["STRETCH_DATAGEN_VISUALIZE"] = "1"
+    elif "STRETCH_DATAGEN_VISUALIZE" in os.environ:
+        del os.environ["STRETCH_DATAGEN_VISUALIZE"]
 
     if slow_rate is not None:
         StretchRolloutRunner.slow_rate = slow_rate
