@@ -8,20 +8,24 @@ One command for the whole data half of the pipeline:
         --task debug
 
     # the same, watched live in MuJoCo's viewer rather than read off a log
-    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
         --task debug --output-dir data/stretch_debug --no-export --visualize
 
+    # slow down playback in the viewer (e.g. 2x slower than real-time)
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+        --task debug --output-dir data/stretch_debug --no-export --visualize --slow_rate 2.0
+
     # a real run: 2000 pick episodes across procthor-objaverse, 8 workers
-    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
         --task pick --episodes 2000 --num-workers 8 --output-dir data/stretch_pick
 
     # several families pooled into one training set
-    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
-        --task pick --task pnp --task open --episodes 1000 \\
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+        --task pick --task pnp --task open --episodes 1000 \
         --output-dir data/stretch_manipulation
 
     # rollouts already on disk; just re-export them
-    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \\
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
         --rollouts data/stretch_pick/rollouts --output-dir data/stretch_pick
 
 Two stages, either of which can be run alone (`--no-export`, `--rollouts`):
@@ -41,11 +45,15 @@ you are most likely to want to change your mind about.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
+import time
 from pathlib import Path
+from typing import Any
 
 import click
+import mujoco
 
 from examples.machine_learning.molmospaces.finetuning.datagen_configs import (
     DATAGEN_CONFIGS,
@@ -55,8 +63,145 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
     ACTION_SPACES,
     export_lerobot_dataset,
 )
+from molmo_spaces.data_generation.config_registry import get_config_class
+from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
 
 log = logging.getLogger(__name__)
+
+
+class StretchRolloutRunner(ParallelRolloutRunner):
+    """ParallelRolloutRunner with optional simulation slowdown for viewer visualization."""
+
+    slow_rate: float | None = None
+
+    @staticmethod
+    def run_single_rollout(
+        episode_seed: int,
+        task: Any,
+        policy: Any,
+        profiler: Any = None,
+        viewer: Any = None,
+        shutdown_event: Any = None,
+        datagen_profiler: Any = None,
+        end_on_success: bool = False,
+    ) -> bool:
+        slow_rate = StretchRolloutRunner.slow_rate
+        if slow_rate is None:
+            env_val = os.environ.get("STRETCH_DATAGEN_SLOW_RATE")
+            if env_val:
+                try:
+                    slow_rate = float(env_val)
+                except ValueError:
+                    slow_rate = None
+
+        if profiler is not None:
+            profiler.start("rollout")
+        if datagen_profiler is not None:
+            datagen_profiler.start("rollout_total")
+            datagen_profiler.start("rollout_reset")
+
+        observation, _info = task.reset()
+
+        if datagen_profiler is not None:
+            datagen_profiler.end("rollout_reset")
+
+        if viewer is not None:
+            viewer.sync()
+
+        try:
+            task.env.current_model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+            task.env.current_model.opt.sleep_tolerance = 1e-3
+        except AttributeError:
+            log.debug("Not setting mujoco sleep. Needs version >=mujoco-3.8")
+
+        step_count = 0
+        while not task.is_done():
+            # Check for shutdown signal
+            if shutdown_event is not None and shutdown_event.is_set():
+                if datagen_profiler is not None:
+                    datagen_profiler.end("rollout_total")
+                return False
+
+            if viewer is not None and hasattr(viewer, "is_running") and not viewer.is_running():
+                break
+
+            t_step_wall_start = time.perf_counter()
+            t_sim_start = (
+                task.env.mj_datas[task.env.current_batch_index].time
+                if hasattr(task, "env") and hasattr(task.env, "mj_datas") and task.env.mj_datas
+                else None
+            )
+
+            # Step with policy
+            if profiler is not None:
+                profiler.start("policy_get_action")
+            if datagen_profiler is not None:
+                datagen_profiler.start("policy_get_action")
+            # An action chunk is a list of actions to be applied open-loop before a
+            # new observation is needed.
+            action_chunk = policy.get_action_chunk(observation) or [policy.get_action(observation)]
+            if profiler is not None:
+                profiler.end("policy_get_action")
+            if datagen_profiler is not None:
+                datagen_profiler.end("policy_get_action")
+
+            # Step the task
+            if profiler is not None:
+                profiler.start("task_step")
+            if datagen_profiler is not None:
+                datagen_profiler.start("task_step")
+            if action_chunk[0] is None:
+                log.info("Policy returned None action, ending episode")
+                break
+            observation, reward, terminal, truncated, infos = task.step_chunk(
+                action_chunk, stop_on_success=end_on_success
+            )
+            step_count += len(action_chunk)
+            if profiler is not None:
+                profiler.end("task_step")
+            if datagen_profiler is not None:
+                datagen_profiler.end("task_step")
+
+            # Add termination if succ
+            if end_on_success and "success" in infos[0] and infos[0]["success"]:
+                break
+
+            if viewer is not None:
+                viewer.sync()
+
+            if slow_rate is not None and slow_rate > 0:
+                t_sim_end = (
+                    task.env.mj_datas[task.env.current_batch_index].time
+                    if hasattr(task, "env") and hasattr(task.env, "mj_datas") and task.env.mj_datas
+                    else None
+                )
+                if t_sim_start is not None and t_sim_end is not None and t_sim_end > t_sim_start:
+                    sim_dt = t_sim_end - t_sim_start
+                else:
+                    policy_dt_ms = getattr(getattr(task, "config", None), "policy_dt_ms", 66.0)
+                    sim_dt = (policy_dt_ms / 1000.0) * len(action_chunk)
+
+                target_wall_dt = sim_dt * slow_rate
+                elapsed_wall = time.perf_counter() - t_step_wall_start
+                sleep_time = target_wall_dt - elapsed_wall
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        try:
+            task.env.current_model.opt.enableflags &= ~int(mujoco.mjtEnableBit.mjENBL_SLEEP)
+        except AttributeError:
+            pass
+
+        # Save profiler summary
+        if profiler is not None:
+            profiler.end("rollout")
+        if datagen_profiler is not None:
+            datagen_profiler.end("rollout_total")
+            datagen_profiler.record("step_count_indicator", step_count / 1000.0)
+
+        # Check success if method exists
+        success = task.judge_success() if hasattr(task, "judge_success") else False
+        return success
 
 
 def generate_rollouts(
@@ -69,6 +214,7 @@ def generate_rollouts(
     houses: int | None = None,
     seed: int | None = None,
     visualize: bool = False,
+    slow_rate: float | None = None,
 ) -> Path:
     """Run the data generation pipeline for one task family.
 
@@ -88,15 +234,12 @@ def generate_rollouts(
         seed: task-sampling seed.
         visualize: watch the rollouts in MuJoCo's passive viewer. Requires
             `num_workers == 1` -- see `main()`.
+        slow_rate: slow down simulation by a time factor (e.g. 1.0 for real-time,
+            2.0 for 2x slower than real-time).
 
     Returns:
         The directory the pipeline actually wrote to.
     """
-    import importlib
-
-    from molmo_spaces.data_generation.config_registry import get_config_class
-    from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
-
     module_name, class_name = qualified_config_name(task).split(":")
     importlib.import_module(module_name)
     config = get_config_class(class_name)()
@@ -118,13 +261,22 @@ def generate_rollouts(
     config.output_dir.mkdir(parents=True, exist_ok=True)
     config.save_config()
 
+    if slow_rate is not None:
+        StretchRolloutRunner.slow_rate = slow_rate
+        os.environ["STRETCH_DATAGEN_SLOW_RATE"] = str(slow_rate)
+    elif "STRETCH_DATAGEN_SLOW_RATE" in os.environ:
+        del os.environ["STRETCH_DATAGEN_SLOW_RATE"]
+        StretchRolloutRunner.slow_rate = None
+    else:
+        StretchRolloutRunner.slow_rate = None
+
     log.info(
         f"[datagen] {class_name} | {config.scene_dataset}/{config.data_split} | "
         f"{len(config.task_sampler_config.house_inds)} houses x "
         f"{config.task_sampler_config.samples_per_house} episodes | "
         f"{num_workers} workers -> {config.output_dir}"
     )
-    successes, total = ParallelRolloutRunner(config).run()
+    successes, total = StretchRolloutRunner(config).run()
     log.info(f"[datagen] {task}: {successes}/{total} episodes succeeded")
     return config.output_dir
 
@@ -214,6 +366,14 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
     help="Watch each episode live in MuJoCo's passive viewer, from the robot's "
     "chase camera. Forces --num-workers 1.",
 )
+@click.option(
+    "--slow-rate",
+    "--slow_rate",
+    "slow_rate",
+    type=float,
+    default=None,
+    help="Slow down simulation by a time factor (e.g. 1.0 for real-time, 2.0 for 2x slower than real-time).",
+)
 @click.option("--export/--no-export", "want_export", default=True, help="Run the export stage.")
 @click.option(
     "--fps", type=float, default=15.0, help="Frame rate to record in the dataset metadata."
@@ -231,6 +391,7 @@ def main(
     seed: int | None,
     keep_failures: bool,
     visualize: bool,
+    slow_rate: float | None,
     want_export: bool,
     fps: float,
 ) -> None:
@@ -268,6 +429,7 @@ def main(
                 houses=houses,
                 seed=seed,
                 visualize=visualize,
+                slow_rate=slow_rate,
             )
             for task in tasks
         ]
