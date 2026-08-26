@@ -679,8 +679,51 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     pickup_name = StretchRerunVisualizer._get_pickup_object_name(task)
     assert pickup_name == "apple_123"
 
+    # Mock policy with grasp and waypoints
+    mock_policy = MagicMock()
+    mock_grasp = MagicMock()
+    mock_grasp.position = np.array([0.5, 0.2, 0.8])
+    mock_grasp.rotation = np.eye(3)
+    mock_grasp.authored = True
+    mock_grasp.approach_yaw = 0.5
+    mock_grasp.wrist_pitch = 0.1
+    mock_grasp.wrist_roll = -0.2
+    mock_policy._grasp = mock_grasp
+
+    wp1 = MagicMock()
+    wp1.label = "raise"
+    wp1.position = np.array([0.5, 0.2, 0.8])
+    wp1.wrist_pitch = 0.1
+    wp1.wrist_roll = -0.2
+    wp1.approach_yaw = None
+    wp1.gripper_open = True
+    wp1.grip_width_m = 0.05
+    wp1.tolerance = 0.03
+    wp1.establishes_grasp = False
+    wp1.verify_grasp = False
+    wp1.settle_steps = 0
+
+    wp2 = MagicMock()
+    wp2.label = "reach"
+    wp2.position = np.array([0.5, 0.2, 0.7])
+    wp2.wrist_pitch = 0.1
+    wp2.wrist_roll = -0.2
+    wp2.approach_yaw = 0.5
+    wp2.gripper_open = True
+    wp2.grip_width_m = 0.05
+    wp2.tolerance = 0.03
+    wp2.establishes_grasp = True
+    wp2.verify_grasp = True
+    wp2.settle_steps = 5
+
+    mock_policy._plan = [wp1, wp2]
+    mock_policy._waypoint_index = 0
+    mock_policy._steps_in_waypoint = 3
+    mock_policy._grasp_lost = False
+    mock_policy._grasp_offset = None
+
     # Start episode 1
-    viz.start_episode(101, task)
+    viz.start_episode(101, task, policy=mock_policy)
     assert len(inits) == 1
     assert "episode_101_" in inits[0][1]
     assert len(connected_urls) == 1
@@ -689,7 +732,7 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     assert "world/robot/robot_0_base_link/geom_0" in logged_static
     assert "world/object/apple_123/geom_1" in logged_static
 
-    viz.log_step(0, task, observation=[{"head_camera": np.zeros((10, 10, 3), dtype=np.uint8)}])
+    viz.log_step(0, task, observation=[{"head_camera": np.zeros((10, 10, 3), dtype=np.uint8)}], policy=mock_policy)
 
     assert "world/frames/wrist_center" in logged_entities
     assert "world/frames/wrist_center/axes" in logged_entities
@@ -700,10 +743,15 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     assert "world/frames/object" in logged_entities
     assert "world/frames/object/axes" in logged_entities
     assert "world/frames/object/label" in logged_entities
+    assert "world/frames/target_grasp" in logged_entities
+    assert "world/frames/target_grasp/axes" in logged_entities
+    assert "world/frames/target_grasp/label" in logged_entities
+    assert "logs/waypoints" in logged_entities
+    assert "planner/waypoint" in logged_entities
     assert "world/cameras/head_camera" in logged_entities
 
     # Start episode 2 -> verifies new recording is created and connected
-    viz.start_episode(102, task)
+    viz.start_episode(102, task, policy=mock_policy)
     assert len(inits) == 2
     assert "episode_102_" in inits[1][1]
     assert inits[0][1] != inits[1][1]

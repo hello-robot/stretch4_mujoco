@@ -405,7 +405,7 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     this check that episode spends the rest of the horizon miming a carry.
     """
 
-    reach_tolerance_m: float = 0.03
+    reach_tolerance_m: float = 0.025
     gripper_settle_steps: int = 8
     max_steps_per_waypoint: int = 120
     """
@@ -539,6 +539,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             return action
 
         base_pose = self.task.env.current_robot.robot_view.base.pose
+        log.info(f"Executing {waypoint.label=}, {base_pose=}, {waypoint=}")
         solution = self._solver.solve(
             base_pose,
             waypoint.position,
@@ -554,7 +555,16 @@ class StretchSimpleIKPolicy(BasePolicy):
             tolerance=policy_config.reach_tolerance_m * 0.5,
         )
         if solution is None:
-            # Out of reach. Hold the arm where it is rather than commanding a
+            # Out of reach. If executing the lift waypoint, raise the lift joint directly.
+            if waypoint.label == "lift":
+                lift_max = float(self._solver.joint_limits["lift"][0, 1])
+                lift_target = min(float(current["lift"][0]) + policy_config.lift_height_m, lift_max)
+                action["lift"] = np.array([lift_target])
+                for group in ("base", "arm", "wrist"):
+                    action[group] = current[group].copy()
+                return action
+
+            # Hold the arm where it is rather than commanding a
             # half-converged pose, and let the step budget move the plan on.
             for group in ("base", "lift", "arm", "wrist"):
                 action[group] = current[group].copy()
@@ -655,13 +665,23 @@ class StretchSimpleIKPolicy(BasePolicy):
                 for group, target in waypoint.joint_targets.items()
             )
 
+        if waypoint.establishes_grasp:
+            # A grasp-closing waypoint is only reached once the fingers have made
+            # contact with the object or reached their closed limit.
+            grip_established = (self._grip_hold is not None) or self._fingers_touching_pickup()
+            gripper = self._gripper_group()
+            closed_pos = gripper.CLOSED_JOINT_POS
+            current_grip = float(np.mean(np.asarray(gripper.joint_pos, dtype=float)))
+            fully_closed = abs(current_grip - closed_pos) < 0.02
+            reached = reached and (grip_established or fully_closed)
+
         if reached:
             self._settled_steps += 1
         timed_out = self._steps_in_waypoint >= self.config.policy_config.max_steps_per_waypoint
 
         if (reached and self._settled_steps > waypoint.settle_steps) or timed_out:
             if timed_out and not reached:
-                log.debug(
+                log.info(
                     f"[stretch-simple-ik] waypoint '{waypoint.label}' timed out "
                     f"{float(np.linalg.norm(tool_position - waypoint.position)):.3f}m short"
                 )
@@ -759,35 +779,32 @@ class StretchSimpleIKPolicy(BasePolicy):
             f"{'unknown' if grip_width is None else f'{grip_width:.3f}m'}"
         )
 
-        plan = self._unstow_waypoints(grasp)
+        waypoints = self._unstow_waypoints(grasp)
         pregrasp = self._reachable_standoff(grasp)
         if pregrasp is not None:
-            plan.append(
+            waypoints.append(
                 Waypoint(
                     position=pregrasp,
-                    gripper_open=False,
+                    gripper_open=True,
                     label="pregrasp",
                     tolerance=policy_config.reach_tolerance_m,
                     **orientation,
                 )
             )
-        plan += [
+
+        reach_position = grasp_point + approach * policy_config.grasp_depth_m
+        lift_height = self._reachable_lift_height(grasp, grasp_point)
+
+        waypoints += [
             Waypoint(
-                position=grasp_point + approach - 0.02,
-                gripper_open=False,
+                position=reach_position,
+                gripper_open=True,
                 label="reach",
                 tolerance=policy_config.reach_tolerance_m,
                 **orientation,
             ),
             Waypoint(
-                position=grasp_point + approach * policy_config.grasp_depth_m,
-                gripper_open=True,
-                label="open",
-                tolerance=policy_config.reach_tolerance_m,
-                **orientation,
-            ),
-            Waypoint(
-                position=grasp_point + approach * policy_config.grasp_depth_m,
+                position=reach_position,
                 gripper_open=False,
                 label="close",
                 settle_steps=policy_config.gripper_settle_steps,
@@ -797,7 +814,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 **orientation,
             ),
             Waypoint(
-                position=grasp_point + np.array([0.0, 0.0, policy_config.lift_height_m]),
+                position=grasp_point + np.array([0.0, 0.0, lift_height]),
                 gripper_open=False,
                 label="lift",
                 settle_steps=policy_config.gripper_settle_steps,
@@ -808,14 +825,14 @@ class StretchSimpleIKPolicy(BasePolicy):
             ),
         ]
         if not with_place:
-            return plan
+            return waypoints
 
         place_point = self._object_grasp_point(self.config.task_config.place_receptacle_name)
         if place_point is None:
-            return plan
+            return waypoints
 
         hover = place_point + np.array([0.0, 0.0, policy_config.place_hover_m])
-        plan += [
+        waypoints += [
             Waypoint(
                 position=hover,
                 gripper_open=False,
@@ -843,7 +860,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 **orientation,
             ),
         ]
-        return plan
+        return waypoints
 
     def _plan_articulation(self, task_cls_name: str) -> list[Waypoint]:
         """Grasp a handle, then drag it along the joint's own motion.
@@ -964,6 +981,17 @@ class StretchSimpleIKPolicy(BasePolicy):
         log.info("[stretch-simple-ik] no reachable pregrasp standoff; approaching directly")
         return None
 
+    def _reachable_lift_height(self, grasp: ToolGrasp, grasp_point: np.ndarray) -> float:
+        """The highest vertical lift from grasp_point that Stretch can physically solve."""
+        nominal = self.config.policy_config.lift_height_m
+        base_pose = self.task.env.current_robot.robot_view.base.pose
+        for fraction in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
+            h = nominal * fraction
+            candidate = grasp_point + np.array([0.0, 0.0, h])
+            if self._solve_at(base_pose, candidate, grasp) is not None:
+                return h
+        return nominal * 0.1
+
     def _solve_at(
         self, base_pose: np.ndarray, position: np.ndarray, grasp: ToolGrasp
     ) -> dict[str, np.ndarray] | None:
@@ -1048,7 +1076,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 position=position,
                 wrist_pitch=pitch,
                 wrist_roll=roll,
-                gripper_open=False,
+                gripper_open=True,
                 label="raise",
                 # The wrist is deliberately absent: `_command_for` holds every
                 # group a joint-space waypoint does not name at its current
@@ -1064,7 +1092,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 position=position,
                 wrist_pitch=pitch,
                 wrist_roll=roll,
-                gripper_open=False,
+                gripper_open=True,
                 label="unstow",
                 # Pitch and roll come out of the grasp, so the wrist arrives at
                 # the tilt the object is going to be taken at and the reach that
@@ -1201,7 +1229,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 grasp_libraries=grasp_libraries,
             )
         except Exception as failure:  # noqa: BLE001 - the library is optional here
-            log.debug(f"[stretch-simple-ik] no grasp library for {object_name!r}: {failure}")
+            log.info(f"[stretch-simple-ik] no grasp library for {object_name!r}: {failure}")
             return None
 
         if poses is None or len(poses) == 0:

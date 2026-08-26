@@ -133,6 +133,56 @@ its base is on the floor and the lift covers the vertical range. Harmlessly so:
 `HoloJointsRobotBaseGroup.pose` only reads x, y and yaw, so the sampler's z is
 discarded rather than obeyed.)
 
+### Authored Grasps and Kinematics Solving
+
+When `generate_dataset.py` runs the procedural `simple_ik` expert, it retrieves pre-authored 6-DOF grasp candidates from MolmoSpaces' asset library and solves for Stretch 4 joint configurations.
+
+```mermaid
+flowchart LR
+    Grasp["Authored Grasp T (4x4)"] --> Decomp["tcp_orientation_from_grasp()"]
+    Decomp --> Pos["Cartesian Position (target_position)"]
+    Decomp --> Pitch["wrist_pitch (elevation angle)"]
+    Decomp --> Roll["wrist_roll (axial rotation)"]
+    Decomp --> Yaw["approach_yaw (azimuth heading)"]
+    
+    Pos --> Solver["StretchReachSolver.solve()"]
+    Pitch --> Solver
+    Roll --> Solver
+    Yaw --> Solver
+    
+    Solver --> Pinocchio["Pinocchio 6-DOF Local IK"]
+    Pinocchio --> Joints["Joint Dict:
+    - base: [x, y, theta]
+    - lift: [z]
+    - arm: [extension]
+    - wrist: [yaw, pitch, roll]"]
+```
+
+#### How Authored Grasps Affect the IK Solver's Output Pose:
+
+1. **Orientation Decomposition (`tcp_orientation_from_grasp`)**:
+   - **`target_position`**: The 3D translation where the gripper's Tool Center Point (TCP) must arrive (adjusted for `grasp_depth_m`).
+   - **`wrist_pitch`**: Extracted from the approach vector's elevation relative to the horizontal plane (e.g., $\approx +\pi/2$ for top-down grasps, $0$ for horizontal grasps). Negative pitch angles that approach from below the surface are filtered out.
+   - **`wrist_roll`**: The rotation of the gripper around its approach axis, which aligns the gripper finger closing plane with the object's geometry.
+   - **`approach_yaw`**: The horizontal heading of the approach vector in the world frame.
+
+2. **Candidate Filtering & Pitch Prioritization (`_authored_grasp`)**:
+   - **Table Collision Filtering**: Candidates with `wrist_pitch < -0.05` are filtered out immediately to prevent approaching from below the tabletop.
+   - **Top-Down Prioritization**: Surviving candidates are **sorted by descending `wrist_pitch`** ($\frac{\pi}{2} \to 0$). Overhead grasps are evaluated first because descending from above minimizes collision risk with surrounding objects and tabletop surfaces.
+   - **Clearance & IK Validation**: The policy checks candidates in sorted order:
+     - The object thickness along the grasp closing axis must fit within Stretch's gripper span (`_object_grasp_width < open_width`).
+     - The candidate pose must be kinematically solvable by `StretchReachSolver`.
+     - The first candidate satisfying both conditions is selected.
+
+3. **Inverse Kinematics Optimization (`StretchReachSolver`)**:
+   - The solver constructs a target SE(3) pose combining `target_position` with the orientation matrix $\mathbf{R}(\text{yaw}, \text{pitch}, \text{roll})$.
+   - Pinocchio numerical IK computes the corresponding joint configuration:
+     - **`base` $(x, y, \theta)$**: Rotates and translates the mobile base to place the shoulder at the appropriate angle and distance relative to the object (translating forward to a $0.70\text{m}$ standoff if the object is initially out of reach).
+     - **`lift`**: Sets the mast height to match the vertical component ($z$), bounded to Stretch's physical mast limit ($1.10\text{m}$).
+     - **`arm`**: Sets the telescoping extension along the horizontal distance.
+     - **`wrist` (yaw, pitch, roll)**: Reorients the gripper fingers to match the authored closing plane and approach vector.
+
+
 **You, driving** — `live_recorder.py`, via
 `examples/molmo_environment.py --record_dataset`:
 

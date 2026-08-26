@@ -71,15 +71,17 @@ log = logging.getLogger(__name__)
 
 
 class StretchRerunVisualizer:
-    """Streams 3D robot meshes, object meshes, and coordinate frames to Rerun."""
+    """Streams 3D robot meshes, object meshes, coordinate frames, target grasp, and waypoints to Rerun."""
 
     def __init__(self, spawn: bool = True, port: int = 9876):
         self._spawn = spawn
         self._port = port
         self._initialized = False
         self._logged_meshes: set[str] = set()
+        self._last_logged_waypoint_idx = -1
+        self._logged_grasp_lost = False
 
-    def start_episode(self, episode_seed: int, task: Any) -> None:
+    def start_episode(self, episode_seed: int, task: Any, policy: Any = None) -> None:
         """Starts a new Rerun recording for each episode."""
         try:
             import uuid
@@ -90,7 +92,13 @@ class StretchRerunVisualizer:
             app_id = "Stretch4 Datagen"
 
             blueprint = rrb.Blueprint(
-                rrb.Spatial3DView(origin="world", name="3D Scene"),
+                rrb.Horizontal(
+                    rrb.Spatial3DView(origin="world", name="3D Scene"),
+                    rrb.Vertical(
+                        rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
+                        rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
+                    ),
+                ),
                 collapse_panels=True,
             )
 
@@ -123,12 +131,35 @@ class StretchRerunVisualizer:
 
             rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
             self._logged_meshes.clear()
+            self._last_logged_waypoint_idx = -1
+            self._logged_grasp_lost = False
 
             pickup_obj_name = self._get_pickup_object_name(task)
             if hasattr(task, "env") and hasattr(task.env, "current_model"):
                 self.setup_meshes(task.env.current_model, pickup_obj_name)
         except Exception as e:
             log.warning(f"Failed to start Rerun episode recording: {e}")
+
+    @staticmethod
+    def _unwrap_policy(policy: Any) -> Any:
+        """Unwraps wrappers around policy to reach the underlying waypoint/grasp planner."""
+        curr = policy
+        for _ in range(5):
+            if curr is None:
+                break
+            if hasattr(curr, "_plan") or hasattr(curr, "_grasp"):
+                return curr
+            if hasattr(curr, "policy"):
+                curr = curr.policy
+            elif hasattr(curr, "_policy"):
+                curr = curr._policy
+            elif hasattr(curr, "inner_policy"):
+                curr = curr.inner_policy
+            elif hasattr(curr, "wrapped_policy"):
+                curr = curr.wrapped_policy
+            else:
+                break
+        return curr
 
     @staticmethod
     def _get_pickup_object_name(task: Any) -> str | None:
@@ -401,6 +432,7 @@ class StretchRerunVisualizer:
         step_idx: int,
         task: Any,
         observation: Any = None,
+        policy: Any = None,
     ) -> None:
         if not self._initialized:
             return
@@ -483,7 +515,117 @@ class StretchRerunVisualizer:
                 rr.log("world/frames/object/axes", rr.Arrows3D(vectors=axes_vectors, colors=axes_colors, labels=axes_labels, show_labels=True))
                 rr.log("world/frames/object/label", rr.Points3D(positions=[[0.0, 0.0, 0.0]], radii=[0.005], colors=[[255, 255, 255]], labels=[f"Object: {pickup_obj_name}" if pickup_obj_name else "Object"], show_labels=True))
 
-            # 4. Optional Camera feeds
+            # 4. Target Grasp frame
+            unwrapped_policy = self._unwrap_policy(policy)
+            if unwrapped_policy is not None and hasattr(unwrapped_policy, "_grasp"):
+                grasp = unwrapped_policy._grasp
+                if grasp is not None:
+                    pos = grasp.position
+                    mat = grasp.rotation
+                    grasp_type = "Authored" if getattr(grasp, "authored", False) else "Styled"
+                    rr.log("world/frames/target_grasp", rr.Transform3D(translation=pos, mat3x3=mat))
+                    rr.log(
+                        "world/frames/target_grasp/axes",
+                        rr.Arrows3D(vectors=axes_vectors, colors=axes_colors, labels=axes_labels, show_labels=True),
+                    )
+                    rr.log(
+                        "world/frames/target_grasp/label",
+                        rr.Points3D(
+                            positions=[[0.0, 0.0, 0.0]],
+                            radii=[0.005],
+                            colors=[[255, 215, 0]],
+                            labels=[f"Target Grasp ({grasp_type})"],
+                            show_labels=True,
+                        ),
+                    )
+
+            # 5. Waypoint Text Log and Info Document
+            if unwrapped_policy is not None and hasattr(unwrapped_policy, "_plan"):
+                plan = unwrapped_policy._plan
+                w_idx = getattr(unwrapped_policy, "_waypoint_index", 0)
+                steps_in_w = getattr(unwrapped_policy, "_steps_in_waypoint", 0)
+                grasp_lost = getattr(unwrapped_policy, "_grasp_lost", False)
+
+                if plan:
+                    if 0 <= w_idx < len(plan):
+                        curr_wp = plan[w_idx]
+                        w_label = curr_wp.label
+                        w_pos = curr_wp.position
+                        w_pitch = np.degrees(curr_wp.wrist_pitch)
+                        w_roll = np.degrees(curr_wp.wrist_roll)
+                        w_yaw = (
+                            f"{np.degrees(curr_wp.approach_yaw):+.1f}°"
+                            if curr_wp.approach_yaw is not None
+                            else "Free"
+                        )
+                        w_grip = "Open" if curr_wp.gripper_open else "Closed"
+                        w_width = (
+                            f"{curr_wp.grip_width_m:.3f} m"
+                            if curr_wp.grip_width_m is not None
+                            else "N/A"
+                        )
+
+                        # Emit chronological text log on waypoint transitions
+                        if w_idx != self._last_logged_waypoint_idx:
+                            self._last_logged_waypoint_idx = w_idx
+                            log_msg = (
+                                f"📍 [Step {step_idx}] Waypoint {w_idx + 1}/{len(plan)}: '{w_label}' | "
+                                f"Target: [{w_pos[0]:.3f}, {w_pos[1]:.3f}, {w_pos[2]:.3f}] | "
+                                f"Pitch: {w_pitch:+.1f}° | Roll: {w_roll:+.1f}° | Gripper: {w_grip}"
+                            )
+                            rr.log("logs/waypoints", rr.TextLog(log_msg, level=rr.TextLogLevel.INFO))
+
+                        # Build plan progress list
+                        checklist_lines = []
+                        for i, wp in enumerate(plan):
+                            if i < w_idx:
+                                checklist_lines.append(f"- [x] `{wp.label}`")
+                            elif i == w_idx:
+                                checklist_lines.append(f"- [x] **`{wp.label}`** ◀ *(Active)*")
+                            else:
+                                checklist_lines.append(f"- [ ] `{wp.label}`")
+                        checklist_str = "\n".join(checklist_lines)
+
+                        doc_md = f"""### 🎯 Active Waypoint: `{w_label}` ({w_idx + 1}/{len(plan)})
+
+| Property | Value |
+|:---|:---|
+| **Label** | `{w_label}` |
+| **Index** | {w_idx + 1} of {len(plan)} |
+| **Steps in Waypoint** | {steps_in_w} |
+| **Target Pos (xyz)** | `[{w_pos[0]:.3f}, {w_pos[1]:.3f}, {w_pos[2]:.3f}]` |
+| **Wrist Pitch** | `{curr_wp.wrist_pitch:+.2f} rad ({w_pitch:+.1f}°)` |
+| **Wrist Roll** | `{curr_wp.wrist_roll:+.2f} rad ({w_roll:+.1f}°)` |
+| **Approach Yaw** | `{w_yaw}` |
+| **Gripper** | {w_grip} |
+| **Grip Width** | {w_width} |
+| **Tolerance** | `{curr_wp.tolerance:.3f} m` |
+| **Establishes Grasp** | `{curr_wp.establishes_grasp}` |
+| **Verify Grasp** | `{curr_wp.verify_grasp}` |
+| **Settle Steps** | {curr_wp.settle_steps} |
+| **Grasp Status** | `{'Grasp Lost!' if grasp_lost else ('Held' if (getattr(unwrapped_policy, "_grasp_offset", None) is not None) else 'In Progress')}` |
+
+#### 📋 Plan Progress
+{checklist_str}
+"""
+                    else:
+                        if w_idx != self._last_logged_waypoint_idx:
+                            self._last_logged_waypoint_idx = w_idx
+                            rr.log(
+                                "logs/waypoints",
+                                rr.TextLog(f"🏁 [Step {step_idx}] All {len(plan)} waypoints completed.", level=rr.TextLogLevel.INFO),
+                            )
+                        doc_md = f"""### 🏁 Plan Complete ({len(plan)}/{len(plan)} waypoints)
+
+All waypoints finished execution. Holding final posture/grip.
+"""
+                    rr.log("planner/waypoint", rr.TextDocument(doc_md, media_type=rr.MediaType.MARKDOWN))
+
+                    if grasp_lost and not self._logged_grasp_lost:
+                        self._logged_grasp_lost = True
+                        rr.log("logs/waypoints", rr.TextLog(f"⚠️ [Step {step_idx}] Grasp lost during lift!", level=rr.TextLogLevel.WARN))
+
+            # 6. Optional Camera feeds
             if observation is not None:
                 obs_dict = observation[0] if isinstance(observation, list) and observation else observation
                 if isinstance(obs_dict, dict):
@@ -568,7 +710,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             if StretchRolloutRunner.rerun_visualizer is None:
                 StretchRolloutRunner.rerun_visualizer = StretchRerunVisualizer(spawn=True)
             rerun_viz = StretchRolloutRunner.rerun_visualizer
-            rerun_viz.start_episode(episode_seed, task)
+            rerun_viz.start_episode(episode_seed, task, policy=policy)
 
         if profiler is not None:
             profiler.start("rollout")
@@ -586,7 +728,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             viewer.sync()
 
         if rerun_viz is not None:
-            rerun_viz.log_step(0, task, observation)
+            rerun_viz.log_step(0, task, observation, policy=policy)
 
         try:
             task.env.current_model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_SLEEP)
@@ -646,7 +788,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
                 viewer.sync()
 
             if rerun_viz is not None:
-                rerun_viz.log_step(step_count, task, observation)
+                rerun_viz.log_step(step_count, task, observation, policy=policy)
 
             # Add termination if succ
             if end_on_success and "success" in infos[0] and infos[0]["success"]:
