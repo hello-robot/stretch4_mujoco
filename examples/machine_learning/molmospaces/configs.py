@@ -138,7 +138,12 @@ class Stretch4BenchmarkEvalConfig(JsonBenchmarkEvalConfig):
 
 
 class StretchSimpleIKEvalConfig(Stretch4BenchmarkEvalConfig):
-    """The simple ik expert: baseline scores, and the teacher for BC data."""
+    """The simple ik expert: baseline scores, and the teacher for BC data.
+
+    Grasps at the pose the asset's own grasp library authors, falling back to a
+    horizontal reach when it cannot reach one -- see
+    `StretchSimpleIKPolicyConfig.use_authored_grasps`.
+    """
 
     policy_config: StretchSimpleIKPolicyConfig = StretchSimpleIKPolicyConfig()
 
@@ -153,9 +158,16 @@ class StretchSimpleIKTopDownEvalConfig(StretchSimpleIKEvalConfig):
     Worth running as an ablation on the pick-family benchmarks: top-down clears
     clutter better, but Stretch has to creep its base to correct lateral error
     (see `policies/kinematics.py`), so it is slower and reaches less far.
+
+    Authored grasps are off here, which is what makes this an ablation of the
+    hand-written styles rather than a run that quietly ignores `grasp_style` --
+    with them on, the style is only what the ~5% of objects with no reachable
+    authored grasp fall back to, and the two configs would score almost alike.
     """
 
-    policy_config: StretchSimpleIKPolicyConfig = StretchSimpleIKPolicyConfig(grasp_style="top_down")
+    policy_config: StretchSimpleIKPolicyConfig = StretchSimpleIKPolicyConfig(
+        grasp_style="top_down", use_authored_grasps=False
+    )
 
     @property
     def tag(self) -> str:
@@ -258,11 +270,18 @@ class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):
 # Which eval config is the sensible default for each benchmark key. Navigation
 # needs a path planner rather than a reach planner, so it does not share the
 # manipulation baseline.
+#
+# The pick family used to default to the top-down config, on the grounds that a
+# fixed downward tilt cleared clutter better than a fixed side-on one. That
+# choice is obsolete: the tilt is no longer fixed, because the expert now grasps
+# at the pose the asset's own grasp library authors and only falls back to a
+# hand-written style when it cannot reach one. `StretchSimpleIKTopDownEvalConfig`
+# is the ablation of that fallback now, not the baseline.
 DEFAULT_BASELINE_CONFIGS: dict[str, str] = {
-    "pick": "StretchSimpleIKTopDownEvalConfig",
-    "pnp": "StretchSimpleIKTopDownEvalConfig",
-    "pnp_next_to": "StretchSimpleIKTopDownEvalConfig",
-    "pnp_color": "StretchSimpleIKTopDownEvalConfig",
+    "pick": "StretchSimpleIKEvalConfig",
+    "pnp": "StretchSimpleIKEvalConfig",
+    "pnp_next_to": "StretchSimpleIKEvalConfig",
+    "pnp_color": "StretchSimpleIKEvalConfig",
     "open": "StretchSimpleIKEvalConfig",
     "close": "StretchSimpleIKEvalConfig",
     "door_opening": "StretchSimpleIKEvalConfig",

@@ -746,6 +746,137 @@ def test_grasp_style_fixes_the_approach_axis(robot_config):
                 assert abs(solution["wrist"][2] - roll) < 1e-3, "roll is pinned away from lock"
 
 
+def _library_grasp(approach, closing):
+    """A 4x4 grasp pose in the MolmoSpaces grasp-library convention.
+
+    That convention is +z along the approach and +-y along the fingers, taken from
+    the gripper markers `molmo_spaces/utils/grasp_sample.py` draws in this frame.
+    `closing` only has to be roughly perpendicular to `approach`; it is squared up
+    here so the caller can write readable axes and still get a proper rotation.
+    """
+    approach = np.asarray(approach, float)
+    approach = approach / np.linalg.norm(approach)
+    closing = np.asarray(closing, float)
+    closing = closing - approach * float(closing @ approach)
+    closing = closing / np.linalg.norm(closing)
+    pose = np.eye(4)
+    pose[:3, :3] = np.column_stack([np.cross(closing, approach), closing, approach])
+    pose[:3, 3] = [0.7, 0.05, 0.9]
+    return pose
+
+
+def test_authored_grasp_conversion_reproduces_the_pose_exactly():
+    """The library-to-tool conversion is a change of coordinates, not a fit.
+
+    `tcp_orientation_from_grasp` re-expresses an authored grasp in the three
+    angles Stretch's kinematics factor into, so feeding the result back through
+    `grasp_orientation` has to return the orientation it started from -- including
+    at pitch = pi/2, where the yaw/roll split is degenerate but any split of it
+    still reconstructs the same rotation.
+    """
+    from examples.machine_learning.molmospaces.policies.kinematics import (
+        GRASP_LIBRARY_TO_TCP,
+        grasp_orientation,
+        tcp_orientation_from_grasp,
+    )
+
+    for approach, closing in (
+        ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),  # straight down, the degenerate case
+        ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),  # level, along +x
+        ([0.4, -0.8, -0.45], [0.9, 0.44, 0.0]),  # a diagonal with real roll in it
+    ):
+        pose = _library_grasp(approach, closing)
+        angles = tcp_orientation_from_grasp(pose)
+        expected = pose[:3, :3] @ GRASP_LIBRARY_TO_TCP
+        assert np.allclose(grasp_orientation(*angles), expected, atol=1e-10)
+
+
+def test_authored_grasp_axes_land_on_the_tool_axes():
+    """Approach maps to approach and the closing axis is preserved.
+
+    Stretch's tool frame approaches along +x and separates its fingers along +-y
+    (measured on the compiled model: the fingertips sit at (-0.019, +-0.094, 0)).
+    A conversion that got either axis wrong would still round-trip through the
+    previous test, so this pins the geometry itself.
+    """
+    from examples.machine_learning.molmospaces.policies.kinematics import (
+        grasp_orientation,
+        tcp_orientation_from_grasp,
+    )
+
+    approach, closing = [0.3, -0.9, -0.31], [0.94, 0.31, 0.0]
+    pose = _library_grasp(approach, closing)
+    rotation = grasp_orientation(*tcp_orientation_from_grasp(pose))
+
+    assert np.allclose(rotation[:, 0], pose[:3, 2], atol=1e-10), "tool +x must be the approach"
+    assert np.allclose(rotation[:, 1], pose[:3, 1], atol=1e-10), "tool +y must be the closing axis"
+
+
+def test_the_hand_written_styles_are_special_cases_of_authored_grasps():
+    """The two styles this policy used to hard-code fall out of the conversion.
+
+    This is the check that the frame transform is the *right* one rather than
+    merely a plausible one: a library grasp approaching straight down has to come
+    back as exactly `PITCH_TOP_DOWN`, and one approaching along +x as exactly
+    `PITCH_HORIZONTAL` with no yaw and no roll.
+    """
+    from examples.machine_learning.molmospaces.policies.kinematics import (
+        tcp_orientation_from_grasp,
+    )
+
+    _, pitch, _ = tcp_orientation_from_grasp(_library_grasp([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]))
+    assert abs(pitch - PITCH_TOP_DOWN) < 1e-12
+
+    yaw, pitch, roll = tcp_orientation_from_grasp(_library_grasp([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]))
+    assert abs(pitch - PITCH_HORIZONTAL) < 1e-12
+    assert abs(yaw) < 1e-12 and abs(roll) < 1e-12
+
+
+def test_authored_grasps_are_reachable_at_the_orientation_they_were_authored_at(robot_config):
+    """An authored grasp is only usable if Stretch can hold its whole pose.
+
+    The solve has to be asked for with the yaw pinned, because that is what
+    `_command_for` will ask for at execution time -- a candidate accepted with a
+    free yaw is one the executor cannot reproduce. Sweeping level approaches
+    around a target inside the workspace, enough of them have to solve for the
+    per-object search to find one.
+    """
+    from examples.machine_learning.molmospaces.policies.kinematics import (
+        StretchReachSolver,
+        tcp_orientation_from_grasp,
+    )
+
+    solver = StretchReachSolver(robot_config)
+    base_pose = planar_pose(0.0, 0.0, 0.0)
+
+    solved = 0
+    bearings = np.linspace(-np.pi, np.pi, 12, endpoint=False)
+    for bearing in bearings:
+        approach = [np.cos(bearing), np.sin(bearing), 0.0]
+        closing = [-np.sin(bearing), np.cos(bearing), 0.0]
+        pose = _library_grasp(approach, closing)
+        pose[:3, 3] = [0.75, 0.0, 0.95]
+        yaw, pitch, roll = tcp_orientation_from_grasp(pose)
+        solution = solver.solve(
+            base_pose,
+            pose[:3, 3],
+            wrist_pitch=pitch,
+            wrist_roll=roll,
+            approach_yaw=yaw,
+            yaw_spread=0.0,
+        )
+        if solution is None:
+            continue
+        solved += 1
+        # The solve honoured the authored orientation rather than substituting a
+        # more convenient one, which is the entire point of pinning the yaw.
+        achieved = solver.forward(solution)
+        assert np.allclose(achieved[:3, 0], pose[:3, 2], atol=5e-3), "approach axis drifted"
+        assert np.allclose(achieved[:3, 1], pose[:3, 1], atol=5e-3), "closing axis drifted"
+
+    assert solved >= len(bearings) // 3, f"only {solved}/{len(bearings)} level approaches solved"
+
+
 def _grasp_check_policy(monkeypatch, drift, tolerance=0.05):
     """A `StretchSimpleIKPolicy` stub wired only for the grasp-follow check.
 

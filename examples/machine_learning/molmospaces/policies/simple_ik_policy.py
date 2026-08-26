@@ -21,10 +21,20 @@ This policy serves two purposes:
    images to these actions.
 
 It is deliberately *not* a planner. There is no collision-aware motion planning
-and no grasp-pose search -- MolmoSpaces' own solvers do both, but they need
-CuRobo and a per-robot grasp library that does not exist for Stretch. What is
-here instead is a waypoint machine: every task family compiles down to a list of
-`Waypoint`s for the tool centre, and one executor drives them.
+-- MolmoSpaces' own solvers do that, but they need CuRobo. What is here instead
+is a waypoint machine: every task family compiles down to a list of `Waypoint`s
+for the tool centre, and one executor drives them.
+
+Grasps, though, are not invented here. MolmoSpaces ships authored grasp poses per
+asset and the task samplers already require them (`filter_for_grasps`), so this
+policy reads the object's grasp library and picks a pose out of it rather than
+guessing at a tilt. Those libraries were generated for the DROID Franka gripper,
+which is *not* a problem: a grasp pose records an approach axis and a closing
+axis, not a robot configuration, and Stretch's fingers open to 0.19m against the
+0.08m the grasps were authored for -- so anything a Franka can straddle, Stretch
+can. `policies/kinematics.py:tcp_orientation_from_grasp` is the whole of the
+translation. The hand-written horizontal and top-down styles survive as the
+fallback for the ~5% of objects where no authored grasp is reachable.
 
 That uniformity is possible because of Stretch's kinematics. A drawer pull, a
 door swing and a place motion are all "hold the gripper closed and move the tool
@@ -42,9 +52,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from examples.machine_learning.molmospaces.policies.kinematics import (
+    APPROACH_YAW_SPREAD_RAD,
     PITCH_HORIZONTAL,
     PITCH_TOP_DOWN,
     StretchReachSolver,
+    grasp_orientation,
+    tcp_orientation_from_grasp,
 )
 from examples.machine_learning.molmospaces.stretch.robot_view import StretchGripperGroup
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
@@ -101,12 +114,68 @@ def _finger_joint_for_width(gripper: StretchGripperGroup, width_m: float) -> flo
 
 
 @dataclass
+class ToolGrasp:
+    """A tool-centre pose to grasp an object at, and where it came from.
+
+    The orientation is carried as the three angles the solver takes rather than
+    as a matrix, because that is the form Stretch's kinematics factor into
+    exactly -- see `policies/kinematics.py`. `rotation`, `approach` and
+    `closing_axis` derive the geometry back out of them, so there is one source
+    of truth for which way this grasp points.
+
+    Attributes:
+        position: world xyz to put the tool centre at.
+        approach_yaw: world heading the tool closes along.
+        wrist_pitch: approach tilt.
+        wrist_roll: spin of the fingers about the approach axis.
+        authored: this pose came out of the asset's grasp library, so all three
+            angles are meant and the solver must honour them. A grasp built from
+            a hand-written style instead only means its pitch and roll, and its
+            yaw is a nominal heading the solver is free to improve on.
+    """
+
+    position: np.ndarray
+    approach_yaw: float
+    wrist_pitch: float
+    wrist_roll: float
+    authored: bool
+
+    @property
+    def solver_yaw(self) -> float | None:
+        """The heading to pin the solve to, or None to leave it free.
+
+        An authored grasp determines all three angles, so there is nothing left
+        to search over. A styled grasp keeps the free yaw that is Stretch's one
+        piece of redundancy, and giving it up measurably costs reach.
+        """
+        return self.approach_yaw if self.authored else None
+
+    @property
+    def rotation(self) -> np.ndarray:
+        """World 3x3 orientation of the tool at this grasp."""
+        return grasp_orientation(self.approach_yaw, self.wrist_pitch, self.wrist_roll)
+
+    @property
+    def approach(self) -> np.ndarray:
+        """Unit vector the tool travels along as it closes on the object."""
+        return self.rotation[:, 0]
+
+    @property
+    def closing_axis(self) -> np.ndarray:
+        """Unit vector the fingers separate along."""
+        return self.rotation[:, 1]
+
+
+@dataclass
 class Waypoint:
     """One tool-centre target in a simple_ik plan.
 
     Attributes:
         position: world xyz for the tool centre.
         wrist_pitch: approach tilt to hold while getting there.
+        wrist_roll: finger spin about the approach axis to hold while getting there.
+        approach_yaw: heading to pin the tool to, or None to let the solver
+            choose one. See `ToolGrasp.solver_yaw`.
         gripper_open: whether the fingers should be open on arrival.
         label: phase name, surfaced through `PolicyPhaseSensor` and the logs.
         settle_steps: extra policy steps to hold once the position is reached,
@@ -136,6 +205,8 @@ class Waypoint:
     wrist_pitch: float
     gripper_open: bool
     label: str
+    wrist_roll: float = 0.0
+    approach_yaw: float | None = None
     settle_steps: int = 0
     establishes_grasp: bool = False
     verify_grasp: bool = False
@@ -152,13 +223,32 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     policy_cls: type | None = None
     policy_factory: PolicyFactory | None = None
 
+    use_authored_grasps: bool = True
+    """
+    Whether to grasp at a pose from the asset's own grasp library.
+
+    On by default, because a hand-written tilt is wrong for most objects. A
+    horizontal grasp closes across whatever happens to lie on the line from the
+    base to the object's origin, which for a mug is its body rather than its
+    handle, for a pan is the pan rather than the grip, and for a bowl is the full
+    0.27m rim-to-rim -- wider than the gripper opens. MolmoSpaces authored a
+    grasp library per asset for exactly this reason and the task samplers already
+    require one (`filter_for_grasps`), so the graspable poses are known.
+
+    Measured over 60 sampled `droid` assets placed at a typical counter standoff,
+    95% have at least one authored grasp Stretch can reach with the orientation
+    it was authored at. `grasp_style` is what the other 5% fall back to, so
+    turning this off is what makes an ablation of that fallback.
+    """
+
     grasp_style: str = "horizontal"
     """
-    'horizontal' or 'top_down'. Horizontal is the default because it is what
-    Stretch's kinematics support: the tool sits ahead of the wrist yaw axis, so
-    yaw gives lateral authority and the arm can reach without driving the base.
-    Reaching straight down loses that authority entirely -- see
-    `policies/kinematics.py`.
+    'horizontal' or 'top_down' -- the tilt to use when no authored grasp works.
+
+    Horizontal is the default because it is what Stretch's kinematics support:
+    the tool sits ahead of the wrist yaw axis, so yaw gives lateral authority and
+    the arm can reach without driving the base. Reaching straight down loses that
+    authority entirely -- see `policies/kinematics.py`.
     """
 
     pregrasp_standoff_m: float = 0.24
@@ -234,20 +324,59 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     Raising the lift first puts that arc in free air over the surface instead.
     """
 
-    grasp_library_candidates: int = 40
+    grasp_library_candidates: int = 80
     """
-    How many authored grasp points to consider before falling back to the object's origin.
+    How many authored grasps to try before giving up and using `grasp_style`.
 
-    The object's body origin is a poor thing to aim at for anything that is not
-    roughly a blob. A bowl's origin is its centre, where the object measures its
-    full 0.27m rim-to-rim -- wider than the gripper opens -- while the rim itself
-    is a few millimetres thick and perfectly graspable. MolmoSpaces ships authored
-    grasp poses per asset and the task sampler already requires them
-    (`filter_for_grasps`), so the graspable places are known; this policy just has
-    to pick one it can also reach.
+    A library runs to ~2000 poses once flipped, and each candidate costs one ~4ms
+    solve, so the list has to be thinned. Eighty is where the return stops:
+    measured over 60 sampled assets, 40 candidates cover 90% of them, 80 cover
+    95%, and 160 still cover 95%.
 
-    Forty is a compromise: enough to find a reachable one on a cluttered shelf,
-    few enough that the search costs a fraction of a second at ~2.5ms per solve.
+    Sweeping all eighty is the cost of a *failure*, about 0.3s once per episode.
+    A success is far cheaper -- ranked as below, the median object is grasped at
+    the first candidate tried.
+    """
+
+    # How to rank authored grasps, since the first reachable one is the one used.
+    #
+    # The library is not ordered by anything useful. Taking an even stride through
+    # it unranked lands on grasps 0.10m out from the object's origin at a mean
+    # |approach . z| of 0.41 -- half-diagonal lunges at the edge of the object,
+    # found at a median of three candidates tried. Ranking first picks grasps
+    # 0.065m out at 0.06, near-level and nearer the middle, at the same 95%
+    # coverage and a median of one candidate tried.
+    #
+    # The first three terms are MolmoSpaces' own, from
+    # `utils/grasp_sample.select_grasp_pose`, at its weights where they carry over.
+
+    grasp_origin_cost_weight: float = 8.0
+    """Prefer grasps near the object's origin. Dominant in MolmoSpaces' cost too,
+    and for the same reason: a grasp near the centre of mass is one the object
+    cannot twist its own weight out of."""
+
+    grasp_reach_cost_weight: float = 1.0
+    """Prefer grasps near where the tool already is -- a proxy for reachability
+    that costs no solve to evaluate."""
+
+    grasp_horizontal_cost_weight: float = 2.0
+    """Prefer a level approach, scored as |approach . world z|. This term is
+    Stretch's rather than MolmoSpaces': their Franka prefers to come down from
+    above, whereas Stretch's lateral authority comes from the wrist yaw and is
+    lost looking straight down (`policies/kinematics.py`)."""
+
+    grasp_alignment_cost_weight: float = 1.0
+    """
+    Prefer grasps that close roughly along the line from the base to the object,
+    scored as the angle between the two.
+
+    Also Stretch's own term. Pinning an authored heading means the base has to
+    turn to face it, and every degree of that is the base pushing itself around a
+    scene it shares with furniture -- the failure documented at length in
+    `unstow_clearance_m`. Measured over 60 assets it takes the mean base turn from
+    17 to 14 degrees and the 90th percentile from 29 to 25, for the same 95%
+    coverage, and it drops the median search from three candidates to one because
+    the grasp Stretch is already pointing at is usually the one it can reach.
     """
 
     grip_measurement_reach_m: float = 0.045
@@ -315,6 +444,7 @@ class StretchSimpleIKPolicy(BasePolicy):
         self._grasp_offset: np.ndarray | None = None
         self._grasp_lost = False
         self._grip_hold: float | None = None
+        self._grasp: ToolGrasp | None = None
 
     # =========================================================================
     # BasePolicy
@@ -328,11 +458,19 @@ class StretchSimpleIKPolicy(BasePolicy):
         self._grasp_offset = None
         self._grasp_lost = False
         self._grip_hold = None
+        self._grasp = None
 
     def get_info(self) -> dict:
         return {
             "policy": "stretch_simple_ik",
             "grasp_style": self.config.policy_config.grasp_style,
+            # Which of the two the episode actually grasped with, so a benchmark
+            # run can be split by it. The fallback rate is the number to watch:
+            # a run where most episodes come back "styled" is one where the grasp
+            # libraries are not being found, not one where Stretch cannot reach.
+            "grasp_source": (
+                None if self._grasp is None else ("authored" if self._grasp.authored else "styled")
+            ),
             "waypoints_total": 0 if self._plan is None else len(self._plan),
             "waypoints_reached": self._waypoint_index,
             "grasp_lost": self._grasp_lost,
@@ -405,7 +543,13 @@ class StretchSimpleIKPolicy(BasePolicy):
             base_pose,
             waypoint.position,
             wrist_pitch=waypoint.wrist_pitch,
-            wrist_roll=0.0,
+            wrist_roll=waypoint.wrist_roll,
+            approach_yaw=waypoint.approach_yaw,
+            # A waypoint that names a heading means it: an authored grasp's yaw is
+            # which way the fingers close, and letting the solver rotate it to
+            # something easier to reach would be closing across a different part
+            # of the object than the one the grasp was authored for.
+            yaw_spread=0.0 if waypoint.approach_yaw is not None else APPROACH_YAW_SPREAD_RAD,
             seed=current,
             tolerance=policy_config.reach_tolerance_m * 0.5,
         )
@@ -588,65 +732,72 @@ class StretchSimpleIKPolicy(BasePolicy):
         return []
 
     def _plan_pick_and_place(self, with_place: bool) -> list[Waypoint]:
-        pitch = self._grasp_pitch()
-        is_top_down = self.config.policy_config.grasp_style == "top_down"
-        grasp_point = self._pickup_grasp_point(pitch)
-        if grasp_point is None:
+        grasp = self._pickup_grasp()
+        if grasp is None:
             return []
+        self._grasp = grasp
 
-        approach = self._approach_direction(pitch, grasp_point)
         policy_config = self.config.policy_config
+        grasp_point = grasp.position
+        approach = grasp.approach
 
-        # The fingers separate along the tool's y axis, which for an unrolled
-        # grasp is perpendicular to both the approach and the vertical.
-        closing_axis = np.cross(np.array([0.0, 0.0, 1.0]), approach)
+        # Every waypoint in a pick holds the grasp orientation: the phases before
+        # the close are lining up for it and the phases after are carrying
+        # something in it, so re-tilting anywhere in between would either miss
+        # the grasp or wring the object out of the fingers.
+        orientation = {
+            "wrist_pitch": grasp.wrist_pitch,
+            "wrist_roll": grasp.wrist_roll,
+            "approach_yaw": grasp.solver_yaw,
+        }
+
         grip_width = self._object_grasp_width(
-            self.config.task_config.pickup_obj_name, closing_axis, grasp_point
+            self.config.task_config.pickup_obj_name, grasp.closing_axis, grasp_point
         )
         log.info(
             f"[stretch-simple-ik] grasp width along the closing axis: "
             f"{'unknown' if grip_width is None else f'{grip_width:.3f}m'}"
         )
 
-        plan = self._unstow_waypoints(grasp_point, pitch)
-        pregrasp = self._reachable_standoff(grasp_point, approach, pitch)
+        plan = self._unstow_waypoints(grasp)
+        pregrasp = self._reachable_standoff(grasp)
         if pregrasp is not None:
             plan.append(
                 Waypoint(
                     position=pregrasp,
-                    wrist_pitch=pitch,
                     gripper_open=True,
                     label="pregrasp",
                     tolerance=policy_config.reach_tolerance_m,
+                    **orientation,
                 )
             )
         plan += [
             Waypoint(
                 position=grasp_point + approach * policy_config.grasp_depth_m,
-                wrist_pitch=pitch,
                 gripper_open=True,
                 label="reach",
                 tolerance=policy_config.reach_tolerance_m,
+                **orientation,
             ),
             Waypoint(
                 position=grasp_point + approach * policy_config.grasp_depth_m,
-                wrist_pitch=pitch,
                 gripper_open=False,
                 label="close",
                 settle_steps=policy_config.gripper_settle_steps,
                 establishes_grasp=True,
                 grip_width_m=grip_width,
                 tolerance=policy_config.reach_tolerance_m * 2.0,
+                **orientation,
             ),
             Waypoint(
                 position=grasp_point + np.array([0.0, 0.0, policy_config.lift_height_m]),
-                wrist_pitch=pitch,
                 gripper_open=False,
                 label="lift",
                 settle_steps=policy_config.gripper_settle_steps,
                 verify_grasp=True,
                 grip_width_m=grip_width,
                 tolerance=policy_config.reach_tolerance_m,
+                **orientation,
             ),
         ]
         if not with_place:
@@ -660,7 +811,6 @@ class StretchSimpleIKPolicy(BasePolicy):
         plan += [
             Waypoint(
                 position=hover,
-                wrist_pitch=pitch,
                 gripper_open=False,
                 label="transfer",
                 grip_width_m=grip_width,
@@ -668,21 +818,22 @@ class StretchSimpleIKPolicy(BasePolicy):
                 # motion whose span routinely exceeds the arm's, so allow the
                 # base to help here even though the grasp phases may not.
                 tolerance=policy_config.reach_tolerance_m * 1.5,
+                **orientation,
             ),
             Waypoint(
                 position=hover,
-                wrist_pitch=pitch,
                 gripper_open=True,
                 label="release",
                 settle_steps=policy_config.gripper_settle_steps,
                 tolerance=policy_config.reach_tolerance_m * 1.5,
+                **orientation,
             ),
             Waypoint(
                 position=hover + np.array([0.0, 0.0, policy_config.place_hover_m]),
-                wrist_pitch=pitch,
                 gripper_open=True,
                 label="retreat",
                 tolerance=policy_config.reach_tolerance_m * 2.0,
+                **orientation,
             ),
         ]
         return plan
@@ -701,10 +852,14 @@ class StretchSimpleIKPolicy(BasePolicy):
 
         policy_config = self.config.policy_config
         # Handles are grasped from the front, never from above -- a top-down
-        # approach on a drawer pull collides with the cabinet face.
+        # approach on a drawer pull collides with the cabinet face. This is the
+        # one place a hand-written style is still the right answer rather than a
+        # fallback: MolmoSpaces does author per-joint grasps for its articulated
+        # assets (`utils/grasps.get_joint_grasps`), but a handle has a single
+        # obvious approach and the joint's own axis already says where to drag it.
         pitch = PITCH_HORIZONTAL
         start = handle_arc[0]
-        approach = self._approach_direction(pitch, start)
+        approach = self._styled_grasp(start, pitch).approach
 
         plan = [
             Waypoint(
@@ -751,31 +906,36 @@ class StretchSimpleIKPolicy(BasePolicy):
     def _gripper_group(self) -> StretchGripperGroup:
         return self.task.env.current_robot.robot_view.get_gripper("gripper")
 
-    def _grasp_pitch(self) -> float:
-        return (
-            PITCH_TOP_DOWN
-            if self.config.policy_config.grasp_style == "top_down"
-            else PITCH_HORIZONTAL
+    def _styled_grasp(self, position: np.ndarray, pitch: float) -> ToolGrasp:
+        """A grasp at `position` built from a hand-written tilt.
+
+        The nominal heading is the bearing from the base to the target, which is
+        the direction a grasp closes along when the robot is facing its work, but
+        it is only nominal -- `authored` is False, so the solver keeps its freedom
+        to rotate the approach and the heading here is used for the geometry
+        (which way to back off, which way the fingers span) rather than as a
+        constraint.
+
+        At `PITCH_TOP_DOWN` that geometry comes out as an approach straight down
+        and a closing axis across the bearing, which is what a top-down grasp is.
+        """
+        position = np.asarray(position, dtype=float)
+        base_xy = self.task.env.current_robot.robot_view.base.pose[:2, 3]
+        direction = position[:2] - base_xy
+        bearing = (
+            0.0
+            if float(np.linalg.norm(direction)) < 1e-6
+            else float(np.arctan2(direction[1], direction[0]))
+        )
+        return ToolGrasp(
+            position=position,
+            approach_yaw=bearing,
+            wrist_pitch=pitch,
+            wrist_roll=0.0,
+            authored=False,
         )
 
-    def _approach_direction(self, pitch: float, target: np.ndarray) -> np.ndarray:
-        """Unit vector the tool travels along as it closes on `target`.
-
-        Straight down for a top-down grasp; for a horizontal grasp, from the
-        robot's base towards the target in the floor plane.
-        """
-        if pitch == PITCH_TOP_DOWN:
-            return np.array([0.0, 0.0, -1.0])
-        base_xy = self.task.env.current_robot.robot_view.base.pose[:2, 3]
-        direction = np.asarray(target[:2], dtype=float) - base_xy
-        norm = float(np.linalg.norm(direction))
-        if norm < 1e-6:
-            return np.array([1.0, 0.0, 0.0])
-        return np.array([direction[0] / norm, direction[1] / norm, 0.0])
-
-    def _reachable_standoff(
-        self, grasp_point: np.ndarray, approach: np.ndarray, pitch: float
-    ) -> np.ndarray | None:
+    def _reachable_standoff(self, grasp: ToolGrasp) -> np.ndarray | None:
         """The furthest-back pregrasp pose the arm can actually hold, or None.
 
         Backing off along a *horizontal* approach means retracting the
@@ -789,12 +949,31 @@ class StretchSimpleIKPolicy(BasePolicy):
         """
         standoff = self.config.policy_config.pregrasp_standoff_m
         base_pose = self.task.env.current_robot.robot_view.base.pose
+        approach = grasp.approach
         for fraction in (1.0, 0.66, 0.33):
-            candidate = grasp_point - approach * (standoff * fraction)
-            if self._solver.solve(base_pose, candidate, wrist_pitch=pitch) is not None:
+            candidate = grasp.position - approach * (standoff * fraction)
+            if self._solve_at(base_pose, candidate, grasp) is not None:
                 return candidate
         log.info("[stretch-simple-ik] no reachable pregrasp standoff; approaching directly")
         return None
+
+    def _solve_at(
+        self, base_pose: np.ndarray, position: np.ndarray, grasp: ToolGrasp
+    ) -> dict[str, np.ndarray] | None:
+        """Whether the tool can be put at `position` in `grasp`'s orientation.
+
+        Planning-time counterpart to `_command_for`, and it has to ask for the
+        same thing: an authored grasp's heading is pinned in both, so a candidate
+        that passes here is one the executor can also hold.
+        """
+        return self._solver.solve(
+            base_pose,
+            position,
+            wrist_pitch=grasp.wrist_pitch,
+            wrist_roll=grasp.wrist_roll,
+            approach_yaw=grasp.solver_yaw,
+            yaw_spread=0.0 if grasp.authored else APPROACH_YAW_SPREAD_RAD,
+        )
 
     def _object_grasp_point(self, object_name: str | None) -> np.ndarray | None:
         """A world point on `object_name` worth aiming the tool at.
@@ -814,7 +993,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             return None
         return np.asarray(scene_object.position, dtype=float)
 
-    def _unstow_waypoints(self, grasp_point: np.ndarray, pitch: float) -> list[Waypoint]:
+    def _unstow_waypoints(self, grasp: ToolGrasp) -> list[Waypoint]:
         """Get the arm out of its stowed pose, clear of whatever it is reaching over.
 
         Joint-space on purpose. The point of this move is the configuration --
@@ -839,27 +1018,29 @@ class StretchSimpleIKPolicy(BasePolicy):
         """
         policy_config = self.config.policy_config
         solver = self._solver
+        pitch, roll = grasp.wrist_pitch, grasp.wrist_roll
         retracted = {
             "base": np.zeros(3),
             "lift": np.array([0.0]),
             "arm": np.array([0.0]),
-            "wrist": np.array([0.0, pitch, 0.0]),
+            "wrist": np.array([0.0, pitch, roll]),
         }
         # Tool height rises one-for-one with the lift, so the offset between them
         # is whatever the tool sits at with the lift at zero.
         tool_height_at_zero_lift = float(solver.forward(retracted)[2, 3])
         base_z = float(self.task.env.current_robot.robot_view.base.pose[2, 3])
-        wanted = float(grasp_point[2]) + policy_config.unstow_clearance_m
+        wanted = float(grasp.position[2]) + policy_config.unstow_clearance_m
         lift_limits = solver.joint_limits["lift"][0]
         lift = float(
             np.clip(wanted - base_z - tool_height_at_zero_lift, lift_limits[0], lift_limits[1])
         )
 
-        position = np.asarray(grasp_point, dtype=float)
+        position = np.asarray(grasp.position, dtype=float)
         return [
             Waypoint(
                 position=position,
                 wrist_pitch=pitch,
+                wrist_roll=roll,
                 gripper_open=True,
                 label="raise",
                 # The wrist is deliberately absent: `_command_for` holds every
@@ -875,62 +1056,112 @@ class StretchSimpleIKPolicy(BasePolicy):
             Waypoint(
                 position=position,
                 wrist_pitch=pitch,
+                wrist_roll=roll,
                 gripper_open=True,
                 label="unstow",
+                # Pitch and roll come out of the grasp, so the wrist arrives at
+                # the tilt the object is going to be taken at and the reach that
+                # follows only has to aim. Yaw is zero rather than the grasp's
+                # heading because this waypoint's whole purpose is to unwind the
+                # stowed 3.14rad yaw in free air; where it then points is the
+                # solver's business.
                 joint_targets={
                     "lift": np.array([lift]),
                     "arm": np.array([0.0]),
-                    "wrist": np.array([0.0, pitch, 0.0]),
+                    "wrist": np.array([0.0, pitch, roll]),
                 },
             ),
         ]
 
-    def _pickup_grasp_point(self, pitch: float) -> np.ndarray | None:
-        """Where to aim the tool to pick up the task's object.
+    def _pickup_grasp(self) -> ToolGrasp | None:
+        """How to grasp the task's pickup object.
 
-        Prefers a point from the asset's authored grasp library over the body
-        origin, because the origin is only a sensible grasp for objects shaped
-        roughly like blobs. Candidates are kept only if Stretch can both *reach*
-        them and *close on* them -- a grasp authored for a wider gripper is no use
-        here -- and the object's origin remains the fallback when the library is
-        missing or nothing in it works.
+        Prefers a pose out of the asset's authored grasp library, and falls back
+        to `grasp_style` at the object's origin when there is no library or
+        nothing in it is reachable. Returns None only when there is no pickup
+        object to grasp at all.
         """
         object_name = self.config.task_config.pickup_obj_name
         origin = self._object_grasp_point(object_name)
-        candidates = self._library_grasp_points(object_name)
-        if candidates is None or origin is None:
-            return origin
+        if origin is None:
+            return None
+        if self.config.policy_config.use_authored_grasps:
+            authored = self._authored_grasp(object_name, origin)
+            if authored is not None:
+                return authored
+        return self._styled_grasp(origin, self._fallback_pitch())
 
-        gripper = self._gripper_group()
-        _, open_width = gripper.inter_finger_dist_range
+    def _fallback_pitch(self) -> float:
+        return (
+            PITCH_TOP_DOWN
+            if self.config.policy_config.grasp_style == "top_down"
+            else PITCH_HORIZONTAL
+        )
+
+    def _authored_grasp(self, object_name: str | None, origin: np.ndarray) -> ToolGrasp | None:
+        """The best-ranked authored grasp Stretch can actually take, or None.
+
+        A candidate has to survive two tests. It must be one the *fingers* can
+        close on, because the libraries were authored for a Franka and a pose that
+        straddles a thin rim there may straddle a fat handle once the object is
+        posed. And it must be one Stretch can hold at the orientation it was
+        authored at -- position alone is not enough, since an authored grasp is
+        exactly a claim about orientation.
+
+        None means the fallback: no library for this asset, or nothing in it
+        passed. That is an ordinary outcome for about one object in twenty, not an
+        error.
+        """
+        poses = self._library_grasp_poses(object_name, origin)
+        if poses is None:
+            return None
+
+        _, open_width = self._gripper_group().inter_finger_dist_range
         base_pose = self.task.env.current_robot.robot_view.base.pose
 
-        for candidate in candidates:
-            approach = self._approach_direction(pitch, candidate)
-            closing_axis = np.cross(np.array([0.0, 0.0, 1.0]), approach)
-            width = self._object_grasp_width(object_name, closing_axis, candidate)
+        unreachable = 0
+        too_wide = 0
+        for pose in poses:
+            approach_yaw, wrist_pitch, wrist_roll = tcp_orientation_from_grasp(pose)
+            candidate = ToolGrasp(
+                position=np.asarray(pose[:3, 3], dtype=float),
+                approach_yaw=approach_yaw,
+                wrist_pitch=wrist_pitch,
+                wrist_roll=wrist_roll,
+                authored=True,
+            )
+            width = self._object_grasp_width(
+                object_name, candidate.closing_axis, candidate.position
+            )
             if width is not None and width >= open_width:
+                too_wide += 1
                 continue
-            if self._solver.solve(base_pose, candidate, wrist_pitch=pitch) is None:
+            if self._solve_at(base_pose, candidate.position, candidate) is None:
+                unreachable += 1
                 continue
             log.info(
-                f"[stretch-simple-ik] grasping at an authored grasp point "
-                f"{float(np.linalg.norm(candidate - origin)):.3f}m from the object origin"
+                f"[stretch-simple-ik] grasping at an authored grasp "
+                f"{float(np.linalg.norm(candidate.position - origin)):.3f}m from the object "
+                f"origin, pitch {wrist_pitch:+.2f} roll {wrist_roll:+.2f} "
+                f"(rejected {too_wide} too wide, {unreachable} unreachable)"
             )
-            return np.asarray(candidate, dtype=float)
+            return candidate
 
         log.info(
-            "[stretch-simple-ik] no authored grasp point was both reachable and narrow "
-            "enough; aiming at the object origin"
+            f"[stretch-simple-ik] none of {len(poses)} authored grasps was both reachable "
+            f"({unreachable} were not) and narrow enough ({too_wide} were not); falling back "
+            f"to a {self.config.policy_config.grasp_style} grasp at the object origin"
         )
-        return origin
+        return None
 
-    def _library_grasp_points(self, object_name: str | None) -> np.ndarray | None:
-        """Authored grasp positions for `object_name`, thinned to a workable number.
+    def _library_grasp_poses(
+        self, object_name: str | None, origin: np.ndarray
+    ) -> np.ndarray | None:
+        """Authored world grasp poses for `object_name`, ranked and thinned.
 
         Returns None whenever the library cannot be consulted -- no metadata, no
-        grasps for this asset -- which is a fallback, not an error: the origin is
-        still a usable aim point and the caller treats it as one.
+        grasps for this asset -- which is a fallback, not an error, and the caller
+        treats it as one.
         """
         if not object_name:
             return None
@@ -956,13 +1187,47 @@ class StretchSimpleIKPolicy(BasePolicy):
         if poses is None or len(poses) == 0:
             return None
 
-        positions = np.asarray(poses, dtype=float)[:, :3, 3]
-        limit = self.config.policy_config.grasp_library_candidates
-        if len(positions) > limit:
-            # Even strides rather than the first N: the library is ordered, and
-            # the first N are all much the same grasp.
-            positions = positions[:: max(1, len(positions) // limit)][:limit]
-        return positions
+        poses = np.asarray(poses, dtype=float)
+        policy_config = self.config.policy_config
+        tool_position = self.task.env.current_robot.robot_view.get_move_group(
+            "gripper"
+        ).leaf_frame_to_world[:3, 3]
+
+        # The library's own order means nothing here, so rank before thinning.
+        # Column 2 of each pose is the grasp frame's z axis, which is its approach
+        # axis (see `kinematics.GRASP_LIBRARY_TO_TCP`), so the last two terms read
+        # straight off the matrix without building a rotation per candidate.
+        base_xy = self.task.env.current_robot.robot_view.base.pose[:2, 3]
+        approach = poses[:, :3, 2]
+        approach_heading = np.arctan2(approach[:, 1], approach[:, 0])
+        bearing = np.arctan2(poses[:, 1, 3] - base_xy[1], poses[:, 0, 3] - base_xy[0])
+        # Wrapped into (-pi, pi] before taking the magnitude, so a heading either
+        # side of the +-pi seam is a small misalignment rather than a full turn.
+        offset = approach_heading - bearing
+        misalignment = np.abs(np.arctan2(np.sin(offset), np.cos(offset)))
+
+        cost = (
+            policy_config.grasp_origin_cost_weight
+            * np.linalg.norm(poses[:, :3, 3] - np.asarray(origin, dtype=float), axis=1)
+            + policy_config.grasp_reach_cost_weight
+            * np.linalg.norm(poses[:, :3, 3] - tool_position, axis=1)
+            + policy_config.grasp_horizontal_cost_weight * np.abs(approach[:, 2])
+            + policy_config.grasp_alignment_cost_weight * misalignment
+        )
+        poses = poses[np.argsort(cost, kind="stable")]
+
+        limit = policy_config.grasp_library_candidates
+        if len(poses) > limit:
+            # Even strides through the ranked order rather than its head. The two
+            # measure the same on an unobstructed counter -- 95% of assets covered
+            # either way, both at a median of one candidate tried -- so this is a
+            # hedge rather than a win: a library's best-ranked few dozen poses are
+            # minor variants of one grasp, and the ranking is only proxies (no
+            # collision checking, and MolmoSpaces' own planner does check). On the
+            # cluttered scenes the measurement does not cover, one grasp's worth of
+            # candidates is a thin thing to have staked the episode on.
+            poses = poses[:: max(1, len(poses) // limit)][:limit]
+        return poses
 
     def _object_grasp_width(
         self, object_name: str | None, closing_axis: np.ndarray, grasp_point: np.ndarray

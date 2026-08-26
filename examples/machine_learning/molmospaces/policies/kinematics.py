@@ -39,6 +39,15 @@ nominal bearing first. The solver then splits that heading between turning the
 base and turning the wrist, which is the redundancy Stretch actually has and the
 position-only formulation could not express.
 
+**An authored grasp pins all three.** A grasp out of a MolmoSpaces grasp library
+says which way the fingers close as well as how the tool is tilted, so there is
+no free angle left and `yaw_spread=0` is the right way to ask for one. That is
+not a loss of the redundancy above so much as a different way of spending it:
+instead of one grasp pose tried at nine headings, the library offers hundreds of
+poses and the search runs over those. `tcp_orientation_from_grasp()` is the
+conversion, and the two hand-written styles turn out to be its two special
+cases.
+
 **The two models pivot about different points.** MuJoCo turns the base about the
 holonomic base body; Pinocchio turns it about the URDF root, ~7cm away. A solve
 that turns the base by `bt` therefore lands `|(I - Rz(bt)) @ offset|` from where
@@ -61,6 +70,7 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import warnings
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -124,6 +134,56 @@ def grasp_orientation(approach_yaw: float, wrist_pitch: float, wrist_roll: float
         @ R.from_euler("y", wrist_pitch).as_matrix()
         @ R.from_euler("x", wrist_roll).as_matrix()
     )
+
+
+# The rotation that carries a MolmoSpaces grasp frame onto Stretch's tool frame.
+#
+# The two conventions agree on the closing axis and disagree on the approach.
+# MolmoSpaces authors its grasps in the frame it draws its own gripper markers in
+# (`molmo_spaces/utils/grasp_sample.py:add_grasp_collision_bodies`): the fingers
+# straddle +-y and extend along +z, so **+z is the approach**. Stretch's
+# `grasp_center_link` also separates its fingers along +-y, but the fingertips sit
+# behind it on -x -- measured on the compiled model they land at
+# (-0.019, +-0.094, 0) -- so **+x is the approach**.
+#
+# Lining approach up with approach while keeping the shared closing axis fixed is
+# therefore one -90 degree rotation about y, and the result is self-checking: a
+# library grasp that approaches straight down comes back as exactly
+# `PITCH_TOP_DOWN`, and one that approaches along +x as exactly
+# `PITCH_HORIZONTAL` at zero yaw and roll. The two hand-written styles are the
+# two special cases of an authored grasp, which is the strongest evidence there
+# is that this is the right transform and not merely a plausible one.
+GRASP_LIBRARY_TO_TCP = R.from_euler("y", -np.pi / 2).as_matrix()
+
+
+def tcp_orientation_from_grasp(grasp_pose: np.ndarray) -> tuple[float, float, float]:
+    """`(approach_yaw, wrist_pitch, wrist_roll)` that realise an authored grasp.
+
+    Takes one 4x4 *world* grasp pose from a MolmoSpaces grasp library -- as
+    `molmo_spaces.utils.grasps.get_pickup_grasps` returns them -- and re-expresses
+    its orientation in the three angles `StretchReachSolver.solve` accepts.
+
+    The decomposition is a ZYX Euler triple because that is exactly how Stretch's
+    tool orientation factors (see the module docstring), so this is a change of
+    coordinates and not a fit: `grasp_orientation(*result)` reproduces the input
+    rotation to machine precision. At `wrist_pitch = +-pi/2` the yaw and roll axes
+    line up and the split between them is arbitrary, but every arbitrary split
+    reconstructs the same rotation, so a top-down authored grasp needs no special
+    case here.
+
+    All three angles are determined, so the caller has nothing left to leave free
+    and should pass `yaw_spread=0.0`.
+    """
+    rotation = np.asarray(grasp_pose, dtype=float)[:3, :3] @ GRASP_LIBRARY_TO_TCP
+    with warnings.catch_warnings():
+        # A top-down grasp is gimbal-locked by construction, and scipy warns that
+        # it had to choose one of the equivalent yaw/roll splits. That is fine
+        # here -- every such split rebuilds the same rotation, which is what the
+        # caller uses -- and top-down grasps are common enough in a library that
+        # the warning would fire on most candidates of most objects.
+        warnings.filterwarnings("ignore", message="Gimbal lock detected")
+        yaw, pitch, roll = R.from_matrix(rotation).as_euler("ZYX")
+    return float(yaw), float(pitch), float(roll)
 
 
 _TCP_OFFSET_CACHE: dict[tuple[str, str], np.ndarray] = {}
