@@ -601,12 +601,22 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     def mock_init(app_id, recording_id=None, **kw):
         inits.append((app_id, recording_id))
 
+    connected_urls = []
+    def mock_connect_grpc(url=None, **kw):
+        connected_urls.append(url)
+
+    rec_names = []
+    def mock_send_recording_name(name, **kw):
+        rec_names.append(name)
+
     monkeypatch.setattr(rr, "log", mock_log)
     monkeypatch.setattr(rr, "init", mock_init)
     monkeypatch.setattr(rr, "spawn", lambda *a, **kw: None)
     monkeypatch.setattr(rr, "set_time", lambda *a, **kw: None)
+    monkeypatch.setattr(rr, "connect_grpc", mock_connect_grpc)
+    monkeypatch.setattr(rr, "send_recording_name", mock_send_recording_name)
 
-    viz = StretchRerunVisualizer(spawn=False)
+    viz = StretchRerunVisualizer(spawn=True, port=9876)
 
     # Mock task
     task = MagicMock()
@@ -673,6 +683,9 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     viz.start_episode(101, task)
     assert len(inits) == 1
     assert "episode_101_" in inits[0][1]
+    assert len(connected_urls) == 1
+    assert "9876" in connected_urls[0]
+    assert rec_names == ["Episode 101"]
     assert "world/robot/robot_0_base_link/geom_0" in logged_static
     assert "world/object/apple_123/geom_1" in logged_static
 
@@ -689,8 +702,10 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     assert "world/frames/object/label" in logged_entities
     assert "world/cameras/head_camera" in logged_entities
 
-    # Start episode 2 -> verifies new recording is created
+    # Start episode 2 -> verifies new recording is created and connected
     viz.start_episode(102, task)
     assert len(inits) == 2
     assert "episode_102_" in inits[1][1]
     assert inits[0][1] != inits[1][1]
+    assert len(connected_urls) == 2
+    assert rec_names == ["Episode 101", "Episode 102"]

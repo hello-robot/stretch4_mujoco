@@ -73,8 +73,9 @@ log = logging.getLogger(__name__)
 class StretchRerunVisualizer:
     """Streams 3D robot meshes, object meshes, and coordinate frames to Rerun."""
 
-    def __init__(self, spawn: bool = True):
+    def __init__(self, spawn: bool = True, port: int = 9876):
         self._spawn = spawn
+        self._port = port
         self._initialized = False
         self._logged_meshes: set[str] = set()
 
@@ -94,15 +95,26 @@ class StretchRerunVisualizer:
             )
 
             if not self._initialized:
-                rr.init(app_id, recording_id=rec_id, spawn=self._spawn, default_blueprint=blueprint)
+                rr.init(app_id, recording_id=rec_id, spawn=False, default_blueprint=blueprint)
                 if self._spawn:
                     try:
-                        rr.spawn(memory_limit="4GB")
-                    except Exception:
-                        pass
+                        rr.spawn(port=self._port, memory_limit="4GB")
+                    except Exception as e:
+                        log.debug(f"rr.spawn note: {e}")
                 self._initialized = True
             else:
                 rr.init(app_id, recording_id=rec_id, spawn=False, default_blueprint=blueprint)
+
+            if self._spawn:
+                try:
+                    rr.connect_grpc(f"rerun+http://127.0.0.1:{self._port}/proxy")
+                except Exception as e:
+                    log.debug(f"rr.connect_grpc note: {e}")
+
+            try:
+                rr.send_recording_name(f"Episode {episode_seed}")
+            except Exception:
+                pass
 
             try:
                 rr.send_blueprint(blueprint)
