@@ -486,3 +486,60 @@ def test_export_encoder_matches_the_bc_encoding():
     assert encoder.state_dim == STATE_DIM
     assert encoder.action_dim == ACTION_DIM
     assert np.allclose(encoder.state(qpos), encode_state(qpos))
+
+
+def test_generate_dataset_cli_supports_slow_rate():
+    from click.testing import CliRunner
+
+    from examples.machine_learning.molmospaces.finetuning.generate_dataset import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--help"])
+    assert result.exit_code == 0
+    assert "--slow-rate" in result.output
+    assert "--slow_rate" in result.output
+
+
+def test_stretch_rollout_runner_slow_rate_timing(monkeypatch):
+    import time
+    from unittest.mock import MagicMock
+
+    from examples.machine_learning.molmospaces.finetuning.generate_dataset import (
+        StretchRolloutRunner,
+    )
+
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+
+    # Mock task with mock env and 2 steps
+    task = MagicMock()
+    step_calls = 0
+
+    def mock_step_chunk(chunk, stop_on_success=False):
+        nonlocal step_calls
+        step_calls += 1
+        # Advance mock sim time by 0.1s each step
+        task.env.mj_datas[0].time += 0.1
+        return MagicMock(), 0.0, False, False, [{}]
+
+    task.step_chunk.side_effect = mock_step_chunk
+    task.is_done.side_effect = lambda: step_calls >= 2
+    task.reset.return_value = (MagicMock(), {})
+    task.judge_success.return_value = True
+    task.env.current_batch_index = 0
+    task.env.mj_datas = [MagicMock(time=0.0)]
+
+    policy = MagicMock()
+    policy.get_action_chunk.return_value = [{"action": 1}]
+
+    StretchRolloutRunner.slow_rate = 2.0
+    success = StretchRolloutRunner.run_single_rollout(
+        episode_seed=42,
+        task=task,
+        policy=policy,
+    )
+    assert success is True
+    assert len(slept) == 2
+    # dt_sim = 0.1s, slow_rate = 2.0 -> target_wall_dt = 0.2s. Sleep should be ~0.2s
+    for s in slept:
+        assert 0.15 <= s <= 0.25
