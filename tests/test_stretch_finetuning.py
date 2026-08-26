@@ -543,3 +543,154 @@ def test_stretch_rollout_runner_slow_rate_timing(monkeypatch):
     # dt_sim = 0.1s, slow_rate = 2.0 -> target_wall_dt = 0.2s. Sleep should be ~0.2s
     for s in slept:
         assert 0.15 <= s <= 0.25
+
+
+def test_snap_free_camera_to_robot():
+    import mujoco
+    from unittest.mock import MagicMock
+
+    from examples.machine_learning.molmospaces.finetuning.generate_dataset import (
+        snap_free_camera_to_robot,
+    )
+
+    viewer = MagicMock()
+    viewer.cam.lookat = [0.0, 0.0, 0.0]
+
+    task = MagicMock()
+    task.env.current_batch_index = 0
+    model = MagicMock()
+    data = MagicMock()
+
+    body_mock = MagicMock()
+    body_mock.id = 1
+    model.body.side_effect = lambda name: body_mock if name == "robot_0/base_link" else (_ for _ in ()).throw(KeyError)
+    data.xpos = {1: np.array([1.2, 3.4, 0.1])}
+    task.env.current_model = model
+    task.env.mj_datas = [data]
+
+    snap_free_camera_to_robot(viewer, task)
+
+    assert viewer.cam.type == mujoco.mjtCamera.mjCAMERA_FREE
+    assert viewer.cam.fixedcamid == -1
+    assert viewer.cam.lookat[0] == pytest.approx(1.2)
+    assert viewer.cam.lookat[1] == pytest.approx(3.4)
+    assert viewer.cam.lookat[2] == pytest.approx(0.7)
+    assert viewer.cam.distance == 2.5
+    assert viewer.cam.elevation == -20.0
+    assert viewer.cam.azimuth == 135.0
+
+
+def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
+    import mujoco
+    import rerun as rr
+    from unittest.mock import MagicMock
+
+    from examples.machine_learning.molmospaces.finetuning.generate_dataset import (
+        StretchRerunVisualizer,
+    )
+
+    logged_entities = {}
+    logged_static = {}
+
+    def mock_log(entity, data, static=False):
+        logged_entities[entity] = data
+        if static:
+            logged_static[entity] = data
+
+    inits = []
+    def mock_init(app_id, recording_id=None, **kw):
+        inits.append((app_id, recording_id))
+
+    monkeypatch.setattr(rr, "log", mock_log)
+    monkeypatch.setattr(rr, "init", mock_init)
+    monkeypatch.setattr(rr, "spawn", lambda *a, **kw: None)
+    monkeypatch.setattr(rr, "set_time", lambda *a, **kw: None)
+
+    viz = StretchRerunVisualizer(spawn=False)
+
+    # Mock task
+    task = MagicMock()
+    task.get_task_objects.return_value = {"pickup_obj": "apple_123"}
+    task.env.current_batch_index = 0
+
+    model = MagicMock()
+    model.ngeom = 2
+    model.nbody = 3
+
+    # Robot body 1
+    # Object body 2
+    body_0 = MagicMock()
+    body_0.name = "world"
+    body_1 = MagicMock()
+    body_1.name = "robot_0/base_link"
+    body_2 = MagicMock()
+    body_2.name = "apple_123"
+    body_map = {0: body_0, 1: body_1, 2: body_2}
+    model.body.side_effect = lambda b_id: body_map[b_id] if isinstance(b_id, int) else (
+        body_1 if "robot_0" in str(b_id) else body_2
+    )
+
+    mesh_0 = MagicMock()
+    mesh_0.name = "base_link"
+    mesh_1 = MagicMock()
+    mesh_1.name = "apple_mesh"
+    mesh_map = {0: mesh_0, 1: mesh_1}
+    model.mesh.side_effect = lambda m_id: mesh_map[m_id]
+
+    model.geom_bodyid = [1, 2]
+    model.geom_type = [mujoco.mjtGeom.mjGEOM_MESH, mujoco.mjtGeom.mjGEOM_MESH]
+    model.geom_dataid = [0, 1]
+    model.mesh_vertadr = [0, 3]
+    model.mesh_vertnum = [3, 3]
+    model.mesh_vert = np.array([
+        [0, 0, 0],
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 0],
+        [0.5, 0, 0],
+        [0, 0.5, 0],
+    ], dtype=np.float32)
+    model.mesh_face = np.array([
+        [0, 1, 2],
+        [0, 1, 2],
+    ], dtype=np.uint32)
+    model.geom_pos = [np.array([0, 0, 0]), np.array([0, 0, 0])]
+    model.geom_quat = [[1, 0, 0, 0], [1, 0, 0, 0]]
+    model.body_parentid = [0, 0, 0]
+
+    data = MagicMock()
+    data.xpos = [np.array([0, 0, 0]), np.array([1, 2, 0]), np.array([3, 4, 0])]
+    data.xmat = [np.eye(3).flatten(), np.eye(3).flatten(), np.eye(3).flatten()]
+    data.time = 0.5
+
+    task.env.current_model = model
+    task.env.mj_datas = [data]
+
+    pickup_name = StretchRerunVisualizer._get_pickup_object_name(task)
+    assert pickup_name == "apple_123"
+
+    # Start episode 1
+    viz.start_episode(101, task)
+    assert len(inits) == 1
+    assert "episode_101_" in inits[0][1]
+    assert "world/robot/robot_0_base_link/geom_0" in logged_static
+    assert "world/object/apple_123/geom_1" in logged_static
+
+    viz.log_step(0, task, observation=[{"head_camera": np.zeros((10, 10, 3), dtype=np.uint8)}])
+
+    assert "world/frames/wrist_center" in logged_entities
+    assert "world/frames/wrist_center/axes" in logged_entities
+    assert "world/frames/wrist_center/label" in logged_entities
+    assert "world/frames/tool_center" in logged_entities
+    assert "world/frames/tool_center/axes" in logged_entities
+    assert "world/frames/tool_center/label" in logged_entities
+    assert "world/frames/object" in logged_entities
+    assert "world/frames/object/axes" in logged_entities
+    assert "world/frames/object/label" in logged_entities
+    assert "world/cameras/head_camera" in logged_entities
+
+    # Start episode 2 -> verifies new recording is created
+    viz.start_episode(102, task)
+    assert len(inits) == 2
+    assert "episode_102_" in inits[1][1]
+    assert inits[0][1] != inits[1][1]
