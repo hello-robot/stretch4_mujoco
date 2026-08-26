@@ -305,7 +305,7 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     real gripper uses, and it needs no estimate.
     """
 
-    unstow_clearance_m: float = 0.25
+    unstow_clearance_m: float = 2.25
     """
     How far above the grasp to swing the arm out of its stowed pose.
 
@@ -765,7 +765,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             plan.append(
                 Waypoint(
                     position=pregrasp,
-                    gripper_open=True,
+                    gripper_open=False,
                     label="pregrasp",
                     tolerance=policy_config.reach_tolerance_m,
                     **orientation,
@@ -773,9 +773,16 @@ class StretchSimpleIKPolicy(BasePolicy):
             )
         plan += [
             Waypoint(
+                position=grasp_point + approach * policy_config.grasp_depth_m  - 0.02,
+                gripper_open=False,
+                label="reach",
+                tolerance=policy_config.reach_tolerance_m,
+                **orientation,
+            ),
+            Waypoint(
                 position=grasp_point + approach * policy_config.grasp_depth_m,
                 gripper_open=True,
-                label="reach",
+                label="open",
                 tolerance=policy_config.reach_tolerance_m,
                 **orientation,
             ),
@@ -1041,7 +1048,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 position=position,
                 wrist_pitch=pitch,
                 wrist_roll=roll,
-                gripper_open=True,
+                gripper_open=False,
                 label="raise",
                 # The wrist is deliberately absent: `_command_for` holds every
                 # group a joint-space waypoint does not name at its current
@@ -1057,7 +1064,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 position=position,
                 wrist_pitch=pitch,
                 wrist_roll=roll,
-                gripper_open=True,
+                gripper_open=False,
                 label="unstow",
                 # Pitch and roll come out of the grasp, so the wrist arrives at
                 # the tilt the object is going to be taken at and the reach that
@@ -1174,11 +1181,13 @@ class StretchSimpleIKPolicy(BasePolicy):
         try:
             from molmo_spaces.utils.grasps import get_pickup_grasps
 
+            task_sampler_config = getattr(self.config, "task_sampler_config", None)
+            grasp_libraries = getattr(task_sampler_config, "grasp_libraries", None)
             poses = get_pickup_grasps(
                 environment,
                 scene_object,
                 include_flipped=True,
-                grasp_libraries=self.config.task_sampler_config.grasp_libraries,
+                grasp_libraries=grasp_libraries,
             )
         except Exception as failure:  # noqa: BLE001 - the library is optional here
             log.debug(f"[stretch-simple-ik] no grasp library for {object_name!r}: {failure}")
