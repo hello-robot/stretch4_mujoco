@@ -773,7 +773,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             )
         plan += [
             Waypoint(
-                position=grasp_point + approach * policy_config.grasp_depth_m  - 0.02,
+                position=grasp_point + approach - 0.02,
                 gripper_open=False,
                 label="reach",
                 tolerance=policy_config.reach_tolerance_m,
@@ -1108,16 +1108,14 @@ class StretchSimpleIKPolicy(BasePolicy):
     def _authored_grasp(self, object_name: str | None, origin: np.ndarray) -> ToolGrasp | None:
         """The best-ranked authored grasp Stretch can actually take, or None.
 
-        A candidate has to survive two tests. It must be one the *fingers* can
-        close on, because the libraries were authored for a Franka and a pose that
-        straddles a thin rim there may straddle a fat handle once the object is
-        posed. And it must be one Stretch can hold at the orientation it was
-        authored at -- position alone is not enough, since an authored grasp is
-        exactly a claim about orientation.
-
-        None means the fallback: no library for this asset, or nothing in it
-        passed. That is an ordinary outcome for about one object in twenty, not an
-        error.
+        A candidate has to survive three tests:
+        1. Orientation clearance: grasps approaching from below the horizontal
+           plane (wrist_pitch < -0.05) are filtered out to prevent table collisions.
+           Candidates are sorted by descending pitch angle (top-down / overhead
+           grasps prioritized first).
+        2. Finger span: the object width at the candidate closing axis must fit
+           within the gripper's open span.
+        3. Reachability: the candidate pose must be solvable by StretchReachSolver.
         """
         poses = self._library_grasp_poses(object_name, origin)
         if poses is None:
@@ -1126,17 +1124,31 @@ class StretchSimpleIKPolicy(BasePolicy):
         _, open_width = self._gripper_group().inter_finger_dist_range
         base_pose = self.task.env.current_robot.robot_view.base.pose
 
-        unreachable = 0
-        too_wide = 0
+        candidates: list[tuple[float, ToolGrasp]] = []
         for pose in poses:
             approach_yaw, wrist_pitch, wrist_roll = tcp_orientation_from_grasp(pose)
-            candidate = ToolGrasp(
-                position=np.asarray(pose[:3, 3], dtype=float),
-                approach_yaw=approach_yaw,
-                wrist_pitch=wrist_pitch,
-                wrist_roll=wrist_roll,
-                authored=True,
+            if wrist_pitch < -0.05:
+                # Approaching from below the horizontal plane; skip to avoid table collisions.
+                continue
+            candidates.append(
+                (
+                    wrist_pitch,
+                    ToolGrasp(
+                        position=np.asarray(pose[:3, 3], dtype=float),
+                        approach_yaw=approach_yaw,
+                        wrist_pitch=wrist_pitch,
+                        wrist_roll=wrist_roll,
+                        authored=True,
+                    ),
+                )
             )
+
+        # Sort by descending pitch: top-down (pitch ~ pi/2) first, horizontal last.
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        unreachable = 0
+        too_wide = 0
+        for pitch, candidate in candidates:
             width = self._object_grasp_width(
                 object_name, candidate.closing_axis, candidate.position
             )
@@ -1149,15 +1161,14 @@ class StretchSimpleIKPolicy(BasePolicy):
             log.info(
                 f"[stretch-simple-ik] grasping at an authored grasp "
                 f"{float(np.linalg.norm(candidate.position - origin)):.3f}m from the object "
-                f"origin, pitch {wrist_pitch:+.2f} roll {wrist_roll:+.2f} "
+                f"origin, pitch {candidate.wrist_pitch:+.2f} roll {candidate.wrist_roll:+.2f} "
                 f"(rejected {too_wide} too wide, {unreachable} unreachable)"
             )
             return candidate
 
         log.info(
-            f"[stretch-simple-ik] none of {len(poses)} authored grasps was both reachable "
-            f"({unreachable} were not) and narrow enough ({too_wide} were not); falling back "
-            f"to a {self.config.policy_config.grasp_style} grasp at the object origin"
+            f"[stretch-simple-ik] none of {len(poses)} authored grasps was reachable "
+            f"and table-clearing; falling back to a {self.config.policy_config.grasp_style} grasp"
         )
         return None
 
