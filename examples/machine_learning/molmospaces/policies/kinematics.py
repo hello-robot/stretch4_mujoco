@@ -140,6 +140,7 @@ class StretchReachSolver:
         self._offset = _tcp_offset_in_base(robot_config)
 
         model = self._kinematics.model_ik
+        model.upperPositionLimit[1] = 1.10  # Match physical mast limit of Stretch 4 in MuJoCo
         lower, upper = model.lowerPositionLimit, model.upperPositionLimit
         self._limits = {
             "lift": np.array([[lower[1], upper[1]]]),
@@ -241,6 +242,35 @@ class StretchReachSolver:
                 achieved = self.forward(solution)[:3, 3]
                 if float(np.linalg.norm(achieved - target_position)) <= tolerance:
                     return solution
+
+        # If unreachable from current base position, solve with base translation towards target
+        offset_2d = target_position[:2] - base_xy
+        dist_2d = float(np.linalg.norm(offset_2d))
+        if dist_2d > 1e-4:
+            dir_2d = offset_2d / dist_2d
+            preferred_standoff = 0.70
+            new_base_xy = target_position[:2] - dir_2d * preferred_standoff
+            new_base_yaw = float(np.arctan2(dir_2d[1], dir_2d[0]))
+            new_to_target = target_position - np.array([new_base_xy[0], new_base_xy[1], 0.0])
+            new_nominal_yaw = 0.0 if approach_yaw is None else float(approach_yaw) - new_base_yaw
+
+            for candidate_yaw in _approach_yaw_candidates(new_nominal_yaw, yaw_spread, yaw_samples):
+                solution = self._solve_at_yaw(
+                    new_to_target,
+                    new_base_xy,
+                    new_base_yaw,
+                    candidate_yaw,
+                    wrist_pitch,
+                    wrist_roll,
+                    seed,
+                    max_iterations,
+                    step_damping,
+                    tolerance,
+                )
+                if solution is not None:
+                    achieved = self.forward(solution)[:3, 3]
+                    if float(np.linalg.norm(achieved - target_position)) <= tolerance:
+                        return solution
 
         return None
 
