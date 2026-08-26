@@ -624,34 +624,39 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     task.env.current_batch_index = 0
 
     model = MagicMock()
-    model.ngeom = 2
-    model.nbody = 3
+    model.ngeom = 3
+    model.nbody = 4
 
     # Robot body 1
     # Object body 2
+    # Scene object body 3
     body_0 = MagicMock()
     body_0.name = "world"
     body_1 = MagicMock()
     body_1.name = "robot_0/base_link"
     body_2 = MagicMock()
     body_2.name = "apple_123"
-    body_map = {0: body_0, 1: body_1, 2: body_2}
+    body_3 = MagicMock()
+    body_3.name = "table_0"
+    body_map = {0: body_0, 1: body_1, 2: body_2, 3: body_3}
     model.body.side_effect = lambda b_id: body_map[b_id] if isinstance(b_id, int) else (
-        body_1 if "robot_0" in str(b_id) else body_2
+        body_1 if "robot_0" in str(b_id) else (body_3 if "table" in str(b_id) else body_2)
     )
 
     mesh_0 = MagicMock()
     mesh_0.name = "base_link"
     mesh_1 = MagicMock()
     mesh_1.name = "apple_mesh"
-    mesh_map = {0: mesh_0, 1: mesh_1}
+    mesh_2 = MagicMock()
+    mesh_2.name = "table_mesh"
+    mesh_map = {0: mesh_0, 1: mesh_1, 2: mesh_2}
     model.mesh.side_effect = lambda m_id: mesh_map[m_id]
 
-    model.geom_bodyid = [1, 2]
-    model.geom_type = [mujoco.mjtGeom.mjGEOM_MESH, mujoco.mjtGeom.mjGEOM_MESH]
-    model.geom_dataid = [0, 1]
-    model.mesh_vertadr = [0, 3]
-    model.mesh_vertnum = [3, 3]
+    model.geom_bodyid = [1, 2, 3]
+    model.geom_type = [mujoco.mjtGeom.mjGEOM_MESH, mujoco.mjtGeom.mjGEOM_MESH, mujoco.mjtGeom.mjGEOM_MESH]
+    model.geom_dataid = [0, 1, 2]
+    model.mesh_vertadr = [0, 3, 6]
+    model.mesh_vertnum = [3, 3, 3]
     model.mesh_vert = np.array([
         [0, 0, 0],
         [1, 0, 0],
@@ -659,18 +664,22 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
         [0, 0, 0],
         [0.5, 0, 0],
         [0, 0.5, 0],
+        [0, 0, 0],
+        [2.0, 0, 0],
+        [0, 2.0, 0],
     ], dtype=np.float32)
     model.mesh_face = np.array([
         [0, 1, 2],
         [0, 1, 2],
+        [0, 1, 2],
     ], dtype=np.uint32)
-    model.geom_pos = [np.array([0, 0, 0]), np.array([0, 0, 0])]
-    model.geom_quat = [[1, 0, 0, 0], [1, 0, 0, 0]]
-    model.body_parentid = [0, 0, 0]
+    model.geom_pos = [np.array([0, 0, 0]), np.array([0, 0, 0]), np.array([0, 0, 0])]
+    model.geom_quat = [[1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]]
+    model.body_parentid = [0, 0, 0, 0]
 
     data = MagicMock()
-    data.xpos = [np.array([0, 0, 0]), np.array([1, 2, 0]), np.array([3, 4, 0])]
-    data.xmat = [np.eye(3).flatten(), np.eye(3).flatten(), np.eye(3).flatten()]
+    data.xpos = [np.array([0, 0, 0]), np.array([1, 2, 0]), np.array([3, 4, 0]), np.array([5, 6, 0])]
+    data.xmat = [np.eye(3).flatten(), np.eye(3).flatten(), np.eye(3).flatten(), np.eye(3).flatten()]
     data.time = 0.5
 
     task.env.current_model = model
@@ -731,9 +740,13 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     assert rec_names == ["Episode 101"]
     assert "world/robot/robot_0_base_link/geom_0" in logged_static
     assert "world/object/apple_123/geom_1" in logged_static
+    assert "world/scene_objects/table_0/geom_2" in logged_static
 
     viz.log_step(0, task, observation=[{"head_camera": np.zeros((10, 10, 3), dtype=np.uint8)}], policy=mock_policy)
 
+    assert "world/robot/robot_0_base_link" in logged_entities
+    assert "world/object/apple_123" in logged_entities
+    assert "world/scene_objects/table_0" in logged_entities
     assert "world/frames/wrist_center" in logged_entities
     assert "world/frames/wrist_center/axes" in logged_entities
     assert "world/frames/wrist_center/label" in logged_entities

@@ -93,7 +93,19 @@ class StretchRerunVisualizer:
 
             blueprint = rrb.Blueprint(
                 rrb.Horizontal(
-                    rrb.Spatial3DView(origin="world", name="3D Scene"),
+                    rrb.Tabs(
+                        rrb.Spatial3DView(
+                            origin="world",
+                            contents=["+ $origin/**", "- $origin/scene_objects/**"],
+                            name="3D Scene",
+                        ),
+                        rrb.Spatial3DView(
+                            origin="world",
+                            contents=["+ $origin/**"],
+                            name="3D Scene (Complete)",
+                        ),
+                        active_tab=0,
+                    ),
                     rrb.Vertical(
                         rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
                         rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
@@ -427,6 +439,118 @@ class StretchRerunVisualizer:
                     )
                 self._logged_meshes.add(obj_geom_key)
 
+        # 3. Other scene objects / environment (furniture, fixtures, walls, floor, tables)
+        scene_geoms = [
+            g
+            for g in range(model.ngeom)
+            if model.geom_bodyid[g] not in obj_body_ids
+            and "robot_0" not in model.body(model.geom_bodyid[g]).name
+        ]
+        scene_visual_bodies = set()
+        for g in scene_geoms:
+            b_id = model.geom_bodyid[g]
+            g_mesh = model.geom_dataid[g] if hasattr(model, "geom_dataid") else -1
+            if g_mesh >= 0:
+                mesh_name = model.mesh(g_mesh).name
+                if "collision" not in mesh_name:
+                    scene_visual_bodies.add(b_id)
+
+        for g in scene_geoms:
+            b_id = model.geom_bodyid[g]
+            b_name = model.body(b_id).name
+            g_type = model.geom_type[g]
+            g_mesh = model.geom_dataid[g] if hasattr(model, "geom_dataid") else -1
+            mesh_name = model.mesh(g_mesh).name if g_mesh >= 0 else ""
+
+            if b_id in scene_visual_bodies and ("collision" in mesh_name or g_mesh < 0):
+                continue
+
+            scene_geom_key = f"scene_objects/{b_name}/{g}"
+            if scene_geom_key not in self._logged_meshes:
+                b_key = b_name.replace("/", "_") if b_name else f"body_{b_id}"
+                if g_type == mujoco.mjtGeom.mjGEOM_MESH and g_mesh >= 0:
+                    vertadr = int(model.mesh_vertadr[g_mesh])
+                    vertnum = int(model.mesh_vertnum[g_mesh])
+                    faceadr = int(model.mesh_faceadr[g_mesh])
+                    facenum = int(model.mesh_facenum[g_mesh])
+                    verts = model.mesh_vert[vertadr : vertadr + vertnum].astype(np.float32)
+                    faces = model.mesh_face[faceadr : faceadr + facenum].astype(np.uint32)
+
+                    rot = R.from_quat(model.geom_quat[g], scalar_first=True)
+                    verts_local = rot.apply(verts) + model.geom_pos[g]
+
+                    mesh_3d = _build_mesh3d(g, verts_local, faces, is_robot=False)
+                    rr.log(
+                        f"world/scene_objects/{b_key}/geom_{g}",
+                        mesh_3d,
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_BOX:
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [200, 200, 200, 255]
+                    rr.log(
+                        f"world/scene_objects/{b_key}/geom_{g}",
+                        rr.Boxes3D(
+                            half_sizes=[model.geom_size[g]],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_PLANE:
+                    sx = float(model.geom_size[g][0]) if model.geom_size[g][0] > 0 else 10.0
+                    sy = float(model.geom_size[g][1]) if model.geom_size[g][1] > 0 else 10.0
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [180, 180, 180, 255]
+                    rr.log(
+                        f"world/scene_objects/{b_key}/geom_{g}",
+                        rr.Boxes3D(
+                            half_sizes=[[sx, sy, 0.002]],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type in (mujoco.mjtGeom.mjGEOM_SPHERE, mujoco.mjtGeom.mjGEOM_ELLIPSOID):
+                    s = float(model.geom_size[g][0])
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [200, 200, 200, 255]
+                    rr.log(
+                        f"world/scene_objects/{b_key}/geom_{g}",
+                        rr.Ellipsoids3D(
+                            half_sizes=[[s, s, s]],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                    r = float(model.geom_size[g][0])
+                    h = float(model.geom_size[g][1]) * 2
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [200, 200, 200, 255]
+                    rr.log(
+                        f"world/scene_objects/{b_key}/geom_{g}",
+                        rr.Cylinders3D(
+                            radii=[r],
+                            lengths=[h],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                elif g_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                    r = float(model.geom_size[g][0])
+                    h = float(model.geom_size[g][1]) * 2
+                    color = (model.geom_rgba[g] * 255).astype(np.uint8).tolist() if hasattr(model, "geom_rgba") else [200, 200, 200, 255]
+                    rr.log(
+                        f"world/scene_objects/{b_key}/geom_{g}",
+                        rr.Capsules3D(
+                            radii=[r],
+                            lengths=[h],
+                            centers=[model.geom_pos[g]],
+                            colors=[color],
+                        ),
+                        static=True,
+                    )
+                self._logged_meshes.add(scene_geom_key)
+
     def log_step(
         self,
         step_idx: int,
@@ -448,18 +572,18 @@ class StretchRerunVisualizer:
             if hasattr(data, "time") and data.time is not None:
                 rr.set_time("sim_time", duration=float(data.time))
 
-            # Update body transforms for Stretch robot and manipulated object
+            # Update body transforms for Stretch robot, manipulated object, and scene objects
             for b_id in range(model.nbody):
                 b_name = model.body(b_id).name
-                b_key = b_name.replace("/", "_")
+                b_key = b_name.replace("/", "_") if b_name else f"body_{b_id}"
+                pos = data.xpos[b_id]
+                mat = data.xmat[b_id].reshape(3, 3)
                 if "robot_0" in b_name:
-                    pos = data.xpos[b_id]
-                    mat = data.xmat[b_id].reshape(3, 3)
                     rr.log(f"world/robot/{b_key}", rr.Transform3D(translation=pos, mat3x3=mat))
                 elif b_id in obj_body_ids:
-                    pos = data.xpos[b_id]
-                    mat = data.xmat[b_id].reshape(3, 3)
                     rr.log(f"world/object/{b_key}", rr.Transform3D(translation=pos, mat3x3=mat))
+                else:
+                    rr.log(f"world/scene_objects/{b_key}", rr.Transform3D(translation=pos, mat3x3=mat))
 
             # Coordinate frame axes config
             axis_len = 0.08

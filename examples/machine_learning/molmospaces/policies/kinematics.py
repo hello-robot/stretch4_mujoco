@@ -140,7 +140,7 @@ class StretchReachSolver:
         self._offset = _tcp_offset_in_base(robot_config)
 
         model = self._kinematics.model_ik
-        model.upperPositionLimit[1] = 1.10  # Match physical mast limit of Stretch 4 in MuJoCo
+        model.upperPositionLimit[1] = 1.23  # Match physical mast limit of Stretch 4 in MuJoCo
         lower, upper = model.lowerPositionLimit, model.upperPositionLimit
         self._limits = {
             "lift": np.array([[lower[1], upper[1]]]),
