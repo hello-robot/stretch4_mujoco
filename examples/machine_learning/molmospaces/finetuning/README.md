@@ -228,12 +228,12 @@ If you wish to fine-tune on a subset of cameras instead of all four, pass `--cam
 # Fine-tune MolmoBot on head and left wrist cameras only:
 python -m examples.machine_learning.molmospaces.finetuning.finetune \
     --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
-    --cameras "head,wrist"
+    --cameras "head,wrist_right"
 
 # Fine-tune on head and stereo wrist cameras:
 python -m examples.machine_learning.molmospaces.finetuning.finetune \
     --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
-    --cameras "head,wrist,wrist_right"
+    --cameras "head,wrist_left,wrist_right"
 
 # Default: trains on all four cameras ("head,wrist,left,right")
 python -m examples.machine_learning.molmospaces.finetuning.finetune \

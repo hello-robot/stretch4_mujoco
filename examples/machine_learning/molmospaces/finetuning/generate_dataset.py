@@ -45,10 +45,15 @@ you are most likely to want to change your mind about.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import importlib
 import logging
 import os
+import pprint
+import random
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -65,9 +70,40 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
     export_lerobot_dataset,
 )
 from molmo_spaces.data_generation.config_registry import get_config_class
-from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
+from molmo_spaces.data_generation.pipeline import (
+    ParallelRolloutRunner,
+    cleanup_context,
+    cleanup_episode_resources,
+    get_worker_logger,
+    mp_context,
+    save_house_trajectories,
+    setup_house_dirs,
+    setup_policy,
+    setup_viewer,
+    worker_stdout_context,
+)
+from molmo_spaces.tasks.task_sampler_errors import HouseInvalidForTask
+from molmo_spaces.utils.profiler_utils import DatagenProfiler
 
 log = logging.getLogger(__name__)
+
+
+def trim_memory() -> None:
+    """Forces Python GC and glibc heap trimmer to release unused memory back to the OS."""
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 
 
 class StretchRerunVisualizer:
@@ -798,12 +834,131 @@ def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
         log.warning(f"Failed to snap free camera to robot: {e}")
 
 
+def stretch_house_processing_worker(
+    worker_id: int,
+    exp_config: Any,
+    work_items: list[tuple[int, int, int, int]],
+    shutdown_event: Any,
+    counter_lock: Any,
+    house_counter: Any,
+    success_count: Any,
+    total_count: Any,
+    completed_houses: Any,
+    skipped_houses: Any,
+    max_allowed_sequential_task_sampler_failures: int = 10,
+    max_allowed_sequential_rollout_failures: int = 10,
+    max_allowed_sequential_irrecoverable_failures: int = 5,
+    preloaded_policy: Any = None,
+    filter_for_successful_trajectories: bool = False,
+    runner_class: Any = None,
+    max_items_per_worker: int | None = 10,
+) -> None:
+    """Worker function that processes a limited number of work items before exiting to recycle memory."""
+    worker_logger = get_worker_logger(worker_id)
+
+    if hasattr(exp_config, "datagen_profiler") and exp_config.datagen_profiler:
+        datagen_profiler = DatagenProfiler(logger=worker_logger, enabled=True)
+    else:
+        datagen_profiler = None
+
+    num_sequential_irrecoverable_failures = 0
+    task_sampler = exp_config.task_sampler_config.task_sampler_class(exp_config)
+    task_sampler.set_datagen_profiler(datagen_profiler)
+
+    items_processed_by_worker = 0
+    with worker_stdout_context(worker_logger, worker_id):
+        try:
+            while True:
+                if shutdown_event.is_set():
+                    worker_logger.info(
+                        f"Worker {worker_id} received shutdown signal, cleaning up..."
+                    )
+                    break
+
+                with counter_lock:
+                    if house_counter.value >= len(work_items):
+                        break
+                    item_idx = house_counter.value
+                    house_counter.value += 1
+
+                current_house_id, batch_samples, batch_num, total_batches = work_items[item_idx]
+
+                worker_logger.info(
+                    f"Worker {worker_id} (PID {os.getpid()}) starting house {current_house_id} "
+                    f"batch {batch_num}/{total_batches} ({batch_samples} episodes) "
+                    f"(item {item_idx + 1}/{len(work_items)})"
+                )
+
+                house_success_count, house_total_count, irrecoverable = (
+                    runner_class.process_single_house(
+                        worker_id,
+                        worker_logger,
+                        current_house_id,
+                        exp_config,
+                        batch_samples,
+                        shutdown_event,
+                        task_sampler,
+                        preloaded_policy,
+                        max_allowed_sequential_task_sampler_failures,
+                        max_allowed_sequential_rollout_failures,
+                        filter_for_successful_trajectories=filter_for_successful_trajectories,
+                        runner_class=runner_class,
+                        batch_num=batch_num,
+                        total_batches=total_batches,
+                        datagen_profiler=datagen_profiler,
+                    )
+                )
+
+                with counter_lock:
+                    success_count.value += house_success_count
+                    total_count.value += house_total_count
+                    if house_total_count > 0:
+                        completed_houses.value += 1
+                    else:
+                        skipped_houses.value += 1
+
+                items_processed_by_worker += 1
+                trim_memory()
+
+                if irrecoverable:
+                    num_sequential_irrecoverable_failures += 1
+                    if (
+                        num_sequential_irrecoverable_failures
+                        >= max_allowed_sequential_irrecoverable_failures
+                    ):
+                        worker_logger.error(
+                            f"Worker {worker_id} encountered {num_sequential_irrecoverable_failures} "
+                            "sequential irrecoverable failures. Exiting worker."
+                        )
+                        break
+                else:
+                    num_sequential_irrecoverable_failures = 0
+
+                # Process recycling check: exit cleanly so kernel frees leaked C/driver memory
+                if max_items_per_worker is not None and max_items_per_worker > 0:
+                    if items_processed_by_worker >= max_items_per_worker:
+                        worker_logger.info(
+                            f"Worker {worker_id} (PID {os.getpid()}) completed {items_processed_by_worker} "
+                            f"work items (limit: {max_items_per_worker}). Recycling process to free OS/GPU memory."
+                        )
+                        break
+
+            worker_logger.info(f"Worker {worker_id} finished processing assigned work items")
+        finally:
+            if datagen_profiler is not None:
+                datagen_profiler.log_worker_summary()
+            if task_sampler is not None:
+                task_sampler.close()
+            trim_memory()
+
+
 class StretchRolloutRunner(ParallelRolloutRunner):
-    """ParallelRolloutRunner with free camera snapping, simulation slowdown, and Rerun 3D viz."""
+    """ParallelRolloutRunner with free camera snapping, simulation slowdown, Rerun 3D viz, and process recycling."""
 
     slow_rate: float | None = None
     visualize: bool = False
     rerun_visualizer: StretchRerunVisualizer | None = None
+    max_items_per_worker: int = 10
 
     @staticmethod
     def run_single_rollout(
@@ -952,6 +1107,498 @@ class StretchRolloutRunner(ParallelRolloutRunner):
         success = task.judge_success() if hasattr(task, "judge_success") else False
         return success
 
+    @staticmethod
+    def process_single_house(
+        worker_id: int,
+        worker_logger: Any,
+        house_id: int,
+        exp_config: Any,
+        samples_per_house: int,
+        shutdown_event: Any,
+        task_sampler: Any,
+        preloaded_policy: Any = None,
+        max_allowed_sequential_task_sampler_failures: int = 10,
+        max_allowed_sequential_rollout_failures: int = 10,
+        filter_for_successful_trajectories: bool = False,
+        runner_class: Any = None,
+        batch_num: int | None = None,
+        total_batches: int | None = None,
+        datagen_profiler: Any = None,
+    ) -> tuple[int, int, bool]:
+        """Process all episodes for a single house with aggressive memory trimming and cache clearing."""
+        house_success_count = 0
+        house_total_count = 0
+        irrecoverable_failure_in_house = False
+
+        # Setup directories and check for existing output
+        house_output_dir, house_debug_dir, batch_suffix, should_skip = setup_house_dirs(
+            exp_config, house_id, batch_num, total_batches
+        )
+        if should_skip:
+            worker_logger.info(
+                f"SKIPPING HOUSE {house_id} BATCH {batch_num}/{total_batches}: "
+                f"Output already exists at {house_output_dir / f'trajectories{batch_suffix}.h5'}"
+            )
+            return 0, 0, False
+
+        episode_specs, shared_task_sampler = runner_class.load_episodes_for_house(
+            exp_config, house_id, batch_suffix, task_sampler, worker_logger
+        )
+
+        if not episode_specs:
+            worker_logger.warning(f"No episodes to process for house {house_id}")
+            return 0, 0, False
+
+        max_attempts = runner_class.get_max_episode_attempts(
+            episode_specs, samples_per_house, exp_config
+        )
+
+        house_raw_histories = []
+        house_debug_raw_histories = []
+
+        num_sequential_task_sampler_failures = 0
+        num_sequential_rollout_failures = 0
+        viewer = None
+
+        episode_idx = 0
+        while episode_idx < max_attempts:
+            should_stop = runner_class.should_stop_early(
+                len(house_raw_histories), samples_per_house, exp_config=exp_config
+            )
+            if should_stop:
+                break
+
+            if shutdown_event.is_set():
+                worker_logger.info(f"Worker {worker_id} house {house_id} received shutdown signal")
+                irrecoverable_failure_in_house = True
+                break
+
+            if num_sequential_task_sampler_failures >= max_allowed_sequential_task_sampler_failures:
+                worker_logger.error(
+                    f"Worker {worker_id} house {house_id} encountered "
+                    f"{num_sequential_task_sampler_failures} consecutive task sampling failures."
+                )
+                irrecoverable_failure_in_house = True
+                break
+
+            if num_sequential_rollout_failures >= max_allowed_sequential_rollout_failures:
+                worker_logger.error(
+                    f"Worker {worker_id} house {house_id} rollout failed across "
+                    f"{num_sequential_rollout_failures} retries."
+                )
+                irrecoverable_failure_in_house = True
+                break
+
+            episode_spec = runner_class.get_episode_spec_at_index(episode_specs, episode_idx)
+
+            task = None
+            policy = None
+            episode_task_sampler = None
+            success = False
+            task_sampling_failed = False
+            house_invalid = False
+
+            if datagen_profiler is not None:
+                datagen_profiler.start("episode_total")
+
+            episode_config = runner_class.prepare_episode_config(
+                exp_config, episode_spec, episode_idx
+            )
+
+            with cleanup_context():
+                if viewer is not None:
+                    viewer.close()
+                    viewer = None
+
+                task_sampling_start = time.perf_counter()
+
+                try:
+                    episode_task_sampler = runner_class.get_episode_task_sampler(
+                        episode_config, episode_spec, shared_task_sampler, datagen_profiler
+                    )
+                    task = runner_class.sample_task_from_spec(
+                        episode_task_sampler, house_id, episode_spec, episode_idx
+                    )
+
+                    if task is None:
+                        worker_logger.info(
+                            f"Worker {worker_id} house {house_id} episode {episode_idx}: task sampling returned None"
+                        )
+                        house_invalid = True
+                    else:
+                        if datagen_profiler is not None:
+                            datagen_profiler.record(
+                                "task_sampling", time.perf_counter() - task_sampling_start
+                            )
+                            task.set_datagen_profiler(datagen_profiler)
+
+                        num_sequential_task_sampler_failures = 0
+                        worker_logger.info(
+                            f"Worker {worker_id} house {house_id} episode {episode_idx}/{max_attempts} "
+                            f"collected={len(house_raw_histories)}/{samples_per_house}"
+                        )
+                except HouseInvalidForTask as e:
+                    traceback.print_exc()
+                    worker_logger.warning(
+                        f"Worker {worker_id} house {house_id} episode {episode_idx} HouseInvalidForTask: {e.reason}"
+                    )
+                    house_invalid = True
+                    if datagen_profiler is not None:
+                        datagen_profiler.record(
+                            "task_sampling_failed", time.perf_counter() - task_sampling_start
+                        )
+                except Exception as e:
+                    traceback.print_exc()
+                    worker_logger.error(
+                        f"Worker {worker_id} house {house_id} episode {episode_idx} task sampling error: {str(e)}"
+                    )
+                    num_sequential_task_sampler_failures += 1
+                    task_sampling_failed = True
+                    if datagen_profiler is not None:
+                        datagen_profiler.record(
+                            "task_sampling_failed", time.perf_counter() - task_sampling_start
+                        )
+
+                if task is not None and not house_invalid and not task_sampling_failed:
+                    try:
+                        policy = setup_policy(
+                            episode_config, task, preloaded_policy, datagen_profiler
+                        )
+                        viewer = setup_viewer(episode_config, task, policy, viewer)
+
+                        episode_seed = runner_class.get_episode_seed(
+                            episode_idx, episode_spec, episode_task_sampler
+                        )
+
+                        success = runner_class.run_single_rollout(
+                            episode_seed=episode_seed,
+                            task=task,
+                            policy=policy,
+                            profiler=episode_config.profiler,
+                            viewer=viewer,
+                            shutdown_event=shutdown_event,
+                            datagen_profiler=datagen_profiler,
+                            end_on_success=exp_config.end_on_success,
+                        )
+
+                        num_sequential_rollout_failures = 0
+
+                        object_name = "unknown"
+                        if hasattr(task, "config") and hasattr(task.config, "task_config"):
+                            if hasattr(task.config.task_config, "pickup_obj_name"):
+                                object_name = task.config.task_config.pickup_obj_name
+
+                        worker_logger.info(
+                            f"Worker {worker_id} house {house_id} episode {episode_idx} "
+                            f"object {object_name} completed with success={success}"
+                        )
+
+                        should_save = success or not filter_for_successful_trajectories
+                        history = task.get_history()
+
+                        # Explicitly clear task caches immediately to release frames/actions
+                        for cache_name in (
+                            "action_cache",
+                            "observation_cache",
+                            "reward_cache",
+                            "terminal_cache",
+                            "truncated_cache",
+                            "success_cache",
+                        ):
+                            cache = getattr(task, cache_name, None)
+                            if isinstance(cache, list):
+                                cache.clear()
+
+                        should_save_debug = not should_save and random.random() < 0.01
+
+                        if should_save or should_save_debug:
+                            episode_info = {
+                                "history": history,
+                                "sensor_suite": task.sensor_suite,
+                                "success": success,
+                                "seed": episode_seed,
+                            }
+                            if should_save:
+                                house_raw_histories.append(episode_info)
+                            elif should_save_debug:
+                                house_debug_raw_histories.append(episode_info)
+                                worker_logger.info(
+                                    f"Queueing failed trajectory for debug (seed: {episode_seed})"
+                                )
+                        else:
+                            del history
+
+                        house_total_count += 1
+                        if success:
+                            house_success_count += 1
+                        else:
+                            asset_uid = task_sampler.get_asset_uid_from_object(
+                                task.env, object_name
+                            )
+                            if asset_uid:
+                                task_sampler.report_asset_failure(asset_uid, "rollout failed")
+
+                        if datagen_profiler is not None:
+                            datagen_profiler.end("episode_total")
+                            datagen_profiler.log_episode_summary(
+                                episode_idx=episode_idx,
+                                house_id=house_id,
+                                success=success,
+                            )
+                    except Exception as e:
+                        worker_logger.error(
+                            f"Worker {worker_id} house {house_id} episode {episode_idx} rollout error: {str(e)}"
+                        )
+                        traceback.print_exc()
+                        num_sequential_rollout_failures += 1
+
+                        try:
+                            asset_uid = task_sampler.get_asset_uid_from_object(
+                                task.env, object_name
+                            )
+                            if asset_uid:
+                                task_sampler.report_asset_failure(
+                                    asset_uid, f"rollout exception: {e}"
+                                )
+                        except Exception:
+                            pass
+
+                        if datagen_profiler is not None:
+                            datagen_profiler.end("episode_total")
+                else:
+                    if datagen_profiler is not None:
+                        datagen_profiler.end("episode_total")
+
+                cleanup_episode_resources(
+                    task=task,
+                    policy=policy,
+                    task_sampler=episode_task_sampler,
+                    preloaded_policy=preloaded_policy,
+                    close_task_sampler=runner_class.should_close_episode_task_sampler(),
+                )
+
+            if house_invalid:
+                irrecoverable_failure_in_house = True
+                break
+
+            episode_idx += 1
+
+        if viewer is not None:
+            viewer.close()
+            viewer = None
+
+        if shutdown_event.is_set():
+            worker_logger.info(
+                f"Worker {worker_id} house {house_id} shutdown requested, skipping save"
+            )
+            return house_success_count, house_total_count, True
+
+        save_house_trajectories(
+            worker_logger,
+            house_raw_histories,
+            house_output_dir,
+            exp_config,
+            batch_suffix,
+            datagen_profiler,
+            batch_num,
+            total_batches,
+        )
+
+        save_house_trajectories(
+            worker_logger,
+            house_debug_raw_histories,
+            house_debug_dir,
+            exp_config,
+            batch_suffix,
+            datagen_profiler=None,
+            batch_num=batch_num,
+            total_batches=total_batches,
+        )
+
+        trim_memory()
+
+        worker_logger.info(
+            f"Worker {worker_id} completed house {house_id}: "
+            f"{house_success_count}/{house_total_count} successful episodes"
+        )
+
+        if datagen_profiler is not None:
+            datagen_profiler.log_house_summary(
+                house_id=house_id,
+                success_count=house_success_count,
+                total_count=house_total_count,
+            )
+
+        return house_success_count, house_total_count, irrecoverable_failure_in_house
+
+    def run(self, preloaded_policy: Any = None) -> tuple[int, int]:
+        """Run rollouts using a pool of recycled worker processes to prevent memory leaks."""
+        total_expected_episodes = sum(wi[1] for wi in self.work_items)
+        self.logger.info(
+            f"Starting rollout of {self.total_houses} houses "
+            f"split into {len(self.work_items)} work items ({total_expected_episodes} total episodes) "
+            f"using {self.config.num_workers} worker processes (recycling every {self.max_items_per_worker} items)"
+        )
+
+        self.logger.info("Evaluation configuration:")
+        self.logger.info(pprint.pformat(self.config.model_dump()))
+        self.config.save_config(output_dir=Path(self.config.output_dir))
+
+        start_time = time.time()
+
+        if self.config.num_workers > 1 or (not self.visualize and self.max_items_per_worker):
+            target_workers = self.config.num_workers
+            active_processes: dict[int, Any] = {}
+            next_worker_id = 0
+
+            def spawn_worker(wid: int) -> Any:
+                p = mp_context.Process(
+                    target=stretch_house_processing_worker,
+                    args=(
+                        wid,
+                        self.config,
+                        self.work_items,
+                        self.shutdown_event,
+                        self.counter_lock,
+                        self.house_counter,
+                        self.success_count,
+                        self.total_count,
+                        self.completed_houses,
+                        self.skipped_houses,
+                        self.max_allowed_sequential_task_sampler_failures,
+                        self.max_allowed_sequential_rollout_failures,
+                        self.max_allowed_sequential_irrecoverable_failures,
+                        preloaded_policy,
+                        self.config.filter_for_successful_trajectories,
+                        type(self),
+                        self.max_items_per_worker,
+                    ),
+                )
+                p.start()
+                return p
+
+            initial_count = min(target_workers, len(self.work_items))
+            for _ in range(initial_count):
+                active_processes[next_worker_id] = spawn_worker(next_worker_id)
+                next_worker_id += 1
+
+            last_log_time = start_time
+            log_interval = 60
+
+            while active_processes:
+                dead_ids = []
+                for wid, p in list(active_processes.items()):
+                    if not p.is_alive():
+                        p.join()
+                        p.close()
+                        dead_ids.append(wid)
+
+                for wid in dead_ids:
+                    del active_processes[wid]
+                    if not self.shutdown_event.is_set():
+                        with self.counter_lock:
+                            has_more_work = self.house_counter.value < len(self.work_items)
+                        if has_more_work and len(active_processes) < target_workers:
+                            active_processes[next_worker_id] = spawn_worker(next_worker_id)
+                            next_worker_id += 1
+
+                current_time = time.time()
+                if self.wandb_enabled and (current_time - last_log_time) >= log_interval:
+                    try:
+                        elapsed_time = current_time - start_time
+                        completed = self.completed_houses.value
+                        skipped = self.skipped_houses.value
+                        success = self.success_count.value
+                        total = self.total_count.value
+                        active = sum(1 for p in active_processes.values() if p.is_alive())
+                        total_work_items = len(self.work_items)
+                        success_rate = success / total if total > 0 else 0.0
+                        episodes_per_second = total / elapsed_time if elapsed_time > 0 else 0.0
+                        completion_percentage = (completed + skipped) / total_work_items * 100
+
+                        import wandb
+
+                        wandb.log(
+                            {
+                                "elapsed_time_seconds": elapsed_time,
+                                "elapsed_time_hours": elapsed_time / 3600,
+                                "completed_houses": completed,
+                                "skipped_houses": skipped,
+                                "success_count": success,
+                                "total_count": total,
+                                "success_rate": success_rate,
+                                "episodes_per_second": episodes_per_second,
+                                "active_workers": active,
+                                "completion_percentage": completion_percentage,
+                            }
+                        )
+                        self.logger.info(
+                            f"Progress: {completed}/{total_work_items} work items completed "
+                            f"({completion_percentage:.1f}%), {success}/{total} successful episodes "
+                            f"({success_rate * 100:.1f}%), {active} workers active"
+                        )
+                        last_log_time = current_time
+                    except Exception as e:
+                        self.logger.warning(f"WandB periodic logging failed: {e}")
+
+                time.sleep(1)
+
+        else:
+            # Single-worker in-process mode (used for --visualize interactive viewer)
+            stretch_house_processing_worker(
+                worker_id=0,
+                exp_config=self.config,
+                work_items=self.work_items,
+                shutdown_event=self.shutdown_event,
+                counter_lock=self.counter_lock,
+                house_counter=self.house_counter,
+                success_count=self.success_count,
+                total_count=self.total_count,
+                completed_houses=self.completed_houses,
+                skipped_houses=self.skipped_houses,
+                max_allowed_sequential_task_sampler_failures=self.max_allowed_sequential_task_sampler_failures,
+                max_allowed_sequential_rollout_failures=self.max_allowed_sequential_rollout_failures,
+                max_allowed_sequential_irrecoverable_failures=self.max_allowed_sequential_irrecoverable_failures,
+                preloaded_policy=preloaded_policy,
+                filter_for_successful_trajectories=self.config.filter_for_successful_trajectories,
+                runner_class=type(self),
+                max_items_per_worker=None,
+            )
+
+        success_count_val = self.success_count.value
+        total_count_val = self.total_count.value
+        completed_houses_val = self.completed_houses.value
+        skipped_houses_val = self.skipped_houses.value
+        success_rate = success_count_val / total_count_val if total_count_val > 0 else 0.0
+
+        self.logger.info(
+            f"Completed {completed_houses_val} work items, skipped {skipped_houses_val} work items"
+        )
+        self.logger.info(f"Success count: {success_count_val}, Total count: {total_count_val}")
+        self.logger.info(f"Success rate: {success_rate * 100:.2f}%")
+
+        if self.wandb_enabled:
+            try:
+                import wandb
+
+                final_elapsed_time = time.time() - start_time
+                wandb.log(
+                    {
+                        "final_success_count": success_count_val,
+                        "final_total_count": total_count_val,
+                        "final_success_rate": success_rate,
+                        "final_completed_houses": completed_houses_val,
+                        "final_skipped_houses": skipped_houses_val,
+                        "final_elapsed_time_seconds": final_elapsed_time,
+                        "final_elapsed_time_hours": final_elapsed_time / 3600,
+                    }
+                )
+                wandb.finish()
+            except Exception as e:
+                self.logger.warning(f"WandB final logging failed: {e}")
+
+        return success_count_val, total_count_val
+
 
 def generate_rollouts(
     task: str,
@@ -965,6 +1612,7 @@ def generate_rollouts(
     keep_failures: bool = False,
     visualize: bool = False,
     slow_rate: float | None = None,
+    max_items_per_worker: int = 10,
 ) -> Path:
     """Run the data generation pipeline for one task family.
 
@@ -987,6 +1635,8 @@ def generate_rollouts(
             `num_workers == 1` -- see `main()`.
         slow_rate: slow down simulation by a time factor (e.g. 1.0 for real-time,
             2.0 for 2x slower than real-time).
+        max_items_per_worker: number of work items (houses) a worker process handles
+            before being recycled to release system and GPU driver memory.
 
     Returns:
         The directory the pipeline actually wrote to.
@@ -1014,6 +1664,7 @@ def generate_rollouts(
     config.save_config()
 
     StretchRolloutRunner.visualize = visualize
+    StretchRolloutRunner.max_items_per_worker = max_items_per_worker
     if visualize:
         os.environ["STRETCH_DATAGEN_VISUALIZE"] = "1"
     elif "STRETCH_DATAGEN_VISUALIZE" in os.environ:
@@ -1032,7 +1683,7 @@ def generate_rollouts(
         f"[datagen] {class_name} | {config.scene_dataset}/{config.data_split} | "
         f"{len(config.task_sampler_config.house_inds)} houses x "
         f"{config.task_sampler_config.samples_per_house} episodes | "
-        f"{num_workers} workers -> {config.output_dir}"
+        f"{num_workers} workers (recycling every {max_items_per_worker} items) -> {config.output_dir}"
     )
     successes, total = StretchRolloutRunner(config).run()
     log.info(f"[datagen] {task}: {successes}/{total} episodes succeeded")
@@ -1132,6 +1783,12 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
     default=None,
     help="Slow down simulation by a time factor (e.g. 1.0 for real-time, 2.0 for 2x slower than real-time).",
 )
+@click.option(
+    "--max-items-per-worker",
+    type=int,
+    default=10,
+    help="Number of house work items a worker process handles before being recycled to release system/GPU memory.",
+)
 @click.option("--export/--no-export", "want_export", default=True, help="Run the export stage.")
 @click.option(
     "--fps", type=float, default=15.0, help="Frame rate to record in the dataset metadata."
@@ -1150,6 +1807,7 @@ def main(
     keep_failures: bool,
     visualize: bool,
     slow_rate: float | None,
+    max_items_per_worker: int,
     want_export: bool,
     fps: float,
 ) -> None:
@@ -1189,6 +1847,7 @@ def main(
                 keep_failures=keep_failures,
                 visualize=visualize,
                 slow_rate=slow_rate,
+                max_items_per_worker=max_items_per_worker,
             )
             for task in tasks
         ]
@@ -1220,3 +1879,4 @@ def main(
 
 if __name__ == "__main__":
     main()
+
