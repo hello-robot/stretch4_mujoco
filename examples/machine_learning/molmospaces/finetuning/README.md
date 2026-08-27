@@ -206,19 +206,44 @@ knowing:
   demonstration of "reach for the mug" that starts thirty seconds before the
   reach teaches a policy to wait.
 
-## Which head camera
+## Camera System & Multi-Camera Fine-Tuning
 
-`head_camera` is the **centre** camera of Stretch 4's head — MJCF
-`camera_center_link`, on `camera_center_optical_link`, 45° vertical FOV, 1.62m
-above the floor and 0.086m ahead of the base axis, looking forward and 35° down.
+By default, dataset generation, LeRobot export, and fine-tuning support all onboard cameras on Stretch 4:
 
-The head also carries `camera_left_link` and `camera_right_link`, the stereo
-pair, 7.5cm either side and pitched 47° down. Nothing here uses them. Stretch 4's
-head has no pan/tilt joint, so all three are rigid to the base yaw: anything that
-turns the base turns the view with it.
+| Camera Name | MJCF Name | Optical Characteristics | Role |
+| --- | --- | --- | --- |
+| `head_camera` | `camera_center_link` | 45° vertical FOV pinhole, 1.62m height, pitched 35° down | Primary visual manipulation & task context |
+| `wrist_camera_left` | `gripper_camera_left_rgb` | Pinhole, mounted on left side of wrist looking along gripper fingers | Close-range grasping & insertion feedback (left eye) |
+| `wrist_camera_right` | `gripper_camera_right_rgb` | Pinhole, mounted on right side of wrist looking along gripper fingers | Close-range grasping & insertion feedback (right eye) |
+| `head_camera_left` | `camera_left_link` | 123.4° vertical FOV wide-angle fisheye (with lens distortion) | Left peripheral & mobile base navigation |
+| `head_camera_right` | `camera_right_link` | 123.2° vertical FOV wide-angle fisheye (with lens distortion) | Right peripheral & mobile base navigation |
 
-`wrist_camera` is `gripper_camera_left_rgb`, on the wrist, looking straight along
-the arm.
+Stretch 4's head assembly is fixed to the mast/base (all three head cameras are rigid to base yaw: turning the base turns the view with it). Camera streams are captured at **640 × 368** native 16:9 widescreen resolution by default.
+
+### Custom Camera Selection
+
+If you wish to fine-tune on a subset of cameras instead of all four, pass `--cameras` to `finetune.py` with names or shorthand aliases (`head`, `wrist`, `wrist_right`, `left`, `right`):
+
+```bash
+# Fine-tune MolmoBot on head and left wrist cameras only:
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
+    --cameras "head,wrist"
+
+# Fine-tune on head and stereo wrist cameras:
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
+    --cameras "head,wrist,wrist_right"
+
+# Default: trains on all four cameras ("head,wrist,left,right")
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --rollouts data/stretch_pick/rollouts/pick --trainer molmobot
+```
+
+The selected cameras are automatically propagated into:
+- **MolmoBot**: The `--camera_names` launch arguments and `finetune_molmobot.json`.
+- **OpenPI / LeRobot**: Filtered `features.images` keys in `finetune_openpi.json` and `finetune_lerobot.json`.
+- **Benchmark Evaluation**: `StretchMolmoBotPolicyConfig.camera_names`.
 
 ## Why the fine-tune itself is not in here
 

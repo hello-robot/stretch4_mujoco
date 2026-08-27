@@ -141,6 +141,7 @@ class StretchReachSolver:
 
         model = self._kinematics.model_ik
         model.upperPositionLimit[1] = 1.23  # Match physical mast limit of Stretch 4 in MuJoCo
+        model.lowerPositionLimit[4] = -1.571  # Allow full 90-degree upward pitch in MuJoCo
         lower, upper = model.lowerPositionLimit, model.upperPositionLimit
         self._limits = {
             "lift": np.array([[lower[1], upper[1]]]),

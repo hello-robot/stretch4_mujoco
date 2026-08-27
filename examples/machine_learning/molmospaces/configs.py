@@ -28,7 +28,7 @@ from examples.machine_learning.molmospaces.policies.molmobot_policy import (
 from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicyConfig
 from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA,
-    WRIST_CAMERA,
+    WRIST_CAMERA_RIGHT,
     Stretch4CameraSystem,
     Stretch4RobotConfig,
 )
@@ -221,7 +221,7 @@ class StretchBCEvalConfig(Stretch4BenchmarkEvalConfig):
     """
 
     policy_config: StretchBCPolicyConfig = StretchBCPolicyConfig(
-        camera_names=[HEAD_CAMERA, WRIST_CAMERA]
+        camera_names=[HEAD_CAMERA, WRIST_CAMERA_RIGHT]
     )
 
     @property

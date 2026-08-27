@@ -82,19 +82,56 @@ as a mirrored finger pair and the recorded `actions/joint_pos` carries both. It
 is one commanded degree of freedom; see `lerobot_export.GRIPPER_CHANNEL_NAMES`.
 """
 
-STRETCH_CAMERA_NAMES = ["head_camera", "wrist_camera"]
-"""
-Cameras to train on, in the order MolmoBot should take them.
+from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
+    CAMERA_FEATURE_NAMES,
+)
 
-These are the names `Stretch4CameraSystem` records under, so they match the
-generated rollouts. `head_camera` is the
-*centre* camera of Stretch 4's fixed three-camera head (MJCF
-`camera_center_link`, 1.62m up, pitched 35 degrees down); the left/right stereo
-pair look 47 degrees down and are not used.
+CAMERA_NAME_ALIASES: dict[str, str] = {
+    "head": "head_camera",
+    "head_camera": "head_camera",
+    "wrist_left": "wrist_camera_left",
+    "wrist_camera_left": "wrist_camera_left",
+    "wrist_right": "wrist_camera_right",
+    "wrist_camera_right": "wrist_camera_right",
+    "left": "head_camera_left",
+    "head_left": "head_camera_left",
+    "head_camera_left": "head_camera_left",
+    "right": "head_camera_right",
+    "head_right": "head_camera_right",
+    "head_camera_right": "head_camera_right",
+}
 
-Conveniently `train_molmobot.py --point_prompt_camera` already defaults to
-`head_camera`, so point prompts work without further argument.
+DEFAULT_CAMERA_NAMES: list[str] = [
+    "head_camera",
+    "wrist_camera_left",
+    "wrist_camera_right",
+    "head_camera_left",
+    "head_camera_right",
+]
+STRETCH_CAMERA_NAMES = DEFAULT_CAMERA_NAMES
 """
+Default cameras available for fine-tuning.
+
+These are the names `Stretch4CameraSystem` records under (`head_camera`,
+`wrist_camera_left`, `head_camera_left`, and `head_camera_right`). When fine-tuning,
+the user can choose which subset of camera streams to train on via `--cameras`.
+"""
+
+
+def parse_camera_names(
+    cameras_str: str | None, available_cameras: list[str] | None = None
+) -> list[str]:
+    """Parse a camera selection string (e.g. 'head,wrist' or 'head_camera,head_camera_left') into canonical camera names."""
+    if not cameras_str:
+        return list(available_cameras) if available_cameras else list(DEFAULT_CAMERA_NAMES)
+    tokens = [t.strip() for t in cameras_str.split(",") if t.strip()]
+    resolved: list[str] = []
+    for token in tokens:
+        canonical = CAMERA_NAME_ALIASES.get(token.lower(), token)
+        if canonical not in resolved:
+            resolved.append(canonical)
+    return resolved
+
 
 MOLMOBOT_ACTION_TYPES = ("joint_pos_rel", "joint_pos")
 """
@@ -168,6 +205,7 @@ def prepare_molmospaces_dataset(
     val_fraction: float = 0.1,
     link: bool = True,
     fps: float = 15.0,
+    camera_names: list[str] | None = None,
 ) -> DatasetSummary:
     """Make a raw rollout run trainable by MolmoBot, and summarise it.
 
@@ -190,6 +228,7 @@ def prepare_molmospaces_dataset(
         val_fraction: share of houses held out for validation.
         link: symlink houses into the split rather than copying them.
         fps: frame rate the rollouts were recorded at, for the report.
+        camera_names: cameras to include in the dataset manifest.
     """
     from examples.machine_learning.molmospaces.hdf5_layout import (
         arrange_train_val_split,
@@ -205,9 +244,21 @@ def prepare_molmospaces_dataset(
             "--task pick --output-dir data/stretch_pick"
         )
 
-    ensure_sensor_data_paths(rollout_dir, camera_names=STRETCH_CAMERA_NAMES)
+    # If camera_names is None, ensure_sensor_data_paths will inspect available MP4s
+    ensure_sensor_data_paths(rollout_dir, camera_names=camera_names)
     task_dir = Path(task_dir) if task_dir else rollout_dir.parent / "molmobot" / rollout_dir.name
     placed = arrange_train_val_split(rollout_dir, task_dir, val_fraction=val_fraction, link=link)
+
+    # Determine video keys (cameras) from the first house's available MP4s
+    detected_cameras: list[str] = []
+    first_h5 = next(rollout_dir.rglob("trajectories*.h5"), None)
+    if first_h5 is not None:
+        for mp4 in first_h5.parent.glob("episode_00000000_*.mp4"):
+            cam_name = mp4.stem.replace("episode_00000000_", "").split("_batch_")[0]
+            if cam_name in DEFAULT_CAMERA_NAMES and cam_name not in detected_cameras:
+                detected_cameras.append(cam_name)
+
+    active_cameras = camera_names or detected_cameras or list(DEFAULT_CAMERA_NAMES)
 
     return DatasetSummary(
         root=task_dir,
@@ -218,7 +269,7 @@ def prepare_molmospaces_dataset(
         num_episodes=count_trajectories(rollout_dir),
         num_frames=0,  # counting frames means opening every trajectory; not worth it here
         fps=fps,
-        video_keys=list(STRETCH_CAMERA_NAMES),
+        video_keys=active_cameras,
         splits={split: len(houses) for split, houses in placed.items()},
     )
 
@@ -247,14 +298,17 @@ def dataset_statistics(summary: DatasetSummary) -> dict[str, list[float]]:
     normalising by a true zero produces NaNs that only surface much later as a
     policy emitting garbage.
     """
-    if summary.kind != "lerobot":
+    stats_path = summary.root / "meta" / "episodes_stats.jsonl"
+    if not stats_path.exists():
         return {}
 
     records = [
         json.loads(line)
-        for line in (summary.root / "meta" / "episodes_stats.jsonl").read_text().splitlines()
+        for line in stats_path.read_text().splitlines()
         if line.strip()
     ]
+    if not records:
+        return {}
     statistics: dict[str, list[float]] = {}
     for key in ("observation.state", "action"):
         counts = np.array([record["stats"][key]["count"][0] for record in records], dtype=float)
@@ -282,6 +336,7 @@ def write_trainer_config(
     steps: int,
     learning_rate: float,
     action_type: str,
+    camera_names: list[str] | None = None,
 ) -> Path:
     """Write the trainer's config next to the dataset and return its path.
 
@@ -311,18 +366,31 @@ def write_trainer_config(
         "evaluation": {"command": _evaluation_command(summary, trainer)},
     }
     if summary.kind == "molmospaces":
+        selected = camera_names or summary.video_keys or list(DEFAULT_CAMERA_NAMES)
         config["action"] = {
             "action_type": action_type,
             "action_move_groups": list(STRETCH_ACTION_SPEC),
             "action_spec": dict(STRETCH_ACTION_SPEC),
             "action_dim": summary.action_dim,
-            "camera_names": list(STRETCH_CAMERA_NAMES),
+            "camera_names": list(selected),
         }
     else:
+        if camera_names:
+            selected_features = {
+                CAMERA_FEATURE_NAMES.get(c, c) for c in camera_names
+            } | set(camera_names)
+            image_keys = [
+                k
+                for k in summary.video_keys
+                if k in selected_features or k.split(".")[-1] in selected_features
+            ]
+        else:
+            image_keys = summary.video_keys
+
         config["features"] = {
             "observation.state": {"shape": [summary.state_dim]},
             "action": {"shape": [summary.action_dim]},
-            "images": summary.video_keys,
+            "images": image_keys,
         }
         config["normalization"] = dataset_statistics(summary)
 
@@ -372,9 +440,11 @@ def trainer_command(
     steps: int,
     action_type: str,
     seq_len: int,
+    camera_names: list[str] | None = None,
 ) -> list[str]:
     """The command line that runs the fine-tune in the trainer's own repository."""
     if trainer == "molmobot":
+        selected = camera_names or summary.video_keys or list(DEFAULT_CAMERA_NAMES)
         return [
             "python",
             "launch_scripts/train_molmobot.py",
@@ -388,7 +458,7 @@ def trainer_command(
             "--action_move_groups",
             *STRETCH_ACTION_SPEC,
             "--camera_names",
-            *STRETCH_CAMERA_NAMES,
+            *selected,
             "--action_type",
             action_type,
             "--global_batch_size",
@@ -425,12 +495,6 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
             "python -m examples.machine_learning.molmospaces.run_benchmarks "
             "--policy molmobot --checkpoint <checkpoint> --benchmark pick"
         )
-    # There is no `--policy` for an openpi or LeRobot checkpoint: those trainers
-    # serve their own inference protocols, and the policy adapter that used to
-    # bridge one (`--policy vla`) only existed to remap Franka-space actions and
-    # went with the rest of the remapping. A checkpoint trained on Stretch's move
-    # groups needs a MolmoSpaces `InferencePolicy` that speaks its trainer's
-    # protocol -- `policies/molmobot_policy.py` is the pattern to copy.
     return (
         f"(no scorer in this repo for a {trainer} checkpoint -- add an "
         "InferencePolicy for its serving protocol, as policies/molmobot_policy.py "
@@ -457,6 +521,13 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     default=None,
     help="An exported LeRobot dataset (the `lerobot/` directory). What --trainer "
     "openpi and lerobot want.",
+)
+@click.option(
+    "--cameras",
+    type=str,
+    default=None,
+    help="Comma-separated list of camera names to train on (e.g. 'head_camera,wrist_camera_right', "
+    "'head,wrist,left,right'). Defaults to all cameras available in the dataset.",
 )
 @click.option(
     "--trainer",
@@ -519,6 +590,7 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
 def main(
     rollouts: Path | None,
     dataset: Path | None,
+    cameras: str | None,
     trainer: str,
     trainer_repo: Path | None,
     base_checkpoint: str | None,
@@ -552,8 +624,14 @@ def main(
         )
 
     base_checkpoint = base_checkpoint or ("8b" if trainer == "molmobot" else "pi05_droid")
+    selected_cameras = parse_camera_names(cameras) if cameras else None
     summary = (
-        prepare_molmospaces_dataset(rollouts, val_fraction=val_fraction, link=link)
+        prepare_molmospaces_dataset(
+            rollout_dir=rollouts,
+            val_fraction=val_fraction,
+            link=link,
+            camera_names=selected_cameras,
+        )
         if rollouts is not None
         else read_lerobot_dataset(dataset)
     )
@@ -570,6 +648,7 @@ def main(
         steps=steps,
         learning_rate=learning_rate,
         action_type=action_type,
+        camera_names=selected_cameras,
     )
     preparation = preparation_commands(summary, action_type)
     command = trainer_command(
@@ -582,6 +661,7 @@ def main(
         steps=steps,
         action_type=action_type,
         seq_len=seq_len,
+        camera_names=selected_cameras,
     )
 
     click.echo("")

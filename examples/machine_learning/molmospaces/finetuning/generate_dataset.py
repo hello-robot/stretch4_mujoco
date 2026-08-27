@@ -753,7 +753,7 @@ All waypoints finished execution. Holding final posture/grip.
             if observation is not None:
                 obs_dict = observation[0] if isinstance(observation, list) and observation else observation
                 if isinstance(obs_dict, dict):
-                    for cam_name in ["head_camera", "wrist_camera", "chase_camera"]:
+                    for cam_name in ["head_camera", "wrist_camera_left", "wrist_camera_right", "head_camera_left", "head_camera_right"]:
                         if cam_name in obs_dict and obs_dict[cam_name] is not None:
                             img = obs_dict[cam_name]
                             if hasattr(img, "ndim") and img.ndim == 3:
@@ -962,6 +962,7 @@ def generate_rollouts(
     data_split: str | None = None,
     houses: int | None = None,
     seed: int | None = None,
+    keep_failures: bool = False,
     visualize: bool = False,
     slow_rate: float | None = None,
 ) -> Path:
@@ -981,6 +982,7 @@ def generate_rollouts(
             contributes a handful of episodes rather than hundreds, which is
             what keeps the scene distribution wide.
         seed: task-sampling seed.
+        keep_failures: keep failed trajectories in the rollout dataset.
         visualize: watch the rollouts in MuJoCo's passive viewer. Requires
             `num_workers == 1` -- see `main()`.
         slow_rate: slow down simulation by a time factor (e.g. 1.0 for real-time,
@@ -1002,6 +1004,7 @@ def generate_rollouts(
     config.num_workers = num_workers
     config.use_wandb = False
     config.use_passive_viewer = visualize
+    config.filter_for_successful_trajectories = not keep_failures
 
     if episodes is not None:
         _spread_episodes(config, episodes, houses)
@@ -1183,6 +1186,7 @@ def main(
                 data_split=data_split,
                 houses=houses,
                 seed=seed,
+                keep_failures=keep_failures,
                 visualize=visualize,
                 slow_rate=slow_rate,
             )

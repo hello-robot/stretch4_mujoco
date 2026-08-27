@@ -52,7 +52,10 @@ log = logging.getLogger(__name__)
 
 TRAINED_CAMERA_MJCF_NAMES = {
     "head_camera": "camera_center_link",
-    "wrist_camera": "gripper_camera_left_rgb",
+    "wrist_camera_left": "gripper_camera_left_rgb",
+    "wrist_camera_right": "gripper_camera_right_rgb",
+    "head_camera_left": "camera_left_link",
+    "head_camera_right": "camera_right_link",
 }
 """
 The camera names a trained policy uses, and the MJCF cameras behind them.

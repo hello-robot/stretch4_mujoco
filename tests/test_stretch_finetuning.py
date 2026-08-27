@@ -29,9 +29,13 @@ from examples.machine_learning.molmospaces.finetuning.live_recorder import (  # 
 )
 from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
     HEAD_CAMERA,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA_LEFT_MJCF_NAME,
     HEAD_CAMERA_MJCF_NAME,
-    WRIST_CAMERA,
-    WRIST_CAMERA_MJCF_NAME,
+    HEAD_CAMERA_RIGHT,
+    HEAD_CAMERA_RIGHT_MJCF_NAME,
+    WRIST_CAMERA_LEFT,
+    WRIST_LEFT_CAMERA_MJCF_NAME,
     Stretch4RobotConfig,
 )
 
@@ -51,7 +55,9 @@ def test_recorder_camera_mapping_matches_the_trained_camera_system():
     """
     assert TRAINED_CAMERA_MJCF_NAMES == {
         HEAD_CAMERA: HEAD_CAMERA_MJCF_NAME,
-        WRIST_CAMERA: WRIST_CAMERA_MJCF_NAME,
+        WRIST_CAMERA_LEFT: WRIST_LEFT_CAMERA_MJCF_NAME,
+        HEAD_CAMERA_LEFT: HEAD_CAMERA_LEFT_MJCF_NAME,
+        HEAD_CAMERA_RIGHT: HEAD_CAMERA_RIGHT_MJCF_NAME,
     }
 
 
@@ -64,7 +70,7 @@ def test_head_camera_is_the_centre_of_the_head_assembly():
     to each side looking 47 degrees down. Everything here uses the centre one.
     """
     assert HEAD_CAMERA_MJCF_NAME == "camera_center_link"
-    assert WRIST_CAMERA_MJCF_NAME == "gripper_camera_left_rgb"
+    assert WRIST_LEFT_CAMERA_MJCF_NAME == "gripper_camera_left_rgb"
 
 
 def test_stretch_action_spec_agrees_across_training_and_evaluation():
@@ -254,7 +260,7 @@ def test_a_frame_with_a_missing_camera_is_skipped_whole(tmp_path):
         qpos=qpos,
         base_pose7=pose,
         tcp_pose7=pose,
-        images={HEAD_CAMERA: np.zeros((8, 8, 3), np.uint8), WRIST_CAMERA: None},
+        images={HEAD_CAMERA: np.zeros((8, 8, 3), np.uint8), WRIST_CAMERA_LEFT: None},
         frame_time=0.0,
     )
     assert recorder.current_length == 0
@@ -770,3 +776,238 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     assert inits[0][1] != inits[1][1]
     assert len(connected_urls) == 2
     assert rec_names == ["Episode 101", "Episode 102"]
+
+
+def test_fisheye_distortion_scaling_arbitrary_resolutions():
+    """Verify fisheye distortion applies correctly across different resolutions without clipping."""
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+
+    cb_left = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
+    cb_right = StretchCameras.cam_nav_rgb_se4_right.post_processing_callback
+    assert cb_left is not None
+    assert cb_right is not None
+
+    for shape in [(224, 224, 3), (1200, 1920, 3), (480, 640, 3)]:
+        img = np.ones(shape, dtype=np.uint8) * 200
+        out_l = cb_left(img)
+        out_r = cb_right(img)
+        assert out_l.shape == shape
+        assert out_r.shape == shape
+        assert np.count_nonzero(out_l) > 0, f"Left fisheye output was all black for {shape}"
+        assert np.count_nonzero(out_r) > 0, f"Right fisheye output was all black for {shape}"
+
+
+def test_cpumujocoenv_fisheye_distortion_hook():
+    """Verify that CPUMujocoEnv.render_rgb_frame applies fisheye distortion for left and right nav cameras."""
+    from molmo_spaces.env.env import CPUMujocoEnv
+
+    class MockCamera:
+        pos = np.array([0.0, 0.0, 0.0])
+        forward = np.array([1.0, 0.0, 0.0])
+        up = np.array([0.0, 0.0, 1.0])
+        fov = 120.0
+
+    class MockCameraManager:
+        registry = {
+            "head_camera": MockCamera(),
+            "wrist_camera": MockCamera(),
+            "head_camera_left": MockCamera(),
+            "head_camera_right": MockCamera(),
+        }
+
+    class MockEnv(CPUMujocoEnv):
+        def __init__(self):
+            self._executor = None
+            self._renderer = None
+            self.object_managers = []
+            self.camera_manager = MockCameraManager()
+
+        def _render_frame(self, pos, forward, up, fov, segmentation=False):
+            return np.ones((224, 224, 3), dtype=np.uint8) * 200
+
+    env = MockEnv()
+    raw_head = env.render_rgb_frame("head_camera")
+    assert np.all(raw_head == 200)  # Untouched
+
+    distorted_left = env.render_rgb_frame("head_camera_left")
+    assert distorted_left.shape == (224, 224, 3)
+    # Circular aperture leaves edges black (0) while center retains pixels
+    assert np.count_nonzero(distorted_left == 0) > 0
+    assert np.count_nonzero(distorted_left > 0) > 0
+
+    distorted_right = env.render_rgb_frame("head_camera_right")
+    assert distorted_right.shape == (224, 224, 3)
+    assert np.count_nonzero(distorted_right == 0) > 0
+    assert np.count_nonzero(distorted_right > 0) > 0
+
+
+def test_camera_feature_names_and_defaults_in_lerobot_export():
+    """Verify LeRobot export maps all 4 cameras to observation features."""
+    from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
+        CAMERA_FEATURE_NAMES,
+        DEFAULT_CAMERA_NAMES,
+    )
+
+    assert HEAD_CAMERA in CAMERA_FEATURE_NAMES
+    assert WRIST_CAMERA_LEFT in CAMERA_FEATURE_NAMES
+    assert HEAD_CAMERA_LEFT in CAMERA_FEATURE_NAMES
+    assert HEAD_CAMERA_RIGHT in CAMERA_FEATURE_NAMES
+    assert CAMERA_FEATURE_NAMES[HEAD_CAMERA_LEFT] == "observation.images.head_left"
+    assert CAMERA_FEATURE_NAMES[HEAD_CAMERA_RIGHT] == "observation.images.head_right"
+    assert set(DEFAULT_CAMERA_NAMES) == {HEAD_CAMERA, WRIST_CAMERA_LEFT, HEAD_CAMERA_LEFT, HEAD_CAMERA_RIGHT}
+
+
+def test_fisheye_active_fill_coverage_not_overly_vignetted():
+    """Verify fisheye distortion does not mask out most of the image with excessive black vignetting."""
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+
+    cb_left = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
+    img = np.ones((224, 224, 3), dtype=np.uint8) * 200
+    out = cb_left(img)
+    non_black_ratio = np.count_nonzero(np.any(out > 0, axis=-1)) / (224 * 224)
+    # The active image area should be >= 70% of the frame (corners only are curved out)
+    assert non_black_ratio >= 0.70, f"Fisheye active area ratio {non_black_ratio:.2f} is too low (excessive black borders)"
+
+
+def test_finetune_camera_selection_parsing_and_commands(tmp_path):
+    """Verify finetune.py camera selection parsing and command generation."""
+    import json
+    from examples.machine_learning.molmospaces.finetuning.finetune import (
+        DatasetSummary,
+        parse_camera_names,
+        trainer_command,
+        write_trainer_config,
+    )
+
+    # 1. Alias parsing
+    cams = parse_camera_names("head,wrist,left")
+    assert cams == ["head_camera", "wrist_camera", "head_camera_left"]
+
+    # 2. MolmoBot command with selected cameras
+    summary_molmo = DatasetSummary(
+        root=tmp_path / "molmobot_test",
+        kind="molmospaces",
+        action_space="stretch_move_groups",
+        state_dim=10,
+        action_dim=10,
+        num_episodes=5,
+        num_frames=100,
+        fps=15.0,
+        video_keys=["head_camera", "wrist_camera", "head_camera_left", "head_camera_right"],
+    )
+    summary_molmo.root.mkdir(parents=True, exist_ok=True)
+    cfg_molmo = write_trainer_config(
+        summary=summary_molmo,
+        trainer="molmobot",
+        base_checkpoint="8b",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        learning_rate=1e-5,
+        action_type="joint_pos_rel",
+        camera_names=["head_camera", "head_camera_left"],
+    )
+    cmd_molmo = trainer_command(
+        summary=summary_molmo,
+        trainer="molmobot",
+        config_path=cfg_molmo,
+        base_checkpoint="8b",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        action_type="joint_pos_rel",
+        seq_len=2048,
+        camera_names=["head_camera", "head_camera_left"],
+    )
+    assert "--camera_names" in cmd_molmo
+    cam_idx = cmd_molmo.index("--camera_names")
+    assert cmd_molmo[cam_idx + 1 : cam_idx + 3] == ["head_camera", "head_camera_left"]
+
+    molmo_json = json.loads(cfg_molmo.read_text())
+    assert molmo_json["action"]["camera_names"] == ["head_camera", "head_camera_left"]
+
+    # 3. LeRobot feature filtering with selected cameras
+    summary_lerobot = DatasetSummary(
+        root=tmp_path / "lerobot_test",
+        kind="lerobot",
+        action_space="stretch_move_groups",
+        state_dim=10,
+        action_dim=10,
+        num_episodes=5,
+        num_frames=100,
+        fps=15.0,
+        video_keys=[
+            "observation.images.head",
+            "observation.images.wrist",
+            "observation.images.head_left",
+            "observation.images.head_right",
+        ],
+    )
+    summary_lerobot.root.mkdir(parents=True, exist_ok=True)
+    cfg_lerobot = write_trainer_config(
+        summary=summary_lerobot,
+        trainer="lerobot",
+        base_checkpoint="pi05_droid",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        learning_rate=1e-5,
+        action_type="joint_pos_rel",
+        camera_names=["head_camera", "head_camera_right"],
+    )
+    lerobot_json = json.loads(cfg_lerobot.read_text())
+    assert lerobot_json["features"]["images"] == [
+        "observation.images.head",
+        "observation.images.head_right",
+    ]
+
+
+def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
+    """Stretch 4 camera system exposes the onboard cameras at 640x368 resolution."""
+    from examples.machine_learning.molmospaces.stretch.config import (
+        CHASE_CAMERA,
+        HEAD_CAMERA,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+        Stretch4CameraSystem,
+    )
+    from examples.machine_learning.molmospaces import hdf5_layout
+    from examples.machine_learning.molmospaces.finetuning import finetune, lerobot_export
+
+    # 1. Stretch4CameraSystem includes the onboard cameras at (640, 368)
+    cam_system = Stretch4CameraSystem()
+    assert cam_system.img_resolution == (640, 368)
+    cam_names = [c.name for c in cam_system.cameras]
+    assert cam_names == [
+        HEAD_CAMERA,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+    ]
+
+    # 2. Defaults for trainers and exports match
+    assert finetune.DEFAULT_CAMERA_NAMES == [
+        HEAD_CAMERA,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+    ]
+    assert CHASE_CAMERA not in finetune.DEFAULT_CAMERA_NAMES
+    assert CHASE_CAMERA not in lerobot_export.DEFAULT_CAMERA_NAMES
+
+    # 3. hdf5_layout._cameras_beside filters out debug/non-training camera MP4s if present
+    house_dir = tmp_path / "house_1"
+    house_dir.mkdir(parents=True, exist_ok=True)
+    (house_dir / "episode_00000000_head_camera.mp4").write_bytes(b"dummy")
+    (house_dir / "episode_00000000_chase_camera.mp4").write_bytes(b"dummy")
+
+    detected = hdf5_layout._cameras_beside(house_dir, 0, "")
+    assert "head_camera" in detected
+    assert "chase_camera" not in detected
+
+
+

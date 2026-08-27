@@ -173,9 +173,30 @@ class StretchCameras(Enum):
                 fx, fy = settings.focal
                 cx, cy = settings.optical_center
                 distortion_params = settings.distortion_params
-                return lambda render: utils.apply_fisheye_distortion(
-                    render, fx, fy, cx, cy, distortion_params
-                )
+                sensor_w = settings.width
+                sensor_h = settings.height
+
+                def _distort(render: np.ndarray) -> np.ndarray:
+                    h, w = render.shape[:2]
+                    fov_deg = float(settings.field_of_view_vertical_in_degrees)
+                    if w == sensor_w and h == sensor_h:
+                        return utils.apply_fisheye_distortion(
+                            render, fx, fy, cx, cy, distortion_params, fov_deg=fov_deg
+                        )
+                    scale = h / float(sensor_h)
+                    cx_scaled = w / 2.0
+                    cy_scaled = h / 2.0
+                    return utils.apply_fisheye_distortion(
+                        render,
+                        fx * scale,
+                        fy * scale,
+                        cx_scaled,
+                        cy_scaled,
+                        distortion_params,
+                        fov_deg=fov_deg,
+                    )
+
+                return _distort
 
         if not self.is_depth:
             return None

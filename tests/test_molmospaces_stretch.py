@@ -363,7 +363,7 @@ def test_the_override_rewrites_the_robot_and_leaves_the_task_alone():
     from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
 
     from examples.machine_learning.molmospaces.configs import StretchDummyEvalConfig
-    from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA
+    from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA_LEFT
     from examples.machine_learning.molmospaces.stretch.episode_overrides import (
         stretch_episode_override,
     )
@@ -395,10 +395,20 @@ def test_the_override_rewrites_the_robot_and_leaves_the_task_alone():
     assert spec.robot.robot_name == "stretch4"
     assert "arm" in spec.robot.init_qpos and "base" not in spec.robot.init_qpos
     assert spec.robot.init_qpos["arm"] == [0.0], "the arm must start stowed"
+    from examples.machine_learning.molmospaces.stretch.config import (
+        HEAD_CAMERA,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+    )
     # Stretch's own cameras, at the episode's resolution.
     assert [camera.name for camera in exp_config.camera_config.cameras] == [
         HEAD_CAMERA,
-        WRIST_CAMERA,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
     ]
     assert tuple(exp_config.camera_config.img_resolution) == (624, 352)
     # The spawn moved into the reach band, and nothing else about the task did.
@@ -448,12 +458,12 @@ def test_live_camera_mapping_matches_the_trained_camera_system():
     from examples.machine_learning.molmospaces.stretch.config import (
         HEAD_CAMERA,
         HEAD_CAMERA_MJCF_NAME,
-        WRIST_CAMERA,
-        WRIST_CAMERA_MJCF_NAME,
+        WRIST_CAMERA_LEFT,
+        WRIST_LEFT_CAMERA_MJCF_NAME,
     )
 
     assert CAMERA_FOR_TRAINED_NAME[HEAD_CAMERA].camera_name_in_mjcf == HEAD_CAMERA_MJCF_NAME
-    assert CAMERA_FOR_TRAINED_NAME[WRIST_CAMERA].camera_name_in_mjcf == WRIST_CAMERA_MJCF_NAME
+    assert CAMERA_FOR_TRAINED_NAME[WRIST_CAMERA_LEFT].camera_name_in_mjcf == WRIST_LEFT_CAMERA_MJCF_NAME
 
 
 def test_simulator_status_encodes_the_same_state_as_the_robot_view():
@@ -931,6 +941,62 @@ def test_grasp_check_passes_when_there_is_nothing_to_check(monkeypatch):
     assert policy._grasp_still_held(np.zeros(3)) is True
 
 
+def test_grasp_offset_in_tool_frame_is_invariant_to_pitch_rotation():
+    """Rotating the gripper (e.g. pitching up 90 deg) must not trigger false grasp slip."""
+    from scipy.spatial.transform import Rotation as R
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
+
+    class MockMoveGroup:
+        def __init__(self, pose):
+            self.leaf_frame_to_world = pose
+
+    class MockRobotView:
+        def __init__(self, pose):
+            self._mg = MockMoveGroup(pose)
+        def get_move_group(self, name):
+            return self._mg
+
+    class MockTaskConfig:
+        pickup_obj_name = "test_obj"
+
+    class MockConfig:
+        task_config = MockTaskConfig()
+        class policy_config:
+            grasp_slip_tolerance_m = 0.05
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+    policy.config = MockConfig()
+    policy._grasp_lost = False
+
+    # Grasp established with tool pointing down (pitch = 90 deg)
+    r0 = R.from_euler("y", 90, degrees=True).as_matrix()
+    p0 = np.array([0.5, 0.0, 0.8])
+    pose0 = np.eye(4)
+    pose0[:3, :3] = r0
+    pose0[:3, 3] = p0
+
+    # Object is 3cm ahead of TCP in local tool coordinates: p_obj = p + R @ [0, 0, 0.03]
+    obj_local = np.array([0.0, 0.0, 0.03])
+    obj_pos_0 = p0 + r0 @ obj_local
+    policy._object_grasp_point = lambda name: obj_pos_0
+
+    policy._grasp_offset = policy._tool_to_object_offset(MockRobotView(pose0))
+    np.testing.assert_allclose(policy._grasp_offset, obj_local, atol=1e-5)
+
+    # Now tool pitches up to horizontal (pitch = 0 deg) and lifts
+    r1 = R.from_euler("y", 0, degrees=True).as_matrix()
+    p1 = np.array([0.4, 0.0, 1.1])
+    pose1 = np.eye(4)
+    pose1[:3, :3] = r1
+    pose1[:3, 3] = p1
+
+    # Object moved rigidly with the gripper
+    obj_pos_1 = p1 + r1 @ obj_local
+    policy._object_grasp_point = lambda name: obj_pos_1
+
+    assert policy._grasp_still_held(MockRobotView(pose1)) is True
+
+
 def test_lift_waypoint_is_the_one_that_verifies_the_grasp():
     """The plan must actually carry the flags the check keys off."""
     from examples.machine_learning.molmospaces.policies.simple_ik_policy import Waypoint
@@ -1060,6 +1126,218 @@ def test_thin_object_grasp_offset():
     policy.task = mock_task
 
     grasp_pt = policy._object_grasp_point("fork")
-    expected_offset = TCP_TO_FINGERTIP_EDGE_M - (0.01 * 0.5)
+    expected_offset = TCP_TO_FINGERTIP_EDGE_M
     assert grasp_pt[2] == pytest.approx(0.75 + expected_offset)
+
+
+def test_grasp_target_bounds_validation():
+    """Grasp targets must be rejected if underneath the object/table or out of bounds."""
+    from unittest.mock import MagicMock
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+    mock_scene_obj = MagicMock()
+    mock_scene_obj.position = np.array([0.5, 0.2, 0.75])
+    mock_scene_obj.aabb_size = np.array([0.02, 0.20, 0.02])  # pencil: x=[-0.01, 0.01], y=[-0.1, 0.1], z=[-0.01, 0.01]
+    # world bounds: x=[0.49, 0.51], y=[0.10, 0.30], z=[0.74, 0.76]
+
+    mock_env = MagicMock()
+    mock_env.current_batch_index = 0
+    mock_obj_mgr = MagicMock()
+    mock_obj_mgr.get_object_by_name.return_value = mock_scene_obj
+    mock_env.object_managers = [mock_obj_mgr]
+    mock_env.current_model = None
+    mock_env.current_data = None
+
+    mock_task = MagicMock()
+    mock_task.env = mock_env
+    policy.task = mock_task
+
+    # 1. Valid grasp in the middle of the pencil
+    assert policy._is_grasp_within_bounds("pencil", np.array([0.50, 0.20, 0.75])) is True
+
+    # 2. Grasp underneath the pencil / table (z = 0.70 < 0.74 - 0.005) -> False
+    assert policy._is_grasp_within_bounds("pencil", np.array([0.50, 0.20, 0.70])) is False
+
+    # 3. Grasp far away laterally (x = 0.70 > 0.51 + 0.04) -> False
+    assert policy._is_grasp_within_bounds("pencil", np.array([0.70, 0.20, 0.75])) is False
+
+    # 4. Grasp far away laterally along y (y = 0.40 > 0.30 + 0.04) -> False
+    assert policy._is_grasp_within_bounds("pencil", np.array([0.50, 0.40, 0.75])) is False
+
+    # 5. Grasp floating way above the pencil (z = 0.85 > 0.76 + 0.04) -> False
+    assert policy._is_grasp_within_bounds("pencil", np.array([0.50, 0.20, 0.85])) is False
+
+
+def test_tall_object_pitch_search_order():
+    """For objects taller than 100mm, pitch angle search starts at 45 deg down (45->0 then 90->45)."""
+    from unittest.mock import MagicMock
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
+    from scipy.spatial.transform import Rotation as R
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+    mock_config = MagicMock()
+    mock_config.policy_config.grasp_style = "top_down"
+    policy.config = mock_config
+
+    mock_gripper = MagicMock()
+    mock_gripper.inter_finger_dist_range = (0.0, 0.1885)
+    policy._gripper_group = MagicMock(return_value=mock_gripper)
+
+    mock_robot_view = MagicMock()
+    mock_robot_view.base.pose = np.eye(4)
+    mock_task = MagicMock()
+    mock_task.env.current_robot.robot_view = mock_robot_view
+    policy.task = mock_task
+
+    # Mock object with height = 0.25m (> 100mm)
+    policy._object_bounds = MagicMock(return_value=(np.array([0, 0, 0]), np.array([0.1, 0.1, 0.25])))
+    policy._object_grasp_width = MagicMock(return_value=0.03)
+
+    # Test pitches: 90 deg, 60 deg, 45 deg, 30 deg, 0 deg
+    from examples.machine_learning.molmospaces.policies.kinematics import GRASP_LIBRARY_TO_TCP, grasp_orientation
+
+    test_pitches = [np.pi / 2, np.pi / 3, np.pi / 4, np.pi / 6, 0.0]
+    poses = []
+    for pitch in test_pitches:
+        mat = np.eye(4)
+        mat[:3, :3] = grasp_orientation(0.0, pitch, 0.0) @ GRASP_LIBRARY_TO_TCP.T
+        poses.append(mat)
+
+    policy._library_grasp_poses = MagicMock(return_value=np.array(poses))
+
+    solved_pitches = []
+    def mock_solve_at(base_pose, pos, candidate):
+        solved_pitches.append(candidate.wrist_pitch)
+        return None  # return None so it evaluates all candidates in order
+
+    policy._solve_at = mock_solve_at
+
+    policy._authored_grasp("tall_bottle", np.zeros(3))
+
+    # Expected order: 45 -> 0 (pi/4, pi/6, 0.0) then 90 -> 45 (pi/2, pi/3)
+    expected_order = [np.pi / 4, np.pi / 6, 0.0, np.pi / 2, np.pi / 3]
+    assert len(solved_pitches) == len(expected_order)
+    for actual, expected in zip(solved_pitches, expected_order):
+        assert actual == pytest.approx(expected, abs=1e-4)
+
+    # For short objects (< 100mm), expected order is standard descending: 90 -> 0
+    policy._object_bounds = MagicMock(return_value=(np.array([0, 0, 0]), np.array([0.1, 0.1, 0.05])))
+    solved_pitches.clear()
+    policy._authored_grasp("short_mug", np.zeros(3))
+    expected_short_order = [np.pi / 2, np.pi / 3, np.pi / 4, np.pi / 6, 0.0]
+    assert len(solved_pitches) == len(expected_short_order)
+    for actual, expected in zip(solved_pitches, expected_short_order):
+        assert actual == pytest.approx(expected, abs=1e-4)
+
+
+def test_object_local_target_tracking_verification():
+    """Verify that target grasp point is tracked relative to object origin and verified after lift."""
+    from unittest.mock import MagicMock
+    from scipy.spatial.transform import Rotation as R
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy, Waypoint, ToolGrasp
+
+    class MockMoveGroup:
+        def __init__(self, pose):
+            self.leaf_frame_to_world = pose
+
+    class MockRobotView:
+        def __init__(self, pose):
+            self._mg = MockMoveGroup(pose)
+        def get_move_group(self, name):
+            return self._mg
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+    mock_config = MagicMock()
+    mock_config.task_config.pickup_obj_name = "can"
+    mock_config.policy_config.grasp_slip_tolerance_m = 0.05
+    policy.config = mock_config
+
+    # Object starts at origin [0.5, 0.2, 0.8] with no rotation
+    obj_pos_0 = np.array([0.5, 0.2, 0.8])
+    obj_rot_0 = np.eye(3)
+    current_obj_pos = obj_pos_0.copy()
+    current_obj_rot = obj_rot_0.copy()
+
+    policy._object_pose = lambda name: (current_obj_pos, current_obj_rot)
+
+    # Grasp target is on the handle: offset by [0.02, 0.0, 0.05] relative to object origin
+    target_pos = obj_pos_0 + np.array([0.02, 0.0, 0.05])
+    policy._grasp = ToolGrasp(
+        position=target_pos,
+        approach_yaw=0.0,
+        wrist_pitch=0.0,
+        wrist_roll=0.0,
+        authored=True,
+    )
+
+    # TCP reaches the target
+    tcp_pose_0 = np.eye(4)
+    tcp_pose_0[:3, 3] = target_pos
+    robot_view_0 = MockRobotView(tcp_pose_0)
+
+    # Record grasp state
+    close_waypoint = Waypoint(
+        position=target_pos,
+        wrist_pitch=0.0,
+        label="close",
+        gripper_open=False,
+        establishes_grasp=True,
+    )
+    policy._record_grasp_state(robot_view_0, close_waypoint)
+
+    # Verify that target was stored relative to object frame
+    assert policy._grasp_target_rel_obj is not None
+    np.testing.assert_allclose(policy._grasp_target_rel_obj, np.array([0.02, 0.0, 0.05]))
+    assert policy._grasp_init_tcp_dist == pytest.approx(0.0, abs=1e-5)
+
+    # Scenario 1: Object is successfully lifted (lifted by +0.2m and rotated 30 deg around z)
+    rot_lift = R.from_euler("z", 30, degrees=True).as_matrix()
+    current_obj_rot = rot_lift
+    current_obj_pos = obj_pos_0 + np.array([0.0, 0.0, 0.2])
+
+    # Gripper moves with the object
+    tcp_pose_lifted = np.eye(4)
+    tcp_pose_lifted[:3, :3] = rot_lift
+    # TCP should be at new target position in world
+    tcp_pose_lifted[:3, 3] = current_obj_pos + rot_lift @ np.array([0.02, 0.0, 0.05])
+    robot_view_lifted = MockRobotView(tcp_pose_lifted)
+
+    assert policy._grasp_still_held(robot_view_lifted) is True
+
+    # Scenario 2: Object dropped / stayed on table while TCP lifted
+    current_obj_pos = obj_pos_0.copy()  # back on table
+    current_obj_rot = np.eye(3)
+    assert policy._grasp_still_held(robot_view_lifted) is False
+
+
+def test_unstow_joint_group_reached():
+    """Verify that joint groups reach unstow targets without timing out on small steady-state errors."""
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+
+    class MockMoveGroup:
+        def __init__(self, pos, vel=None):
+            self.joint_pos = np.array(pos)
+            if vel is not None:
+                self.joint_vel = np.array(vel)
+
+    # 1. Wrist yaw unwinding from 3.14 to near 0.0 (e.g. at 0.12 rad, pitch=0.01, roll=0.01)
+    wrist_mg = MockMoveGroup([0.12, 0.01, 0.01])
+    assert policy._joint_group_reached("wrist", wrist_mg, np.array([0.0, 0.0, 0.0]), 0.05) is True
+
+    # 2. Wrist yaw settled at 0.30 rad with near-zero velocity
+    wrist_settled = MockMoveGroup([0.30, 0.05, 0.02], vel=[0.001, 0.001, 0.001])
+    assert policy._joint_group_reached("wrist", wrist_settled, np.array([0.0, 0.0, 0.0]), 0.05) is True
+
+    # 3. Wrist still at stowed yaw (3.14 rad) -> not reached
+    wrist_stowed = MockMoveGroup([3.14, 0.0, 0.0])
+    assert policy._joint_group_reached("wrist", wrist_stowed, np.array([0.0, 0.0, 0.0]), 0.05) is False
+
+    # 4. Lift reaching target within tolerance
+    lift_mg = MockMoveGroup([0.72])
+    assert policy._joint_group_reached("lift", lift_mg, np.array([0.70]), 0.05) is True
+
+
 

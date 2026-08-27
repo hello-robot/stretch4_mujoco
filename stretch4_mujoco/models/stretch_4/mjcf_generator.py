@@ -334,6 +334,7 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             j.set("class", "wrist_yaw_stretch4")
         elif "wrist_pitch_joint" in name:
             j.set("class", "wrist_pitch_stretch4")
+            j.set("range", "-1.571 4.276")
         elif "wrist_roll_joint" in name:
             j.set("class", "wrist_roll_stretch4")
         elif "gripper_finger_left_joint" in name:

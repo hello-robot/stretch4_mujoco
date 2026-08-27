@@ -191,6 +191,9 @@ def ensure_sensor_data_paths(
     return counts
 
 
+DEBUG_CAMERAS: set[str] = {"chase_camera", "tracker_camera", "review"}
+
+
 def _cameras_beside(episode_dir: Path, episode_index: int, batch_suffix: str) -> list[str]:
     """Camera names inferred from the MP4s sitting next to a trajectory file."""
     prefix = f"episode_{episode_index:08d}_"
@@ -198,7 +201,7 @@ def _cameras_beside(episode_dir: Path, episode_index: int, batch_suffix: str) ->
     cameras = []
     for path in sorted(episode_dir.glob(f"{prefix}*{suffix}")):
         camera = path.name[len(prefix) : -len(suffix)] if suffix else path.stem
-        if camera:
+        if camera and camera not in DEBUG_CAMERAS:
             cameras.append(camera)
     return cameras
 
