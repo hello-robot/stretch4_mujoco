@@ -75,8 +75,8 @@ from molmo_spaces.data_generation.pipeline import (
     cleanup_context,
     cleanup_episode_resources,
     get_worker_logger,
+    log_memory_usage,
     mp_context,
-    save_house_trajectories,
     setup_house_dirs,
     setup_policy,
     setup_viewer,
@@ -84,12 +84,21 @@ from molmo_spaces.data_generation.pipeline import (
 )
 from molmo_spaces.tasks.task_sampler_errors import HouseInvalidForTask
 from molmo_spaces.utils.profiler_utils import DatagenProfiler
+from molmo_spaces.utils.save_utils import prepare_episode_for_saving, save_trajectories
 
 log = logging.getLogger(__name__)
 
 
 def trim_memory() -> None:
-    """Forces Python GC and glibc heap trimmer to release unused memory back to the OS."""
+    """Forces Python GC and glibc heap trimmer to release unused memory back to the OS.
+
+    Only ever a second-order effect: the camera frames that dominate a worker's
+    footprint are multi-hundred-kilobyte numpy arrays, which glibc mostly serves
+    with `mmap` and returns at `free()` without help. This is here for the churn
+    of small objects underneath them, and is only worth calling at a point where
+    the big allocations have *already* gone out of scope -- see
+    `flush_episode_to_disk`, which is what actually bounds the footprint.
+    """
     gc.collect()
     try:
         libc = ctypes.CDLL("libc.so.6")
@@ -104,6 +113,111 @@ def trim_memory() -> None:
     except Exception:
         pass
 
+
+def flush_episode_to_disk(
+    worker_logger: Any,
+    history: dict,
+    sensor_suite: Any,
+    save_dir: Path,
+    exp_config: Any,
+    batch_suffix: str,
+    episode_idx: int,
+    datagen_profiler: Any = None,
+) -> dict | None:
+    """Encode one finished episode's videos and drop its camera frames immediately.
+
+    This is the whole memory story of a datagen run. An episode's observation
+    history is ~4.3 MiB per step -- five 640x368 RGB streams plus a float32 depth
+    stream -- so a 300-step episode is ~1.3 GiB and a 500-step one ~2.1 GiB, and
+    *none* of it lands in the HDF5: the frames go out as side-car MP4s.
+
+    The pipeline's own `save_house_trajectories` does this encoding once per
+    house, at the end, which means all `samples_per_house` episodes are held as
+    raw frames simultaneously -- 4 x 2.1 GiB per worker at the default, times
+    `--num-workers`. Calling it per episode instead trades nothing (the encoding
+    work is identical and the MP4 filenames come out the same) for a peak of one
+    episode's frames rather than a houseful.
+
+    What comes back is the camera-stripped batched tensor dict -- the ~10 MiB of
+    poses, joint states and per-camera intrinsics that actually go into the HDF5
+    -- so accumulating those across a house costs nothing worth counting.
+
+    Returns:
+        The prepared episode, or None if there was nothing to save.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    if datagen_profiler is not None:
+        datagen_profiler.start("save_batch_prep")
+    try:
+        prepared = prepare_episode_for_saving(
+            history,
+            sensor_suite,
+            fps=exp_config.fps,
+            save_dir=save_dir,
+            episode_idx=episode_idx,
+            save_file_suffix=batch_suffix,
+        )
+    except Exception as e:
+        # A failed encode costs one episode, not the house, and must not be
+        # mistaken for a rollout failure by the caller's retry counters.
+        worker_logger.error(f"Failed to prepare episode {episode_idx} for saving: {e}")
+        traceback.print_exc()
+        prepared = None
+    finally:
+        if datagen_profiler is not None:
+            datagen_profiler.end("save_batch_prep")
+
+    return prepared
+
+
+def save_prepared_trajectories(
+    worker_logger: Any,
+    prepared_episodes: list[dict],
+    save_dir: Path,
+    exp_config: Any,
+    batch_suffix: str,
+    datagen_profiler: Any = None,
+    batch_num: int | None = None,
+    total_batches: int | None = None,
+) -> None:
+    """Write already-prepared (camera-stripped) episodes into the house's HDF5.
+
+    The back half of `save_house_trajectories`; the front half -- video encoding
+    and frame release -- has already happened per episode in
+    `flush_episode_to_disk`.
+    """
+    if not prepared_episodes:
+        worker_logger.warning(f"No trajectory data to save for {save_dir.name}")
+        return
+
+    batch_info = f" batch {batch_num}/{total_batches}" if batch_num is not None else ""
+    worker_logger.info(
+        f"Saving trajectory data for {save_dir.name}{batch_info}: "
+        f"{len(prepared_episodes)} episodes"
+    )
+
+    try:
+        t_start = time.perf_counter()
+        if datagen_profiler is not None:
+            datagen_profiler.start("save_trajectories")
+        save_trajectories(
+            prepared_episodes,
+            save_dir=save_dir,
+            fps=exp_config.fps,
+            save_file_suffix=batch_suffix,
+            save_mp4s=True,
+            logger=worker_logger,
+        )
+        if datagen_profiler is not None:
+            datagen_profiler.end("save_trajectories")
+        worker_logger.info(
+            f"Successfully saved trajectory data for {save_dir.name} "
+            f"in {time.perf_counter() - t_start:.2f}s"
+        )
+    except Exception as e:
+        worker_logger.error(f"Failed to save trajectory data for {save_dir.name}: {e}")
+        traceback.print_exc()
 
 
 class StretchRerunVisualizer:
@@ -925,6 +1039,14 @@ def stretch_house_processing_worker(
 
                 items_processed_by_worker += 1
                 trim_memory()
+                # Logged after the trim, so a footprint that keeps climbing across
+                # work items is a real leak worth chasing, while one that returns
+                # to a flat baseline is just the per-episode peak.
+                log_memory_usage(
+                    worker_logger,
+                    prefix=f"Worker {worker_id} after {items_processed_by_worker} "
+                    f"work items (house {current_house_id}): ",
+                )
 
                 if irrecoverable:
                     num_sequential_irrecoverable_failures += 1
@@ -1159,8 +1281,11 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             episode_specs, samples_per_house, exp_config
         )
 
-        house_raw_histories = []
-        house_debug_raw_histories = []
+        # Camera-stripped batched tensors, one per kept episode. The raw frames
+        # they came from are released as each episode finishes, so this list
+        # stays in the tens of megabytes rather than the tens of gigabytes.
+        house_prepared_episodes: list[dict] = []
+        house_debug_prepared_episodes: list[dict] = []
 
         num_sequential_task_sampler_failures = 0
         num_sequential_rollout_failures = 0
@@ -1169,7 +1294,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
         episode_idx = 0
         while episode_idx < max_attempts:
             should_stop = runner_class.should_stop_early(
-                len(house_raw_histories), samples_per_house, exp_config=exp_config
+                len(house_prepared_episodes), samples_per_house, exp_config=exp_config
             )
             if should_stop:
                 break
@@ -1241,7 +1366,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
                         num_sequential_task_sampler_failures = 0
                         worker_logger.info(
                             f"Worker {worker_id} house {house_id} episode {episode_idx}/{max_attempts} "
-                            f"collected={len(house_raw_histories)}/{samples_per_house}"
+                            f"collected={len(house_prepared_episodes)}/{samples_per_house}"
                         )
                 except HouseInvalidForTask as e:
                     traceback.print_exc()
@@ -1304,22 +1429,44 @@ class StretchRolloutRunner(ParallelRolloutRunner):
 
                         should_save_debug = not should_save and random.random() < 0.01
 
+                        # Encode and release this episode's frames now rather than
+                        # at the end of the house. `history` aliases the task's own
+                        # observation cache and `prepare_episode_for_saving` empties
+                        # it in place, so the frames are gone before the next
+                        # episode's scene is loaded.
                         if should_save or should_save_debug:
-                            episode_info = {
-                                "history": history,
-                                "sensor_suite": task.sensor_suite,
-                                "success": success,
-                                "seed": episode_seed,
-                            }
                             if should_save:
-                                house_raw_histories.append(episode_info)
-                            elif should_save_debug:
-                                house_debug_raw_histories.append(episode_info)
+                                target_dir = house_output_dir
+                                target_list = house_prepared_episodes
+                            else:
+                                target_dir = house_debug_dir
+                                target_list = house_debug_prepared_episodes
                                 worker_logger.info(
-                                    f"Queueing failed trajectory for debug (seed: {episode_seed})"
+                                    f"Saving failed trajectory for debug (seed: {episode_seed})"
                                 )
-                        else:
-                            del history
+
+                            prepared = flush_episode_to_disk(
+                                worker_logger,
+                                history=history,
+                                sensor_suite=task.sensor_suite,
+                                save_dir=target_dir,
+                                exp_config=exp_config,
+                                batch_suffix=batch_suffix,
+                                episode_idx=len(target_list),
+                                datagen_profiler=(
+                                    datagen_profiler if should_save else None
+                                ),
+                            )
+                            if prepared is not None:
+                                target_list.append(prepared)
+
+                        del history
+                        trim_memory()
+                        log_memory_usage(
+                            worker_logger,
+                            prefix=f"Worker {worker_id} house {house_id} "
+                            f"after episode {episode_idx}: ",
+                        )
 
                         house_total_count += 1
                         if success:
@@ -1384,11 +1531,22 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             worker_logger.info(
                 f"Worker {worker_id} house {house_id} shutdown requested, skipping save"
             )
+            # The HDF5 is what `setup_house_dirs` resumes off, so not writing it
+            # means this house batch gets redone. Videos are now written as each
+            # episode finishes rather than alongside the HDF5, so they have to be
+            # cleared too -- otherwise the re-run leaves stale MP4s behind
+            # whenever it keeps fewer episodes than this attempt did.
+            for stale_dir in (house_output_dir, house_debug_dir):
+                for stale_mp4 in Path(stale_dir).glob(f"episode_*{batch_suffix}.mp4"):
+                    try:
+                        stale_mp4.unlink()
+                    except OSError as e:
+                        worker_logger.warning(f"Could not remove partial video {stale_mp4}: {e}")
             return house_success_count, house_total_count, True
 
-        save_house_trajectories(
+        save_prepared_trajectories(
             worker_logger,
-            house_raw_histories,
+            house_prepared_episodes,
             house_output_dir,
             exp_config,
             batch_suffix,
@@ -1397,9 +1555,9 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             total_batches,
         )
 
-        save_house_trajectories(
+        save_prepared_trajectories(
             worker_logger,
-            house_debug_raw_histories,
+            house_debug_prepared_episodes,
             house_debug_dir,
             exp_config,
             batch_suffix,
@@ -1408,6 +1566,10 @@ class StretchRolloutRunner(ParallelRolloutRunner):
             total_batches=total_batches,
         )
 
+        # Drop the prepared tensors before trimming; the previous version trimmed
+        # while they were still in scope, so it could not reclaim them.
+        house_prepared_episodes.clear()
+        house_debug_prepared_episodes.clear()
         trim_memory()
 
         worker_logger.info(
