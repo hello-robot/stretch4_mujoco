@@ -31,18 +31,66 @@ from molmo_spaces.configs.robot_configs import BaseRobotConfig
 from molmo_spaces.robots.abstract import Robot
 from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
 
-# Names of the two Stretch MJCF cameras this integration exposes to policies.
-# The benchmark episodes name Franka cameras ("wrist_camera", "exo_camera_1",
-# ...), which is one of the things `episode_overrides.py` rewrites.
+# Names of the Stretch MJCF cameras this integration exposes to policies.
 HEAD_CAMERA = "head_camera"
-WRIST_CAMERA = "wrist_camera"
+WRIST_CAMERA_LEFT = "wrist_camera_left"
+WRIST_CAMERA_RIGHT = "wrist_camera_right"
+HEAD_CAMERA_LEFT = "head_camera_left"
+HEAD_CAMERA_RIGHT = "head_camera_right"
+CHASE_CAMERA = "chase_camera"
+TRACKER_CAMERA = "tracker_camera"
 
 # The corresponding camera elements in the generated MJCF. Stretch 4's head is a
 # fixed stereo + centre assembly (there is no pan/tilt joint in the SE4 URDF), so
 # the head camera is a forward-and-down view rigidly tied to the base yaw; the
-# gripper camera rides the wrist and provides the close-up view.
+# gripper cameras (left and right stereo pair) ride the wrist and provide close-up views.
+# The left and right stereo navigation cameras have wide fisheye lenses (~123° FOV).
 HEAD_CAMERA_MJCF_NAME = "camera_center_link"
 WRIST_CAMERA_MJCF_NAME = "gripper_camera_left_rgb"
+WRIST_LEFT_CAMERA_MJCF_NAME = "gripper_camera_left_rgb"
+WRIST_RIGHT_CAMERA_MJCF_NAME = "gripper_camera_right_rgb"
+HEAD_CAMERA_LEFT_MJCF_NAME = "camera_left_link"
+HEAD_CAMERA_RIGHT_MJCF_NAME = "camera_right_link"
+CHASE_CAMERA_MJCF_NAME = "chase_camera"
+
+
+def install_fisheye_distortion_hook() -> None:
+    """Hook CPUMujocoEnv.render_rgb_frame to apply fisheye distortion to nav cameras."""
+    try:
+        from molmo_spaces.env.env import CPUMujocoEnv
+    except ImportError:
+        return
+
+    if getattr(CPUMujocoEnv, "_stretch_fisheye_hooked", False):
+        return
+
+    _orig_render_rgb_frame = CPUMujocoEnv.render_rgb_frame
+
+    def _distorted_render_rgb_frame(self: Any, camera_name: str) -> Any:
+        frame = _orig_render_rgb_frame(self, camera_name)
+        if frame is None:
+            return frame
+        try:
+            from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+
+            if camera_name in (HEAD_CAMERA_LEFT, HEAD_CAMERA_LEFT_MJCF_NAME, "cam_nav_rgb_se4_left"):
+                cb = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
+                if cb is not None:
+                    return cb(frame)
+            elif camera_name in (HEAD_CAMERA_RIGHT, HEAD_CAMERA_RIGHT_MJCF_NAME, "cam_nav_rgb_se4_right"):
+                cb = StretchCameras.cam_nav_rgb_se4_right.post_processing_callback
+                if cb is not None:
+                    return cb(frame)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Error applying fisheye distortion to {camera_name}: {e}")
+        return frame
+
+    CPUMujocoEnv.render_rgb_frame = _distorted_render_rgb_frame
+    CPUMujocoEnv._stretch_fisheye_hooked = True
+
+
+install_fisheye_distortion_hook()
 
 
 @lru_cache(maxsize=1)
@@ -78,15 +126,14 @@ def default_stretch_robot_xml_path() -> Path:
 
 
 class Stretch4CameraSystem(CameraSystemConfig):
-    """Head + wrist views, taken straight from the cameras in the Stretch MJCF.
+    """Head + wrist + left/right fisheye views from the Stretch MJCF.
 
     Using `MjcfCameraConfig` rather than `RobotMountedCameraConfig` means the
     camera extrinsics come from the robot model itself, so a simulated view lines
-    up with what the corresponding camera sees on hardware. `fov=None` makes the
-    camera manager fall back to the MJCF's own `fovy`.
+    up with what the corresponding camera sees on hardware.
     """
 
-    img_resolution: tuple[int, int] = (224, 224)
+    img_resolution: tuple[int, int] = (640, 368)
     cameras: list[Any] = [
         MjcfCameraConfig(
             name=HEAD_CAMERA,
@@ -95,10 +142,28 @@ class Stretch4CameraSystem(CameraSystemConfig):
             fov=None,
         ),
         MjcfCameraConfig(
-            name=WRIST_CAMERA,
-            mjcf_name=WRIST_CAMERA_MJCF_NAME,
+            name=WRIST_CAMERA_LEFT,
+            mjcf_name=WRIST_LEFT_CAMERA_MJCF_NAME,
             robot_namespace="robot_0/",
             fov=None,
+        ),
+        MjcfCameraConfig(
+            name=WRIST_CAMERA_RIGHT,
+            mjcf_name=WRIST_RIGHT_CAMERA_MJCF_NAME,
+            robot_namespace="robot_0/",
+            fov=None,
+        ),
+        MjcfCameraConfig(
+            name=HEAD_CAMERA_LEFT,
+            mjcf_name=HEAD_CAMERA_LEFT_MJCF_NAME,
+            robot_namespace="robot_0/",
+            fov=123.39,
+        ),
+        MjcfCameraConfig(
+            name=HEAD_CAMERA_RIGHT,
+            mjcf_name=HEAD_CAMERA_RIGHT_MJCF_NAME,
+            robot_namespace="robot_0/",
+            fov=123.20,
         ),
     ]
 

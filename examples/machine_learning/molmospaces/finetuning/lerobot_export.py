@@ -62,7 +62,13 @@ from examples.machine_learning.molmospaces.policies.networks import (
     encode_action,
     encode_state,
 )
-from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA
+from examples.machine_learning.molmospaces.stretch.config import (
+    HEAD_CAMERA,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA_RIGHT,
+    WRIST_CAMERA_LEFT,
+    WRIST_CAMERA_RIGHT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +85,10 @@ VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_inde
 
 CAMERA_FEATURE_NAMES = {
     HEAD_CAMERA: "observation.images.head",
-    WRIST_CAMERA: "observation.images.wrist",
+    WRIST_CAMERA_LEFT: "observation.images.wrist_left",
+    WRIST_CAMERA_RIGHT: "observation.images.wrist_right",
+    HEAD_CAMERA_LEFT: "observation.images.head_left",
+    HEAD_CAMERA_RIGHT: "observation.images.head_right",
 }
 """MolmoSpaces camera name -> LeRobot feature key."""
 
@@ -179,13 +188,22 @@ class _StretchSpaceEncoder:
         return encode_action(commanded, base_xytheta)
 
 
+DEFAULT_CAMERA_NAMES: tuple[str, ...] = (
+    HEAD_CAMERA,
+    WRIST_CAMERA_LEFT,
+    WRIST_CAMERA_RIGHT,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA_RIGHT,
+)
+
+
 def export_lerobot_dataset(
     rollout_dirs: list[Path],
     output_dir: Path,
     action_space: str = "stretch",
     successful_only: bool = True,
     fps: float = 15.0,
-    camera_names: tuple[str, ...] = (HEAD_CAMERA, WRIST_CAMERA),
+    camera_names: tuple[str, ...] | None = None,
     validate: bool = False,
 ) -> ExportMetadata:
     """Convert recorded rollouts into a LeRobot-format dataset.
@@ -201,6 +219,7 @@ def export_lerobot_dataset(
             rollouts were recorded at (`policy_dt_ms`), or every timestamp in
             the dataset is wrong.
         camera_names: MolmoSpaces cameras to include, in `CAMERA_FEATURE_NAMES`.
+            If None, auto-detects all available camera videos from rollout_dirs.
         validate: after writing, try to open the result with an installed
             `lerobot` and report what it says.
 
@@ -211,6 +230,15 @@ def export_lerobot_dataset(
 
     if action_space not in ACTION_SPACES:
         raise ValueError(f"action_space must be one of {ACTION_SPACES}, got {action_space!r}")
+
+    if camera_names is None:
+        detected = []
+        for cam in DEFAULT_CAMERA_NAMES:
+            for r_dir in rollout_dirs:
+                if list(Path(r_dir).rglob(f"*_{cam}_*.mp4")) or list(Path(r_dir).rglob(f"*_{cam}.mp4")):
+                    detected.append(cam)
+                    break
+        camera_names = tuple(detected) if detected else DEFAULT_CAMERA_NAMES
 
     output_dir = Path(output_dir)
     (output_dir / "meta").mkdir(parents=True, exist_ok=True)

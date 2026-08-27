@@ -32,7 +32,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA
+from examples.machine_learning.molmospaces.stretch.config import (
+    HEAD_CAMERA,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA_RIGHT,
+    WRIST_CAMERA_LEFT,
+)
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.policy.base_policy import BasePolicy, PolicyFactory
 from molmo_spaces.utils.function_utils import make_lenient
@@ -106,13 +111,17 @@ class StretchMolmoBotPolicyConfig(BasePolicyConfig):
     execute_horizon: int = 8
     """Steps executed before re-querying. Also MolmoBot's default."""
 
-    camera_names: list[str] = [HEAD_CAMERA, WRIST_CAMERA]
+    camera_names: list[str] = [
+        HEAD_CAMERA,
+        WRIST_CAMERA_LEFT,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+    ]
     """
     Cameras to feed, in order.
 
-    Stretch's own two, which is the whole advantage of fine-tuning: the model
-    sees the cameras it was trained on, rather than a head camera standing in for
-    the two fixed shoulder views a DROID-trained model expects.
+    Defaults to all four Stretch 4 camera viewpoints (head center, wrist, head left fisheye,
+    head right fisheye).
     """
 
     action_move_group_names: list[str] = list(STRETCH_ACTION_SPEC)

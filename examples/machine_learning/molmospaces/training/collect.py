@@ -34,7 +34,7 @@ from pathlib import Path
 
 import click
 
-from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA
+from examples.machine_learning.molmospaces.stretch.config import HEAD_CAMERA, WRIST_CAMERA_LEFT
 from examples.machine_learning.molmospaces.training.dataset import build_dataset
 
 log = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def collect_demonstrations(
     build_dataset(
         run_dirs=[Path(directory) for directory in rollout_dirs],
         output_dir=output_dir,
-        camera_names=[HEAD_CAMERA, WRIST_CAMERA],
+        camera_names=[HEAD_CAMERA, WRIST_CAMERA_LEFT],
         successful_only=successful_only,
     )
     return output_dir

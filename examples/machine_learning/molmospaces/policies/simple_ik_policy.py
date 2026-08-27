@@ -72,7 +72,7 @@ log = logging.getLogger(__name__)
 
 # Joint arrival threshold for a joint-space waypoint, in radians (and metres for
 # the prismatic groups, which are the same order of magnitude here).
-_JOINT_ARRIVAL_TOLERANCE_RAD = 0.05
+_JOINT_ARRIVAL_TOLERANCE_RAD = 0.08
 
 PICK_TASK_CLASSES = frozenset(
     {
@@ -305,7 +305,7 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
     real gripper uses, and it needs no estimate.
     """
 
-    unstow_clearance_m: float = 2.25
+    unstow_clearance_m: float = 0.3
     """
     How far above the grasp to swing the arm out of its stowed pose.
 
@@ -431,8 +431,8 @@ class StretchSimpleIKPolicyConfig(BasePolicyConfig):
         ), f"grasp_style must be 'horizontal' or 'top_down', got {self.grasp_style!r}"
 
 
-TCP_TO_FINGERTIP_EDGE_M: float = 0.035
-PITCH_RAMP_STEP_RAD: float = 0.03
+TCP_TO_FINGERTIP_EDGE_M: float = 0.025
+PITCH_RAMP_STEP_RAD: float = 0.05
 ARM_RAMP_STEP_M: float = 0.005
 
 
@@ -447,9 +447,12 @@ class StretchSimpleIKPolicy(BasePolicy):
         self._steps_in_waypoint = 0
         self._settled_steps = 0
         self._grasp_offset: np.ndarray | None = None
+        self._grasp_target_rel_obj: np.ndarray | None = None
+        self._grasp_init_tcp_dist: float = 0.0
         self._grasp_lost = False
         self._grip_hold: float | None = None
         self._grasp: ToolGrasp | None = None
+        self._last_action: dict[str, np.ndarray] | None = None
 
     # =========================================================================
     # BasePolicy
@@ -461,9 +464,12 @@ class StretchSimpleIKPolicy(BasePolicy):
         self._steps_in_waypoint = 0
         self._settled_steps = 0
         self._grasp_offset = None
+        self._grasp_target_rel_obj = None
+        self._grasp_init_tcp_dist = 0.0
         self._grasp_lost = False
         self._grip_hold = None
         self._grasp = None
+        self._last_action = None
 
     def get_info(self) -> dict:
         return {
@@ -493,17 +499,16 @@ class StretchSimpleIKPolicy(BasePolicy):
 
         robot_view = self.task.env.current_robot.robot_view
         if self._waypoint_index >= len(self._plan):
-            # Hold still, but keep the grip the plan finished with. The generic
-            # noop re-derives open-versus-closed from how far apart the fingers
-            # currently are (`GripperGroup.noop_ctrl` -> `is_open`), and anything
-            # held wider than the midpoint of their range reads as "open" -- so a
-            # bowl or a book gets released the moment the plan runs out. Success
-            # is judged at the last step of the episode, hundreds of noop steps
-            # later, which is exactly when that matters.
+            # Hold still, but keep the commanded configuration and grip the plan finished with.
             action = robot_view.get_noop_ctrl_dict()
+            if self._last_action is not None:
+                for group in ("base", "lift", "arm", "wrist"):
+                    if group in self._last_action:
+                        action[group] = self._last_action[group].copy()
             if self._plan:
                 finger_target = self._finger_target(self._plan[-1])
                 action["gripper"] = np.array([finger_target, finger_target])
+            action["done"] = True
             return action
 
         waypoint = self._plan[self._waypoint_index]
@@ -520,6 +525,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             # scores the episode a failure on its merits.
             return {**robot_view.get_noop_ctrl_dict(), "done": True}
 
+        self._last_action = {k: (v.copy() if hasattr(v, "copy") else v) for k, v in action.items()}
         return action
 
     # =========================================================================
@@ -544,7 +550,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             return action
 
         base_pose = self.task.env.current_robot.robot_view.base.pose
-        log.info(f"Executing {waypoint.label=}, {base_pose=}, {waypoint=}")
+        # log.info(f"Executing {waypoint.label=}, {base_pose=}, {waypoint=}")
         solution = self._solver.solve(
             base_pose,
             waypoint.position,
@@ -563,7 +569,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             # Out of reach. If executing the lift waypoint, raise the lift joint directly.
             if waypoint.label == "lift":
                 lift_max = float(self._solver.joint_limits["lift"][0, 1])
-                wrist_pitch_max = float(self._solver.joint_limits["wrist"][1, 1])
+                wrist_pitch_min = float(self._solver.joint_limits["wrist"][1, 0])
                 arm_min = float(self._solver.joint_limits["arm"][0, 0])
 
                 lift_target = min(float(current["lift"][0]) + policy_config.lift_height_m, lift_max)
@@ -573,10 +579,10 @@ class StretchSimpleIKPolicy(BasePolicy):
                 # pitch wrist up to lift the object, and retract arm slightly to clear obstacles.
                 lift_headroom = lift_max - float(current["lift"][0])
                 wrist_action = current["wrist"].copy()
-                if lift_headroom < policy_config.lift_height_m * 0.9:
-                    target_pitch = min(float(current["wrist"][1]) + 0.5, wrist_pitch_max)
+                if lift_headroom < policy_config.lift_height_m * 0.7:
+                    target_pitch = max(waypoint.wrist_pitch - (np.pi / 2), wrist_pitch_min)
                     target_arm = max(float(current["arm"][0]) - 0.08, arm_min)
-                    wrist_action[1] = min(float(current["wrist"][1]) + PITCH_RAMP_STEP_RAD, target_pitch)
+                    wrist_action[1] = max(float(current["wrist"][1]) - PITCH_RAMP_STEP_RAD, target_pitch)
                     action["arm"] = np.array([max(float(current["arm"][0]) - ARM_RAMP_STEP_M, target_arm)])
                 else:
                     action["arm"] = current["arm"].copy()
@@ -599,13 +605,14 @@ class StretchSimpleIKPolicy(BasePolicy):
         # If lift headroom is constrained for tall objects, pitch wrist up and retract arm smoothly
         if waypoint.label == "lift":
             lift_max = float(self._solver.joint_limits["lift"][0, 1])
-            wrist_pitch_max = float(self._solver.joint_limits["wrist"][1, 1])
+            wrist_pitch_min = float(self._solver.joint_limits["wrist"][1, 0])
             arm_min = float(self._solver.joint_limits["arm"][0, 0])
             lift_headroom = lift_max - float(current["lift"][0])
-            if lift_headroom < policy_config.lift_height_m * 0.9:
-                target_pitch = min(float(action["wrist"][1]) + 0.5, wrist_pitch_max)
+            if lift_headroom < policy_config.lift_height_m * 0.7:
+                action["lift"] = np.array([lift_max])
+                target_pitch = max(waypoint.wrist_pitch - (np.pi / 2), wrist_pitch_min)
                 target_arm = max(float(action["arm"][0]) - 0.08, arm_min)
-                action["wrist"][1] = min(float(current["wrist"][1]) + PITCH_RAMP_STEP_RAD, target_pitch)
+                action["wrist"][1] = max(float(current["wrist"][1]) - PITCH_RAMP_STEP_RAD, target_pitch)
                 action["arm"] = np.array([max(float(current["arm"][0]) - ARM_RAMP_STEP_M, target_arm)])
         return action
 
@@ -637,8 +644,12 @@ class StretchSimpleIKPolicy(BasePolicy):
         either_touch = left_touch or right_touch
 
         if self._grip_hold is None and (both_touch or (either_touch and abs(current - closed) < 0.15)):
-            self._grip_hold = current + inward * policy_config.grasp_hold_preload_rad
+            self._grip_hold = current + inward * max(policy_config.grasp_hold_preload_rad, 0.04)
         if self._grip_hold is not None:
+            # If contact is lost while holding, keep applying closing pressure to maintain grasp
+            if not (left_touch or right_touch) and abs(current - closed) > 0.02:
+                stepped = current + inward * policy_config.grasp_close_step_rad
+                return float(np.clip(stepped, min(closed, opened), max(closed, opened)))
             return float(np.clip(self._grip_hold, min(closed, opened), max(closed, opened)))
 
         stepped = current + inward * policy_config.grasp_close_step_rad
@@ -686,6 +697,46 @@ class StretchSimpleIKPolicy(BasePolicy):
                 body = model.body_parentid[body]
         return left_touch, right_touch
 
+    def _joint_group_reached(
+        self, group: str, move_group, target: np.ndarray, tolerance: float
+    ) -> bool:
+        """Whether a move group has reached its target configuration in joint space."""
+        pos = np.asarray(move_group.joint_pos, dtype=float).ravel()
+        tgt = np.asarray(target, dtype=float).ravel()
+        err = np.abs(pos - tgt)
+
+        vel = getattr(move_group, "joint_vel", None)
+        is_settled = False
+        if vel is not None:
+            v = np.asarray(vel, dtype=float).ravel()
+            is_settled = bool(np.max(np.abs(v)) < 0.05)
+
+        if group == "wrist":
+            # Wrist yaw only needs to unwind from stowed (~3.14 rad) to near forward (<0.25 rad),
+            # pitch and roll have ~0.15 rad tolerance.
+            tolerances = np.array([0.25, 0.15, 0.15])[: len(err)]
+            if np.all(err <= tolerances):
+                return True
+            if is_settled and np.all(err <= tolerances * 1.5):
+                return True
+            return False
+        elif group == "lift":
+            tol = max(tolerance, 0.08)
+            if np.all(err <= tol):
+                return True
+            if is_settled and np.all(err <= tol * 1.25):
+                return True
+            return False
+        elif group == "arm":
+            tol = max(tolerance, 0.05)
+            if np.all(err <= tol):
+                return True
+            if is_settled and np.all(err <= tol * 1.5):
+                return True
+            return False
+
+        return bool(np.all(err <= tolerance) or (is_settled and np.all(err <= tolerance * 1.5)))
+
     def _advance(self, waypoint: Waypoint, robot_view) -> None:
         """Move to the next waypoint once this one is reached, settled or timed out."""
         self._steps_in_waypoint += 1
@@ -694,19 +745,32 @@ class StretchSimpleIKPolicy(BasePolicy):
             reached = float(np.linalg.norm(tool_position - waypoint.position)) <= waypoint.tolerance
         else:
             # A joint-space waypoint is about the configuration, so arrival is
-            # measured there; the tool is wherever that configuration puts it.
+            # measured per group with appropriate joint tolerances and steady-state checks.
             reached = all(
-                float(
-                    np.max(
-                        np.abs(
-                            np.ravel(robot_view.get_move_group(group).joint_pos)
-                            - np.ravel(target)
-                        )
-                    )
+                self._joint_group_reached(
+                    group,
+                    robot_view.get_move_group(group),
+                    target,
+                    waypoint.tolerance,
                 )
-                <= _JOINT_ARRIVAL_TOLERANCE_RAD
                 for group, target in waypoint.joint_targets.items()
             )
+
+        if waypoint.label == "lift":
+            lift_max = float(self._solver.joint_limits["lift"][0, 1])
+            wrist_pitch_min = float(self._solver.joint_limits["wrist"][1, 0])
+            current_qpos = robot_view.get_qpos_dict()
+            lift_headroom = lift_max - float(current_qpos["lift"][0])
+            if lift_headroom < self.config.policy_config.lift_height_m * 0.7:
+                target_pitch = max(waypoint.wrist_pitch - (np.pi / 2), wrist_pitch_min)
+                lift_done = float(current_qpos["lift"][0]) >= lift_max - 0.03
+                pitch_done = abs(float(current_qpos["wrist"][1]) - target_pitch) < 0.10
+                reached = lift_done or pitch_done
+            else:
+                dist = float(np.linalg.norm(tool_position - waypoint.position))
+                lift_elevated = tool_position[2] >= waypoint.position[2] - 0.04
+                lateral_close = float(np.linalg.norm(tool_position[:2] - waypoint.position[:2])) <= 0.06
+                reached = (dist <= max(waypoint.tolerance, 0.075)) or (lift_elevated and lateral_close)
 
         if waypoint.establishes_grasp:
             # A grasp-closing waypoint is only reached once both fingers have made
@@ -727,46 +791,154 @@ class StretchSimpleIKPolicy(BasePolicy):
 
         if (reached and self._settled_steps > waypoint.settle_steps) or timed_out:
             if timed_out and not reached:
-                log.info(
-                    f"[stretch-simple-ik] waypoint '{waypoint.label}' timed out "
-                    f"{float(np.linalg.norm(tool_position - waypoint.position)):.3f}m short"
-                )
+                if waypoint.joint_targets is not None:
+                    log.info(f"[stretch-simple-ik] waypoint '{waypoint.label}' timed out in joint space")
+                elif waypoint.label == "lift" and lift_headroom < self.config.policy_config.lift_height_m * 0.7:
+                    log.info(
+                        f"[stretch-simple-ik] waypoint 'lift' finished pitch-up lift "
+                        f"(lift={float(current_qpos['lift'][0]):.3f}m, pitch={float(current_qpos['wrist'][1]):.3f}rad)"
+                    )
+                else:
+                    log.info(
+                        f"[stretch-simple-ik] waypoint '{waypoint.label}' timed out "
+                        f"{float(np.linalg.norm(tool_position - waypoint.position)):.3f}m short"
+                    )
             if waypoint.establishes_grasp:
-                self._grasp_offset = self._tool_to_object_offset(tool_position)
-            elif waypoint.verify_grasp and not self._grasp_still_held(tool_position):
+                self._record_grasp_state(robot_view, waypoint)
+            elif waypoint.verify_grasp and not self._grasp_still_held(robot_view):
                 self._grasp_lost = True
 
             self._waypoint_index += 1
             self._steps_in_waypoint = 0
             self._settled_steps = 0
 
-    def _tool_to_object_offset(self, tool_position: np.ndarray) -> np.ndarray | None:
-        """Where the pickup object sits relative to the tool, right now."""
-        object_position = self._object_grasp_point(self.config.task_config.pickup_obj_name)
+    def _object_pose(self, object_name: str | None) -> tuple[np.ndarray, np.ndarray] | None:
+        """Returns (position_3, rotation_3x3) of the object in world coordinates."""
+        if not object_name:
+            return None
+        task = getattr(self, "task", None)
+        environment = getattr(task, "env", None)
+        if environment is None:
+            return None
+        object_managers = getattr(environment, "object_managers", None)
+        if not object_managers:
+            return None
+        current_batch_index = getattr(environment, "current_batch_index", 0)
+        if current_batch_index >= len(object_managers):
+            return None
+        scene_object = object_managers[current_batch_index].get_object_by_name(object_name)
+        if scene_object is None:
+            return None
+
+        model = getattr(environment, "current_model", None)
+        data = getattr(environment, "current_data", None)
+        if model is not None and data is not None and hasattr(scene_object, "body_id"):
+            body_id = scene_object.body_id
+            pos = np.asarray(data.xpos[body_id], dtype=float).copy()
+            rot = np.asarray(data.xmat[body_id], dtype=float).reshape(3, 3).copy()
+            return pos, rot
+
+        pos = getattr(scene_object, "position", None)
+        if pos is not None:
+            pos = np.asarray(pos, dtype=float).copy()
+            quat = getattr(scene_object, "quat", None)
+            if quat is not None:
+                from scipy.spatial.transform import Rotation as R
+
+                rot = R.from_quat(quat, scalar_first=True).as_matrix()
+            else:
+                rot = np.eye(3)
+            return pos, rot
+        return None
+
+    def _record_grasp_state(self, robot_view, waypoint: Waypoint) -> None:
+        """Record the target grasp pose in object local coordinates and TCP offset."""
+        if hasattr(robot_view, "get_move_group"):
+            tool_pose = robot_view.get_move_group("gripper").leaf_frame_to_world
+            tcp_pos = np.asarray(tool_pose[:3, 3], dtype=float)
+            tcp_rot = np.asarray(tool_pose[:3, :3], dtype=float)
+        else:
+            tcp_pos = np.asarray(robot_view, dtype=float)
+            tcp_rot = np.eye(3)
+
+        target_pos = (
+            np.asarray(self._grasp.position, dtype=float)
+            if self._grasp is not None
+            else np.asarray(waypoint.position, dtype=float)
+        )
+
+        reach_dist = float(np.linalg.norm(tcp_pos - target_pos))
+        log.info(
+            f"[stretch-simple-ik] grasp established: TCP distance to target pose is {reach_dist:.3f}m"
+        )
+
+        pickup_obj_name = getattr(getattr(self.config, "task_config", None), "pickup_obj_name", None)
+        obj_pose = self._object_pose(pickup_obj_name)
+        if obj_pose is not None:
+            obj_pos, obj_rot = obj_pose
+            # Target pose in object local frame:
+            self._grasp_target_rel_obj = obj_rot.T @ (target_pos - obj_pos)
+            self._grasp_init_tcp_dist = reach_dist
+            self._grasp_offset = tcp_rot.T @ (obj_pos - tcp_pos)
+        else:
+            self._grasp_target_rel_obj = None
+            self._grasp_init_tcp_dist = reach_dist
+            self._grasp_offset = self._tool_to_object_offset(robot_view)
+
+    def _tool_to_object_offset(self, robot_view_or_pos) -> np.ndarray | None:
+        """Where the pickup object sits relative to the tool frame (in tool local coordinates)."""
+        pickup_obj_name = getattr(getattr(self.config, "task_config", None), "pickup_obj_name", None)
+        object_position = self._object_grasp_point(pickup_obj_name)
         if object_position is None:
             return None
-        return np.asarray(object_position, dtype=float) - np.asarray(tool_position, dtype=float)
+        if hasattr(robot_view_or_pos, "get_move_group"):
+            tool_pose = robot_view_or_pos.get_move_group("gripper").leaf_frame_to_world
+            r_tool = tool_pose[:3, :3]
+            p_tool = tool_pose[:3, 3]
+            return r_tool.T @ (np.asarray(object_position, dtype=float) - p_tool)
+        return np.asarray(object_position, dtype=float) - np.asarray(robot_view_or_pos, dtype=float)
 
-    def _grasp_still_held(self, tool_position: np.ndarray) -> bool:
+    def _grasp_still_held(self, robot_view_or_pos) -> bool:
         """Whether the object has travelled with the tool since the fingers closed.
 
         Reaching the lift waypoint says only that the *arm* got there. The object
-        is held if and only if it kept its place relative to the tool, so that
-        offset is what gets compared -- not the object's height, which also rises
-        when the fingers merely shove it up a slope, and not contact, which a
-        brush registers as firmly as a grip.
-
-        Unknowable cases count as held: a task with no pickup object, or one
-        where the grasp offset was never captured, has nothing to fail here and
-        should be left to the task's own success criterion.
+        is held if and only if the distance between the TCP and the target pose on
+        the object has not drifted out of tolerance.
         """
-        if self._grasp_offset is None:
+        pickup_obj_name = getattr(getattr(self.config, "task_config", None), "pickup_obj_name", None)
+        if hasattr(robot_view_or_pos, "get_move_group"):
+            tool_pose = robot_view_or_pos.get_move_group("gripper").leaf_frame_to_world
+            tcp_pos_now = np.asarray(tool_pose[:3, 3], dtype=float)
+        else:
+            tcp_pos_now = np.asarray(robot_view_or_pos, dtype=float)
+
+        grasp_target_rel_obj = getattr(self, "_grasp_target_rel_obj", None)
+        grasp_init_tcp_dist = getattr(self, "_grasp_init_tcp_dist", 0.0)
+        if pickup_obj_name is not None and grasp_target_rel_obj is not None:
+            obj_pose = self._object_pose(pickup_obj_name)
+            if obj_pose is not None:
+                obj_pos_now, obj_rot_now = obj_pose
+                target_world_now = obj_pos_now + obj_rot_now @ grasp_target_rel_obj
+                current_dist = float(np.linalg.norm(tcp_pos_now - target_world_now))
+                drift = abs(current_dist - grasp_init_tcp_dist)
+                if drift > self.config.policy_config.grasp_slip_tolerance_m:
+                    log.info(
+                        f"[stretch-simple-ik] grasp lost: distance between TCP and object target drifted "
+                        f"{drift:.3f}m during the lift (current: {current_dist:.3f}m, "
+                        f"init: {grasp_init_tcp_dist:.3f}m, tolerance: "
+                        f"{self.config.policy_config.grasp_slip_tolerance_m:.3f}m)"
+                    )
+                    return False
+                return True
+
+        grasp_offset = getattr(self, "_grasp_offset", None)
+        if grasp_offset is None:
             return True
-        offset = self._tool_to_object_offset(tool_position)
+        offset = self._tool_to_object_offset(robot_view_or_pos)
         if offset is None:
             return True
 
-        drift = float(np.linalg.norm(offset - self._grasp_offset))
+        drift = float(np.linalg.norm(offset - grasp_offset))
         if drift > self.config.policy_config.grasp_slip_tolerance_m:
             log.info(
                 f"[stretch-simple-ik] grasp lost: object drifted {drift:.3f}m out of the "
@@ -866,7 +1038,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 settle_steps=policy_config.gripper_settle_steps,
                 verify_grasp=True,
                 grip_width_m=grip_width,
-                tolerance=policy_config.reach_tolerance_m,
+                tolerance=policy_config.reach_tolerance_m * 2.5,
                 **orientation,
             ),
         ]
@@ -1056,25 +1228,105 @@ class StretchSimpleIKPolicy(BasePolicy):
             yaw_spread=0.0 if grasp.authored else APPROACH_YAW_SPREAD_RAD,
         )
 
+    def _object_bounds(self, object_name: str | None) -> tuple[np.ndarray, np.ndarray] | None:
+        """World-space axis-aligned bounding box (min_bound, max_bound) of object_name."""
+        if not object_name:
+            return None
+        environment = self.task.env
+        object_managers = getattr(environment, "object_managers", None)
+        if not object_managers:
+            return None
+        current_batch_index = getattr(environment, "current_batch_index", 0)
+        scene_object = object_managers[current_batch_index].get_object_by_name(object_name)
+        if scene_object is None:
+            return None
+
+        model = getattr(environment, "current_model", None)
+        data = getattr(environment, "current_data", None)
+        if model is not None and data is not None and hasattr(scene_object, "body_id"):
+            try:
+                from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
+
+                geoms = descendant_geoms(model, scene_object.body_id)
+            except Exception:
+                geoms = None
+
+            if geoms is not None and len(geoms) > 0:
+                signs = np.array(
+                    [[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)], dtype=float
+                )
+                all_corners = []
+                for geom_id in geoms:
+                    if hasattr(model, "geom_aabb") and geom_id < len(model.geom_aabb):
+                        centre, half_extent = (
+                            model.geom_aabb[geom_id][:3],
+                            model.geom_aabb[geom_id][3:],
+                        )
+                        corners = centre + signs * half_extent
+                        world_corners = data.geom_xpos[geom_id] + corners @ np.asarray(
+                            data.geom_xmat[geom_id]
+                        ).reshape(3, 3).T
+                        all_corners.append(world_corners)
+                if all_corners:
+                    all_corners = np.vstack(all_corners)
+                    return np.min(all_corners, axis=0), np.max(all_corners, axis=0)
+
+        # Fallback to scene_object position and aabb_size if model geoms not available
+        pos = getattr(scene_object, "position", None)
+        aabb = getattr(scene_object, "aabb_size", None)
+        if pos is not None and aabb is not None:
+            pos = np.asarray(pos, dtype=float)
+            half = np.asarray(aabb, dtype=float) * 0.5
+            return pos - half, pos + half
+
+        return None
+
+    def _is_grasp_within_bounds(
+        self,
+        object_name: str | None,
+        grasp_position: np.ndarray,
+        xy_margin: float = 0.04,
+        z_top_margin: float = 0.04,
+        z_bottom_margin: float = 0.005,
+    ) -> bool:
+        """Check whether the grasp target is within the object's envelope and not underneath it."""
+        bounds = self._object_bounds(object_name)
+        if bounds is None:
+            return True
+        min_bound, max_bound = bounds
+        pos = np.asarray(grasp_position, dtype=float)
+
+        # Target must not be underneath the object / table surface
+        if pos[2] < min_bound[2] - z_bottom_margin:
+            log.info(
+                f"[stretch-simple-ik] rejected grasp candidate: z ({pos[2]:.3f}m) is underneath "
+                f"object minimum height ({min_bound[2]:.3f}m)"
+            )
+            return False
+
+        # Target must be within lateral (XY) and upper vertical (Z) envelope
+        if (
+            pos[0] < min_bound[0] - xy_margin
+            or pos[0] > max_bound[0] + xy_margin
+            or pos[1] < min_bound[1] - xy_margin
+            or pos[1] > max_bound[1] + xy_margin
+            or pos[2] > max_bound[2] + z_top_margin
+        ):
+            log.info(
+                f"[stretch-simple-ik] rejected grasp candidate: position {pos} is out of bounds "
+                f"for object bounds [{min_bound}, {max_bound}] (margins xy={xy_margin}m, z={z_top_margin}m)"
+            )
+            return False
+
+        return True
+
     def _object_height(self, scene_object) -> float:
         """Vertical bounding height of the object in world coordinates."""
-        environment = self.task.env
-        model, data = environment.current_model, environment.current_data
-        body_id = scene_object.body_id
-        z_min = float("inf")
-        z_max = float("-inf")
-        found = False
-        for gid in range(model.ngeom):
-            bid = model.geom_bodyid[gid]
-            if bid == body_id or model.body_rootid[bid] == body_id:
-                found = True
-                pos_z = float(data.geom_xpos[gid][2])
-                size = model.geom(gid).size
-                extent_z = float(size[2] if len(size) > 2 else size[0])
-                z_min = min(z_min, pos_z - extent_z)
-                z_max = max(z_max, pos_z + extent_z)
-        if found and z_max > z_min:
-            return z_max - z_min
+        name = getattr(scene_object, "name", None)
+        if name is not None:
+            bounds = self._object_bounds(name)
+            if bounds is not None:
+                return float(bounds[1][2] - bounds[0][2])
 
         try:
             aabb = scene_object.aabb_size
@@ -1109,7 +1361,7 @@ class StretchSimpleIKPolicy(BasePolicy):
         if object_name == self.config.task_config.pickup_obj_name:
             height = self._object_height(scene_object)
             if height < TCP_TO_FINGERTIP_EDGE_M:
-                offset_z = TCP_TO_FINGERTIP_EDGE_M - (height * 0.5)
+                offset_z = TCP_TO_FINGERTIP_EDGE_M #- (height * 0.25)
                 pos[2] += offset_z
                 log.info(
                     f"[stretch-simple-ik] object {object_name!r} height ({height:.3f}m) < "
@@ -1261,16 +1513,36 @@ class StretchSimpleIKPolicy(BasePolicy):
                 )
             )
 
-        # Sort by descending pitch: top-down (pitch ~ pi/2) first, horizontal last.
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        bounds = self._object_bounds(object_name)
+        is_tall_object = False
+        if bounds is not None:
+            object_height = float(bounds[1][2] - bounds[0][2])
+            is_tall_object = object_height > 0.15  # taller than 150 mm
+
+        if is_tall_object:
+            # For objects taller than 150 mm, search pitch angles starting at 45 deg down:
+            # 45 deg -> 0 deg first (descending), then 90 deg -> 45 deg (descending).
+            def tall_sort_key(item: tuple[float, ToolGrasp]):
+                pitch = item[0]
+                is_high_pitch = 1 if pitch > (np.pi / 4 + 1e-4) else 0
+                return (is_high_pitch, -pitch)
+
+            candidates.sort(key=tall_sort_key)
+        else:
+            # Sort by descending pitch: top-down (pitch ~ pi/2) first, horizontal last.
+            candidates.sort(key=lambda item: item[0], reverse=True)
 
         unreachable = 0
         too_wide = 0
+        no_geometry = 0
         for pitch, candidate in candidates:
             width = self._object_grasp_width(
                 object_name, candidate.closing_axis, candidate.position
             )
-            if width is not None and width >= open_width:
+            if width is None:
+                no_geometry += 1
+                continue
+            if width >= open_width:
                 too_wide += 1
                 continue
             if self._solve_at(base_pose, candidate.position, candidate) is None:
@@ -1280,7 +1552,7 @@ class StretchSimpleIKPolicy(BasePolicy):
                 f"[stretch-simple-ik] grasping at an authored grasp "
                 f"{float(np.linalg.norm(candidate.position - origin)):.3f}m from the object "
                 f"origin, pitch {candidate.wrist_pitch:+.2f} roll {candidate.wrist_roll:+.2f} "
-                f"(rejected {too_wide} too wide, {unreachable} unreachable)"
+                f"(rejected {too_wide} too wide, {unreachable} unreachable, {no_geometry} no geometry)"
             )
             return candidate
 
@@ -1328,8 +1600,20 @@ class StretchSimpleIKPolicy(BasePolicy):
         poses = np.asarray(poses, dtype=float).copy()
         height = self._object_height(scene_object)
         if height < TCP_TO_FINGERTIP_EDGE_M:
-            offset_z = TCP_TO_FINGERTIP_EDGE_M - (height * 0.5)
+            offset_z = TCP_TO_FINGERTIP_EDGE_M #- (height * 0.25)
             poses[:, 2, 3] += offset_z
+
+        valid_mask = [
+            self._is_grasp_within_bounds(object_name, pose[:3, 3])
+            for pose in poses
+        ]
+        poses = poses[valid_mask]
+        if len(poses) == 0:
+            log.info(
+                f"[stretch-simple-ik] all authored grasps for {object_name!r} were out of bounds "
+                f"or underneath the object"
+            )
+            return None
 
         policy_config = self.config.policy_config
         tool_position = self.task.env.current_robot.robot_view.get_move_group(

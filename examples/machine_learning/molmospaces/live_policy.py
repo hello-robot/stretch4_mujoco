@@ -46,9 +46,15 @@ from examples.machine_learning.molmospaces.policies.checkpoint import TrainedPol
 from examples.machine_learning.molmospaces.policies.networks import STATE_GROUPS
 from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA_LEFT_MJCF_NAME,
     HEAD_CAMERA_MJCF_NAME,
-    WRIST_CAMERA,
-    WRIST_CAMERA_MJCF_NAME,
+    HEAD_CAMERA_RIGHT,
+    HEAD_CAMERA_RIGHT_MJCF_NAME,
+    WRIST_CAMERA_LEFT,
+    WRIST_CAMERA_RIGHT,
+    WRIST_LEFT_CAMERA_MJCF_NAME,
+    WRIST_RIGHT_CAMERA_MJCF_NAME,
 )
 from examples.molmo_environment import STRETCH_ROOT_BODY
 from stretch4_mujoco.enums.actuators import Actuators
@@ -89,7 +95,10 @@ def _camera_for_mjcf_name(mjcf_name: str) -> StretchCameras:
 # same MJCF cameras `Stretch4CameraSystem` used during training.
 CAMERA_FOR_TRAINED_NAME: dict[str, StretchCameras] = {
     HEAD_CAMERA: _camera_for_mjcf_name(HEAD_CAMERA_MJCF_NAME),
-    WRIST_CAMERA: _camera_for_mjcf_name(WRIST_CAMERA_MJCF_NAME),
+    WRIST_CAMERA_LEFT: _camera_for_mjcf_name(WRIST_LEFT_CAMERA_MJCF_NAME),
+    WRIST_CAMERA_RIGHT: _camera_for_mjcf_name(WRIST_RIGHT_CAMERA_MJCF_NAME),
+    HEAD_CAMERA_LEFT: _camera_for_mjcf_name(HEAD_CAMERA_LEFT_MJCF_NAME),
+    HEAD_CAMERA_RIGHT: _camera_for_mjcf_name(HEAD_CAMERA_RIGHT_MJCF_NAME),
 }
 
 # Move groups the policy commands as absolute joint positions, and the simulator
