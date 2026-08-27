@@ -401,12 +401,14 @@ def test_the_override_rewrites_the_robot_and_leaves_the_task_alone():
         HEAD_CAMERA_RIGHT,
         WRIST_CAMERA_LEFT,
         WRIST_CAMERA_RIGHT,
+        WRIST_CAMERA_STEREO,
     )
     # Stretch's own cameras, at the episode's resolution.
     assert [camera.name for camera in exp_config.camera_config.cameras] == [
         HEAD_CAMERA,
         WRIST_CAMERA_LEFT,
         WRIST_CAMERA_RIGHT,
+        WRIST_CAMERA_STEREO,
         HEAD_CAMERA_LEFT,
         HEAD_CAMERA_RIGHT,
     ]
@@ -1037,6 +1039,7 @@ def test_head_camera_renders_upright(robot_config):
     from mujoco import MjSpec
 
     from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
     spec = MjSpec()
     spec.worldbody.add_geom(
@@ -1062,9 +1065,13 @@ def test_head_camera_renders_upright(robot_config):
     view.get_move_group("wrist").joint_pos = np.zeros(3)
     mujoco.mj_forward(model, data)
 
-    renderer = mujoco.Renderer(model, 224, 224)
+    renderer = mujoco.Renderer(model, 368, 640)
     renderer.update_scene(data, camera=f"{robot_config.robot_namespace}camera_center_link")
-    image = renderer.render()
+    raw = renderer.render()
+    rot = StretchCameras.cam_nav_rgb_se4_center.initial_camera_settings.rotate_number_of_times
+    image = np.rot90(raw, rot)
+
+    assert image.shape == (640, 368, 3), "rotated head camera frame should be portrait (640x368)"
 
     red = (
         (image[:, :, 0].astype(int) > 90)

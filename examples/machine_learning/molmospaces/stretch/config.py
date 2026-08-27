@@ -22,6 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from mujoco import MjData
 
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot
@@ -35,6 +36,7 @@ from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
 HEAD_CAMERA = "head_camera"
 WRIST_CAMERA_LEFT = "wrist_camera_left"
 WRIST_CAMERA_RIGHT = "wrist_camera_right"
+WRIST_CAMERA_STEREO = "wrist_camera_stereo"
 HEAD_CAMERA_LEFT = "head_camera_left"
 HEAD_CAMERA_RIGHT = "head_camera_right"
 CHASE_CAMERA = "chase_camera"
@@ -43,50 +45,74 @@ TRACKER_CAMERA = "tracker_camera"
 # The corresponding camera elements in the generated MJCF. Stretch 4's head is a
 # fixed stereo + centre assembly (there is no pan/tilt joint in the SE4 URDF), so
 # the head camera is a forward-and-down view rigidly tied to the base yaw; the
-# gripper cameras (left and right stereo pair) ride the wrist and provide close-up views.
-# The left and right stereo navigation cameras have wide fisheye lenses (~123° FOV).
+# wrist cameras are mounted on the gripper itself and follow the arm/wrist.
 HEAD_CAMERA_MJCF_NAME = "camera_center_link"
-WRIST_CAMERA_MJCF_NAME = "gripper_camera_left_rgb"
 WRIST_LEFT_CAMERA_MJCF_NAME = "gripper_camera_left_rgb"
 WRIST_RIGHT_CAMERA_MJCF_NAME = "gripper_camera_right_rgb"
+WRIST_STEREO_CAMERA_MJCF_NAME = "gripper_camera_stereo_depth"
 HEAD_CAMERA_LEFT_MJCF_NAME = "camera_left_link"
 HEAD_CAMERA_RIGHT_MJCF_NAME = "camera_right_link"
 CHASE_CAMERA_MJCF_NAME = "chase_camera"
 
 
 def install_fisheye_distortion_hook() -> None:
-    """Hook CPUMujocoEnv.render_rgb_frame to apply fisheye distortion to nav cameras."""
+    """Hook CPUMujocoEnv.render_rgb_frame and render_depth_frame to apply distortion and rotation to nav cameras."""
     try:
         from molmo_spaces.env.env import CPUMujocoEnv
     except ImportError:
         return
 
-    if getattr(CPUMujocoEnv, "_stretch_fisheye_hooked", False):
+    if getattr(CPUMujocoEnv, "_stretch_camera_hooked", False):
         return
 
     _orig_render_rgb_frame = CPUMujocoEnv.render_rgb_frame
+    _orig_render_depth_frame = CPUMujocoEnv.render_depth_frame
 
-    def _distorted_render_rgb_frame(self: Any, camera_name: str) -> Any:
-        frame = _orig_render_rgb_frame(self, camera_name)
+    def _postprocess_camera_frame(camera_name: str, frame: np.ndarray, is_depth: bool = False) -> np.ndarray:
         if frame is None:
             return frame
         try:
             from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
             if camera_name in (HEAD_CAMERA_LEFT, HEAD_CAMERA_LEFT_MJCF_NAME, "cam_nav_rgb_se4_left"):
-                cb = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
-                if cb is not None:
-                    return cb(frame)
+                if not is_depth:
+                    cb = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
+                    if cb is not None:
+                        frame = cb(frame)
+                rot = StretchCameras.cam_nav_rgb_se4_left.initial_camera_settings.rotate_number_of_times
+                if rot != 0:
+                    frame = np.rot90(frame, rot)
+                return frame
             elif camera_name in (HEAD_CAMERA_RIGHT, HEAD_CAMERA_RIGHT_MJCF_NAME, "cam_nav_rgb_se4_right"):
-                cb = StretchCameras.cam_nav_rgb_se4_right.post_processing_callback
-                if cb is not None:
-                    return cb(frame)
+                if not is_depth:
+                    cb = StretchCameras.cam_nav_rgb_se4_right.post_processing_callback
+                    if cb is not None:
+                        frame = cb(frame)
+                rot = StretchCameras.cam_nav_rgb_se4_right.initial_camera_settings.rotate_number_of_times
+                if rot != 0:
+                    frame = np.rot90(frame, rot)
+                return frame
+            elif camera_name in (HEAD_CAMERA, HEAD_CAMERA_MJCF_NAME, "cam_nav_rgb_se4_center", "cam_nav_rgb_se4_center_low_rez"):
+                rot = StretchCameras.cam_nav_rgb_se4_center.initial_camera_settings.rotate_number_of_times
+                if rot != 0:
+                    frame = np.rot90(frame, rot)
+                return frame
         except Exception as e:
             import logging
-            logging.getLogger(__name__).warning(f"Error applying fisheye distortion to {camera_name}: {e}")
+            logging.getLogger(__name__).warning(f"Error applying camera post-processing to {camera_name}: {e}")
         return frame
 
+    def _distorted_render_rgb_frame(self: Any, camera_name: str) -> Any:
+        frame = _orig_render_rgb_frame(self, camera_name)
+        return _postprocess_camera_frame(camera_name, frame, is_depth=False)
+
+    def _distorted_render_depth_frame(self: Any, camera_name: str) -> Any:
+        frame = _orig_render_depth_frame(self, camera_name)
+        return _postprocess_camera_frame(camera_name, frame, is_depth=True)
+
     CPUMujocoEnv.render_rgb_frame = _distorted_render_rgb_frame
+    CPUMujocoEnv.render_depth_frame = _distorted_render_depth_frame
+    CPUMujocoEnv._stretch_camera_hooked = True
     CPUMujocoEnv._stretch_fisheye_hooked = True
 
 
@@ -152,6 +178,14 @@ class Stretch4CameraSystem(CameraSystemConfig):
             mjcf_name=WRIST_RIGHT_CAMERA_MJCF_NAME,
             robot_namespace="robot_0/",
             fov=None,
+        ),
+        MjcfCameraConfig(
+            name=WRIST_CAMERA_STEREO,
+            mjcf_name=WRIST_STEREO_CAMERA_MJCF_NAME,
+            robot_namespace="robot_0/",
+            fov=None,
+            record_rgb=False,
+            record_depth=True,
         ),
         MjcfCameraConfig(
             name=HEAD_CAMERA_LEFT,

@@ -68,6 +68,7 @@ from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA_RIGHT,
     WRIST_CAMERA_LEFT,
     WRIST_CAMERA_RIGHT,
+    WRIST_CAMERA_STEREO,
 )
 
 log = logging.getLogger(__name__)

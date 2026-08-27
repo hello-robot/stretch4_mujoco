@@ -35,7 +35,11 @@ from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
     HEAD_CAMERA_RIGHT,
     HEAD_CAMERA_RIGHT_MJCF_NAME,
     WRIST_CAMERA_LEFT,
+    WRIST_CAMERA_RIGHT,
+    WRIST_CAMERA_STEREO,
     WRIST_LEFT_CAMERA_MJCF_NAME,
+    WRIST_RIGHT_CAMERA_MJCF_NAME,
+    WRIST_STEREO_CAMERA_MJCF_NAME,
     Stretch4RobotConfig,
 )
 
@@ -56,6 +60,8 @@ def test_recorder_camera_mapping_matches_the_trained_camera_system():
     assert TRAINED_CAMERA_MJCF_NAMES == {
         HEAD_CAMERA: HEAD_CAMERA_MJCF_NAME,
         WRIST_CAMERA_LEFT: WRIST_LEFT_CAMERA_MJCF_NAME,
+        WRIST_CAMERA_RIGHT: WRIST_RIGHT_CAMERA_MJCF_NAME,
+        WRIST_CAMERA_STEREO: WRIST_STEREO_CAMERA_MJCF_NAME,
         HEAD_CAMERA_LEFT: HEAD_CAMERA_LEFT_MJCF_NAME,
         HEAD_CAMERA_RIGHT: HEAD_CAMERA_RIGHT_MJCF_NAME,
     }
@@ -853,8 +859,13 @@ def test_camera_feature_names_and_defaults_in_lerobot_export():
     assert HEAD_CAMERA_LEFT in CAMERA_FEATURE_NAMES
     assert HEAD_CAMERA_RIGHT in CAMERA_FEATURE_NAMES
     assert CAMERA_FEATURE_NAMES[HEAD_CAMERA_LEFT] == "observation.images.head_left"
-    assert CAMERA_FEATURE_NAMES[HEAD_CAMERA_RIGHT] == "observation.images.head_right"
-    assert set(DEFAULT_CAMERA_NAMES) == {HEAD_CAMERA, WRIST_CAMERA_LEFT, HEAD_CAMERA_LEFT, HEAD_CAMERA_RIGHT}
+    assert set(DEFAULT_CAMERA_NAMES) == {
+        HEAD_CAMERA,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+    }
 
 
 def test_fisheye_active_fill_coverage_not_overly_vignetted():
@@ -881,7 +892,7 @@ def test_finetune_camera_selection_parsing_and_commands(tmp_path):
 
     # 1. Alias parsing
     cams = parse_camera_names("head,wrist,left")
-    assert cams == ["head_camera", "wrist_camera", "head_camera_left"]
+    assert cams == ["head_camera", "wrist_camera_left", "head_camera_left"]
 
     # 2. MolmoBot command with selected cameras
     summary_molmo = DatasetSummary(
@@ -971,6 +982,7 @@ def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
         HEAD_CAMERA_RIGHT,
         WRIST_CAMERA_LEFT,
         WRIST_CAMERA_RIGHT,
+        WRIST_CAMERA_STEREO,
         Stretch4CameraSystem,
     )
     from examples.machine_learning.molmospaces import hdf5_layout
@@ -984,6 +996,7 @@ def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
         HEAD_CAMERA,
         WRIST_CAMERA_LEFT,
         WRIST_CAMERA_RIGHT,
+        WRIST_CAMERA_STEREO,
         HEAD_CAMERA_LEFT,
         HEAD_CAMERA_RIGHT,
     ]

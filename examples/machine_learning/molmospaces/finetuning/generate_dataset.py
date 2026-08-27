@@ -794,6 +794,12 @@ All waypoints finished execution. Holding final posture/grip.
                             img = obs_dict[cam_name]
                             if hasattr(img, "ndim") and img.ndim == 3:
                                 rr.log(f"world/cameras/{cam_name}", rr.Image(img))
+                    for depth_key in [k for k in obs_dict.keys() if k.endswith("_depth")]:
+                        depth_img = obs_dict[depth_key]
+                        if depth_img is not None and hasattr(depth_img, "ndim") and depth_img.ndim in (2, 3):
+                            if depth_img.ndim == 3 and depth_img.shape[-1] == 1:
+                                depth_img = depth_img.squeeze(-1)
+                            rr.log(f"world/cameras/{depth_key}", rr.DepthImage(depth_img))
         except Exception as e:
             log.debug(f"Error logging to Rerun: {e}")
 
@@ -1295,19 +1301,6 @@ class StretchRolloutRunner(ParallelRolloutRunner):
 
                         should_save = success or not filter_for_successful_trajectories
                         history = task.get_history()
-
-                        # Explicitly clear task caches immediately to release frames/actions
-                        for cache_name in (
-                            "action_cache",
-                            "observation_cache",
-                            "reward_cache",
-                            "terminal_cache",
-                            "truncated_cache",
-                            "success_cache",
-                        ):
-                            cache = getattr(task, cache_name, None)
-                            if isinstance(cache, list):
-                                cache.clear()
 
                         should_save_debug = not should_save and random.random() < 0.01
 
