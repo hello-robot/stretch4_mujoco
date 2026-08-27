@@ -59,7 +59,10 @@ from examples.machine_learning.molmospaces.policies.kinematics import (
     grasp_orientation,
     tcp_orientation_from_grasp,
 )
-from examples.machine_learning.molmospaces.stretch.robot_view import StretchGripperGroup
+from examples.machine_learning.molmospaces.stretch.robot_view import (
+    JointTargetClipper,
+    StretchGripperGroup,
+)
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.policy.base_policy import BasePolicy, PolicyFactory
 from molmo_spaces.utils.function_utils import make_lenient
@@ -453,6 +456,7 @@ class StretchSimpleIKPolicy(BasePolicy):
         self._grip_hold: float | None = None
         self._grasp: ToolGrasp | None = None
         self._last_action: dict[str, np.ndarray] | None = None
+        self._clipper_cache: JointTargetClipper | None = None
 
     # =========================================================================
     # BasePolicy
@@ -470,6 +474,8 @@ class StretchSimpleIKPolicy(BasePolicy):
         self._grip_hold = None
         self._grasp = None
         self._last_action = None
+        # The model is recompiled per episode, so the limits are re-read with it.
+        self._clipper_cache = None
 
     def get_info(self) -> dict:
         return {
@@ -532,10 +538,29 @@ class StretchSimpleIKPolicy(BasePolicy):
     # Execution
     # =========================================================================
 
+    def _clipper(self) -> JointTargetClipper:
+        """This episode's joint-limit clipper, built against its robot view."""
+        if self._clipper_cache is None:
+            self._clipper_cache = JointTargetClipper(
+                self.task.env.current_robot.robot_view
+            )
+        return self._clipper_cache
+
     def _command_for(
         self, waypoint: Waypoint, current: dict[str, np.ndarray]
     ) -> dict[str, np.ndarray]:
-        """Absolute joint targets that pursue `waypoint` from `current`."""
+        """Absolute joint targets that pursue `waypoint` from `current`.
+
+        Every target is inside the model's own limits: the branches live in
+        `_unclipped_command_for` and the clip happens here, on all of them at
+        once, so a new branch there cannot reintroduce an uncommandable target.
+        """
+        return self._clipper().clip_action(self._unclipped_command_for(waypoint, current))
+
+    def _unclipped_command_for(
+        self, waypoint: Waypoint, current: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray]:
+        """`_command_for` before the limits are applied. Call that, not this."""
         policy_config = self.config.policy_config
         finger_target = self._finger_target(waypoint)
         action: dict[str, np.ndarray] = {
@@ -700,7 +725,14 @@ class StretchSimpleIKPolicy(BasePolicy):
     def _joint_group_reached(
         self, group: str, move_group, target: np.ndarray, tolerance: float
     ) -> bool:
-        """Whether a move group has reached its target configuration in joint space."""
+        """Whether a move group has reached its target configuration in joint space.
+
+        `target` must be the target as *commanded* -- that is, already clipped to
+        the model's limits; `_advance` is where that happens. Measuring against
+        an unclipped target is what let an out-of-range waypoint stall the plan:
+        the joint parks at its limit with zero velocity, nothing touching it, and
+        an error no tolerance can close, until the step budget times it out.
+        """
         pos = np.asarray(move_group.joint_pos, dtype=float).ravel()
         tgt = np.asarray(target, dtype=float).ravel()
         err = np.abs(pos - tgt)
@@ -745,12 +777,14 @@ class StretchSimpleIKPolicy(BasePolicy):
             reached = float(np.linalg.norm(tool_position - waypoint.position)) <= waypoint.tolerance
         else:
             # A joint-space waypoint is about the configuration, so arrival is
-            # measured per group with appropriate joint tolerances and steady-state checks.
+            # measured per group with appropriate joint tolerances and steady-state
+            # checks -- against the target as the controller received it, which is
+            # the target clipped to the model's limits.
             reached = all(
                 self._joint_group_reached(
                     group,
                     robot_view.get_move_group(group),
-                    target,
+                    self._clipper().clip_group(group, target),
                     waypoint.tolerance,
                 )
                 for group, target in waypoint.joint_targets.items()
@@ -1500,6 +1534,7 @@ class StretchSimpleIKPolicy(BasePolicy):
             if wrist_pitch < -0.05:
                 # Approaching from below the horizontal plane; skip to avoid table collisions.
                 continue
+            wrist_roll = self._reachable_roll(wrist_roll)
             candidates.append(
                 (
                     wrist_pitch,
@@ -1561,6 +1596,33 @@ class StretchSimpleIKPolicy(BasePolicy):
             f"and table-clearing; falling back to a {self.config.policy_config.grasp_style} grasp"
         )
         return None
+
+    def _reachable_roll(self, wrist_roll: float) -> float:
+        """The same grasp, expressed at a roll the wrist can actually hold.
+
+        Stretch's roll range is not symmetric -- the compiled model gives
+        [-4.276, 1.135] -- so a third of the authored grasps decompose to a roll
+        the joint cannot reach, most of them the near-top-down ones the candidate
+        ordering prefers first. Rolling by pi is the way out: it points the same
+        approach axis along the same closing line and only swaps which finger is
+        on which side, which is the same reason the grasp libraries are loaded
+        `include_flipped=True` in the first place.
+
+        Left alone when neither representation fits, so the reachability test
+        below still gets to reject the candidate on its merits.
+        """
+        limits = self._solver.joint_limits["wrist"][2]
+        if limits[0] <= wrist_roll <= limits[1]:
+            return wrist_roll
+        for flipped in (wrist_roll - np.pi, wrist_roll + np.pi):
+            if limits[0] <= flipped <= limits[1]:
+                log.debug(
+                    f"[stretch-simple-ik] grasp roll {wrist_roll:+.3f} is outside the wrist's "
+                    f"{np.round(limits, 3).tolist()}; taking the flipped-finger equivalent "
+                    f"{flipped:+.3f}"
+                )
+                return float(flipped)
+        return wrist_roll
 
     def _library_grasp_poses(
         self, object_name: str | None, origin: np.ndarray

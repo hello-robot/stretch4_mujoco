@@ -38,6 +38,7 @@ from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA_RIGHT,
     WRIST_CAMERA_LEFT,
 )
+from examples.machine_learning.molmospaces.stretch.robot_view import JointTargetClipper
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.policy.base_policy import BasePolicy, PolicyFactory
 from molmo_spaces.utils.function_utils import make_lenient
@@ -163,6 +164,7 @@ class StretchMolmoBotPolicy(BasePolicy):
 
     def __init__(self, config: "MlSpacesExpConfig", task: "BaseMujocoTask" = None) -> None:
         super().__init__(config, task)
+        self._clipper: JointTargetClipper | None = None
         self._inner = self._build_inner_policy()
 
     # =========================================================================
@@ -237,12 +239,31 @@ class StretchMolmoBotPolicy(BasePolicy):
         # first episode it may have been built with None. Keep it in step.
         self._inner.task = self.task
         self._inner.reset()
+        # The model is recompiled per episode, so the limits are re-read with it.
+        self._clipper = None
 
     def get_action(self, observation) -> dict[str, Any]:
-        return self._inner.get_action(observation)
+        return self._clip_to_limits(self._inner.get_action(observation))
 
     def get_action_chunk(self, observation) -> list[dict[str, Any]] | None:
-        return self._inner.get_action_chunk(observation)
+        chunk = self._inner.get_action_chunk(observation)
+        if chunk is None:
+            return None
+        return [self._clip_to_limits(action) for action in chunk]
+
+    def _clip_to_limits(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Bring one of the VLA's actions inside what the model says is possible.
+
+        The checkpoint is trained, not constrained: nothing in it knows where
+        Stretch's joints stop, and a target past a limit is a standing position
+        error the actuator holds against a joint that cannot follow.
+        `JointTargetClipper` reads the bounds off the compiled MJCF, and leaves
+        alone the keys that are not move groups -- `done`, and whatever else the
+        wrapped policy reports alongside its targets.
+        """
+        if self._clipper is None:
+            self._clipper = JointTargetClipper(self.task.env.current_robot.robot_view)
+        return self._clipper.clip_action(action)
 
     def create_policy_sensors(self):
         return self._inner.create_policy_sensors()

@@ -44,7 +44,9 @@ from examples.machine_learning.molmospaces.stretch.episode_overrides import (  #
 )
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot  # noqa: E402
 from examples.machine_learning.molmospaces.stretch.robot_view import (  # noqa: E402
+    JointTargetClipper,
     Stretch4RobotView,
+    commandable_limits,
 )
 
 NAMESPACE = "robot_0/"
@@ -1176,7 +1178,7 @@ def test_grasp_target_bounds_validation():
     assert policy._is_grasp_within_bounds("pencil", np.array([0.50, 0.20, 0.85])) is False
 
 
-def test_tall_object_pitch_search_order():
+def test_tall_object_pitch_search_order(robot_config):
     """For objects taller than 100mm, pitch angle search starts at 45 deg down (45->0 then 90->45)."""
     from unittest.mock import MagicMock
     from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicy
@@ -1186,6 +1188,10 @@ def test_tall_object_pitch_search_order():
     mock_config = MagicMock()
     mock_config.policy_config.grasp_style = "top_down"
     policy.config = mock_config
+    # A real solver rather than a mock: candidate construction asks it for the
+    # wrist's limits, and the point of reading those off the compiled model is
+    # lost if the test supplies its own numbers.
+    policy._solver = StretchReachSolver(robot_config)
 
     mock_gripper = MagicMock()
     mock_gripper.inter_finger_dist_range = (0.0, 0.1885)
@@ -1345,6 +1351,134 @@ def test_unstow_joint_group_reached():
     # 4. Lift reaching target within tolerance
     lift_mg = MockMoveGroup([0.72])
     assert policy._joint_group_reached("lift", lift_mg, np.array([0.70]), 0.05) is True
+
+
+def test_joint_targets_are_clipped_to_the_models_limits(compiled_robot):
+    """A joint-space waypoint cannot ask for a position the model forbids.
+
+    The failure this pins down: a top-down authored grasp decomposes to a wrist
+    roll outside the joint's asymmetric range, `unstow` commanded it verbatim,
+    and `JointPosController` clipped it -- leaving the joint parked at its limit
+    with zero velocity while the policy waited out its whole step budget for an
+    arrival that could not happen. Nothing was colliding; the target simply did
+    not exist.
+    """
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import (
+        StretchSimpleIKPolicy,
+    )
+
+    _, _, robot_view = compiled_robot
+    clipper = JointTargetClipper(robot_view)
+
+    roll_limits = commandable_limits(robot_view.get_move_group("wrist"))[2]
+    assert roll_limits[1] < np.pi, (
+        "this test is only meaningful while the wrist roll range is asymmetric and "
+        f"narrower than a half turn; the model now says {roll_limits}"
+    )
+
+    out_of_range = float(roll_limits[1]) + 0.9
+    commanded = clipper.clip_group("wrist", [0.0, 0.5, out_of_range])
+    assert commanded[2] == pytest.approx(roll_limits[1])
+
+    # The joint can sit at its limit, so measuring against the commanded target
+    # is what lets the waypoint finish. Against the raw target it never would.
+    wrist = robot_view.get_move_group("wrist")
+    restore = np.asarray(wrist.joint_pos, dtype=float).copy()
+    try:
+        wrist.joint_pos = np.array([0.0, 0.5, float(roll_limits[1])])
+        policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+        assert policy._joint_group_reached("wrist", wrist, commanded, 0.05) is True
+        assert (
+            policy._joint_group_reached("wrist", wrist, np.array([0.0, 0.5, out_of_range]), 0.05)
+            is False
+        )
+    finally:
+        # `compiled_robot` is module-scoped, so anything set here outlives the test.
+        wrist.joint_pos = restore
+
+
+def test_unstow_finishes_instead_of_waiting_out_its_budget(compiled_robot):
+    """The observed stall, end to end: `unstow` advances, it does not time out.
+
+    Every number here was read off a stalled episode. The mast was asked for
+    1.23m and sat at 1.199 (the MJCF stops at 1.2); the wrist was asked for a
+    roll of 2.020 and sat at 1.130 (the MJCF stops at 1.135), velocity zero on
+    every joint, nothing in contact. That configuration is *arrived*, and the
+    waypoint has to be able to say so.
+    """
+    from unittest.mock import MagicMock
+
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import (
+        StretchSimpleIKPolicy,
+        Waypoint,
+    )
+
+    _, _, robot_view = compiled_robot
+    stalled = {
+        "lift": np.array([1.199]),
+        "arm": np.array([0.001]),
+        "wrist": np.array([0.005, 1.547, 1.130]),
+    }
+    # `compiled_robot` is module-scoped, so put back whatever was there.
+    restore = {
+        group: np.asarray(robot_view.get_move_group(group).joint_pos, dtype=float).copy()
+        for group in stalled
+    }
+    try:
+        for group, value in stalled.items():
+            robot_view.get_move_group(group).joint_pos = value
+
+        policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+        policy._clipper_cache = None
+        policy._waypoint_index = 0
+        policy._steps_in_waypoint = 0
+        policy._settled_steps = 0
+        policy.config = MagicMock()
+        policy.config.policy_config.max_steps_per_waypoint = 120
+        policy.task = MagicMock()
+        policy.task.env.current_robot.robot_view = robot_view
+
+        waypoint = Waypoint(
+            position=np.array([0.4, 0.0, 1.1]),
+            wrist_pitch=1.552,
+            wrist_roll=2.020,
+            gripper_open=True,
+            label="unstow",
+            joint_targets={
+                "lift": np.array([1.23]),
+                "arm": np.array([0.0]),
+                "wrist": np.array([0.0, 1.552, 2.020]),
+            },
+        )
+
+        for step in range(3):
+            policy._advance(waypoint, robot_view)
+            if policy._waypoint_index == 1:
+                break
+        assert policy._waypoint_index == 1, (
+            "unstow did not advance from a settled, at-the-limit configuration -- it "
+            f"would burn all {policy.config.policy_config.max_steps_per_waypoint} steps"
+        )
+        assert step < 2
+    finally:
+        for group, value in restore.items():
+            robot_view.get_move_group(group).joint_pos = value
+
+
+def test_solver_limits_come_from_the_model(robot_config, compiled_robot):
+    """The IK's joint limits are the compiled model's, not numbers written in Python.
+
+    A solver limit wider than the model's produces solutions the controller
+    clips: the arm holds its commanded configuration, the tool sits short of the
+    waypoint, and no amount of settling closes the gap. The mast is the one that
+    bit -- the old override said 1.23m where both the URDF and the MJCF say 1.2.
+    """
+    _, _, robot_view = compiled_robot
+    solver = StretchReachSolver(robot_config)
+    for group in ("lift", "arm", "wrist"):
+        assert solver.joint_limits[group] == pytest.approx(
+            commandable_limits(robot_view.get_move_group(group))
+        ), f"{group} limits have drifted from the model"
 
 
 
