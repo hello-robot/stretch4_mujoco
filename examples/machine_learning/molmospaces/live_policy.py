@@ -144,17 +144,37 @@ def apply_action(
     targets: dict[str, np.ndarray],
     base_xytheta: np.ndarray,
     control_period_s: float,
+    joint_limits: dict[Actuators, tuple[float, float]] | None = None,
 ) -> dict[str, float]:
     """Send one decoded action to the simulator. Returns what was commanded.
 
-    The arm joints take absolute targets directly. The base cannot: this robot
-    steers three omniwheels, so `TrainedPolicy` hands back an absolute world
-    pose that has to be turned into the velocity that would close that gap over
-    one control period, rotated into the base's own frame.
+    The arm joints take absolute targets directly, clipped to `joint_limits` --
+    which is `Stretch4MujocoSimulator.pull_joint_limits()`, read off the MJCF's
+    own joint ranges by the simulator process. A network's output is only bounded
+    by what it was trained on, so nothing else stops a target sailing past the
+    end of a joint's travel, and an actuator commanded past its limit holds a
+    permanent position error against a joint that cannot move any further. An
+    actuator the simulator reports no limit for is passed through untouched
+    rather than clipped against a number invented here.
+
+    The base cannot take an absolute target: this robot steers three omniwheels,
+    so `TrainedPolicy` hands back an absolute world pose that has to be turned
+    into the velocity that would close that gap over one control period, rotated
+    into the base's own frame.
     """
+    limits = joint_limits or {}
     commanded: dict[str, float] = {}
     for (group, index), actuator in ACTUATOR_FOR_JOINT_TARGET.items():
         value = float(np.asarray(targets[group]).reshape(-1)[index])
+        limit = limits.get(actuator)
+        if limit is not None:
+            clipped = float(np.clip(value, limit[0], limit[1]))
+            if clipped != value:
+                log.debug(
+                    f"[policy] {actuator.name} target {value:+.3f} clipped to {clipped:+.3f} "
+                    f"by the model's limits {limit}"
+                )
+            value = clipped
         sim._move_to(actuator, value)
         commanded[actuator.name] = value
 
@@ -201,6 +221,9 @@ class PolicyRunner:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.step_count = 0
+        # Pulled once: these come from the compiled model, which does not change
+        # while the simulator is up, and each pull is an IPC round trip.
+        self._joint_limits: dict[Actuators, tuple[float, float]] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -255,7 +278,11 @@ class PolicyRunner:
         state = read_state(status)
         base_xytheta = np.array([status.base.x, status.base.y, status.base.theta])
         targets = self.policy.act(images, state, base_xytheta)
-        commanded = apply_action(self.sim, targets, base_xytheta, self.control_period_s)
+        if self._joint_limits is None:
+            self._joint_limits = self.sim.pull_joint_limits()
+        commanded = apply_action(
+            self.sim, targets, base_xytheta, self.control_period_s, self._joint_limits
+        )
 
         self.step_count += 1
         if self.telemetry_sink is not None:

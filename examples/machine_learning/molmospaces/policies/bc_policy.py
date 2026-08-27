@@ -26,6 +26,7 @@ import torch
 
 from examples.machine_learning.molmospaces.policies.checkpoint import TrainedPolicy
 from examples.machine_learning.molmospaces.policies.networks import decode_action, encode_state
+from examples.machine_learning.molmospaces.stretch.robot_view import JointTargetClipper
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.policy.base_policy import InferencePolicy, PolicyFactory
 from molmo_spaces.utils.function_utils import make_lenient
@@ -79,6 +80,7 @@ class StretchBCPolicy(InferencePolicy):
     def __init__(self, config: "MlSpacesExpConfig", task: "BaseMujocoTask" = None) -> None:
         super().__init__(config, task)
         self._policy: TrainedPolicy | None = None
+        self._clipper: JointTargetClipper | None = None
         self.prepare_model(config.policy_config.checkpoint_path)
 
     # =========================================================================
@@ -102,6 +104,8 @@ class StretchBCPolicy(InferencePolicy):
 
     def reset(self) -> None:
         self._policy.reset()
+        # The model is recompiled per episode, so the limits are re-read with it.
+        self._clipper = None
 
     # =========================================================================
     # InferencePolicy
@@ -118,7 +122,20 @@ class StretchBCPolicy(InferencePolicy):
         return self._policy.predict_chunk(images, state)
 
     def model_output_to_action(self, model_output: np.ndarray) -> dict[str, Any]:
-        return decode_action(model_output[0], self._base_xytheta())
+        return self._clip_to_limits(decode_action(model_output[0], self._base_xytheta()))
+
+    def _clip_to_limits(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Bring a predicted action inside what the model says the robot can do.
+
+        A checkpoint's output is bounded only by what it was trained on, so it
+        can name a target past the end of a joint's travel -- and an actuator
+        held past its limit is a standing position error driven into a
+        mechanical stop. `JointTargetClipper` reads the bounds off the compiled
+        MJCF, so they cannot go stale against the robot description.
+        """
+        if self._clipper is None:
+            self._clipper = JointTargetClipper(self.task.env.current_robot.robot_view)
+        return self._clipper.clip_action(action)
 
     def get_action(self, observation) -> dict[str, Any]:
         """One step, served from the current action chunk.
@@ -131,7 +148,7 @@ class StretchBCPolicy(InferencePolicy):
         cheap enough to do on every step regardless of whether it gets used.
         """
         images, state = self.obs_to_model_input(observation)
-        return self._policy.act(images, state, self._base_xytheta())
+        return self._clip_to_limits(self._policy.act(images, state, self._base_xytheta()))
 
     def _base_xytheta(self) -> np.ndarray:
         base_pose = self.task.env.current_robot.robot_view.base.pose

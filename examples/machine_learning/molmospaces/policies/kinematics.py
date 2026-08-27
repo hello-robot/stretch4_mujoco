@@ -19,7 +19,10 @@ from scipy.spatial.transform import Rotation as R
 from stretch4_kinematics.kinematic_models.base_kinematic_models import StretchKinematics
 from stretch4_kinematics.state.joint_positions import StretchJointPositions
 
-from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
+from examples.machine_learning.molmospaces.stretch.robot_view import (
+    Stretch4RobotView,
+    commandable_limits,
+)
 
 if TYPE_CHECKING:
     from molmo_spaces.configs.robot_configs import BaseRobotConfig
@@ -70,14 +73,26 @@ def planar_pose(x: float, y: float, yaw: float) -> np.ndarray:
     return pose
 
 
-_TCP_OFFSET_CACHE: dict[tuple[str, str], np.ndarray] = {}
+_MODEL_CALIBRATION_CACHE: dict[tuple[str, str], tuple[np.ndarray, dict[str, np.ndarray]]] = {}
 
 
-def _tcp_offset_in_base(robot_config: "BaseRobotConfig") -> np.ndarray:
-    """Translation offset from MuJoCo holonomic base origin to URDF base origin in base coordinates."""
+def _model_calibration(
+    robot_config: "BaseRobotConfig",
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """The two things this module needs out of the compiled MJCF.
+
+    Returns:
+        The translation offset from the MuJoCo holonomic base origin to the URDF
+        base origin, in base coordinates, and the commandable joint limits per
+        move group (see `commandable_limits`).
+
+    Compiling the robot on its own is what makes both of these readable without
+    a scene: they are properties of the robot description, so a throwaway spec
+    with the meshes stripped is enough, and the result is cached per description.
+    """
     key = (str(robot_config.robot_dir), robot_config.robot_namespace)
-    if key in _TCP_OFFSET_CACHE:
-        return _TCP_OFFSET_CACHE[key]
+    if key in _MODEL_CALIBRATION_CACHE:
+        return _MODEL_CALIBRATION_CACHE[key]
 
     namespace = robot_config.robot_namespace
     spec = MjSpec()
@@ -111,8 +126,12 @@ def _tcp_offset_in_base(robot_config: "BaseRobotConfig") -> np.ndarray:
     ).translation
 
     offset = np.asarray(pin_tcp, dtype=float) - mujoco_tcp
-    _TCP_OFFSET_CACHE[key] = offset
-    return offset
+    limits = {
+        group: commandable_limits(view.get_move_group(group))
+        for group in Stretch4RobotView.MOVE_GROUP_ORDER
+    }
+    _MODEL_CALIBRATION_CACHE[key] = (offset, limits)
+    return offset, limits
 
 
 @lru_cache(maxsize=1)
@@ -134,25 +153,44 @@ def _approach_yaw_candidates(nominal: float, spread: float, samples: int) -> lis
 class StretchReachSolver:
     """Solves reach kinematics for Stretch 4 using Pinocchio."""
 
+    # Which pinocchio configuration index each MuJoCo move group's joints land
+    # on, for `model_ik`'s joint order: mobile_base_rotation, lift_joint,
+    # arm_l4_joint, wrist_yaw, wrist_pitch, wrist_roll.
+    _PIN_CONFIG_INDICES = {"lift": (1,), "arm": (2,), "wrist": (3, 4, 5)}
+
     def __init__(self, robot_config: "BaseRobotConfig") -> None:
         self._kinematics = _kinematics()
         self._namespace = robot_config.robot_namespace
-        self._offset = _tcp_offset_in_base(robot_config)
+        self._offset, model_limits = _model_calibration(robot_config)
 
+        # The IK's limits are the MJCF's, so a solution is by construction
+        # something `JointPosController` can command without clipping -- and a
+        # solution the controller *would* clip is one the robot parks short of
+        # while the policy waits for an arrival that cannot come.
+        #
+        # Two things were wrong with writing them here instead. The mast was
+        # widened to 1.23m, which is a number no description contains: both the
+        # URDF and the MJCF say 1.2, so every solve that saturated the lift
+        # returned 30mm of travel that does not exist. The wrist pitch was
+        # widened to -1.571, which is right -- the URDF really does stop 25
+        # degrees short of the MJCF's full 90 up -- but only until one of the two
+        # descriptions changes, and then it is another 1.23.
         model = self._kinematics.model_ik
-        model.upperPositionLimit[1] = 1.23  # Match physical mast limit of Stretch 4 in MuJoCo
-        model.lowerPositionLimit[4] = -1.571  # Allow full 90-degree upward pitch in MuJoCo
-        lower, upper = model.lowerPositionLimit, model.upperPositionLimit
-        self._limits = {
-            "lift": np.array([[lower[1], upper[1]]]),
-            "arm": np.array([[lower[2], upper[2]]]),
-            "wrist": np.array(
-                [[lower[3], upper[3]], [lower[4], upper[4]], [lower[5], upper[5]]]
-            ),
-        }
+        self._limits = {}
+        for group, indices in self._PIN_CONFIG_INDICES.items():
+            limits = np.asarray(model_limits[group], dtype=float)
+            assert len(limits) == len(indices), (
+                f"move group {group!r} reports {len(limits)} commandable joints, "
+                f"but the IK model has {len(indices)}"
+            )
+            for row, index in enumerate(indices):
+                model.lowerPositionLimit[index] = limits[row, 0]
+                model.upperPositionLimit[index] = limits[row, 1]
+            self._limits[group] = limits
 
     @property
     def joint_limits(self) -> dict[str, np.ndarray]:
+        """Commandable `(n, 2)` limits per move group, as compiled into the MJCF."""
         return self._limits
 
     def forward(self, configuration: dict[str, np.ndarray]) -> np.ndarray:

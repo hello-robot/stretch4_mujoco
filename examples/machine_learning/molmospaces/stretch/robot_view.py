@@ -23,6 +23,7 @@ which is 10 commanded degrees of freedom, matching the 10 actuators the
 generated MJCF ends up with once the wheel actuators are replaced.
 """
 
+import logging
 from functools import cached_property
 
 import numpy as np
@@ -38,6 +39,8 @@ from molmo_spaces.robots.robot_views.abstract import (
 )
 from molmo_spaces.utils.linalg_utils import normalize_ang_error
 from molmo_spaces.utils.mj_model_and_data_utils import body_pose
+
+log = logging.getLogger(__name__)
 
 # The body the Stretch MJCF hangs its whole kinematic chain off, and the body we
 # treat as the tool centre point. `grasp_center_link` sits between the two
@@ -264,6 +267,95 @@ class StretchGripperGroup(MJCFFrameMixin, GripperGroup):
         right = self.mj_data.xpos[self._right_tip_body_id]
         left = self.mj_data.xpos[self._left_tip_body_id]
         return float(np.linalg.norm(right - left))
+
+
+def commandable_limits(move_group: MoveGroup) -> np.ndarray:
+    """The `(n, 2)` interval a move group's joints can actually be commanded to.
+
+    `JointPosController` clips every target to the actuator's `ctrlrange`, and
+    physics clips the joint to its own `range`, so the commandable interval is
+    the intersection of the two. Anything outside it is a position the robot will
+    never report reaching, held as a standing error by the actuator.
+    """
+    ctrl = np.asarray(move_group.ctrl_limits, dtype=float).reshape(-1, 2)
+    joint = np.asarray(move_group.joint_pos_limits, dtype=float).reshape(-1, 2)
+    if ctrl.shape != joint.shape:
+        # A group whose actuators are not one-to-one with its joints reports the
+        # two in different coordinates -- the telescoping arm's tendon drives
+        # four segments -- so this is a mismatch, not something to broadcast
+        # over. `StretchTelescopingArmGroup` overrides `joint_pos_limits` to the
+        # commanded coordinate for exactly this reason; anything that has not,
+        # only the control range is known to be in the right units.
+        return ctrl
+    return np.stack(
+        [np.maximum(ctrl[:, 0], joint[:, 0]), np.minimum(ctrl[:, 1], joint[:, 1])], axis=1
+    )
+
+
+class JointTargetClipper:
+    """Clips per-move-group joint targets to the limits in the compiled model.
+
+    One of these belongs to one episode: the MJCF is recompiled per episode, and
+    the limits are read through the move groups of that episode's robot view and
+    cached per group, because each read walks the model's actuator and joint
+    tables.
+
+    Every policy in this repo that commands absolute joint positions goes through
+    here, for two different reasons. For the scripted expert it is about
+    *waiting*: `JointPosController` clips the target anyway, so an unclipped
+    command does not move the robot anywhere different, but it leaves the policy
+    watching for an arrival at a position the joint cannot occupy -- which reads
+    as a joint stuck at its limit with nothing touching it. For a learned policy
+    it is about *force*: a checkpoint's output is bounded only by what it was
+    trained on, and a target past the end of travel is a permanent position error
+    driven into a mechanical stop.
+
+    Keys that do not name a move group (`done`, and whatever else a policy
+    reports alongside its targets) pass through untouched.
+    """
+
+    def __init__(self, robot_view: RobotView) -> None:
+        self._robot_view = robot_view
+        self._limits: dict[str, np.ndarray | None] = {}
+
+    def limits_for(self, group: str) -> np.ndarray | None:
+        """Commandable limits for one group, or None if it is not a move group."""
+        if group not in self._limits:
+            try:
+                move_group = self._robot_view.get_move_group(group)
+            except (KeyError, AttributeError, AssertionError):
+                self._limits[group] = None
+            else:
+                self._limits[group] = commandable_limits(move_group)
+        return self._limits[group]
+
+    def clip_group(self, group: str, value) -> np.ndarray:
+        """`value` brought inside `group`'s limits, as a float array."""
+        target = np.asarray(value, dtype=float).reshape(-1)
+        limits = self.limits_for(group)
+        if limits is None or len(target) != len(limits):
+            # A width that does not match the model's is an action-spec mismatch,
+            # which wants to fail where it is diagnosable rather than be
+            # half-clipped here.
+            return target
+        clipped = np.clip(target, limits[:, 0], limits[:, 1])
+        if not np.allclose(clipped, target):
+            log.debug(
+                f"[stretch-limits] {group} target {np.round(target, 3)} clipped to "
+                f"{np.round(clipped, 3)} by the model's limits "
+                f"{np.round(limits, 3).tolist()}"
+            )
+        return clipped
+
+    def clip_action(self, action: dict) -> dict:
+        """A whole action dict clipped, leaving non-joint entries alone."""
+        clipped = {}
+        for group, value in action.items():
+            if self.limits_for(group) is None or isinstance(value, (bool, str)):
+                clipped[group] = value
+            else:
+                clipped[group] = self.clip_group(group, value)
+        return clipped
 
 
 class Stretch4RobotView(RobotView):
