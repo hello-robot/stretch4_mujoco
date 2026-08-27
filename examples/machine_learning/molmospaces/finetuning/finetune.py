@@ -89,10 +89,18 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
 CAMERA_NAME_ALIASES: dict[str, str] = {
     "head": "head_camera",
     "head_camera": "head_camera",
+    "wrist": "wrist_camera_left",
+    "wrist_camera": "wrist_camera_left",
     "wrist_left": "wrist_camera_left",
     "wrist_camera_left": "wrist_camera_left",
     "wrist_right": "wrist_camera_right",
     "wrist_camera_right": "wrist_camera_right",
+    "stereo": "wrist_camera_stereo",
+    "wrist_stereo": "wrist_camera_stereo",
+    "wrist_camera_stereo": "wrist_camera_stereo",
+    "wrist_depth": "wrist_camera_stereo",
+    "wrist_camera_depth": "wrist_camera_stereo",
+    "gripper_camera_stereo_depth": "wrist_camera_stereo",
     "left": "head_camera_left",
     "head_left": "head_camera_left",
     "head_camera_left": "head_camera_left",
@@ -113,7 +121,7 @@ STRETCH_CAMERA_NAMES = DEFAULT_CAMERA_NAMES
 Default cameras available for fine-tuning.
 
 These are the names `Stretch4CameraSystem` records under (`head_camera`,
-`wrist_camera_left`, `head_camera_left`, and `head_camera_right`). When fine-tuning,
+`wrist_camera_left`, `wrist_camera_right`, `head_camera_left`, and `head_camera_right`). When fine-tuning,
 the user can choose which subset of camera streams to train on via `--cameras`.
 """
 

@@ -223,8 +223,6 @@ class Stretch4Robot(Robot):
         for key in list(robot_spec.keys):
             robot_spec.delete(key)
 
-        cls._orient_cameras_to_hardware_convention(robot_spec)
-
         # Both the robot spec and any MolmoSpaces house call their root default
         # class "main". Compiling a merged spec with two of them is fine, but
         # serialising it back out produces a second unnamed <default> block that
