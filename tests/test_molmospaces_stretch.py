@@ -1028,3 +1028,38 @@ def test_gripper_cameras_are_left_alone(robot_config):
         assert settings.rotate_number_of_times != 0, (
             f"{hardware_name} needs no correction and should not be listed"
         )
+
+
+def test_thin_object_grasp_offset():
+    """Thin objects like a fork get a vertical offset so fingertips grasp at their tips without table collision."""
+    from unittest.mock import MagicMock
+    from examples.machine_learning.molmospaces.policies.simple_ik_policy import (
+        StretchSimpleIKPolicy,
+        TCP_TO_FINGERTIP_EDGE_M,
+    )
+
+    policy = StretchSimpleIKPolicy.__new__(StretchSimpleIKPolicy)
+    policy.config = MagicMock()
+    policy.config.task_config.pickup_obj_name = "fork"
+
+    mock_scene_obj = MagicMock()
+    mock_scene_obj.position = np.array([0.5, 0.2, 0.75])
+    mock_scene_obj.body_id = 1
+    mock_scene_obj.aabb_size = np.array([0.02, 0.15, 0.01])  # 1cm tall
+
+    mock_env = MagicMock()
+    mock_env.current_batch_index = 0
+    mock_obj_mgr = MagicMock()
+    mock_obj_mgr.get_object_by_name.return_value = mock_scene_obj
+    mock_env.object_managers = [mock_obj_mgr]
+    mock_env.current_model.ngeom = 0
+    mock_env.current_data.geom_xpos = []
+
+    mock_task = MagicMock()
+    mock_task.env = mock_env
+    policy.task = mock_task
+
+    grasp_pt = policy._object_grasp_point("fork")
+    expected_offset = TCP_TO_FINGERTIP_EDGE_M - (0.01 * 0.5)
+    assert grasp_pt[2] == pytest.approx(0.75 + expected_offset)
+
