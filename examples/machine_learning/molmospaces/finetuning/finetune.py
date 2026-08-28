@@ -225,6 +225,16 @@ on. `--global_batch_size` is unaffected: the gradient accumulation just runs
 more, smaller steps for the same effective batch.
 """
 
+PROGRESS_FILTER = Path(__file__).resolve().parent / "train_progress.py"
+"""
+The progress bar the generated script pipes training through.
+
+A file in this repository rather than shell generated into the script: it is a
+hundred lines of Python with a regex in it, and that belongs somewhere it can be
+linted, tested and read on its own. Stdlib-only, so running it under MolmoBot's
+virtualenv interpreter costs nothing.
+"""
+
 MOLMOBOT_OPTIONAL_FLAGS: list[tuple[str, list[str]]] = [
     (
         "--img_aug",
@@ -604,6 +614,7 @@ def trainer_command(
     save_folder_ref: str | None = None,
     device_batch_size: int | str = DEFAULT_DEVICE_BATCH_SIZE,
     num_workers: int | str = 4,
+    log_interval: int | str = 20,
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """The command line that runs the fine-tune in the trainer's own repository.
@@ -683,6 +694,8 @@ def trainer_command(
             str(device_batch_size),
             "--num_workers",
             str(num_workers),
+            "--log_interval",
+            str(log_interval),
             "--stats_path",
             stats_path,
             f"--exp_name={experiment_name(datasets)}",
@@ -898,12 +911,40 @@ def _molmobot_script(
         )
         for name, _ in variables
     ]
+    training_command = _shell(
+        trainer_command(
+            datasets=datasets,
+            trainer="molmobot",
+            config_path=config_path,
+            base_checkpoint='"$CHECKPOINT"',
+            output_dir=output_dir,
+            batch_size='"$GLOBAL_BATCH"',
+            steps='"$MAX_STEPS"',
+            action_type=action_type,
+            seq_len='"$SEQ_LEN"',
+            camera_names=camera_names,
+            dataset_refs=[f'"${name}"' for name, _ in variables],
+            sample_rates=sample_rates,
+            save_folder_ref='"$SAVE_FOLDER"',
+            device_batch_size='"$DEVICE_BATCH"',
+            num_workers='"$NUM_WORKERS"',
+            log_interval='"$LOG_INTERVAL"',
+            extra_args=['"${EXTRA_ARGS[@]}"'],
+            launcher=[
+                '"$TORCHRUN"',
+                "--nnodes=1",
+                '--nproc-per-node="$NPROC"',
+                "--master_port=29401",
+            ],
+        )
+    )
 
     return [
         f"PACKAGE={shlex.quote(str(package))}",
         f"SCRIPTS={shlex.quote(str(scripts))}",
         *(f"{name}={shlex.quote(str(d.root.resolve()))}" for name, d in variables),
         f"SAVE_FOLDER={shlex.quote(str((output_dir / experiment_name(datasets)).resolve()))}",
+        f"PROGRESS_FILTER={shlex.quote(str(PROGRESS_FILTER))}",
         'PYTHON="$PACKAGE"/.venv/bin/python',
         'TORCHRUN="$PACKAGE"/.venv/bin/torchrun',
         "",
@@ -986,32 +1027,20 @@ def _molmobot_script(
         ' device_batch=$DEVICE_BATCH global_batch=$GLOBAL_BATCH"',
         'mkdir -p "$SAVE_FOLDER"',
         'export PYTHONPATH="$PACKAGE${PYTHONPATH:+:$PYTHONPATH}"',
-        _shell(
-            trainer_command(
-                datasets=datasets,
-                trainer="molmobot",
-                config_path=config_path,
-                base_checkpoint='"$CHECKPOINT"',
-                output_dir=output_dir,
-                batch_size='"$GLOBAL_BATCH"',
-                steps='"$MAX_STEPS"',
-                action_type=action_type,
-                seq_len='"$SEQ_LEN"',
-                camera_names=camera_names,
-                dataset_refs=[f'"${name}"' for name, _ in variables],
-                sample_rates=sample_rates,
-                save_folder_ref='"$SAVE_FOLDER"',
-                device_batch_size='"$DEVICE_BATCH"',
-                num_workers='"$NUM_WORKERS"',
-                extra_args=['"${EXTRA_ARGS[@]}"'],
-                launcher=[
-                    '"$TORCHRUN"',
-                    "--nnodes=1",
-                    '--nproc-per-node="$NPROC"',
-                    "--master_port=29401",
-                ],
-            )
-        ),
+        "",
+        "# The trainer already knows how far along it is -- Trainer.fit prints",
+        "# `[step=N/max, eta=...]` every LOG_INTERVAL steps -- but as the first line",
+        "# of a multi-line metrics dump, so it scrolls past. train_progress.py passes",
+        "# every line through untouched and appends a bar when it sees one.",
+        "#",
+        "# `set -o pipefail` is on, so a training failure still fails this script even",
+        "# though the trainer is no longer the last command in the pipeline. 2>&1",
+        "# because the headers go to the logging handler's stream, not stdout.",
+        'if [ "$PROGRESS" = on ]; then',
+        f"    {training_command} 2>&1 | \"$PYTHON\" -u \"$PROGRESS_FILTER\"",
+        "else",
+        f"    {training_command}",
+        "fi",
         "",
         "# Then score the checkpoint, back in the stretch4_mujoco repo -- natively, with",
         "# no action remapping:",
@@ -1095,6 +1124,17 @@ def _tuning_block(
         "# Dataloader worker processes. Host RAM and CPU, not VRAM -- lower it if the",
         "# machine starts swapping while the GPU sits idle.",
         'NUM_WORKERS="${NUM_WORKERS:-4}"',
+        "",
+        "# --- Progress reporting ----------------------------------------------------",
+        "# How often the trainer prints its step header, which is also how often the",
+        "# progress bar can redraw. Every header costs a host-device sync for the",
+        "# metrics behind it, so this is a real (small) throughput trade.",
+        'LOG_INTERVAL="${LOG_INTERVAL:-20}"',
+        "",
+        "# PROGRESS=off pipes the trainer straight to the terminal instead of through",
+        "# train_progress.py. The filter only passes lines through and appends a bar,",
+        "# but a pipe is a pipe -- turn it off if you are debugging output ordering.",
+        'PROGRESS="${PROGRESS:-on}"',
         "",
         "# --- Weights & Biases ------------------------------------------------------",
         "# Off by default, and not merely for quiet: the trainer's wandb config",

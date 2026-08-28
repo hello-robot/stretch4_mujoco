@@ -983,6 +983,7 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     `val` pass leaves out an index `SynthmanipDataset` raises without.
     """
     import subprocess
+    from pathlib import Path
 
     from examples.machine_learning.molmospaces.finetuning.finetune import (
         VRAM_TIERS,
@@ -1100,6 +1101,17 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     assert "EXTRA_ARGS+=(--wandb=null)" in body
     assert '"${EXTRA_ARGS[@]}"' in body
 
+    # 7e. training runs through the progress filter, and PROGRESS=off skips the
+    #     pipe entirely -- both branches must invoke the same trainer command
+    assert 'if [ "$PROGRESS" = on ]; then' in body
+    assert '2>&1 | "$PYTHON" -u "$PROGRESS_FILTER"' in body
+    assert body.count("launch_scripts/train_molmobot.py") == 2
+    assert '--log_interval "$LOG_INTERVAL"' in body
+    filter_path = Path([
+        line.split("=", 1)[1] for line in body.splitlines() if line.startswith("PROGRESS_FILTER=")
+    ][0])
+    assert filter_path.exists(), "the generated script points at a filter that is not there"
+
     # 8. an empty split is not validated -- there is no directory to index
     solo = DatasetSummary(**{**summary.__dict__, "splits": {"train": 1, "val": 0}})
     solo_body = write_launch_script(
@@ -1115,6 +1127,64 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
         checkout=checkout,
     ).read_text()
     assert '"$DATASET"/val' not in solo_body
+
+
+def test_train_progress_passes_the_log_through_and_draws_a_bar():
+    """The progress filter must never eat a line, whatever it does with the bar.
+
+    It sits on the end of the training pipeline, so it is the only thing between
+    a crashing trainer and the terminal. A regex that swallowed unmatched lines,
+    or an exception on a line it did not expect, would turn a real stack trace
+    into silence.
+    """
+    import io
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+
+    from examples.machine_learning.molmospaces.finetuning import train_progress
+
+    header = "[2026-01-01 00:00:00] INFO [olmo.train.trainer:1306, rank=0] "
+    lines = [
+        "Set up torchrun environment",
+        f"{header}[step=15000/30000, eta=1 hour, 2 minutes]",
+        "    train/CrossEntropyLoss=1.2345",
+        # ANSI colour from the logging handler must not break the match
+        f"\033[36m{header}[step=30000/30000, eta=1 minute]\033[0m",
+        "Traceback (most recent call last):",
+    ]
+
+    captured = io.StringIO()
+    stdin = sys.stdin
+    try:
+        sys.stdin = io.StringIO("\n".join(lines) + "\n")
+        with redirect_stdout(captured):
+            assert train_progress.main() == 0
+    finally:
+        sys.stdin = stdin
+    out = captured.getvalue()
+
+    # 1. every input line survives, including the traceback after the last header
+    for line in lines:
+        assert line in out
+    assert "Traceback (most recent call last):" in out
+
+    # 2. the bar reflects the trainer's own step counter and carries its eta
+    assert "50.0%  step 15,000/30,000" in out
+    assert "1 hour, 2 minutes" in out
+    assert "100.0%  step 30,000/30,000" in out
+    assert train_progress.render_bar(1.0).strip("#") == ""
+    assert train_progress.render_bar(0.0).strip("-") == ""
+
+    # 3. a failing trainer still fails the pipeline -- the filter is last in it
+    failing = "python -c 'print(\"boom\"); raise SystemExit(3)'"
+    piped = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail; {failing} 2>&1 | python -u {train_progress.__file__}"],
+        capture_output=True,
+        text=True,
+    )
+    assert piped.returncode == 3
+    assert "boom" in piped.stdout
 
 
 def test_finetune_trains_several_tasks_as_one_mixture(tmp_path):
@@ -1204,8 +1274,18 @@ def test_finetune_trains_several_tasks_as_one_mixture(tmp_path):
     assert '--data_paths "$DATASET_PICK" "$DATASET_PNP"' in body
     assert '--val_data_paths "$DATASET_PICK" "$DATASET_PNP"' in body
     assert "--dataset_sample_rates 0.6 0.4" in body
-    assert body.count("launch_scripts/train_molmobot.py") == 1
     assert "--exp_name=stretch4_pick_pnp" in body
+
+    # 4a. exactly one training invocation per PROGRESS branch, and the two must be
+    #     the same command -- a knob added to one branch only is silently ignored
+    #     for whoever set PROGRESS=off
+    invocations = [
+        line.strip().split(" 2>&1 |")[0]
+        for line in body.splitlines()
+        if "launch_scripts/train_molmobot.py" in line
+    ]
+    assert len(invocations) == 2
+    assert invocations[0] == invocations[1]
 
     # 4b. the mixture gets its own save folder and its own normalisation stats,
     #     so a pick-only run and a pick+pnp run cannot overwrite each other
