@@ -1,7 +1,7 @@
 """
-Run Stretch 4 on the eight MolmoSpaces benchmark evaluations.
+Run Stretch 4 on the MolmoSpaces benchmark evaluations.
 
-    # baseline policies, a few episodes each, all eight benchmarks
+    # baseline policies, a few episodes each, every released benchmark
     python -m examples.machine_learning.molmospaces.run_benchmarks --episodes 5
 
     # one benchmark, more episodes, in parallel
@@ -16,6 +16,10 @@ Run Stretch 4 on the eight MolmoSpaces benchmark evaluations.
     python -m examples.machine_learning.molmospaces.run_benchmarks \
         --policy molmobot --checkpoint /path/to/checkpoint --benchmark pick
 
+    # a locally built benchmark: not in the default sweep, so name it
+    python -m examples.machine_learning.molmospaces.run_benchmarks \
+        --benchmark potato --episodes 20
+
     # just list what is registered and whether it is installed
     python -m examples.machine_learning.molmospaces.run_benchmarks --list
 
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import json
 import logging
 import os
 import traceback
@@ -281,13 +286,23 @@ def main(
         _print_benchmark_listing(list(benchmark_keys) or list(ALL_BENCHMARK_KEYS))
         return
 
-    skipped = [key for key in ALL_BENCHMARK_KEYS if key not in keys]
-    if not benchmark_keys and skipped:
-        click.secho(
-            f"Skipping {', '.join(skipped)}: not evaluable with Stretch "
-            "(see --list). Pass --benchmark <key> to run one anyway.",
-            fg="yellow",
-        )
+    if not benchmark_keys:
+        missing = [k for k in ALL_BENCHMARK_KEYS if k not in keys]
+        unsupported = [k for k in missing if not BENCHMARKS[k].supported]
+        unbuilt = [k for k in missing if BENCHMARKS[k].locally_built]
+        if unsupported:
+            click.secho(
+                f"Skipping {', '.join(unsupported)}: not evaluable with Stretch "
+                "(see --list). Pass --benchmark <key> to run one anyway.",
+                fg="yellow",
+            )
+        if unbuilt:
+            click.secho(
+                f"Skipping {', '.join(unbuilt)}: built locally rather than released, so "
+                "it is only as current as the last build_benchmark.py run. Pass "
+                "--benchmark <key> to include it.",
+                fg="yellow",
+            )
 
     if alternate is not None and len(keys) != 1:
         raise click.UsageError("--alternate applies to a single --benchmark.")
@@ -359,22 +374,46 @@ def _write_reports(results: list[BenchmarkResult]) -> None:
             log.error(f"[report] {result.benchmark} failed: {type(error).__name__}: {error}")
 
 
+def _built_episode_count(directory: Path) -> int:
+    """Episode count of a locally built benchmark, from its metadata or its JSON."""
+    metadata_path = directory / "benchmark_metadata.json"
+    if metadata_path.exists():
+        try:
+            with metadata_path.open() as handle:
+                count = json.load(handle).get("num_episodes")
+            if isinstance(count, int):
+                return count
+        except (OSError, ValueError):
+            pass
+    try:
+        with (directory / "benchmark.json").open() as handle:
+            return len(json.load(handle))
+    except (OSError, ValueError):
+        return 0
+
+
 def _print_benchmark_listing(keys: list[str]) -> None:
     for key in keys:
         benchmark = BENCHMARKS[key]
+        episodes = benchmark.num_episodes
         try:
             directory = resolve_benchmark_dir(key)
-            status = click.style("installed", fg="green")
+            status = click.style("built" if benchmark.locally_built else "installed", fg="green")
             location = str(directory)
+            if benchmark.locally_built:
+                # A built benchmark holds however many episodes the run it was
+                # built from produced, so the registry's count cannot know it.
+                episodes = _built_episode_count(directory)
         except FileNotFoundError:
-            status = click.style("NOT INSTALLED", fg="red")
+            missing_label = "NOT BUILT" if benchmark.locally_built else "NOT INSTALLED"
+            status = click.style(missing_label, fg="red")
             location = benchmark.relative_dir
         if not benchmark.supported:
             status += click.style("  (not evaluable with Stretch)", fg="yellow")
         click.echo(f"{key:14s} {benchmark.display_name:34s} {status}")
         click.echo(f"{'':14s} {benchmark.description}")
         click.echo(
-            f"{'':14s} {benchmark.num_episodes} episodes, authored with "
+            f"{'':14s} {episodes} episodes, authored with "
             f"{benchmark.authoring_robot}, task {benchmark.task_cls.rsplit('.', 1)[-1]}"
         )
         click.echo(f"{'':14s} {location}")

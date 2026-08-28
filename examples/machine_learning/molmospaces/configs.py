@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 
+from examples.machine_learning.molmospaces.added_pickup_repair import install_eval_repair
 from examples.machine_learning.molmospaces.policies.bc_policy import StretchBCPolicyConfig
 from examples.machine_learning.molmospaces.policies.molmobot_policy import (
     StretchMolmoBotPolicyConfig,
@@ -91,6 +92,14 @@ def register_stretch_episode_override() -> None:
 
 
 register_stretch_episode_override()
+
+# A benchmark whose target object is *added* to the scene (the locally built
+# `potato` one) needs the same asset-mass correction data generation applies, or
+# every policy scores 0% on a 20kg potato. See `added_pickup_repair`; measured,
+# a benchmark built from episodes the expert had just solved replayed at 0/3
+# without this. A no-op for the released benchmarks, whose target objects come
+# with the scene and whose `added_objects` is empty.
+install_eval_repair()
 
 
 class Stretch4BenchmarkEvalConfig(JsonBenchmarkEvalConfig):
@@ -279,6 +288,7 @@ class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):
 # is the ablation of that fallback now, not the baseline.
 DEFAULT_BASELINE_CONFIGS: dict[str, str] = {
     "pick": "StretchSimpleIKEvalConfig",
+    "potato": "StretchSimpleIKEvalConfig",
     "pnp": "StretchSimpleIKEvalConfig",
     "pnp_next_to": "StretchSimpleIKEvalConfig",
     "pnp_color": "StretchSimpleIKEvalConfig",

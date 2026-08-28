@@ -325,6 +325,75 @@ its base is on the floor and the lift covers the vertical range. Harmlessly so:
 `HoloJointsRobotBaseGroup.pose` only reads x, y and yaw, so the sampler's z is
 discarded rather than obeyed.)
 
+### `--task potato`: generating data for one object category
+
+`potato` is `pick` narrowed to a single object class, and it is the worked example
+for pointing the generator at whatever object you actually care about.
+
+The obvious implementation is the wrong one. Restricting the sampler's
+`pickup_types` to potatoes filters the *scene's own* objects, and a procthor
+kitchen only sometimes has a potato in it — most houses would come back
+`HouseInvalidForTask` and be abandoned, so the yield per house of simulation
+would collapse.
+
+So `StretchPotatoPickDataGenConfig` uses the sampler's **pick-from-set** mode
+instead. `added_pickup_objects` puts a set of potato assets *into* the scene and
+makes them the pickup targets; the scene's own objects are demoted to position
+anchors, used only to find a cluttered surface to stand a potato on. Every house
+that can host a pick episode at all hosts a potato pick.
+
+```bash
+python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+    --task potato --episodes 2000 --num-workers 8 \
+    --output-dir data/stretch_potato --no-export
+```
+
+Four things worth knowing if you copy this for another category:
+
+- **Added THOR prefabs arrive weighing 16–40 kg, and you must fix it.** A prefab
+  under `objects/thor/` gives its collider a sensible `density="80"` but its
+  visual mesh no mass at all — and the mesh carries `inertia="shell"`, so MuJoCo
+  derives a mass from surface area × the default 1000 kg/m³. procthor's house
+  generator writes `mass="1e-08"` on the visual geom of every prefab it inlines;
+  the added-pickupable path attaches the raw prefab and does not. That single
+  value is the difference between 0/8 and 3/8 episodes solved, and it is what
+  `added_pickup_repair.py` applies on both the datagen and the eval path. If you
+  add assets from a different source, check the mass before blaming the policy.
+
+
+- **The pool is what has grasps, not what exists.** 56 assets are annotated
+  `potato.n.01`; 29 of them have a grasp file, and those 29 are the iTHOR
+  `Potato_*` prefabs rather than the objaverse scans. An asset without grasps
+  does not merely produce worse data — the sampler raises out of
+  `get_pickup_grasps()` and burns an episode attempt. `potato_pickup_uids()`
+  filters on `has_valid_pickup_grasps` for that reason.
+- **Don't route through `added_pickup_class_rank`.** It is the upstream way to
+  select a category, and it calls `_pickupable_class_ranking()`, which reads an
+  absolute `/weka/...` path that only exists inside AI2. It raises
+  `FileNotFoundError` anywhere else.
+- **Leave `pickup_types` alone.** In pick-from-set mode it selects the anchor
+  objects, not the target, so setting it to your category reintroduces exactly
+  the empty-candidate-list failure the mode exists to avoid.
+
+`POTATO_PICKUPS_PER_HOUSE` (10) is how much of the pool each house sees; only one
+potato is in the room at a time, and the sampler advances to the next one each
+episode. The rest wait on a staging platform at z≈25m, directly above the house —
+so if you watch a run with `--visualize` you will see a row of potatoes floating
+outside the building. That is the upstream mode working as designed: they are
+above the ceiling, invisible to every camera, and only the placed one is part of
+the task. Set `POTATO_PICKUPS_PER_HOUSE = 1` if you would rather not see them, at
+the cost of every episode in a house using the same asset.
+
+Expected yield: **3/8** episodes solved over two `procthor-10k` houses, against
+1/8 for plain `pick` on the same houses. That is *after* the mass repair above;
+before it, the expert grasped the potato every time and then lost it on the lift
+(`grasp lost: … drifted 0.124m`) for 0/8. If you see that signature, suspect the
+object's mass before the policy.
+
+To *score* a potato policy, see "A benchmark for a task with no release" in
+[../README.md](../README.md) — the released suites have six potato episodes
+between them, so the test set gets built rather than downloaded.
+
 ### Authored Grasps and Kinematics Solving
 
 When `generate_dataset.py` runs the procedural `simple_ik` expert, it retrieves pre-authored 6-DOF grasp candidates from MolmoSpaces' asset library and solves for Stretch 4 joint configurations.

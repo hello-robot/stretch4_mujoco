@@ -32,8 +32,12 @@ generated and retargeted episodes present the robot with the same geometry.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path
+from typing import cast
 
+from examples.machine_learning.molmospaces.added_pickup_repair import repair_added_pickup_masses
 from examples.machine_learning.molmospaces.stretch.episode_overrides import REACH_BAND_M
 from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicyConfig
 from examples.machine_learning.molmospaces.stretch.config import (
@@ -51,8 +55,10 @@ from molmo_spaces.configs.base_pick_config import PickBaseConfig
 from molmo_spaces.configs.camera_configs import CameraSystemConfig
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
 from molmo_spaces.configs.robot_configs import BaseRobotConfig
+from molmo_spaces.configs.task_sampler_configs import PickTaskSamplerConfig
 from molmo_spaces.data_generation.config_registry import register_config
 from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+from molmo_spaces.tasks.pick_task_sampler import PickTaskSampler
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +116,78 @@ discarded rather than obeyed.
 
 DATAGEN_ROOT = Path(ASSETS_DIR) / "experiment_output" / "datagen"
 """Where MolmoSpaces' own configs write, so Stretch's runs sit beside them."""
+
+POTATO_SYNSET = "potato.n.01"
+"""
+WordNet synset every potato asset in the object metadata is annotated with.
+
+The right key to select on rather than the category string: `category` is
+`"potato"` for the iTHOR prefabs and `"ObjaPotato"`/`"potato"` for objaverse
+assets depending on the pack, while the synset is normalised across both. It is
+also what `_pickupable_synset_to_uids()` groups by upstream, so the set this
+picks out is the same set MolmoSpaces would call the potato class.
+"""
+
+POTATO_PICKUPS_PER_HOUSE = 10
+"""
+How many potatoes to add to each house's scene.
+
+There are only ~29 potato assets with grasps, so this is not a sample of a large
+pool -- it is how much of the pool each house sees. Every added pickupable is
+compiled into the scene MJCF whether or not it is used, so the whole pool in
+every house would pay model-compile time for assets most episodes never touch;
+ten is enough that a house's episodes are not all the same potato, and the
+sampler's own random pre-selection differs per house, so the run as a whole
+still covers the pool.
+
+Only one is placed in the room at a time -- see `episodes_per_added_pickup`
+below and `PickTaskSampler._prepare_added_pickupable`. The rest stay on the
+staging platform the sampler parks them on, 25m above the house.
+"""
+
+
+@lru_cache(maxsize=1)
+def potato_pickup_uids() -> tuple[str, ...]:
+    """Asset UIDs for every potato that can actually be picked up.
+
+    Two filters, both necessary. The synset selects potatoes; `has_valid_pickup_grasps`
+    drops the ones with no grasp annotation, which is most of them -- of the 56
+    potato assets in the metadata, 29 have grasps, and they are the iTHOR
+    `Potato_*` prefabs rather than the objaverse scans. An asset without grasps
+    is not merely lower quality: `PickTaskSampler` raises `ValueError` from
+    `get_pickup_grasps()` on it and burns an episode attempt per house.
+
+    Not `synset_utils._pickupable_class_ranking()`, which is the upstream route
+    to the same thing (`added_pickup_class_rank`): it reads
+    `BENCHMARK_BLACKLIST_UIDS_PATH`, an absolute `/weka/...` path that only
+    exists inside AI2, so it raises `FileNotFoundError` on any other machine.
+
+    Cached because it walks all ~131k annotation records.
+    """
+    from molmo_spaces.utils.grasps import has_valid_pickup_grasps
+    from molmo_spaces.utils.object_metadata import ObjectMeta
+
+    # Called with no arguments this returns the whole annotation container, a
+    # mapping; the signature's `list | dict | None` covers its by-uid overloads.
+    annotations = cast(Mapping[str, dict], ObjectMeta.annotation())
+    potatoes = sorted(
+        uid for uid, anno in annotations.items() if anno.get("synset") == POTATO_SYNSET
+    )
+    graspable = tuple(uid for uid in potatoes if has_valid_pickup_grasps(uid))
+
+    if not graspable:
+        raise RuntimeError(
+            f"No potato assets with pickup grasps found: {len(potatoes)} assets are "
+            f"annotated {POTATO_SYNSET} but none has a grasp file. The 'objects' and "
+            "'grasps' asset packages are probably not installed; generate any other "
+            "task first, which installs them on demand."
+        )
+
+    log.info(
+        f"[stretch-datagen] potato pool: {len(graspable)} graspable of {len(potatoes)} "
+        f"{POTATO_SYNSET} assets"
+    )
+    return graspable
 
 
 class StretchDataGenMixin:
@@ -201,6 +279,92 @@ class StretchPickDataGenConfig(StretchDataGenMixin, PickBaseConfig):
         return "stretch_pick_datagen"
 
 
+class StretchAddedPickupTaskSampler(PickTaskSampler):
+    """`PickTaskSampler` that repairs the mass of the pickupables it adds to a scene.
+
+    Without this, an added THOR prefab weighs 16-40 kg rather than ~30 g, which
+    makes it both unliftable and prone to rolling away. See
+    `added_pickup_repair` for the measurements and the reason.
+
+    Not potato-specific -- it applies to any THOR prefab used as an added
+    pickupable, which is why it selects by name rather than by asset.
+    """
+
+    def add_auxiliary_objects(self, spec) -> None:
+        super().add_auxiliary_objects(spec)
+
+        if self.config.task_sampler_config.added_pickup_objects is None:
+            return
+
+        # `self.added_objects` is every pickupable attached to this scene, before
+        # `_select_pickup_object` trims `task_config.added_objects` to the one
+        # this episode uses. All of them need repairing: an unused potato still
+        # sits on the staging platform as a 20 kg body the solver has to carry.
+        added = list(getattr(self, "added_objects", {}) or {})
+        repaired = repair_added_pickup_masses(spec, added)
+
+        if repaired:
+            log.debug(f"[stretch-datagen] repaired {repaired} added-pickupable visual geoms")
+        else:
+            # Loud, because a silent no-op here reappears as an unexplained
+            # collapse in success rate rather than as an error.
+            log.warning(
+                f"[stretch-datagen] repaired nothing on {len(added)} added pickupables. "
+                "If the asset layout changed upstream they may weigh tens of kilograms; "
+                "see added_pickup_repair."
+            )
+
+
+@register_config("StretchPotatoPickDataGenConfig", strict=False)
+class StretchPotatoPickDataGenConfig(StretchPickDataGenConfig):
+    """Stretch picking up potatoes, and only potatoes.
+
+    Same task, same expert and same houses as `StretchPickDataGenConfig`; the one
+    change is *what* gets picked up. Rather than filtering the scene's own
+    objects down to potatoes -- procthor kitchens rarely have one, so almost every
+    house would be abandoned with `HouseInvalidForTask` -- this uses the sampler's
+    pick-from-set mode: `added_pickup_objects` puts a set of potatoes into the
+    scene and makes them the pickup targets, while the scene's own objects serve
+    only as position anchors to place a potato next to on a cluttered surface.
+    So every house that can host a pick episode at all hosts a potato pick.
+
+    Note what is *not* set: `pickup_types`. It is tempting as a "only potatoes"
+    filter, but in pick-from-set mode it selects the *reference* objects a potato
+    is placed beside, not the pickup target -- restricting those to potatoes
+    would put us straight back to the empty-candidate-list failure above.
+    """
+
+    output_dir: Path = DATAGEN_ROOT / "stretch_potato_v1"
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+
+        # Cast only for the type checker: the mixin widens this field's declared
+        # type, while every config here builds a pick-family sampler config.
+        sampler_config = cast(PickTaskSamplerConfig, self.task_sampler_config)
+        sampler_config.added_pickup_objects = list(potato_pickup_uids())
+        sampler_config.num_added_pickups = POTATO_PICKUPS_PER_HOUSE
+
+        # Without this the potatoes weigh 16-40 kg each; see the class docstring.
+        sampler_config.task_sampler_class = StretchAddedPickupTaskSampler
+
+        # One episode per potato before advancing to the next one in the house's
+        # set, so a house's episodes vary the asset rather than repeating one.
+        sampler_config.episodes_per_added_pickup = 1
+
+        # `PickTaskSamplerConfig.model_post_init` does this for a config that
+        # declares `added_pickup_objects` as a field default; ours is set here,
+        # after that has already run. Oversampling exists to raise the share of
+        # objaverse assets among *pickup* candidates, and in pick-from-set mode
+        # the pickup candidates are the potatoes we added, so it now only skews
+        # which scene objects get used as anchors.
+        sampler_config.objaverse_oversampling_factor = 1
+
+    @property
+    def tag(self) -> str:
+        return "stretch_potato_pick_datagen"
+
+
 @register_config("StretchPickAndPlaceDataGenConfig", strict=False)
 class StretchPickAndPlaceDataGenConfig(StretchDataGenMixin, PickAndPlaceDataGenConfig):
     """Stretch picking an object and placing it on a named receptacle."""
@@ -286,6 +450,7 @@ class StretchPickDebugDataGenConfig(StretchPickDataGenConfig):
 
 DATAGEN_CONFIGS: dict[str, str] = {
     "pick": "StretchPickDataGenConfig",
+    "potato": "StretchPotatoPickDataGenConfig",
     "pnp": "StretchPickAndPlaceDataGenConfig",
     "pnp_next_to": "StretchPickAndPlaceNextToDataGenConfig",
     "pnp_color": "StretchPickAndPlaceColorDataGenConfig",

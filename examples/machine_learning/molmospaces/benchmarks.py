@@ -1,5 +1,11 @@
 """
-The eight MolmoSpaces benchmark evaluations, as a registry.
+The benchmark evaluations Stretch can be scored on, as a registry.
+
+Eight of them are MolmoSpaces' released benchmarks; the ninth (`potato`) is built
+locally by `build_benchmark.py` out of Stretch's own rollouts, because the task
+it scores has no release. `Benchmark.locally_built` is what tells them apart, and
+everything downstream -- `run_benchmarks.py`, `resolve_benchmark_dir` -- treats
+them the same once the file exists.
 
 MolmoSpaces ships its benchmarks as `benchmark.json` files under
 `$MLSPACES_ASSETS_DIR/benchmarks/`, one directory per (suite, scene dataset,
@@ -65,6 +71,18 @@ class Benchmark:
     unless asked for by name.
     """
 
+    locally_built: bool = False
+    """
+    Whether this benchmark is built on this machine rather than downloaded.
+
+    A released benchmark's directory arrives with the MolmoSpaces assets, so it
+    either exists or the asset package is not installed. A locally built one does
+    not exist until `build_benchmark.py` has been pointed at a set of rollouts,
+    which is why these are left out of `SUPPORTED_BENCHMARK_KEYS`: a default
+    sweep should not report an ERROR row for a benchmark nobody has built yet.
+    Name one with `--benchmark <key>` and it runs like any other.
+    """
+
     alternates: dict[str, str] = field(default_factory=dict)
     """Other released benchmark directories for the same task family, by label."""
 
@@ -95,6 +113,17 @@ def default_benchmarks_root() -> Path:
 _V1 = "molmospaces-bench-v1"
 _V2 = "molmospaces-bench-v2"
 
+LOCAL_SUITE = "stretch-local"
+"""
+Directory under `<assets>/benchmarks/` that `build_benchmark.py` writes into.
+
+Deliberately not one of the released suite names: a locally built benchmark must
+never be mistaken for `molmospaces-bench-v2`, whose numbers are comparable with
+the MolmoSpaces leaderboard's. It also keeps built benchmarks out of the way of
+the resource manager, which owns the released suites' directories and would
+happily replace their contents on the next asset install.
+"""
+
 BENCHMARKS: dict[str, Benchmark] = {
     b.key: b
     for b in (
@@ -113,6 +142,18 @@ BENCHMARKS: dict[str, Benchmark] = {
                 "ms": f"{_V1}/procthor-10k/FrankaPickDroidMiniBench"
                 "/FrankaPickDroidMiniBench_json_benchmark_20251231",
             },
+        ),
+        Benchmark(
+            key="potato",
+            display_name="Potato-Pick (local)",
+            task_cls="molmo_spaces.tasks.pick_task.PickTask",
+            relative_dir=f"{LOCAL_SUITE}/potato",
+            authoring_robot="stretch4",
+            num_episodes=0,
+            description="Pick up a potato. The test set for the 'potato' datagen task; "
+            "built locally from held-out rollouts by build_benchmark.py, because no "
+            "released suite has more than a handful of potato episodes.",
+            locally_built=True,
         ),
         Benchmark(
             key="pnp",
@@ -223,8 +264,18 @@ BENCHMARKS: dict[str, Benchmark] = {
 
 ALL_BENCHMARK_KEYS = tuple(BENCHMARKS)
 
-SUPPORTED_BENCHMARK_KEYS = tuple(key for key, b in BENCHMARKS.items() if b.supported)
-"""The benchmarks a Stretch run sweeps by default. See `Benchmark.supported`."""
+SUPPORTED_BENCHMARK_KEYS = tuple(
+    key for key, b in BENCHMARKS.items() if b.supported and not b.locally_built
+)
+"""
+The benchmarks a Stretch run sweeps by default.
+
+See `Benchmark.supported` for what is excluded as un-evaluable, and
+`Benchmark.locally_built` for what is excluded as not-yet-built.
+"""
+
+LOCALLY_BUILT_BENCHMARK_KEYS = tuple(key for key, b in BENCHMARKS.items() if b.locally_built)
+"""The benchmarks `build_benchmark.py` can write. See `Benchmark.locally_built`."""
 
 # Task families whose success criterion is reached by driving rather than by
 # manipulating. `run_benchmarks.py` and the simple ik policy branch on this.
@@ -249,6 +300,17 @@ def resolve_benchmark_dir(
     benchmark = BENCHMARKS[key]
     directory = benchmark.directory(benchmarks_root, alternate=alternate)
     if not (directory / "benchmark.json").exists():
+        if benchmark.locally_built:
+            raise FileNotFoundError(
+                f"No benchmark.json under {directory}.\n"
+                f"The '{key}' benchmark is built locally rather than downloaded. Generate "
+                "held-out episodes and freeze them into it with:\n"
+                "  python -m examples.machine_learning.molmospaces.finetuning.generate_dataset "
+                f"--task {key} --episodes 200 --data-split val --no-export "
+                f"--output-dir data/stretch_{key}_eval\n"
+                "  python -m examples.machine_learning.molmospaces.build_benchmark "
+                f"--rollouts data/stretch_{key}_eval/rollouts/{key} --benchmark {key}"
+            )
         suite = benchmark.relative_dir.split("/", 1)[0]
         raise FileNotFoundError(
             f"No benchmark.json under {directory}.\n"
