@@ -57,8 +57,8 @@ python -m examples.machine_learning.molmospaces.finetuning.finetune \
     --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
     --cameras "head_right,wrist_right"
 
-# 4. read that script, then run it: it installs MolmoBot's deps, builds the
-#    trajectory index its dataloader requires, and trains
+# 4. read that script, then run it: it installs MolmoBot's deps, downloads the
+#    base checkpoint, builds the trajectory index its dataloader requires, trains
 bash data/stretch_pick/rollouts/molmobot/pick/run_molmobot.sh
 
 # 5. score the result -- natively, no remapping
@@ -96,9 +96,49 @@ with quantiles over the raw actions and min/max over raw `qpos` — so the
 generated script explains that and leaves it in for the modes that do.
 
 Nothing past writing the script runs from here. `uv sync --extra train` pulls
-torch and the fine-tune runs for a long time, so both are lines in
-`run_<trainer>.sh` for you to launch, not side effects of a command that mostly
-inspects data.
+torch, the base checkpoint is ~20GB, and the fine-tune runs for a long time, so
+all three are lines in `run_<trainer>.sh` for you to launch, not side effects of
+a command that mostly inspects data.
+
+### The base checkpoint is a directory, not a name
+
+`train_molmobot.py`'s help calls its positional argument "Path to checkpoint or
+'8b' for base model", but **nothing in the trainer maps `8b` to a model** —
+`select_checkpoint` runs `os.listdir` on whatever string it is handed, so `8b`
+dies with a bare `FileNotFoundError: '8b'` after the dataset has already loaded.
+The default here is `allenai/MolmoBot-DROID`, whose HuggingFace repository holds
+exactly the `model.pt` + `config.yaml` that `select_checkpoint` and `get_model`
+accept; the generated script downloads it and passes the directory. Pass a local
+path to `--base-checkpoint` to use a checkpoint you already have, or follow
+MolmoBot's README to start from the Molmo2-4B VLM instead — that is the
+from-scratch recipe and wants far more data than a fine-tune does.
+
+## Several tasks, one policy
+
+MolmoBot is language-conditioned on each trajectory's `task_description`, so pick
+and pnp belong in **one** run and one checkpoint — training them separately gives
+two models, each having forgotten the other's task. Repeat `--rollouts`:
+
+```bash
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --rollouts data/stretch_pick/rollouts/pick \
+    --rollouts data/stretch_pick/rollouts/pnp \
+    --sample-rates "0.6,0.4" --trainer molmobot
+```
+
+Each task is prepared into its own `train/`+`val/` layout, every split of every
+task is indexed, and the script lands in their shared parent
+(`rollouts/molmobot/run_molmobot.sh`) because the run spans all of them.
+
+Two details the generated command handles that are easy to miss by hand:
+
+- **`--val_data_paths` is passed explicitly.** Left off, MolmoBot validates on
+  the `val/` of the *first* `--data_paths` entry alone, so a two-task run reports
+  pick's loss while training on both.
+- **Every task needs a non-empty `val/`.** `arrange_train_val_split` holds out no
+  houses when a task has only one, and an empty split has no
+  `valid_trajectory_index.json` for the dataloader to open. `finetune.py` warns
+  about this before you spend an hour on the earlier steps.
 
 ## The other trainers, and the LeRobot export
 
