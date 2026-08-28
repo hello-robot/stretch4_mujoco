@@ -52,6 +52,15 @@ log = logging.getLogger(__name__)
 TRAJECTORY_FILE_PATTERN = re.compile(r"^trajectories(?P<suffix>.*)\.h5$")
 TRAJECTORY_KEY_PATTERN = re.compile(r"^traj_(?P<index>\d+)$")
 
+
+class DuplicateSplitError(RuntimeError):
+    """A house is in both `train/` and `val/`, so the split leaks.
+
+    Its own type rather than a bare `RuntimeError` because callers should be able
+    to say something better than a traceback: `finetune.py` turns it into a
+    `ClickException`, and a test can assert on it without matching on message text.
+    """
+
 VIDEO_PATH_FIELD_BYTES = 100
 """
 Width of the `obs/sensor_data/<camera>` byte array, from MolmoSpaces' own writer.
@@ -266,6 +275,40 @@ def arrange_train_val_split(
         log.warning(f"[hdf5] only one house in {rollout_dir}; no validation split held out")
 
     splits = {"train": train_houses, "val": val_houses}
+
+    # Drop placements from a previous split before writing this one. Houses are
+    # assigned by position (`houses[::stride]`), so growing or regenerating a
+    # rollout directory moves some of them across the boundary -- and the
+    # "already placed, skip" branch below only ever looks at the split it is
+    # writing, so the *other* split keeps its old entry. The house then appears
+    # in both, and the same trajectories are trained on and validated against.
+    # Observed exactly that: 5 houses in both splits, 13% of val also in train.
+    #
+    # Only entries this function could have written are removed -- a symlink, or
+    # a directory when link=False. Anything else is left in place and reported by
+    # the disjointness check after placement, because deleting something a person
+    # put there by hand is worse than failing.
+    assigned = {house.name: split for split, houses_ in splits.items() for house in houses_}
+    for split in splits:
+        split_dir = output_dir / split
+        if not split_dir.is_dir():
+            continue
+        for existing in sorted(split_dir.iterdir()):
+            if not existing.name.startswith("house_"):
+                continue
+            belongs = assigned.get(existing.name)
+            if belongs is None or belongs == split:
+                continue  # still ours, or no longer in the rollout dir at all
+            if existing.is_symlink() or (not link and existing.is_dir()):
+                log.warning(
+                    f"[hdf5] {existing} is now a {belongs} house; removing the stale "
+                    f"{split} placement that would otherwise put it in both splits"
+                )
+                if existing.is_symlink():
+                    existing.unlink()
+                else:
+                    shutil.rmtree(existing)
+
     placed: dict[str, list[Path]] = {}
     for split, split_houses in splits.items():
         split_dir = output_dir / split
@@ -295,11 +338,53 @@ def arrange_train_val_split(
                 shutil.copytree(split_house, destination)
             placed[split].append(destination)
 
+    _assert_splits_disjoint(output_dir)
+
     log.info(
         f"[hdf5] {output_dir}: {len(placed['train'])} train houses, "
         f"{len(placed['val'])} val houses ({'symlinked' if link else 'copied'})"
     )
     return placed
+
+
+def _assert_splits_disjoint(output_dir: Path) -> None:
+    """Fail if any house ended up in both `train/` and `val/`.
+
+    Read back off the disk rather than from the lists just written, so this also
+    catches houses left by an earlier run, placed by hand, or copied in -- not
+    only the ones this call is responsible for.
+
+    The failure it guards against is silent and expensive: a house in both splits
+    means the same trajectories are trained on and validated against, so val loss
+    reads better than reality and drifts further off as the model memorises them.
+    Nothing downstream notices -- the trainer builds both datasets happily -- and
+    the number you would use to decide whether the policy generalises is the
+    number that has been compromised. Cheaper to refuse to produce the layout.
+    """
+    on_disk = {
+        split: {
+            path.name
+            for path in (output_dir / split).iterdir()
+            if path.name.startswith("house_") and (path.is_dir() or path.is_symlink())
+        }
+        for split in ("train", "val")
+        if (output_dir / split).is_dir()
+    }
+    both = on_disk.get("train", set()) & on_disk.get("val", set())
+    if not both:
+        return
+
+    listed = "\n".join(
+        f"    {output_dir / 'train' / name}\n    {output_dir / 'val' / name}"
+        for name in sorted(both)
+    )
+    raise DuplicateSplitError(
+        f"{len(both)} house(s) are in both train/ and val/ under {output_dir}, so the same "
+        f"trajectories would be trained on and validated against:\n{listed}\n"
+        "Remove whichever placement is wrong, or delete both split directories and let this "
+        "rebuild them -- the houses themselves live in the rollout directory and are not "
+        "touched by either."
+    )
 
 
 def count_trajectories(rollout_dir: Path, successful_only: bool = False) -> int:
