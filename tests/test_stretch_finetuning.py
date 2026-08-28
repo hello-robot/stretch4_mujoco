@@ -973,6 +973,106 @@ def test_finetune_camera_selection_parsing_and_commands(tmp_path):
     ]
 
 
+def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
+    """The generated script is valid bash, and says the things that are easy to get wrong.
+
+    Every failure this guards against is silent at generation time and loud a
+    long way downstream: a mis-quoted `"$DATASET"` sends validate_trajectories at
+    a directory literally named `$DATASET`; a `--data_paths` with the split
+    already on the end makes MolmoBot look for `train/train`; and a missing
+    `val` pass leaves out an index `SynthmanipDataset` raises without.
+    """
+    import subprocess
+
+    from examples.machine_learning.molmospaces.finetuning.finetune import (
+        DatasetSummary,
+        write_launch_script,
+        write_trainer_config,
+    )
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        PACKAGE_SUBDIR,
+        TRAINER_SCRIPT,
+        MolmoBotCheckout,
+    )
+
+    dataset = tmp_path / "molmobot" / "pick"
+    dataset.mkdir(parents=True)
+    checkout = MolmoBotCheckout(
+        root=tmp_path / "MolmoBot",
+        package_dir=tmp_path / "MolmoBot" / PACKAGE_SUBDIR,
+        data_scripts_dir=tmp_path / "MolmoBot" / "data_scripts",
+    )
+    (checkout.package_dir / TRAINER_SCRIPT).parent.mkdir(parents=True)
+
+    summary = DatasetSummary(
+        root=dataset,
+        kind="molmospaces",
+        action_space="stretch_move_groups",
+        state_dim=10,
+        action_dim=10,
+        num_episodes=8,
+        num_frames=0,
+        fps=15.0,
+        video_keys=["head_camera_right", "wrist_camera_right"],
+        splits={"train": 1, "val": 1},
+    )
+    config_path = write_trainer_config(
+        summary=summary,
+        trainer="molmobot",
+        base_checkpoint="8b",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        learning_rate=1e-5,
+        action_type="joint_pos_rel",
+    )
+    script = write_launch_script(
+        summary=summary,
+        trainer="molmobot",
+        config_path=config_path,
+        base_checkpoint="8b",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        action_type="joint_pos_rel",
+        seq_len=2048,
+        checkout=checkout,
+    )
+    body = script.read_text()
+
+    # 1. bash parses it, and it is executable
+    assert subprocess.run(["bash", "-n", str(script)], capture_output=True).returncode == 0
+    assert script.stat().st_mode & 0o111
+
+    # 2. shell variables survive quoting rather than being emitted literally
+    assert '"$SCRIPTS"/validate_trajectories.py "$DATASET"/train' in body
+    assert '"$SCRIPTS"/validate_trajectories.py "$DATASET"/val' in body
+    assert "'\"$DATASET\"'" not in body
+
+    # 3. --data_paths takes the task directory; MolmoBot appends the split itself
+    assert "--data_paths \"$DATASET\" " in body
+    assert '--data_paths "$DATASET"/train' not in body
+
+    # 4. the gripper's min_max lookup needs joint_pos alongside the action type
+    assert "--keys actions/joint_pos_rel actions/joint_pos obs/agent/qpos" in body
+
+    # 5. an empty split is not validated -- there is no directory to index
+    solo = DatasetSummary(**{**summary.__dict__, "splits": {"train": 1, "val": 0}})
+    solo_body = write_launch_script(
+        summary=solo,
+        trainer="molmobot",
+        config_path=config_path,
+        base_checkpoint="8b",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        action_type="joint_pos_rel",
+        seq_len=2048,
+        checkout=checkout,
+    ).read_text()
+    assert '"$DATASET"/val' not in solo_body
+
+
 def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
     """Stretch 4 camera system exposes the onboard cameras at 640x368 resolution."""
     from examples.machine_learning.molmospaces.stretch.config import (

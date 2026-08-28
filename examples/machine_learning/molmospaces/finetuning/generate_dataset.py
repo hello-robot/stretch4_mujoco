@@ -2028,7 +2028,7 @@ def main(
     click.echo(
         "Fine-tune with:\n"
         f"  python -m examples.machine_learning.molmospaces.finetuning.finetune "
-        f"--dataset {dataset_dir} --dry-run"
+        f"--dataset {dataset_dir} --trainer openpi"
     )
 
 
