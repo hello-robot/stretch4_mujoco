@@ -11,7 +11,8 @@ datagen_configs.py   Stretch versions of MolmoSpaces' data generation configs
 generate_dataset.py  run them, then optionally export -- one command
 live_recorder.py     record teleop demonstrations from examples/molmo_environment.py
 lerobot_export.py    rollouts -> a LeRobot v2.1 dataset (for openpi / LeRobot)
-finetune.py          check the data, prepare it, write the trainer config, launch
+molmobot_repo.py     clone MolmoBot, fetch the scripts that are not in it
+finetune.py          check the data, prepare it, write the config and a run script
 ```
 
 The trajectory format itself is `../hdf5_layout.py`, one level up because
@@ -51,11 +52,15 @@ python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
     --task pick --task pnp --episodes 2000 --num-workers 8 \
     --output-dir data/stretch_pick --no-export
 
-# 3. prepare and print the commands
+# 3. prepare the data, fetch MolmoBot, write run_molmobot.sh
 python -m examples.machine_learning.molmospaces.finetuning.finetune \
-    --rollouts data/stretch_pick/rollouts/pick --trainer molmobot
+    --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
+    --cameras "head_right,wrist_right"
 
-# 4. run MolmoBot's two preprocessing steps, then its trainer (in your checkout)
+# 4. read that script, then run it: it installs MolmoBot's deps, builds the
+#    trajectory index its dataloader requires, and trains
+bash data/stretch_pick/rollouts/molmobot/pick/run_molmobot.sh
+
 # 5. score the result -- natively, no remapping
 python -m examples.machine_learning.molmospaces.run_benchmarks \
     --policy molmobot --checkpoint <checkpoint> --benchmark pick
@@ -76,10 +81,24 @@ MolmoBot dataset, both easy to miss:
   `arrange_train_val_split()` symlinks them across, moving houses *whole* so a
   room never lands in both splits.
 
-It also prints MolmoBot's own two preprocessing commands
-(`validate_trajectories.py`, `calculate_stats.py`) rather than running them —
-they live in its repository and write the manifest and norm-stats YAML its
-trainer reads.
+Step 3 also clones MolmoBot (into `third_party/MolmoBot`, gitignored) and
+downloads its two data-postprocessing scripts. Those are worth a note, because
+MolmoBot's README references `validate_trajectories.py` and `calculate_stats.py`
+as though they sat beside its trainer and **they are not in its git repository at
+all** — they ship with the `allenai/molmobot-data` dataset on HuggingFace.
+`molmobot_repo.py` fetches them into `third_party/MolmoBot/data_scripts/`.
+
+Of the two, only `validate_trajectories.py` is load-bearing: it writes the
+`valid_trajectory_index.json` that `SynthmanipDataset` raises without, once per
+split directory. `calculate_stats.py` writes a `stats` group that
+`train_molmobot.py` does not read on the path configured here — it normalises
+with quantiles over the raw actions and min/max over raw `qpos` — so the
+generated script explains that and leaves it in for the modes that do.
+
+Nothing past writing the script runs from here. `uv sync --extra train` pulls
+torch and the fine-tune runs for a long time, so both are lines in
+`run_<trainer>.sh` for you to launch, not side effects of a command that mostly
+inspects data.
 
 ## The other trainers, and the LeRobot export
 

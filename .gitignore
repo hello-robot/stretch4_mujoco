@@ -27,3 +27,7 @@ stretch_temp_abs.xml
 
 # Default output directory for examples/machine_learning/molmospaces/run_benchmarks.py
 eval_output/
+
+# MolmoBot: a plain clone (robocasa/robosuite beside it are submodules), put
+# there by finetuning/finetune.py so it can generate a runnable training script.
+third_party/MolmoBot/
