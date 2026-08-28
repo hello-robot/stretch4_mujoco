@@ -97,9 +97,11 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
 )
 from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     DEFAULT_CHECKOUT,
+    STRETCH_PRESET_NAMES,
     MolmoBotCheckout,
     MolmoBotSetupError,
     ensure_checkout,
+    ensure_stretch_presets,
 )
 
 CAMERA_NAME_ALIASES: dict[str, str] = {
@@ -705,8 +707,13 @@ def trainer_command(
             str(seq_len),
             "--action_dim",
             str(summary.action_dim),
-            "--action_move_groups",
-            *STRETCH_ACTION_SPEC,
+            # The preset, not --action_move_groups: MolmoBot takes the per-group
+            # widths only from ACTION_SPECS[action_preset], and sets the move
+            # groups from the same entry. `molmobot_repo.ensure_stretch_presets`
+            # writes it from STRETCH_ACTION_SPEC, so the order the policy unpacks
+            # in comes from one place.
+            "--action_preset",
+            STRETCH_PRESET_NAMES[action_type],
             "--camera_names",
             *selected,
             "--action_type",
@@ -1598,9 +1605,10 @@ def main(
     if trainer == "molmobot":
         try:
             checkout = ensure_checkout(trainer_repo or DEFAULT_CHECKOUT, clone=clone)
+            registered = ensure_stretch_presets(checkout, STRETCH_ACTION_SPEC)
         except MolmoBotSetupError as e:
             raise click.ClickException(str(e)) from e
-        _print_checkout(checkout)
+        _print_checkout(checkout, registered)
 
     script_path = write_launch_script(
         datasets=datasets,
@@ -1673,7 +1681,7 @@ def _warn_about_empty_val_splits(datasets: list[DatasetSummary]) -> None:
     )
 
 
-def _print_checkout(checkout: MolmoBotCheckout) -> None:
+def _print_checkout(checkout: MolmoBotCheckout, registered: list[str]) -> None:
     click.echo("")
     click.secho(
         f"MolmoBot  {checkout.root}  ({'cloned just now' if checkout.cloned else 'already there'})",
@@ -1684,6 +1692,11 @@ def _print_checkout(checkout: MolmoBotCheckout) -> None:
         f"  scripts: {', '.join(fetched)} (downloaded)"
         if fetched
         else "  scripts: validate_trajectories.py, calculate_stats.py (already there)"
+    )
+    click.echo(
+        f"  presets: {', '.join(registered)} (registered in synthmanip_presets.py)"
+        if registered
+        else f"  presets: {', '.join(sorted(set(STRETCH_PRESET_NAMES.values())))} (already there)"
     )
     click.echo(
         f"  venv:    {checkout.venv_python}"

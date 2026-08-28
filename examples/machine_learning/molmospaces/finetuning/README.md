@@ -89,7 +89,26 @@ as though they sat beside its trainer and **they are not in its git repository a
 all** — they ship with the `allenai/molmobot-data` dataset on HuggingFace.
 `molmobot_repo.py` fetches them into `third_party/MolmoBot/data_scripts/`.
 
-Of the two, only `validate_trajectories.py` is load-bearing: it writes the
+It also **registers Stretch in MolmoBot's preset table**, which a fresh clone has
+no way to learn. `--action_dim` and `--action_move_groups` give the trainer the
+width and the names, but the *per-group* widths come only from
+`ACTION_SPECS[args.action_preset]`, and with nothing matched `train_molmobot.py`
+raises:
+
+```
+ValueError: Action spec must be specified via --action_preset.
+```
+
+It raises that *after* the data paths validate, so it reads like a data problem
+when it is a missing preset. `molmobot_repo.ensure_stretch_presets` writes
+`stretch_joint` and `stretch_jointdelta` into `synthmanip_presets.py` from
+`STRETCH_ACTION_SPEC` — one source for the widths and the move-group order the
+evaluation policy unpacks in — and the generated command passes
+`--action_preset` instead of `--action_move_groups`. It is idempotent, leaves an
+existing entry alone, and needs no patch to `train_molmobot.py`: with the preset
+present that `raise` is never reached, so the trainer runs unmodified.
+
+Of the two downloaded scripts, only `validate_trajectories.py` is load-bearing: it writes the
 `valid_trajectory_index.json` that `SynthmanipDataset` raises without, once per
 split directory. `calculate_stats.py` writes a `stats` group that
 `train_molmobot.py` does not read on the path configured here — it normalises

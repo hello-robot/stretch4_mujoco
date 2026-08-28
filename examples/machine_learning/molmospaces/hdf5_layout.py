@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -270,15 +271,28 @@ def arrange_train_val_split(
         split_dir = output_dir / split
         split_dir.mkdir(parents=True, exist_ok=True)
         placed[split] = []
-        for house in split_houses:
-            destination = split_dir / house.name
+        for split_house in split_houses:
+            destination = split_dir / split_house.name
+            # A symlink that no longer resolves is repaired rather than kept.
+            # The targets written here are absolute, so moving or copying a data
+            # directory to another machine -- or another path on this one --
+            # leaves every split entry dangling. Treating "a symlink exists" as
+            # "this house is placed" would then hand the trainer a layout whose
+            # houses all point at nothing, and the failure surfaces as an empty
+            # dataset rather than as a broken path.
+            if destination.is_symlink() and not destination.resolve().exists():
+                log.warning(
+                    f"[hdf5] {destination} pointed at a missing "
+                    f"{os.readlink(destination)}; relinking"
+                )
+                destination.unlink()
             if destination.exists() or destination.is_symlink():
                 placed[split].append(destination)
                 continue
             if link:
-                destination.symlink_to(house.resolve(), target_is_directory=True)
+                destination.symlink_to(split_house.resolve(), target_is_directory=True)
             else:
-                shutil.copytree(house, destination)
+                shutil.copytree(split_house, destination)
             placed[split].append(destination)
 
     log.info(
