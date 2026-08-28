@@ -139,6 +139,47 @@ The table rows in `VRAM_TIERS` are **starting points, not measurements**:
 extrapolated from MolmoBot's own recipe with margin for the resident backbone.
 Turn them down for more cameras, up when a run fits with room to spare.
 
+### Wide-angle lenses, and what `--cameras_to_warp` is actually for
+
+`head_camera_left` and `head_camera_right` are wide-angle: `stretch/config.py`
+gives them a ~123° FOV and `install_fisheye_distortion_hook()` runs a barrel
+distortion on every frame **at render time**, so the lens is baked into the
+recorded MP4s. `head_camera` and both wrist cameras take the MJCF's default FOV
+with no distortion callback.
+
+That makes MolmoBot's `--cameras_to_warp` a trap. Its help — "apply GoPro
+fisheye warping (resize to 640×480 4:3 + barrel distortion)" — reads like the
+flag you want when your cameras are wide-angle, but pointed at these two it
+distorts already-distorted frames and trains the policy on a lens nothing has.
+The result still looks like a plausible wide-angle photo, so nothing flags it.
+`WARP_CAMERAS` is therefore empty, and the generated script names which of *your*
+selected cameras are already distorted and which are not. The flag's real use is
+the opposite case: a camera that renders rectilinear in sim but is wide-angle on
+the robot.
+
+### LoRA, and what MolmoBot has instead
+
+**MolmoBot has no LoRA.** There is no adapter, PEFT or low-rank code anywhere in
+the repository, so there is no rank to set and no flag to expose; adding it would
+mean injecting adapters into its model modules — a fork of the trainer, not a
+configuration change.
+
+What it has is whole-component freezing plus per-component learning rates, which
+already satisfies two of the three usual LoRA recommendations:
+
+- **Action head unfrozen, at a higher learning rate** — the action expert is the
+  thing being trained and there is no flag to freeze it. `ACTION_EXPERT_LR`
+  defaults to `1e-4`, 10× the LLM's and 20× the ViT's.
+- **Everything else frozen** — which is what makes a run fit on one card.
+- **Adapting the vision tower** — `TRAINABLE=vision` unfreezes it outright rather
+  than through an adapter. Given the ~123° distorted head cameras and MolmoBot's
+  rectilinear DROID/RBY1 pretraining, this is the first thing to try when a run
+  plateaus with the tower frozen. Expect it to need a smaller `DEVICE_BATCH`.
+
+`TRAINABLE` takes `action_expert` (default), `vision`, or `full`, and rejects
+anything else rather than silently training the wrong thing. `ACTION_EXPERT_LR`,
+`VIT_LR` and `LLM_LR` are exposed alongside it.
+
 ### Watching a run
 
 MolmoBot already tracks its own progress — `Trainer.fit` prints

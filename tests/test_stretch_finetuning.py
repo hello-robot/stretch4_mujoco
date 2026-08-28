@@ -1101,6 +1101,18 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     assert "EXTRA_ARGS+=(--wandb=null)" in body
     assert '"${EXTRA_ARGS[@]}"' in body
 
+    # 7d-ii. the freezing tiers reach the trainer as real ft_* dotlist fields,
+    #        and the per-component learning rates are exposed. There is no LoRA
+    #        flag because MolmoBot has no LoRA -- do not invent one.
+    assert 'TRAINABLE="${TRAINABLE:-action_expert}"' in body
+    assert "EXTRA_ARGS+=(--ft_vit=True)" in body
+    assert "--ft_vit=True --ft_llm=True --ft_connector=True" in body
+    assert '--optimizer.action_expert_learning_rate="$ACTION_EXPERT_LR"' in body
+    # No LoRA flag reaches the trainer -- MolmoBot has no LoRA to turn on. The
+    # comments may name it; the executed lines must not.
+    executed = [line for line in body.splitlines() if not line.lstrip().startswith("#")]
+    assert not [line for line in executed if "lora" in line.lower()]
+
     # 7e. training runs through the progress filter, and PROGRESS=off skips the
     #     pipe entirely -- both branches must invoke the same trainer command
     assert 'if [ "$PROGRESS" = on ]; then' in body
@@ -1127,6 +1139,105 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
         checkout=checkout,
     ).read_text()
     assert '"$DATASET"/val' not in solo_body
+
+
+def test_generated_script_never_rewarps_an_already_fisheye_camera(tmp_path):
+    """`--cameras_to_warp` must stay empty for the cameras that render distorted.
+
+    `stretch/config.py` gives `head_camera_left` and `head_camera_right` a ~123
+    degree FOV and a barrel-distortion callback that runs before the MP4 is
+    written, so the lens is already in the data. MolmoBot's `--cameras_to_warp`
+    applies a second GoPro-style distortion -- and the result still looks like a
+    plausible wide-angle photo, so a mistake here is invisible in every artefact
+    a person would inspect.
+    """
+    from examples.machine_learning.molmospaces.finetuning.finetune import (
+        FISHEYE_CAMERA_NAMES,
+        DatasetSummary,
+        write_launch_script,
+        write_trainer_config,
+    )
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        PACKAGE_SUBDIR,
+        TRAINER_SCRIPT,
+        MolmoBotCheckout,
+    )
+    from examples.machine_learning.molmospaces.stretch.config import (
+        HEAD_CAMERA,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+    )
+
+    # The set has to match the cameras config.py actually distorts, or the
+    # warning lands on the wrong camera name.
+    assert FISHEYE_CAMERA_NAMES == {HEAD_CAMERA_LEFT, HEAD_CAMERA_RIGHT}
+    assert HEAD_CAMERA not in FISHEYE_CAMERA_NAMES
+    assert not FISHEYE_CAMERA_NAMES & {WRIST_CAMERA_LEFT, WRIST_CAMERA_RIGHT}
+
+    checkout = MolmoBotCheckout(
+        root=tmp_path / "MolmoBot",
+        package_dir=tmp_path / "MolmoBot" / PACKAGE_SUBDIR,
+        data_scripts_dir=tmp_path / "MolmoBot" / "data_scripts",
+    )
+    (checkout.package_dir / TRAINER_SCRIPT).parent.mkdir(parents=True)
+    root = tmp_path / "molmobot" / "pick"
+    root.mkdir(parents=True)
+    summary = DatasetSummary(
+        root=root,
+        kind="molmospaces",
+        action_space="stretch_move_groups",
+        state_dim=10,
+        action_dim=10,
+        num_episodes=8,
+        num_frames=0,
+        fps=15.0,
+        video_keys=[HEAD_CAMERA_RIGHT, WRIST_CAMERA_RIGHT],
+        splits={"train": 3, "val": 1},
+    )
+
+    def build(cameras):
+        config_path = write_trainer_config(
+            datasets=[summary],
+            trainer="molmobot",
+            base_checkpoint="allenai/MolmoBot-DROID",
+            output_dir=tmp_path / "checkpoints",
+            batch_size=16,
+            steps=1000,
+            learning_rate=1e-5,
+            action_type="joint_pos_rel",
+        )
+        return write_launch_script(
+            datasets=[summary],
+            trainer="molmobot",
+            config_path=config_path,
+            base_checkpoint="allenai/MolmoBot-DROID",
+            output_dir=tmp_path / "checkpoints",
+            batch_size=16,
+            steps=1000,
+            action_type="joint_pos_rel",
+            seq_len=528,
+            camera_names=cameras,
+            checkout=checkout,
+        ).read_text()
+
+    # 1. a fisheye camera is never warped by default, and the script says why
+    wide = build([HEAD_CAMERA_RIGHT, WRIST_CAMERA_RIGHT])
+    assert 'WARP_CAMERAS="${WARP_CAMERAS:-}"' in wide
+    assert f"{HEAD_CAMERA_RIGHT} already carries the wide lens" in wide
+    assert f"{WRIST_CAMERA_RIGHT} is rectilinear" in wide
+
+    # 2. the wide lens is also the argument for unfreezing the vision tower
+    assert "TRAINABLE=vision is the first thing to try" in wide
+
+    # 3. an all-rectilinear selection gets the opposite advice, and is still
+    #    warned off the two cameras that must never be listed
+    narrow = build([HEAD_CAMERA, WRIST_CAMERA_RIGHT])
+    assert "render rectilinear" in narrow
+    assert "must never" in narrow
+    assert "already carries the wide lens" not in narrow
+    assert "TRAINABLE=vision is the first thing to try" not in narrow
 
 
 def test_train_progress_passes_the_log_through_and_draws_a_bar():
