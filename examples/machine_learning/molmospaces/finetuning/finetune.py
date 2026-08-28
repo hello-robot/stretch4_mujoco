@@ -45,6 +45,11 @@ rather than something this command does on your behalf.
     # ... then run it yourself
     bash data/stretch_pick/rollouts/molmobot/pick/run_molmobot.sh
 
+    # several tasks, one language-conditioned policy across all of them
+    python -m examples.machine_learning.molmospaces.finetuning.finetune \\
+        --rollouts data/stretch_pick/rollouts/pick \\
+        --rollouts data/stretch_pick/rollouts/pnp --sample-rates "0.6,0.4"
+
     # pi0.5, from an exported LeRobot dataset
     python -m examples.machine_learning.molmospaces.finetuning.finetune \\
         --dataset data/stretch_pick/lerobot --trainer openpi --base-checkpoint pi05_droid
@@ -54,6 +59,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,6 +156,22 @@ def parse_camera_names(
             resolved.append(canonical)
     return resolved
 
+
+DEFAULT_MOLMOBOT_CHECKPOINT = "allenai/MolmoBot-DROID"
+"""
+What `--trainer molmobot` fine-tunes from unless told otherwise.
+
+Not MolmoBot's own `8b`: that string appears in `train_molmobot.py`'s help as
+"Path to checkpoint or '8b' for base model", but nothing in the trainer maps it
+to a model. `select_checkpoint` calls `os.listdir` on whatever it is handed, so
+`8b` dies with `FileNotFoundError: '8b'` after the dataset has already loaded.
+
+This repository holds `model.pt` and `config.yaml`, which is exactly the shape
+`select_checkpoint` and `get_model` accept, so the generated script downloads it
+and passes the directory. Starting from a trained MolmoBot policy also wants far
+less data than starting from the Molmo2 VLM, which is the other documented route
+-- see `_checkpoint_step`.
+"""
 
 MOLMOBOT_ACTION_TYPES = ("joint_pos_rel", "joint_pos")
 """
@@ -346,8 +368,19 @@ def dataset_statistics(summary: DatasetSummary) -> dict[str, list[float]]:
 # =============================================================================
 
 
+def mixture_root(datasets: list[DatasetSummary]) -> Path:
+    """Where a run's config and launch script go.
+
+    One task: inside its own directory, where it was before multi-task training
+    existed. Several: their shared parent, which `prepare_molmospaces_dataset`
+    guarantees for tasks generated into the same output directory -- the run
+    spans all of them, so it does not belong inside any one.
+    """
+    return datasets[0].root if len(datasets) == 1 else datasets[0].root.parent
+
+
 def write_trainer_config(
-    summary: DatasetSummary,
+    datasets: list[DatasetSummary],
     trainer: str,
     base_checkpoint: str,
     output_dir: Path,
@@ -356,15 +389,21 @@ def write_trainer_config(
     learning_rate: float,
     action_type: str,
     camera_names: list[str] | None = None,
+    sample_rates: list[float] | None = None,
 ) -> Path:
-    """Write the trainer's config next to the dataset and return its path.
+    """Write the trainer's config beside the dataset(s) and return its path.
 
     Emitted as JSON rather than as the trainer's native Python or YAML: all three
     trainers resolve configs from dataclasses whose fields move between versions,
     so a generated module is a file that stops importing. JSON of the same field
     names is stable, diffable, and reviewable before it is handed to something
     that will spend a day on it.
+
+    `datasets` is a list because MolmoBot trains one language-conditioned policy
+    across several task directories at once; the action spec and cameras are
+    global to the run, so they are read off the first.
     """
+    summary = datasets[0]
     config = {
         "trainer": trainer,
         "base_checkpoint": base_checkpoint,
@@ -384,6 +423,19 @@ def write_trainer_config(
         "output_dir": str(output_dir),
         "evaluation": {"command": _evaluation_command(summary, trainer)},
     }
+    if len(datasets) > 1:
+        config["mixture"] = {
+            "tasks": [
+                {
+                    "name": d.root.name,
+                    "root": str(d.root),
+                    "num_episodes": d.num_episodes,
+                    "splits": d.splits,
+                }
+                for d in datasets
+            ],
+            "sample_rates": list(sample_rates) if sample_rates else None,
+        }
     if summary.kind == "molmospaces":
         selected = camera_names or summary.video_keys or list(DEFAULT_CAMERA_NAMES)
         config["action"] = {
@@ -413,13 +465,18 @@ def write_trainer_config(
         }
         config["normalization"] = dataset_statistics(summary)
 
-    path = summary.root / f"finetune_{trainer}.json"
+    path = mixture_root(datasets) / f"finetune_{trainer}.json"
     path.write_text(json.dumps(config, indent=2))
     return path
 
 
+def experiment_name(datasets: list[DatasetSummary]) -> str:
+    """`--exp_name`, naming every task in the mixture so runs are told apart."""
+    return "stretch4_" + "_".join(d.root.name for d in datasets)
+
+
 def trainer_command(
-    summary: DatasetSummary,
+    datasets: list[DatasetSummary],
     trainer: str,
     config_path: Path,
     base_checkpoint: str,
@@ -429,32 +486,72 @@ def trainer_command(
     action_type: str,
     seq_len: int,
     camera_names: list[str] | None = None,
-    dataset_ref: str | None = None,
-    python: str = "python",
+    dataset_refs: list[str] | None = None,
+    sample_rates: list[float] | None = None,
+    launcher: list[str] | None = None,
+    save_folder_ref: str | None = None,
 ) -> list[str]:
     """The command line that runs the fine-tune in the trainer's own repository.
 
     Args:
-        dataset_ref: how to spell the dataset root in the command. Defaults to
-            its absolute path; the generated shell script passes `"$DATASET"`
-            so the emitted command stays readable.
-        python: the interpreter to invoke. The generated script passes the
-            trainer virtualenv's own, since it is never on `$PATH` here.
+        datasets: the task directories to train across, most-important first.
+            MolmoBot aggregates several into one mixture and one policy,
+            conditioned on each trajectory's `task_description`; the action spec,
+            cameras and experiment name are global to the run.
+        dataset_refs: how to spell those roots in the command. Defaults to their
+            absolute paths; the generated shell script passes `"$DATASET_PICK"`
+            and friends so the emitted command stays readable.
+        sample_rates: one weight per dataset. Equal weighting when omitted.
+        launcher: what to invoke the trainer with, e.g. `["torchrun",
+            "--nproc-per-node=2"]`. Defaults to a bare `python`.
 
     `--data_paths` takes the *task* directory, not a split: MolmoBot appends
     `train` or `val` itself (`SynthmanipDataset._resolve_data_path`). MolmoBot's
     README shows a Franka example with `/train` already on the end, which would
     make it look for `train/train`.
+
+    `--val_data_paths` is passed explicitly whenever there is more than one task,
+    because MolmoBot otherwise validates on the `val/` of the *first* data path
+    alone -- so a two-task run would report pick's loss while training on both.
+
+    Three of MolmoBot's arguments are not argparse options at all. It builds a
+    `TrainConfig` and then merges the leftover `--name=value` arguments into it
+    as an OmegaConf dotlist, so `save_folder`, `max_duration` and `wandb` are
+    fields of that config rather than flags with help text:
+
+    - `save_folder` is `omegaconf.MISSING` and is the only mandatory field, so
+      leaving it off fails at `OmegaConf.to_object` -- after the checkpoint has
+      loaded and the normalisation statistics have been computed.
+    - `wandb` interpolates `${oc.env:WANDB_PROJECT}` and `${oc.env:WANDB_ENTITY}`,
+      which the same `to_object` call resolves; with those unset it raises
+      immediately after `save_folder` is satisfied. `wandb=null` turns the
+      logging off instead, and the generated script says how to turn it back on.
+    - `max_duration` is hardcoded to 200000 in the constructed config, so this is
+      where `--steps` actually lands.
     """
-    root = dataset_ref if dataset_ref is not None else str(summary.root)
+    summary = datasets[0]
+    refs = dataset_refs if dataset_refs is not None else [str(d.root) for d in datasets]
+    run = launcher or ["python"]
     if trainer == "molmobot":
         selected = camera_names or summary.video_keys or list(DEFAULT_CAMERA_NAMES)
-        return [
-            python,
+        save_folder = save_folder_ref or str(output_dir / experiment_name(datasets))
+        stats_path = (
+            f"{save_folder}/synthmanip_norm_stats.yaml"
+            if save_folder.startswith('"$')
+            else str(Path(save_folder) / "synthmanip_norm_stats.yaml")
+        )
+        command = [
+            *run,
             "launch_scripts/train_molmobot.py",
             base_checkpoint,
             "--data_paths",
-            root,
+            *refs,
+        ]
+        if len(refs) > 1:
+            command += ["--val_data_paths", *refs]
+            if sample_rates:
+                command += ["--dataset_sample_rates", *(str(rate) for rate in sample_rates)]
+        return command + [
             "--seq_len",
             str(seq_len),
             "--action_dim",
@@ -467,7 +564,12 @@ def trainer_command(
             action_type,
             "--global_batch_size",
             str(batch_size),
-            f"--exp_name=stretch4_{summary.root.name}",
+            "--stats_path",
+            stats_path,
+            f"--exp_name={experiment_name(datasets)}",
+            f"--save_folder={save_folder}",
+            f"--max_duration={steps}",
+            "--wandb=null",
         ]
     if trainer == "openpi":
         return [
@@ -476,15 +578,15 @@ def trainer_command(
             "scripts/train.py",
             base_checkpoint,
             f"--exp-name=stretch4_{summary.action_space}",
-            f"--data.repo-id={root}",
+            f"--data.repo-id={refs[0]}",
             f"--checkpoint-dir={output_dir}",
             f"--overrides={config_path}",
         ]
     return [
-        python,
+        *run,
         "-m",
         "lerobot.scripts.train",
-        f"--dataset.root={root}",
+        f"--dataset.root={refs[0]}",
         f"--dataset.repo_id=stretch4/{summary.root.name}",
         f"--policy.path={base_checkpoint}",
         f"--output_dir={output_dir}",
@@ -500,17 +602,53 @@ def trainer_command(
 def _shell(parts: list[str]) -> str:
     """Join a command for the generated script, leaving `"$VAR"` references expandable.
 
-    A token that opens with `"$` was written by the code below with its own
-    quoting already in place -- `"$DATASET"/train` and the like -- and must pass
-    through untouched, or the variable is emitted literally and the script looks
-    for a directory called `$DATASET`. Everything else is a value and gets
-    quoted.
+    A token containing `"$` was written by the code below with its own quoting
+    already in place -- `"$DATASET"/train`, `--nproc-per-node="$NPROC"` -- and
+    must pass through untouched, or the variable is emitted literally and the
+    script looks for a directory called `$DATASET`. Everything else is a value
+    from the dataset or the CLI and gets quoted.
     """
-    return " ".join(part if part.startswith('"$') else shlex.quote(part) for part in parts)
+    return " ".join(part if '"$' in part else shlex.quote(part) for part in parts)
+
+
+def dataset_variables(datasets: list[DatasetSummary]) -> list[tuple[str, DatasetSummary]]:
+    """Shell variable names for the task directories, one per dataset.
+
+    A single task keeps the plain `DATASET`; several are named after themselves
+    -- `DATASET_PICK`, `DATASET_PNP` -- so the trainer's `--data_paths` line says
+    which task each path is without anyone matching up absolute paths by eye.
+    """
+    if len(datasets) == 1:
+        return [("DATASET", datasets[0])]
+    names: list[tuple[str, DatasetSummary]] = []
+    taken: set[str] = set()
+    for index, dataset in enumerate(datasets):
+        stem = re.sub(r"[^A-Z0-9]+", "_", dataset.root.name.upper()).strip("_") or "TASK"
+        name = f"DATASET_{stem}"
+        if name in taken:  # two tasks whose directory names differ only in punctuation
+            name = f"{name}_{index}"
+        taken.add(name)
+        names.append((name, dataset))
+    return names
+
+
+def is_hf_repo_id(reference: str) -> bool:
+    """True for `org/name`, the form a base checkpoint takes when it needs downloading.
+
+    MolmoBot's released checkpoints are HuggingFace repositories, but its trainer
+    only takes a local directory -- `select_checkpoint` calls `os.listdir` on
+    whatever it is given. So the generated script downloads first, and this is
+    how it tells a repository from a path already on disk.
+    """
+    return (
+        reference.count("/") == 1
+        and not reference.startswith((".", "/", "~"))
+        and not Path(reference).exists()
+    )
 
 
 def write_launch_script(
-    summary: DatasetSummary,
+    datasets: list[DatasetSummary],
     trainer: str,
     config_path: Path,
     base_checkpoint: str,
@@ -520,22 +658,24 @@ def write_launch_script(
     action_type: str,
     seq_len: int,
     camera_names: list[str] | None = None,
+    sample_rates: list[float] | None = None,
     checkout: MolmoBotCheckout | None = None,
 ) -> Path:
     """Write the rest of the workflow as a shell script, and return its path.
 
     A script rather than a printed list of commands, because the sequence is
-    four steps long, every path in it is absolute, and two of the steps are easy
+    five steps long, every path in it is absolute, and most of the steps are easy
     to skip by accident -- and because a file can be read, edited and re-run,
     which a terminal scrollback cannot.
 
     It is emitted, never executed. `uv sync` pulls torch into MolmoBot's
-    virtualenv and the training itself runs for a day; both are decisions to
-    take deliberately, not side effects of a command that mostly inspects data.
+    virtualenv, the base checkpoint is several gigabytes, and the training itself
+    runs for a day; those are decisions to take deliberately, not side effects of
+    a command that mostly inspects data.
     """
     body = (
         _molmobot_script(
-            summary=summary,
+            datasets=datasets,
             checkout=checkout,
             base_checkpoint=base_checkpoint,
             config_path=config_path,
@@ -545,10 +685,11 @@ def write_launch_script(
             action_type=action_type,
             seq_len=seq_len,
             camera_names=camera_names,
+            sample_rates=sample_rates,
         )
         if trainer == "molmobot" and checkout is not None
         else _generic_trainer_script(
-            summary=summary,
+            datasets=datasets,
             trainer=trainer,
             config_path=config_path,
             base_checkpoint=base_checkpoint,
@@ -561,10 +702,13 @@ def write_launch_script(
         )
     )
 
+    tasks = ", ".join(d.root.name for d in datasets)
     header = [
         "#!/usr/bin/env bash",
         "#",
-        f"# Fine-tune {trainer} on {summary.root.name}.",
+        f"# Fine-tune {trainer} on {tasks}."
+        + (" One policy across all of them, conditioned on each" if len(datasets) > 1 else ""),
+        *(["# trajectory's task description."] if len(datasets) > 1 else []),
         "#",
         "# Generated by examples/machine_learning/molmospaces/finetuning/finetune.py.",
         "# Re-running that command overwrites this file; nothing reads it back, so",
@@ -572,15 +716,22 @@ def write_launch_script(
         "",
         "set -euo pipefail",
         "",
+        "step() {",
+        '    echo',
+        '    echo "------------------------------------------------------------"',
+        '    echo "$*"',
+        '    echo "------------------------------------------------------------"',
+        "}",
+        "",
     ]
-    path = summary.root / f"run_{trainer}.sh"
+    path = mixture_root(datasets) / f"run_{trainer}.sh"
     path.write_text("\n".join(header + body) + "\n")
     path.chmod(0o755)
     return path
 
 
 def _molmobot_script(
-    summary: DatasetSummary,
+    datasets: list[DatasetSummary],
     checkout: MolmoBotCheckout,
     base_checkpoint: str,
     config_path: Path,
@@ -590,31 +741,53 @@ def _molmobot_script(
     action_type: str,
     seq_len: int,
     camera_names: list[str] | None,
+    sample_rates: list[float] | None = None,
 ) -> list[str]:
-    """The four steps between a prepared rollout run and a MolmoBot checkpoint."""
-    dataset = summary.root.resolve()
+    """The five steps between a prepared rollout run and a MolmoBot checkpoint."""
     package = checkout.package_dir.resolve()
     scripts = checkout.data_scripts_dir.resolve()
-    splits = [split for split, count in summary.splits.items() if count]
+    variables = dataset_variables(datasets)
 
     validate = [
         _shell(
             [
                 '"$PYTHON"',
-                f'"$SCRIPTS"/validate_trajectories.py',
-                f'"$DATASET"/{split}',
+                '"$SCRIPTS"/validate_trajectories.py',
+                f'"${name}"/{split}',
                 "--num-workers",
                 "8",
             ]
         )
-        for split in splits
+        for name, dataset in variables
+        for split, count in dataset.splits.items()
+        if count
+    ]
+    statistics = [
+        _shell(
+            [
+                '"$PYTHON"',
+                '"$SCRIPTS"/calculate_stats.py',
+                f'"${name}"/train',
+                "--keys",
+                f"actions/{action_type}",
+                "actions/joint_pos",
+                "obs/agent/qpos",
+            ]
+        )
+        for name, _ in variables
     ]
 
     return [
         f"PACKAGE={shlex.quote(str(package))}",
         f"SCRIPTS={shlex.quote(str(scripts))}",
-        f"DATASET={shlex.quote(str(dataset))}",
+        *(f"{name}={shlex.quote(str(d.root.resolve()))}" for name, d in variables),
+        f"SAVE_FOLDER={shlex.quote(str((output_dir / experiment_name(datasets)).resolve()))}",
         'PYTHON="$PACKAGE"/.venv/bin/python',
+        'TORCHRUN="$PACKAGE"/.venv/bin/torchrun',
+        "",
+        "# One training process per GPU. Override with `NPROC=4 bash <this script>`.",
+        'NPROC="${NPROC:-$(nvidia-smi --list-gpus 2>/dev/null | wc -l)}"',
+        '[ "${NPROC:-0}" -ge 1 ] 2>/dev/null || NPROC=1',
         "",
         'cd "$PACKAGE"',
         "",
@@ -625,10 +798,12 @@ def _molmobot_script(
         "#    scripts import; decord and tqdm are already core dependencies. This is the",
         "#    step that downloads torch, so it is the slow one.",
         "# --------------------------------------------------------------------------",
+        'step "Syncing MolmoBot dependencies"',
         "uv sync --extra train",
         "",
+        *_checkpoint_step(base_checkpoint, output_dir),
         "# --------------------------------------------------------------------------",
-        "# 2. valid_trajectory_index.json, once per split.",
+        "# 3. valid_trajectory_index.json, once per split of every task.",
         "#",
         "#    The only mandatory step: SynthmanipDataset opens this file and raises if",
         "#    it is missing from a split directory. It also writes a `valid_traj_mask`",
@@ -640,10 +815,11 @@ def _molmobot_script(
         "#    episodes where the target object is not in frame at the first step. Left",
         "#    off here because it discards data, and how much depends on the task.",
         "# --------------------------------------------------------------------------",
+        'step "Validating trajectories"',
         *validate,
         "",
         "# --------------------------------------------------------------------------",
-        "# 3. Per-trajectory statistics, into a `stats` group in each HDF5 plus an",
+        "# 4. Per-trajectory statistics, into a `stats` group in each HDF5 plus an",
         "#    aggregated_stats.json.",
         "#",
         "#    Optional for the run below, despite MolmoBot's README presenting it as a",
@@ -657,55 +833,124 @@ def _molmobot_script(
         "#    because the min_max path looks the gripper up under joint_pos regardless",
         "#    of the action type, and silently yields nothing when it is absent.",
         "# --------------------------------------------------------------------------",
-        _shell(
-            [
-                '"$PYTHON"',
-                '"$SCRIPTS"/calculate_stats.py',
-                '"$DATASET"/train',
-                "--keys",
-                f"actions/{action_type}",
-                "actions/joint_pos",
-                "obs/agent/qpos",
-            ]
-        ),
+        'step "Calculating statistics"',
+        *statistics,
         "",
         "# --------------------------------------------------------------------------",
-        "# 4. Train.",
+        "# 5. Train.",
         "#",
-        "#    --stats_path defaults to synthmanip_norm_stats.yaml, which the trainer",
-        "#    computes on the first run and reuses afterwards. Delete it to recompute",
-        "#    after the dataset changes, or the policy is normalised against the old one.",
+        "#    --save_folder, --max_duration and --wandb are not argparse options:",
+        "#    train_molmobot.py builds a TrainConfig and merges leftover --name=value",
+        "#    arguments into it as an OmegaConf dotlist. save_folder is that config's",
+        "#    only mandatory field, and wandb interpolates ${oc.env:WANDB_PROJECT} and",
+        "#    ${oc.env:WANDB_ENTITY} -- both are resolved in the same call, so with",
+        "#    either missing the run dies *after* loading the checkpoint and computing",
+        "#    the statistics. To log to Weights & Biases instead, drop `--wandb=null`",
+        "#    and export WANDB_PROJECT and WANDB_ENTITY.",
+        "#",
+        "#    --stats_path is kept inside SAVE_FOLDER rather than at its relative",
+        "#    default, which would write it into the shared MolmoBot checkout and",
+        "#    silently reuse one mixture's normalisation for the next. Delete it to",
+        "#    recompute after the data changes.",
         "#",
         "#    Scale --global_batch_size to the hardware; MolmoBot micro-batches with",
-        "#    --device_batch_size, and its own runs used torchrun across 8-64 H100s.",
+        "#    --device_batch_size, and its own runs used 8-64 H100s.",
+        *(
+            [
+                "#",
+                "#    --val_data_paths is passed explicitly because MolmoBot otherwise",
+                "#    validates on the first --data_paths entry alone, which would report",
+                f"#    {datasets[0].root.name}'s loss for a run training on all of them.",
+            ]
+            if len(datasets) > 1
+            else []
+        ),
         "# --------------------------------------------------------------------------",
-        "export PYTHONPATH=\"$PACKAGE${PYTHONPATH:+:$PYTHONPATH}\"",
+        'step "Starting training, this may take a while"',
+        'mkdir -p "$SAVE_FOLDER"',
+        'export PYTHONPATH="$PACKAGE${PYTHONPATH:+:$PYTHONPATH}"',
         _shell(
             trainer_command(
-                summary=summary,
+                datasets=datasets,
                 trainer="molmobot",
                 config_path=config_path,
-                base_checkpoint=base_checkpoint,
+                base_checkpoint='"$CHECKPOINT"',
                 output_dir=output_dir,
                 batch_size=batch_size,
                 steps=steps,
                 action_type=action_type,
                 seq_len=seq_len,
                 camera_names=camera_names,
-                dataset_ref='"$DATASET"',
-                python='"$PYTHON"',
+                dataset_refs=[f'"${name}"' for name, _ in variables],
+                sample_rates=sample_rates,
+                save_folder_ref='"$SAVE_FOLDER"',
+                launcher=[
+                    '"$TORCHRUN"',
+                    "--nnodes=1",
+                    '--nproc-per-node="$NPROC"',
+                    "--master_port=29401",
+                ],
             )
         ),
         "",
         "# Then score the checkpoint, back in the stretch4_mujoco repo -- natively, with",
         "# no action remapping:",
-        f"#   {_evaluation_command(summary, 'molmobot')}",
+        *(f"#   {_evaluation_command(d, 'molmobot')}" for d in datasets),
         f"# serving it with `--action-type {action_type}`, matching what it trained on.",
     ]
 
 
+def _checkpoint_step(base_checkpoint: str, output_dir: Path) -> list[str]:
+    """Put the base checkpoint on disk, because the trainer will not fetch it.
+
+    `train_molmobot.py`'s help says its positional argument is a "Path to
+    checkpoint or '8b' for base model", but nothing maps `8b` to anything --
+    `select_checkpoint` calls `os.listdir` straight on the string, so `8b` fails
+    with a bare `FileNotFoundError: '8b'`. A local directory is the only thing
+    that works, and MolmoBot's released checkpoints are HuggingFace repositories
+    of exactly the `model.pt` + `config.yaml` that `select_checkpoint` and
+    `get_model` want, so downloading one is the whole step.
+    """
+    header = [
+        "# --------------------------------------------------------------------------",
+        "# 2. The base checkpoint.",
+        "#",
+        "#    train_molmobot.py takes a local directory holding model.pt and",
+        "#    config.yaml; it resolves no names and downloads nothing itself. Its own",
+        "#    `8b` placeholder is not handled anywhere and fails as a missing path.",
+    ]
+    if not is_hf_repo_id(base_checkpoint):
+        return [
+            *header,
+            "# --------------------------------------------------------------------------",
+            f"CHECKPOINT={shlex.quote(base_checkpoint)}",
+            'if [ ! -e "$CHECKPOINT"/model.pt ] && [ ! -d "$CHECKPOINT"/model_and_optim ]; then',
+            '    echo "No checkpoint at $CHECKPOINT (expected model.pt or model_and_optim/)." >&2',
+            "    exit 1",
+            "fi",
+            "",
+        ]
+    local = (output_dir.parent / "base_checkpoints" / base_checkpoint.split("/")[-1]).resolve()
+    return [
+        *header,
+        "#",
+        "#    To start from the Molmo2 VLM instead of a trained MolmoBot policy, follow",
+        "#    MolmoBot's README: untar Molmo2-4B and run launch_scripts/convert_to_",
+        "#    unsharded.py, then point CHECKPOINT at the unsharded directory. That is",
+        "#    the from-scratch recipe and wants far more data than a fine-tune does.",
+        "# --------------------------------------------------------------------------",
+        f"CHECKPOINT={shlex.quote(str(local))}",
+        'if [ ! -e "$CHECKPOINT"/model.pt ]; then',
+        f'    step "Downloading {base_checkpoint}"',
+        f'    "$PACKAGE"/.venv/bin/hf download {shlex.quote(base_checkpoint)} '
+        '--local-dir "$CHECKPOINT"',
+        "fi",
+        "",
+    ]
+
+
 def _generic_trainer_script(
-    summary: DatasetSummary,
+    datasets: list[DatasetSummary],
     trainer: str,
     config_path: Path,
     base_checkpoint: str,
@@ -729,7 +974,7 @@ def _generic_trainer_script(
         "",
         _shell(
             trainer_command(
-                summary=summary,
+                datasets=datasets,
                 trainer=trainer,
                 config_path=config_path,
                 base_checkpoint=base_checkpoint,
@@ -739,20 +984,23 @@ def _generic_trainer_script(
                 action_type=action_type,
                 seq_len=seq_len,
                 camera_names=camera_names,
-                dataset_ref=str(summary.root.resolve()),
+                dataset_refs=[str(datasets[0].root.resolve())],
             )
         ),
         "",
-        f"# {_evaluation_command(summary, trainer)}",
+        f"# {_evaluation_command(datasets[0], trainer)}",
     ]
 
 
 def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     """How to score the resulting checkpoint on the benchmarks."""
     if trainer == "molmobot" and summary.kind == "molmospaces":
+        # The rollout directory is named after the task it was generated for, and
+        # the benchmark keys are the same names, so a mixture scores one task per
+        # line rather than always claiming to be `pick`.
         return (
             "python -m examples.machine_learning.molmospaces.run_benchmarks "
-            "--policy molmobot --checkpoint <checkpoint> --benchmark pick"
+            f"--policy molmobot --checkpoint <checkpoint> --benchmark {summary.root.name}"
         )
     return (
         f"(no scorer in this repo for a {trainer} checkpoint -- add an "
@@ -770,9 +1018,19 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
 @click.option(
     "--rollouts",
     type=click.Path(path_type=Path, exists=True),
-    default=None,
+    multiple=True,
     help="A raw MolmoSpaces rollout run (`house_*/trajectories*.h5`). What --trainer "
-    "molmobot wants, and what generate_dataset.py writes under `rollouts/`.",
+    "molmobot wants, and what generate_dataset.py writes under `rollouts/`. Repeat it "
+    "to train one policy across several tasks -- MolmoBot conditions on each "
+    "trajectory's task description, so pick and pnp share a checkpoint rather than "
+    "needing one each.",
+)
+@click.option(
+    "--sample-rates",
+    type=str,
+    default=None,
+    help="Comma-separated mixture weight per --rollouts, in the same order (e.g. "
+    "'0.6,0.4'). Equal weighting when omitted. Only meaningful with several tasks.",
 )
 @click.option(
     "--dataset",
@@ -807,11 +1065,11 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     "--base-checkpoint",
     type=str,
     default=None,
-    help="Checkpoint to fine-tune from. Defaults to '8b' for molmobot (its base "
-    "model) and 'pi05_droid' otherwise. Pass a MolmoBot checkpoint path, or "
-    "'allenai/MolmoBot-DROID' to start from the released Franka-space model -- its "
-    "vision and language weights carry over, its action head is re-learned on "
-    "Stretch's move groups.",
+    help=f"Checkpoint to fine-tune from. Defaults to '{DEFAULT_MOLMOBOT_CHECKPOINT}' for "
+    "molmobot and 'pi05_droid' otherwise. An `org/name` is downloaded from HuggingFace "
+    "by the generated script; anything else is used as a local checkpoint directory. "
+    "The released Franka-space model's vision and language weights carry over, and its "
+    "action head is re-learned on Stretch's move groups.",
 )
 @click.option(
     "--output-dir",
@@ -851,7 +1109,8 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     "its git repository. --no-clone makes a missing checkout an error instead.",
 )
 def main(
-    rollouts: Path | None,
+    rollouts: tuple[Path, ...],
+    sample_rates: str | None,
     dataset: Path | None,
     cameras: str | None,
     trainer: str,
@@ -869,41 +1128,54 @@ def main(
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    if (rollouts is None) == (dataset is None):
+    if bool(rollouts) == (dataset is not None):
         raise click.UsageError(
-            "Pass exactly one of --rollouts (a MolmoSpaces run, for --trainer molmobot) "
-            "or --dataset (an exported LeRobot dataset, for --trainer openpi/lerobot)."
+            "Pass --rollouts (one or more MolmoSpaces runs, for --trainer molmobot) or "
+            "--dataset (an exported LeRobot dataset, for --trainer openpi/lerobot), not both."
         )
-    if trainer == "molmobot" and rollouts is None:
+    if trainer == "molmobot" and not rollouts:
         raise click.UsageError(
             "--trainer molmobot trains on MolmoSpaces trajectories, so it needs --rollouts. "
             "There is no conversion step: point it at the `rollouts/<task>` directory "
-            "generate_dataset.py wrote."
+            "generate_dataset.py wrote, once per task."
         )
     if trainer != "molmobot" and dataset is None:
         raise click.UsageError(
             f"--trainer {trainer} needs a LeRobot dataset, so pass --dataset. Build one with "
             "`generate_dataset.py`."
         )
-
-    base_checkpoint = base_checkpoint or ("8b" if trainer == "molmobot" else "pi05_droid")
-    selected_cameras = parse_camera_names(cameras) if cameras else None
-    summary = (
-        prepare_molmospaces_dataset(
-            rollout_dir=rollouts,
-            val_fraction=val_fraction,
-            link=link,
-            camera_names=selected_cameras,
+    if trainer != "molmobot" and len(rollouts) > 1:
+        raise click.UsageError(
+            f"--trainer {trainer} trains on one LeRobot dataset. Mixing several tasks in one "
+            "run is a MolmoBot feature; export them into a single dataset instead."
         )
-        if rollouts is not None
-        else read_lerobot_dataset(dataset)
-    )
-    output_dir = Path(output_dir) if output_dir else summary.root.parent / "checkpoints"
 
-    _print_summary(summary)
+    rates = _parse_sample_rates(sample_rates, len(rollouts))
+    base_checkpoint = base_checkpoint or (
+        DEFAULT_MOLMOBOT_CHECKPOINT if trainer == "molmobot" else "pi05_droid"
+    )
+    selected_cameras = parse_camera_names(cameras) if cameras else None
+    datasets = (
+        [
+            prepare_molmospaces_dataset(
+                rollout_dir=rollout_dir,
+                val_fraction=val_fraction,
+                link=link,
+                camera_names=selected_cameras,
+            )
+            for rollout_dir in rollouts
+        ]
+        if rollouts
+        else [read_lerobot_dataset(dataset)]  # type: ignore[arg-type]
+    )
+    output_dir = Path(output_dir) if output_dir else mixture_root(datasets).parent / "checkpoints"
+
+    for summary in datasets:
+        _print_summary(summary)
+    _warn_about_empty_val_splits(datasets)
 
     config_path = write_trainer_config(
-        summary=summary,
+        datasets=datasets,
         trainer=trainer,
         base_checkpoint=base_checkpoint,
         output_dir=output_dir,
@@ -912,6 +1184,7 @@ def main(
         learning_rate=learning_rate,
         action_type=action_type,
         camera_names=selected_cameras,
+        sample_rates=rates,
     )
     checkout = None
     if trainer == "molmobot":
@@ -922,7 +1195,7 @@ def main(
         _print_checkout(checkout)
 
     script_path = write_launch_script(
-        summary=summary,
+        datasets=datasets,
         trainer=trainer,
         config_path=config_path,
         base_checkpoint=base_checkpoint,
@@ -932,6 +1205,7 @@ def main(
         action_type=action_type,
         seq_len=seq_len,
         camera_names=selected_cameras,
+        sample_rates=rates,
         checkout=checkout,
     )
 
@@ -948,6 +1222,45 @@ def main(
         "torch and the last runs for a long time, which is why it is yours to launch."
         if checkout is not None
         else f"Set TRAINER_REPO to your {trainer} checkout first."
+    )
+
+
+def _parse_sample_rates(rates: str | None, expected: int) -> list[float] | None:
+    """`--sample-rates '0.6,0.4'` -> `[0.6, 0.4]`, checked against the task count."""
+    if not rates:
+        return None
+    try:
+        parsed = [float(token) for token in rates.split(",") if token.strip()]
+    except ValueError as e:
+        raise click.UsageError(f"--sample-rates must be comma-separated numbers: {e}") from e
+    if len(parsed) != expected:
+        raise click.UsageError(
+            f"--sample-rates has {len(parsed)} weights for {expected} --rollouts. MolmoBot "
+            "takes one per task, in the order they are passed."
+        )
+    if any(rate <= 0 for rate in parsed):
+        raise click.UsageError("--sample-rates must all be positive; drop the task instead.")
+    return parsed
+
+
+def _warn_about_empty_val_splits(datasets: list[DatasetSummary]) -> None:
+    """Say so when a task held out no validation houses, because the trainer will not.
+
+    MolmoBot requires a `val/` directory beside every `train/`, and
+    `arrange_train_val_split` does create one -- but a task with a single house
+    leaves it empty, and an empty split has no `valid_trajectory_index.json` for
+    `SynthmanipDataset` to open. That surfaces as a raise deep in the dataloader
+    long after `uv sync` and the checkpoint download have run.
+    """
+    starved = [d.root.name for d in datasets if d.kind == "molmospaces" and not d.splits.get("val")]
+    if not starved:
+        return
+    click.echo("")
+    click.secho(
+        f"Warning: {', '.join(starved)} held out no validation houses, so MolmoBot will "
+        "raise\nwhen it opens that split. Generate more houses for it, or drop the task "
+        "from the run.",
+        fg="yellow",
     )
 
 

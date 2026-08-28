@@ -908,7 +908,7 @@ def test_finetune_camera_selection_parsing_and_commands(tmp_path):
     )
     summary_molmo.root.mkdir(parents=True, exist_ok=True)
     cfg_molmo = write_trainer_config(
-        summary=summary_molmo,
+        datasets=[summary_molmo],
         trainer="molmobot",
         base_checkpoint="8b",
         output_dir=tmp_path / "checkpoints",
@@ -919,7 +919,7 @@ def test_finetune_camera_selection_parsing_and_commands(tmp_path):
         camera_names=["head_camera", "head_camera_left"],
     )
     cmd_molmo = trainer_command(
-        summary=summary_molmo,
+        datasets=[summary_molmo],
         trainer="molmobot",
         config_path=cfg_molmo,
         base_checkpoint="8b",
@@ -956,7 +956,7 @@ def test_finetune_camera_selection_parsing_and_commands(tmp_path):
     )
     summary_lerobot.root.mkdir(parents=True, exist_ok=True)
     cfg_lerobot = write_trainer_config(
-        summary=summary_lerobot,
+        datasets=[summary_lerobot],
         trainer="lerobot",
         base_checkpoint="pi05_droid",
         output_dir=tmp_path / "checkpoints",
@@ -1017,7 +1017,7 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
         splits={"train": 1, "val": 1},
     )
     config_path = write_trainer_config(
-        summary=summary,
+        datasets=[summary],
         trainer="molmobot",
         base_checkpoint="8b",
         output_dir=tmp_path / "checkpoints",
@@ -1027,7 +1027,7 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
         action_type="joint_pos_rel",
     )
     script = write_launch_script(
-        summary=summary,
+        datasets=[summary],
         trainer="molmobot",
         config_path=config_path,
         base_checkpoint="8b",
@@ -1056,10 +1056,27 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     # 4. the gripper's min_max lookup needs joint_pos alongside the action type
     assert "--keys actions/joint_pos_rel actions/joint_pos obs/agent/qpos" in body
 
-    # 5. an empty split is not validated -- there is no directory to index
+    # 5. no argument reaches torchrun or the trainer with its $VAR quoted shut
+    assert '\'--nproc-per-node="$NPROC"\'' not in body
+    assert '--nproc-per-node="$NPROC"' in body
+
+    # 6. the three OmegaConf dotlist fields, none of which is an argparse option:
+    #    save_folder is TrainConfig's only mandatory value, wandb interpolates
+    #    two environment variables that are normally unset, and max_duration is
+    #    otherwise hardcoded to 200000 -- all three are resolved in one call, so
+    #    each missing one fails only after the checkpoint and stats are loaded.
+    assert '--save_folder="$SAVE_FOLDER"' in body
+    assert 'mkdir -p "$SAVE_FOLDER"' in body
+    assert "--wandb=null" in body
+    assert "--max_duration=1000" in body
+
+    # 7. the norm stats stay with the run, not in the shared MolmoBot checkout
+    assert '--stats_path "$SAVE_FOLDER"/synthmanip_norm_stats.yaml' in body
+
+    # 8. an empty split is not validated -- there is no directory to index
     solo = DatasetSummary(**{**summary.__dict__, "splits": {"train": 1, "val": 0}})
     solo_body = write_launch_script(
-        summary=solo,
+        datasets=[solo],
         trainer="molmobot",
         config_path=config_path,
         base_checkpoint="8b",
@@ -1071,6 +1088,123 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
         checkout=checkout,
     ).read_text()
     assert '"$DATASET"/val' not in solo_body
+
+
+def test_finetune_trains_several_tasks_as_one_mixture(tmp_path):
+    """Several `--rollouts` become one policy, not one run each.
+
+    MolmoBot conditions on each trajectory's task description, so pick and pnp
+    share a checkpoint. The failure modes are all quiet: validation silently
+    covering only the first task, a mixture weighted by accident, or two tasks
+    whose paths are indistinguishable in the emitted command.
+    """
+    import subprocess
+
+    from examples.machine_learning.molmospaces.finetuning.finetune import (
+        DatasetSummary,
+        write_launch_script,
+        write_trainer_config,
+    )
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        PACKAGE_SUBDIR,
+        TRAINER_SCRIPT,
+        MolmoBotCheckout,
+    )
+
+    checkout = MolmoBotCheckout(
+        root=tmp_path / "MolmoBot",
+        package_dir=tmp_path / "MolmoBot" / PACKAGE_SUBDIR,
+        data_scripts_dir=tmp_path / "MolmoBot" / "data_scripts",
+    )
+    (checkout.package_dir / TRAINER_SCRIPT).parent.mkdir(parents=True)
+
+    def task(name: str) -> DatasetSummary:
+        (tmp_path / "molmobot" / name).mkdir(parents=True)
+        return DatasetSummary(
+            root=tmp_path / "molmobot" / name,
+            kind="molmospaces",
+            action_space="stretch_move_groups",
+            state_dim=10,
+            action_dim=10,
+            num_episodes=8,
+            num_frames=0,
+            fps=15.0,
+            video_keys=["head_camera_right"],
+            splits={"train": 3, "val": 1},
+        )
+
+    datasets = [task("pick"), task("pnp")]
+    rates = [0.6, 0.4]
+    config_path = write_trainer_config(
+        datasets=datasets,
+        trainer="molmobot",
+        base_checkpoint="allenai/MolmoBot-DROID",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        learning_rate=1e-5,
+        action_type="joint_pos_rel",
+        sample_rates=rates,
+    )
+    script = write_launch_script(
+        datasets=datasets,
+        trainer="molmobot",
+        config_path=config_path,
+        base_checkpoint="allenai/MolmoBot-DROID",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        action_type="joint_pos_rel",
+        seq_len=2048,
+        sample_rates=rates,
+        checkout=checkout,
+    )
+    body = script.read_text()
+
+    # 1. the config and script live above the tasks, since the run spans them
+    assert script.parent == tmp_path / "molmobot"
+    assert config_path.parent == tmp_path / "molmobot"
+
+    # 2. one variable per task, named after it
+    assert "DATASET_PICK=" in body and "DATASET_PNP=" in body
+
+    # 3. every split of every task is indexed, not just the first task's
+    for name in ("PICK", "PNP"):
+        for split in ("train", "val"):
+            assert f'validate_trajectories.py "$DATASET_{name}"/{split}' in body
+
+    # 4. one training command over both, weighted, with validation spanning both
+    assert '--data_paths "$DATASET_PICK" "$DATASET_PNP"' in body
+    assert '--val_data_paths "$DATASET_PICK" "$DATASET_PNP"' in body
+    assert "--dataset_sample_rates 0.6 0.4" in body
+    assert body.count("launch_scripts/train_molmobot.py") == 1
+    assert "--exp_name=stretch4_pick_pnp" in body
+
+    # 4b. the mixture gets its own save folder and its own normalisation stats,
+    #     so a pick-only run and a pick+pnp run cannot overwrite each other
+    assert body.count("checkpoints/stretch4_pick_pnp") >= 1
+    assert '--stats_path "$SAVE_FOLDER"/synthmanip_norm_stats.yaml' in body
+
+    # 5. the base checkpoint is downloaded, because the trainer resolves no names
+    assert "hf download allenai/MolmoBot-DROID" in body
+    assert subprocess.run(["bash", "-n", str(script)], capture_output=True).returncode == 0
+
+    # 6. a single task keeps the plain DATASET and passes no mixture flags
+    single = write_launch_script(
+        datasets=[datasets[0]],
+        trainer="molmobot",
+        config_path=config_path,
+        base_checkpoint="allenai/MolmoBot-DROID",
+        output_dir=tmp_path / "checkpoints",
+        batch_size=16,
+        steps=1000,
+        action_type="joint_pos_rel",
+        seq_len=2048,
+        checkout=checkout,
+    ).read_text()
+    assert '--data_paths "$DATASET" ' in single
+    assert "--val_data_paths" not in single
+    assert "--dataset_sample_rates" not in single
 
 
 def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
