@@ -97,6 +97,7 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
 )
 from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     DEFAULT_CHECKOUT,
+    GRIPPER_STATE_WIDTH,
     STRETCH_PRESET_NAMES,
     MolmoBotCheckout,
     MolmoBotSetupError,
@@ -451,7 +452,11 @@ def prepare_molmospaces_dataset(
         root=task_dir,
         kind="molmospaces",
         action_space="stretch_move_groups",
-        state_dim=sum(STRETCH_ACTION_SPEC.values()),
+        # The state is narrower than the action by the gripper; see GRIPPER_STATE_WIDTH.
+        state_dim=sum(
+            GRIPPER_STATE_WIDTH if "gripper" in group else width
+            for group, width in STRETCH_ACTION_SPEC.items()
+        ),
         action_dim=sum(STRETCH_ACTION_SPEC.values()),
         num_episodes=count_trajectories(rollout_dir),
         num_frames=0,  # counting frames means opening every trajectory; not worth it here
@@ -1186,7 +1191,7 @@ def _tuning_block(
         "#   action_expert  (default) only the action expert. Cheapest.",
         "#   vision         + the vision tower, at VIT_LR.",
         "#   full           + the LLM and connector. MolmoBot's own recipe, on 8-64 H100s.",
-        'TRAINABLE="${TRAINABLE:-action_expert}"',
+        'TRAINABLE="${TRAINABLE:-vision}"',
         "",
         "# Per-component learning rates, all of them OmegaConf dotlist fields on",
         "# TrainConfig.optimizer.",
@@ -1694,7 +1699,8 @@ def _print_checkout(checkout: MolmoBotCheckout, registered: list[str]) -> None:
         else "  scripts: validate_trajectories.py, calculate_stats.py (already there)"
     )
     click.echo(
-        f"  presets: {', '.join(registered)} (registered in synthmanip_presets.py)"
+        f"  presets: {', '.join(sorted(set(STRETCH_PRESET_NAMES.values())))} "
+        f"(registered in synthmanip_presets.py: {', '.join(registered)})"
         if registered
         else f"  presets: {', '.join(sorted(set(STRETCH_PRESET_NAMES.values())))} (already there)"
     )
