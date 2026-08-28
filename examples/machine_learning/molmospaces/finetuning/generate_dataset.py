@@ -52,6 +52,8 @@ import logging
 import os
 import pprint
 import random
+import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -60,6 +62,7 @@ from typing import Any
 import click
 import mujoco
 import numpy as np
+from tqdm import tqdm
 
 from examples.machine_learning.molmospaces.finetuning.datagen_configs import (
     DATAGEN_CONFIGS,
@@ -87,6 +90,109 @@ from molmo_spaces.utils.profiler_utils import DatagenProfiler
 from molmo_spaces.utils.save_utils import prepare_episode_for_saving, save_trajectories
 
 log = logging.getLogger(__name__)
+
+PROGRESS_POLL_SECONDS = 1.0
+
+
+class TqdmLoggingHandler(logging.StreamHandler):
+    """A stderr log handler that writes through `tqdm.write`.
+
+    `tqdm.write` clears the bar, writes the line, and redraws, so a log record
+    lands above the bar rather than on top of it. This only covers the process
+    that installs it: with `--num-workers > 1` the rollout workers are separate
+    processes with their own handlers on the same terminal, and they will still
+    write over the bar -- it just redraws on the next poll.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record), file=sys.stderr)
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+
+
+class DatagenProgressBar:
+    """A work-item progress bar fed from the runner's shared counters.
+
+    Rollout progress already exists as the `multiprocessing.Value`s that workers
+    bump as they finish houses and episodes, so this only has to read them once
+    a second and render them; the workers pay nothing for it.
+
+    It counts *work items* rather than episodes because that is the only number
+    here that is both bounded and monotone. A failed episode is retried and a
+    house that turns out to be invalid for the task is abandoned, so the episode
+    counter can overshoot or undershoot the total that was asked for, while each
+    house batch is completed or skipped exactly once. Episodes are shown in the
+    postfix, where being approximate costs nothing.
+
+    Polling happens on a thread rather than in the runner's own wait loop so that
+    the single-worker in-process path -- which blocks inside the worker function
+    itself, and is what `--visualize` uses -- gets the same bar as the pool path.
+    """
+
+    def __init__(self, runner: Any, enabled: bool = True) -> None:
+        self._runner = runner
+        self._total_items = len(runner.work_items)
+        self._total_episodes = sum(item[1] for item in runner.work_items)
+        self._enabled = enabled and self._total_items > 0
+        self._bar: Any = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._start_time = 0.0
+
+    def __enter__(self) -> DatagenProgressBar:
+        if self._enabled:
+            self._start_time = time.time()
+            self._bar = tqdm(
+                total=self._total_items,
+                desc="rollouts",
+                unit="house",
+                dynamic_ncols=True,
+                file=sys.stderr,
+            )
+            self._thread = threading.Thread(target=self._poll, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc_info: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2 * PROGRESS_POLL_SECONDS)
+            self._thread = None
+        if self._bar is not None:
+            self.refresh()
+            self._bar.close()
+            self._bar = None
+
+    def _poll(self) -> None:
+        while not self._stop.wait(PROGRESS_POLL_SECONDS):
+            self.refresh()
+
+    def refresh(self) -> None:
+        bar = self._bar
+        if bar is None:
+            return
+
+        # Read the counters without taking `counter_lock`, as the periodic wandb
+        # logging does: an inconsistent read costs one stale progress line, while
+        # contending for the workers' lock from here would put a display detail
+        # on the critical path of every worker's bookkeeping.
+        runner = self._runner
+        done = runner.completed_houses.value + runner.skipped_houses.value
+        episodes = runner.total_count.value
+        successes = runner.success_count.value
+
+        elapsed = max(time.time() - self._start_time, 1e-9)
+        postfix = [f"{episodes}/{self._total_episodes} eps"]
+        if episodes:
+            postfix.append(f"{successes / episodes:.0%} ok")
+        postfix.append(f"{episodes / elapsed * 60:.1f} eps/min")
+
+        bar.n = min(done, self._total_items)
+        bar.set_postfix_str(", ".join(postfix), refresh=False)
+        bar.refresh()
 
 
 def trim_memory() -> None:
@@ -1087,6 +1193,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
     visualize: bool = False
     rerun_visualizer: StretchRerunVisualizer | None = None
     max_items_per_worker: int = 10
+    show_progress: bool = False
 
     @staticmethod
     def run_single_rollout(
@@ -1601,6 +1708,13 @@ class StretchRolloutRunner(ParallelRolloutRunner):
 
         start_time = time.time()
 
+        with DatagenProgressBar(self, enabled=self.show_progress):
+            self._run_work_items(preloaded_policy, start_time)
+
+        return self._summarize(start_time)
+
+    def _run_work_items(self, preloaded_policy: Any, start_time: float) -> None:
+        """Spawn and babysit worker processes until every work item is claimed."""
         if self.config.num_workers > 1 or (not self.visualize and self.max_items_per_worker):
             target_workers = self.config.num_workers
             active_processes: dict[int, Any] = {}
@@ -1720,6 +1834,8 @@ class StretchRolloutRunner(ParallelRolloutRunner):
                 max_items_per_worker=None,
             )
 
+    def _summarize(self, start_time: float) -> tuple[int, int]:
+        """Log the run totals, push the final wandb row, and report the counts."""
         success_count_val = self.success_count.value
         total_count_val = self.total_count.value
         completed_houses_val = self.completed_houses.value
@@ -1768,6 +1884,7 @@ def generate_rollouts(
     visualize: bool = False,
     slow_rate: float | None = None,
     max_items_per_worker: int = 10,
+    show_progress: bool = False,
 ) -> Path:
     """Run the data generation pipeline for one task family.
 
@@ -1792,6 +1909,7 @@ def generate_rollouts(
             2.0 for 2x slower than real-time).
         max_items_per_worker: number of work items (houses) a worker process handles
             before being recycled to release system and GPU driver memory.
+        show_progress: draw a progress bar over the work items on stderr.
 
     Returns:
         The directory the pipeline actually wrote to.
@@ -1820,6 +1938,7 @@ def generate_rollouts(
 
     StretchRolloutRunner.visualize = visualize
     StretchRolloutRunner.max_items_per_worker = max_items_per_worker
+    StretchRolloutRunner.show_progress = show_progress
     if visualize:
         os.environ["STRETCH_DATAGEN_VISUALIZE"] = "1"
     elif "STRETCH_DATAGEN_VISUALIZE" in os.environ:
@@ -1944,6 +2063,13 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
     default=10,
     help="Number of house work items a worker process handles before being recycled to release system/GPU memory.",
 )
+@click.option(
+    "--progress/--no-progress",
+    "show_progress",
+    default=None,
+    help="Show a progress bar for the generation and export stages. Defaults to on "
+    "when stderr is a terminal, off when it is a log file.",
+)
 @click.option("--export/--no-export", "want_export", default=True, help="Run the export stage.")
 @click.option(
     "--fps", type=float, default=15.0, help="Frame rate to record in the dataset metadata."
@@ -1963,10 +2089,21 @@ def main(
     visualize: bool,
     slow_rate: float | None,
     max_items_per_worker: int,
+    show_progress: bool | None,
     want_export: bool,
     fps: float,
 ) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    if show_progress is None:
+        show_progress = sys.stderr.isatty()
+
+    # With a bar on screen, this process' own log lines have to go out through
+    # `tqdm.write` or they land on top of it. Worker processes keep their own
+    # handlers and are not covered; see `TqdmLoggingHandler`.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+        handlers=[TqdmLoggingHandler()] if show_progress else None,
+    )
 
     # MolmoSpaces renders off-screen through EGL; without this a headless run
     # fails inside the camera manager rather than at startup. The passive viewer
@@ -2003,6 +2140,7 @@ def main(
                 visualize=visualize,
                 slow_rate=slow_rate,
                 max_items_per_worker=max_items_per_worker,
+                show_progress=show_progress,
             )
             for task in tasks
         ]
@@ -2018,6 +2156,7 @@ def main(
         action_space=action_space,
         successful_only=not keep_failures,
         fps=fps,
+        show_progress=show_progress,
     )
     click.echo("")
     click.secho(

@@ -45,10 +45,12 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from examples.machine_learning.molmospaces.hdf5_layout import (
     TRAJECTORY_FILE_PATTERN,
@@ -206,6 +208,7 @@ def export_lerobot_dataset(
     fps: float = 15.0,
     camera_names: tuple[str, ...] | None = None,
     validate: bool = False,
+    show_progress: bool = False,
 ) -> ExportMetadata:
     """Convert recorded rollouts into a LeRobot-format dataset.
 
@@ -223,6 +226,7 @@ def export_lerobot_dataset(
             If None, auto-detects all available camera videos from rollout_dirs.
         validate: after writing, try to open the result with an installed
             `lerobot` and report what it says.
+        show_progress: draw a progress bar over the trajectory files on stderr.
 
     Returns:
         `ExportMetadata`, also written to `meta/stretch_export.json`.
@@ -258,13 +262,26 @@ def export_lerobot_dataset(
     episode_records: list[dict] = []
     episode_stats: list[dict] = []
 
+    # Collected up front rather than walked lazily so the bar has a total. The
+    # count is of files, not episodes: how many trajectories a file holds is only
+    # knowable by opening it, and a house batch is a handful of episodes, so the
+    # extra pass would buy a smoother bar at the cost of opening every HDF5 twice.
+    trajectory_files: list[tuple[Path, str]] = []
     for rollout_dir in rollout_dirs:
-        for h5_path in sorted(Path(rollout_dir).rglob("trajectories*.h5")):
-            match = TRAJECTORY_FILE_PATTERN.match(h5_path.name)
-            if match is None:
-                continue
-            batch_suffix = match.group("suffix")
+        for path in sorted(Path(rollout_dir).rglob("trajectories*.h5")):
+            match = TRAJECTORY_FILE_PATTERN.match(path.name)
+            if match is not None:
+                trajectory_files.append((path, match.group("suffix")))
 
+    with tqdm(
+        trajectory_files,
+        desc="export",
+        unit="file",
+        dynamic_ncols=True,
+        file=sys.stderr,
+        disable=not show_progress,
+    ) as progress:
+        for h5_path, batch_suffix in progress:
             with h5py.File(h5_path, "r") as h5_file:
                 for traj_key in sorted(h5_file.keys()):
                     key_match = TRAJECTORY_KEY_PATTERN.match(traj_key)
@@ -327,6 +344,10 @@ def export_lerobot_dataset(
                         f"[export] {h5_path.parent.name}/{traj_key} -> "
                         f"episode_{episode_index:06d} ({episode['length']} frames)"
                     )
+
+            progress.set_postfix_str(
+                f"{metadata.num_episodes} eps, {metadata.num_frames} frames"
+            )
 
     if metadata.num_episodes == 0:
         raise RuntimeError(

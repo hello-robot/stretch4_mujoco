@@ -65,4 +65,5 @@ jupyter = [
 ]
 molmo = [
     "molmo-spaces[mujoco]",
+    "tqdm>=4.66",
 ]
