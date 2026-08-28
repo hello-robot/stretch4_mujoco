@@ -1228,8 +1228,10 @@ def test_generated_script_never_rewarps_an_already_fisheye_camera(tmp_path):
     assert f"{HEAD_CAMERA_RIGHT} already carries the wide lens" in wide
     assert f"{WRIST_CAMERA_RIGHT} is rectilinear" in wide
 
-    # 2. the wide lens is also the argument for unfreezing the vision tower
-    assert "TRAINABLE=vision is the first thing to try" in wide
+    # 2. the wide lens is also the argument for unfreezing the vision tower,
+    #    which TRAINABLE=vision does
+    assert 'TRAINABLE="${TRAINABLE:-action_expert}"' in wide
+    assert "vision         + the vision tower" in wide
 
     # 3. an all-rectilinear selection gets the opposite advice, and is still
     #    warned off the two cameras that must never be listed
@@ -1237,7 +1239,78 @@ def test_generated_script_never_rewarps_an_already_fisheye_camera(tmp_path):
     assert "render rectilinear" in narrow
     assert "must never" in narrow
     assert "already carries the wide lens" not in narrow
-    assert "TRAINABLE=vision is the first thing to try" not in narrow
+
+
+def test_stretch_presets_are_registered_in_a_pristine_checkout(tmp_path):
+    """A fresh clone has no Stretch preset, and MolmoBot cannot be told one.
+
+    `--action_dim` and `--action_move_groups` give MolmoBot the width and the
+    names, but the *per group* widths come only from
+    `ACTION_SPECS[args.action_preset]`. With nothing matched, `train_molmobot.py`
+    raises `Action spec must be specified via --action_preset` -- and it does so
+    after the data paths validate, so it looks like a data problem. This is what
+    made a working machine and a fresh one behave differently.
+    """
+    from examples.machine_learning.molmospaces.finetuning.finetune import STRETCH_ACTION_SPEC
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        PRESETS_MODULE,
+        STRETCH_PRESET_NAMES,
+        MolmoBotCheckout,
+        MolmoBotSetupError,
+        ensure_stretch_presets,
+    )
+
+    package = tmp_path / "MolmoBot"
+    presets = package / PRESETS_MODULE
+    presets.parent.mkdir(parents=True)
+    # The shape of MolmoBot's table, minus everything that does not matter here.
+    presets.write_text(
+        "from typing import Dict, List, Optional, Union\n\n"
+        'ACTION_SPECS: Dict[str, Dict[str, int]] = {\n'
+        '    "franka_joint": {"arm": 7, "gripper": 1},\n'
+        "}\n\n"
+        'ACTION_DATASET_KEYS: Dict[str, Union[str, Dict[str, str]]] = {\n'
+        '    "franka_joint": "joint_pos",\n'
+        "}\n"
+    )
+    checkout = MolmoBotCheckout(
+        root=tmp_path,
+        package_dir=package,
+        data_scripts_dir=tmp_path / "data_scripts",
+    )
+
+    # 1. the presets are added, and adding them twice is a no-op
+    assert ensure_stretch_presets(checkout, STRETCH_ACTION_SPEC) == [
+        "stretch_joint",
+        "stretch_jointdelta",
+    ]
+    assert ensure_stretch_presets(checkout, STRETCH_ACTION_SPEC) == []
+
+    # 2. the result is importable, keeps MolmoBot's own presets, and carries the
+    #    move-group order the evaluation policy unpacks in
+    namespace: dict = {}
+    exec(compile(presets.read_text(), str(presets), "exec"), namespace)  # noqa: S102
+    specs, keys = namespace["ACTION_SPECS"], namespace["ACTION_DATASET_KEYS"]
+    assert specs["franka_joint"] == {"arm": 7, "gripper": 1}, "upstream presets survive"
+    for action_type, name in STRETCH_PRESET_NAMES.items():
+        assert specs[name] == dict(STRETCH_ACTION_SPEC)
+        assert list(specs[name]) == list(STRETCH_ACTION_SPEC), "order is the unpack order"
+        assert sum(specs[name].values()) == 10
+        assert keys[name] == action_type, "the preset must read the action type it is named for"
+
+    # 3. a preset table this cannot recognise is a clear error, not a silent skip
+    broken = tmp_path / "broken" / PRESETS_MODULE
+    broken.parent.mkdir(parents=True)
+    broken.write_text("ACTION_SPECS = dict(franka_joint={})\n")
+    with pytest.raises(MolmoBotSetupError, match="ACTION_SPECS"):
+        ensure_stretch_presets(
+            MolmoBotCheckout(
+                root=tmp_path / "broken",
+                package_dir=tmp_path / "broken" / "MolmoBot",
+                data_scripts_dir=tmp_path / "broken" / "data_scripts",
+            ),
+            STRETCH_ACTION_SPEC,
+        )
 
 
 def test_train_progress_passes_the_log_through_and_draws_a_bar():
