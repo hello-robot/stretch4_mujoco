@@ -225,6 +225,29 @@ on. `--global_batch_size` is unaffected: the gradient accumulation just runs
 more, smaller steps for the same effective batch.
 """
 
+FISHEYE_CAMERA_NAMES = frozenset({"head_camera_left", "head_camera_right"})
+"""
+The Stretch cameras whose frames are already barrel-distorted when recorded.
+
+`stretch/config.py` gives these two a ~123 degree field of view and installs
+`install_fisheye_distortion_hook()`, which runs
+`StretchCameras.cam_nav_rgb_se4_{left,right}.post_processing_callback` -- the
+`_distort` function -- on every rendered frame before the MP4 is written. So the
+wide-angle geometry is baked into the dataset, not something a trainer has to
+reproduce.
+
+That matters because MolmoBot has a `--cameras_to_warp` flag whose help reads
+"apply GoPro fisheye warping (resize to 640x480 4:3 + barrel distortion)", which
+is exactly what someone with wide-angle cameras reaches for. Pointed at these
+two it distorts already-distorted frames, and the policy trains on a lens that
+does not exist. The flag is for the opposite case: a camera rendered rectilinear
+in simulation that is wide-angle on the robot.
+
+`head_camera`, `wrist_camera_left` and `wrist_camera_right` are the rectilinear
+ones -- they take the MJCF's default FOV and their post-processing callback is
+None, so they get rotation only.
+"""
+
 PROGRESS_FILTER = Path(__file__).resolve().parent / "train_progress.py"
 """
 The progress bar the generated script pipes training through.
@@ -948,7 +971,13 @@ def _molmobot_script(
         'PYTHON="$PACKAGE"/.venv/bin/python',
         'TORCHRUN="$PACKAGE"/.venv/bin/torchrun',
         "",
-        *_tuning_block(seq_len, device_batch_size, batch_size, steps),
+        *_tuning_block(
+            seq_len,
+            device_batch_size,
+            batch_size,
+            steps,
+            cameras=camera_names or datasets[0].video_keys or list(DEFAULT_CAMERA_NAMES),
+        ),
         'cd "$PACKAGE"',
         "",
         "# --------------------------------------------------------------------------",
@@ -1054,6 +1083,7 @@ def _tuning_block(
     device_batch_size: int | None,
     batch_size: int,
     steps: int,
+    cameras: list[str] | None = None,
 ) -> list[str]:
     """The knobs, at the top of the script, sized from whatever GPU is present.
 
@@ -1144,6 +1174,19 @@ def _tuning_block(
         "# the normalisation statistics. Set WANDB=on with both exported to log.",
         'WANDB="${WANDB:-off}"',
         "",
+        *_lens_block(cameras or []),
+        "# --- What actually trains --------------------------------------------------",
+        "#   action_expert  (default) only the action expert. Cheapest.",
+        "#   vision         + the vision tower, at VIT_LR.",
+        "#   full           + the LLM and connector. MolmoBot's own recipe, on 8-64 H100s.",
+        'TRAINABLE="${TRAINABLE:-action_expert}"',
+        "",
+        "# Per-component learning rates, all of them OmegaConf dotlist fields on",
+        "# TrainConfig.optimizer.",
+        'ACTION_EXPERT_LR="${ACTION_EXPERT_LR:-1e-4}"',
+        'VIT_LR="${VIT_LR:-5e-6}"',
+        'LLM_LR="${LLM_LR:-1e-5}"',
+        "",
         "# --- Optional training flags ----------------------------------------------",
         "# Uncomment a line to turn one on. They are appended verbatim to the trainer.",
         "EXTRA_ARGS=()",
@@ -1157,7 +1200,84 @@ def _tuning_block(
         "    EXTRA_ARGS+=(--wandb=null)",
         "fi",
         "",
+        "# run_trainer.py freezes a component when its ft_* flag is false, so the",
+        "# defaults below are the frozen case and each tier only adds.",
+        'case "$TRAINABLE" in',
+        "    action_expert) ;;",
+        "    vision)  EXTRA_ARGS+=(--ft_vit=True) ;;",
+        "    full)    EXTRA_ARGS+=(--ft_vit=True --ft_llm=True --ft_connector=True) ;;",
+        "    *)",
+        '        echo "TRAINABLE must be action_expert, vision or full (got: $TRAINABLE)" >&2',
+        "        exit 1",
+        "        ;;",
+        "esac",
+        "EXTRA_ARGS+=(",
+        '    --optimizer.action_expert_learning_rate="$ACTION_EXPERT_LR"',
+        '    --optimizer.vit_learning_rate="$VIT_LR"',
+        '    --optimizer.llm_learning_rate="$LLM_LR"',
+        ")",
+        "",
+        'if [ -n "$WARP_CAMERAS" ]; then',
+        "    # Unquoted on purpose: WARP_CAMERAS is a space-separated list and",
+        "    # --cameras_to_warp takes nargs=*.",
+        "    # shellcheck disable=SC2206",
+        "    EXTRA_ARGS+=(--cameras_to_warp $WARP_CAMERAS)",
+        "fi",
+        "",
     ]
+
+
+def _lens_block(cameras: list[str]) -> list[str]:
+    """The wide-angle section, named after the cameras this run actually uses.
+
+    Written per-run rather than as a general note because the correct answer
+    depends on which cameras were selected, and the wrong answer is invisible:
+    warping an already-fisheye frame produces an image that still looks like a
+    plausible wide-angle photo.
+    """
+    fisheye = [camera for camera in cameras if camera in FISHEYE_CAMERA_NAMES]
+    rectilinear = [camera for camera in cameras if camera not in FISHEYE_CAMERA_NAMES]
+
+    lines = [
+        "# --- Wide-angle lenses ------------------------------------------------------",
+    ]
+    if fisheye:
+        carries = "already carries" if len(fisheye) == 1 else "already carry"
+        lines += [
+            f"# {', '.join(fisheye)} {carries} the wide lens: stretch/config.py gives",
+            "# it a ~123 degree FOV and runs a barrel-distortion callback on every frame at",
+            "# render time, so the distortion is baked into the recorded MP4s.",
+            "#",
+            "# This is why WARP_CAMERAS is empty. MolmoBot's --cameras_to_warp applies",
+            "# *another* GoPro-style barrel distortion, and pointing it at that camera",
+            "# would train the policy on a lens nothing has -- while still producing images",
+            "# that look like plausible wide-angle photos, so nothing would flag it.",
+        ]
+        if rectilinear:
+            is_are = "is rectilinear" if len(rectilinear) == 1 else "are rectilinear"
+            lines += [
+                "#",
+                f"# {', '.join(rectilinear)} {is_are} (MJCF default FOV, no distortion",
+                "# callback). Warping that is the flag's real use: it is for a camera that",
+                "# renders rectilinear in simulation but is wide-angle on the robot.",
+            ]
+    else:
+        renders = "renders" if len(cameras) == 1 else "render"
+        lines += [
+            f"# {', '.join(cameras) or 'The selected cameras'} {renders} rectilinear -- MJCF",
+            "# default FOV, no distortion callback. If the corresponding camera on the",
+            "# robot is wide-angle, --cameras_to_warp closes that sim2real gap by applying",
+            "# GoPro-style barrel distortion during training. Stretch's head_camera_left",
+            "# and head_camera_right are already distorted at render time and must never",
+            "# be listed here.",
+        ]
+    lines += [
+        "#",
+        "# Space-separated camera names to warp, e.g. WARP_CAMERAS=\"head_camera\".",
+        'WARP_CAMERAS="${WARP_CAMERAS:-}"',
+        "",
+    ]
+    return lines
 
 
 def _optional_flag_lines() -> list[str]:
