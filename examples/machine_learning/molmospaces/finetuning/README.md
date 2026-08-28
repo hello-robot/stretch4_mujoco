@@ -67,6 +67,17 @@ python -m examples.machine_learning.molmospaces.run_benchmarks \
     --policy molmobot --checkpoint <checkpoint> --benchmark pick
 ```
 
+> Note: On a 5090, you may need to install CUDA 12.8 and also rebuild pytorch on both the third_part/MolmoBot/MolmoBot/.venv and this repo's venv:
+```
+uv pip uninstall torch torchvision torchaudio -y
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_arch_list()); print(torch.cuda.get_device_name(0))"
+# Make sure the last command outputs sm_120, if it does, then it's set up correctly.
+
+# You may also need to comment out `uv sync --extra train` from run_molmobot.sh.
+```
+
+
 Step 3 does the two mechanical things that stand between a MolmoSpaces run and a
 MolmoBot dataset, both easy to miss:
 
