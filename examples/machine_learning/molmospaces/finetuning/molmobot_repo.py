@@ -87,6 +87,96 @@ DOWNLOAD_TIMEOUT_SECONDS = 60
 PRESETS_MODULE = "olmo/data/synthmanip_presets.py"
 """Where MolmoBot keeps the robot presets, relative to the package directory."""
 
+OPTIM_MODULE = "olmo/train/optim.py"
+"""Where MolmoBot builds the optimizer, relative to the package directory."""
+
+ADAMW8BIT = "adamw8bit"
+"""
+The `optimizer.name` the generated script passes by default.
+
+MolmoBot ships `lionw` and `adamw`, both keeping optimizer state in fp32. At
+`TRAINABLE=vision` that is 918M trainable parameters (vision tower + action
+expert) at 8 bytes each -- 6.8GiB of moments on top of 18.6GiB of fp32 master
+weights, which does not fit beside activations on a 32GiB card. torchao's
+block-wise 8-bit AdamW is the same update rule with the moments quantized, ~2
+bytes/param, and `ensure_adamw8bit` teaches MolmoBot to build it.
+"""
+
+_ADAMW8BIT_ENUM_MEMBER = '''    adamw8bit = "adamw8bit"
+    """
+    AdamW with both moments held in 8 bits instead of fp32, from torchao.
+
+    Same update rule as `adamw`; only the state is quantized, block-wise with a
+    per-block scale, so the optimizer costs ~2 bytes/param rather than 8. On a
+    single 32GiB card that is the difference between fitting the vision tower
+    and not: fp32 moments for 918M trainable params (ViT + action expert) are
+    6.8GiB against 1.7GiB here.
+
+    torchao rather than bitsandbytes because this trainer runs FSDP2
+    (`FSDPConfig.fsdp2`), so parameters are DTensors -- torchao's optimizers
+    unwrap to the local shard and rewrap with `DTensor.from_local`, which
+    bitsandbytes has no equivalent of.
+
+    Kept out of `pyproject.toml` on purpose: this is a vendored checkout, and
+    resolving torchao as a project dependency drags torch back to a version
+    without Blackwell (sm_120) wheels. The generated launch script installs it
+    into the venv on its own.
+    """
+'''
+
+_ADAMW8BIT_BUILDER = '''
+
+def _build_adamw8bit(param_groups, **kwargs) -> Optimizer:
+    """torchao's 8-bit AdamW, adapted to the learning rate this trainer hands it.
+
+    torchao pins each group's ``lr`` to a tensor -- it is passed as an argument
+    into a ``torch.compile``d step -- and raises if anything replaces it with a
+    float. :meth:`Trainer.train_step` assigns the scheduled lr as a plain float
+    every step, so the value is rewrapped here just before stepping.
+
+    Rewrapped *in place*: one tensor per group, reused with ``fill_`` rather than
+    rebuilt, so the compiled step keeps seeing the same object and does not
+    re-guard on a new one every step.
+    """
+    try:
+        from torchao.optim import AdamW8bit
+    except ImportError as e:
+        raise ImportError(
+            "optimizer.name=adamw8bit needs torchao, which is not installed. "
+            "Install it into this venv without adding it to pyproject.toml "
+            "(as a project dependency it pulls torch back off the cu128 wheels "
+            "that Blackwell needs):\\n"
+            "    uv pip install --no-deps torchao"
+        ) from e
+
+    class AdamW8bitScheduledLr(AdamW8bit):
+        def step(self, closure=None):
+            holders = self.__dict__.setdefault("_lr_holders", {})
+            for i, group in enumerate(self.param_groups):
+                lr = group["lr"]
+                if not torch.is_tensor(lr):
+                    holder = holders.get(i)
+                    if holder is None:
+                        holder = holders[i] = torch.tensor(float(lr), dtype=torch.float32)
+                    else:
+                        holder.fill_(float(lr))
+                    group["lr"] = holder
+            return super().step(closure)
+
+    return AdamW8bitScheduledLr(param_groups, **kwargs)
+'''
+
+_ADAMW8BIT_BRANCH = '''        elif self.name == OptimizerType.adamw8bit:
+            log.info("Using 8-bit AdamW; optimizer state is ~2 bytes/param instead of 8")
+            return _build_adamw8bit(
+                param_groups,
+                lr=self.learning_rate,
+                betas=self.betas,
+                weight_decay=self.weight_decay,
+                eps=self.eps,
+            )
+'''
+
 STRETCH_PRESET_NAMES: dict[str, str] = {
     "joint_pos": "stretch_joint",
     "joint_pos_rel": "stretch_jointdelta",
@@ -347,6 +437,89 @@ def _insert_after_dict_opening(source: str, name: str, block: str, path: Path) -
     """Put `block` immediately inside the `name = {` literal at module level."""
     cut = _find_dict_opening(source, name, path).end() + 1  # past the newline ending that line
     return source[:cut] + block + source[cut:]
+
+
+def ensure_adamw8bit(checkout: MolmoBotCheckout) -> bool:
+    """Teach MolmoBot's optimizer factory to build torchao's 8-bit AdamW.
+
+    See `ADAMW8BIT` for why: fp32 optimizer moments do not fit beside the fp32
+    master weights on one 32GiB card once the vision tower is trainable.
+
+    Three insertions into `olmo/train/optim.py` -- a member on the `OptimizerType`
+    enum, a `_build_adamw8bit` factory, and the branch in
+    `OptimizerConfig.build_optimizer` that calls it -- in the same gitignored
+    clone, and for the same reason, as `ensure_stretch_presets`: the generated
+    script *defaults* to `--optimizer.name=adamw8bit`, so without this a freshly
+    recreated checkout would reject its own launch script. torchao itself is not
+    touched here; the script installs it into the venv.
+
+    Idempotent: a checkout already mentioning `adamw8bit` is left alone.
+
+    Returns:
+        True if this call patched the file, False if it was already patched.
+    """
+    path = checkout.package_dir / OPTIM_MODULE
+    if not path.exists():
+        raise MolmoBotSetupError(
+            f"{path} not found, so this MolmoBot checkout does not keep its optimizer "
+            "where this expects. It may be a version whose layout has moved; re-clone, "
+            "or run with OPTIMIZER=adamw and accept the fp32 optimizer state."
+        )
+
+    source = path.read_text()
+    if ADAMW8BIT in source:
+        return False
+
+    # The enum member goes after the last existing member, found by anchoring on
+    # `adamw` inside the `class OptimizerType` block rather than on the class line,
+    # so a reordered enum still lands somewhere valid.
+    enum_anchor = re.search(
+        r"^class OptimizerType\(StrEnum\):\n(?:[ \t]+\w+ = \"[^\"]+\"\n)+", source, re.MULTILINE
+    )
+    if enum_anchor is None:
+        raise MolmoBotSetupError(
+            f"Could not find the `class OptimizerType(StrEnum)` block in {path}, so "
+            f"{ADAMW8BIT} cannot be registered. Run with OPTIMIZER=adamw, or add the "
+            "member and the matching `build_optimizer` branch by hand."
+        )
+
+    # The branch goes immediately before build_optimizer's fallthrough, so it is
+    # reached only after the names MolmoBot ships have had their turn.
+    branch_anchor = re.search(
+        r"^([ \t]+)else:\n[ \t]+raise NotImplementedError\n", source[enum_anchor.end() :], re.MULTILINE
+    )
+    if branch_anchor is None:
+        raise MolmoBotSetupError(
+            f"Could not find `build_optimizer`'s `else: raise NotImplementedError` in {path}, "
+            f"so the {ADAMW8BIT} branch has nowhere to go. Run with OPTIMIZER=adamw, or add "
+            "the branch by hand."
+        )
+    cut = enum_anchor.end() + branch_anchor.start()
+
+    # The factory goes at module level, after the last helper defined before
+    # OptimizerConfig, so it is in scope by the time build_optimizer runs.
+    helper_anchor = re.search(
+        r"^def _clean_param_name\(name: str\) -> str:\n(?:[ \t]+.*\n)+", source, re.MULTILINE
+    )
+    if helper_anchor is None:
+        raise MolmoBotSetupError(
+            f"Could not find `_clean_param_name` in {path}, so there is no anchor for the "
+            f"{ADAMW8BIT} factory. Run with OPTIMIZER=adamw, or add it by hand."
+        )
+    if helper_anchor.end() > cut:
+        raise MolmoBotSetupError(
+            f"`_clean_param_name` sits after `build_optimizer` in {path}, so inserting the "
+            f"{ADAMW8BIT} factory there would not put it in scope. Add it by hand."
+        )
+
+    # Applied back to front so each insertion cannot shift the offsets of the
+    # ones still to come.
+    source = source[:cut] + _ADAMW8BIT_BRANCH + source[cut:]
+    source = source[: helper_anchor.end()] + _ADAMW8BIT_BUILDER + source[helper_anchor.end() :]
+    source = source[: enum_anchor.end()] + _ADAMW8BIT_ENUM_MEMBER + source[enum_anchor.end() :]
+    path.write_text(source)
+    log.info(f"[molmobot] registered {ADAMW8BIT} in {path}")
+    return True
 
 
 def _clone(root: Path) -> None:
