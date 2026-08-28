@@ -66,11 +66,13 @@ Between `molmospaces-bench-v1` and `-v2` there are around ninety released
 benchmark directories, but they cover eight distinct task families — the seven
 `TaskSpec` subclasses in MolmoSpaces' `benchmark_schema.py`, with `OpeningTask`
 split into its "open" and "close" suites. `benchmarks.py` pins one directory per
-family:
+family, plus one benchmark that is built locally rather than downloaded
+(see [below](#a-benchmark-for-a-task-with-no-release)):
 
 | key            | release  | task                                    | episodes |
 | -------------- | -------- | --------------------------------------- | -------- |
 | `pick`         | MB-Pick  | pick a named object off a surface       | 1000     |
+| `potato`       | *local*  | pick up a potato                        | *built*  |
 | `pnp`          | MB-PnP   | place it in or on a named receptacle    | 1000     |
 | `pnp_next_to`  | MB-PnP-next-to | place it *beside* a named object  | 1000     |
 | `pnp_color`    | MB-PnP-color | receptacle told apart only by colour | 1000    |
@@ -95,9 +97,79 @@ simply a difficulty preference:
 - **`door_opening`** cannot be evaluated with Stretch at all, see *Known
   limitations*. It is skipped when sweeping and only runs when named.
 
+`potato` is also skipped when sweeping, for a different reason: it does not exist
+until you build it, and a default sweep should not report an ERROR row for that.
+
 ```bash
 python -m examples.machine_learning.molmospaces.run_benchmarks --list
 ```
+
+## A benchmark for a task with no release
+
+The eight above are released asset packages — fixed episode lists that arrive
+with the MolmoSpaces assets. That covers any task family that *has* a release. It
+does not cover a task family invented locally, and filtering does not rescue it:
+of the 1000 episodes in MB-Pick, **six** pick up a potato, and MS-Pick has none.
+
+`build_benchmark.py` builds the test set instead, from the same generation
+pipeline that produces the training data:
+
+```bash
+# 1. generate evaluation episodes -- from a HELD-OUT split
+python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+    --task potato --episodes 200 --data-split val --no-export \
+    --output-dir data/stretch_potato_eval
+
+# 2. freeze them into <assets>/benchmarks/stretch-local/potato/benchmark.json
+python -m examples.machine_learning.molmospaces.build_benchmark \
+    --rollouts data/stretch_potato_eval/rollouts/potato --benchmark potato
+
+# 3. score a policy on it, exactly like a released benchmark
+python -m examples.machine_learning.molmospaces.run_benchmarks \
+    --benchmark potato --policy molmobot --checkpoint <ckpt>
+```
+
+This works because **every rollout already carries its own initial conditions.**
+`BaseMujocoTask.reset()` calls `MlSpacesExpConfig.freeze_task_config()`, which
+pickles camera extrinsics resolved to fixed values, the robot's start joint
+positions, the base pose, the pickup object and its pose, every mobile object's
+pose, and the referral expressions — and stores it base64-encoded under
+`obs_scene["frozen_config"]` in the HDF5. That is the same information an
+`EpisodeSpec` holds, so `build_benchmark.py` is a translation rather than a
+reconstruction: the poses it writes are the ones the rollout actually ran from.
+Verified: a benchmark built from three episodes the expert solved during
+generation replays at **3/3**.
+
+That check is worth repeating whenever you build a benchmark for a new task,
+because it is the one that catches a scene the replay cannot rebuild faithfully.
+It initially came out 0/3 here: the eval path was reconstructing the added target
+object from the raw asset, without the mass correction data generation applies, so
+the potato weighed 20kg on replay and nothing could lift it. See
+[added_pickup_repair.py](added_pickup_repair.py).
+
+Two things make an episode set a benchmark rather than more training data, and
+only one of them can be enforced here:
+
+- **A held-out split.** Generate with `--data-split val`. Scoring a policy on the
+  houses it was fine-tuned in measures memorisation. The builder cannot know what
+  you trained on, so it warns whenever the rollouts it is handed came from
+  `train`.
+- **Solvable episodes.** Only episodes the expert *finished* are kept, which is
+  the last step's success flag rather than `success.any()` — an episode that
+  lifted a potato and then dropped it has the latter True and is not evidence the
+  episode is completable. `--include-failures` overrides.
+
+Rebuilding refuses to overwrite without `--force`: a benchmark whose episodes
+change underneath you invalidates every number already recorded against it. Built
+benchmarks live under `benchmarks/stretch-local/` so they can never be mistaken
+for `molmospaces-bench-v2`, whose scores are comparable with the MolmoSpaces
+leaderboard's, and so the resource manager does not replace them on the next asset
+install.
+
+Nothing here is potato-specific except the registry entry — `_task_dict()` copies
+whatever task-spec fields the frozen config carries, so the same command builds a
+benchmark out of `pnp` or `open` rollouts. Add a `Benchmark(..., locally_built=True)`
+entry to give one a `--benchmark` key.
 
 ## Running
 

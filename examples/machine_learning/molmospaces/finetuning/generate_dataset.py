@@ -24,6 +24,11 @@ One command for the whole data half of the pipeline:
         --task pick --task pnp --task open --episodes 1000 \
         --output-dir data/stretch_manipulation
 
+    # one object category: pick, with potatoes added to every scene
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+        --task potato --episodes 2000 --num-workers 8 \
+        --output-dir data/stretch_potato --no-export
+
     # rollouts already on disk; just re-export them
     python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
         --rollouts data/stretch_pick/rollouts --output-dir data/stretch_pick
