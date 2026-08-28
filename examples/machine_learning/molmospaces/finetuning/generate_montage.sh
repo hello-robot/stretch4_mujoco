@@ -8,6 +8,10 @@
 #     head_left  | head_center   | head_right
 #     wrist_left | wrist_depth   | wrist_right
 #
+# The wrist depth stream is stored as a 16-bit metric depth packed into the R/G
+# channels, so it is decoded back to a greyscale depth map for the grid rather
+# than shown as the green banding the raw file plays back as.
+#
 # The per-episode grids are then montaged together across every subfolder,
 # either one after another (default) or side by side as a grid of grids.
 #
@@ -59,7 +63,8 @@ Options:
   -H PX     camera cell height (default $CELL_H)
   -r FPS    output frame rate (default: frame rate of the first source video)
   -j N      parallel ffmpeg jobs (default: half the cores)
-  -k        keep the intermediate per-episode grid videos
+  -k        keep the intermediate per-episode grid videos (a later run then
+            reuses them instead of re-encoding)
   -h        this help
 EOF
 }
@@ -194,8 +199,15 @@ build_grid() {
     for i in "${!files[@]}"; do args+=(-i "${files[$i]}"); done
 
     for i in "${!files[@]}"; do
-        cell="[$i:v]fps=${FPS},scale=${CELL_W}:${CELL_H}:force_original_aspect_ratio=decrease"
-        cell+=",pad=${CELL_W}:${CELL_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+        cell="[$i:v]fps=${FPS}"
+        # Depth streams are not pictures: the saver packs a 16-bit metric depth
+        # into R (high byte) and G (low byte) with B=0, which plays back as
+        # green contour bands. The high byte on its own is the depth map at
+        # 8-bit resolution -- ~2 mm over the encoder's 5-55 cm range -- so pull
+        # it out and show that as greyscale. Black is either 5 cm or invalid.
+        [[ ${CAMERAS[$i]} == *depth* ]] && cell+=",format=gbrp,extractplanes=r,format=gray"
+        cell+=",scale=${CELL_W}:${CELL_H}:force_original_aspect_ratio=decrease"
+        cell+=",pad=${CELL_W}:${CELL_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
         local t
         t=$(drawtext_filter "${CELL_LABELS[$i]}" 8 "h-th-8" 16)
         [[ -n $t ]] && cell+=",$t"
@@ -221,6 +233,7 @@ GRIDS=()
 GRID_LABELS=()
 pending=0
 skipped=0
+reused=0
 
 for idx in "${!EP_IDS[@]}"; do
     dir=${EP_DIRS[$idx]}
@@ -244,6 +257,12 @@ for idx in "${!EP_IDS[@]}"; do
     grid="$WORK/${scene}_episode_${ep}.mp4"
     GRIDS+=("$grid")
     GRID_LABELS+=("$label")
+
+    if [[ -s $grid ]]; then
+        echo "have  $label -- reusing $(basename "$grid")"
+        reused=$((reused + 1))
+        continue
+    fi
 
     echo "grid  $label"
     build_grid "$grid" "$label" "${inputs[@]}" &
@@ -340,3 +359,4 @@ fi
 
 echo "done: $OUT"
 (( skipped == 0 )) || echo "note: skipped $skipped episode(s) with missing cameras" >&2
+(( reused == 0 )) || echo "note: reused $reused existing episode grid(s) from $WORK" >&2
