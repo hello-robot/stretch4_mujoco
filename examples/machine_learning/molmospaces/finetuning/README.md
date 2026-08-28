@@ -12,6 +12,7 @@ generate_dataset.py  run them, then optionally export -- one command
 live_recorder.py     record teleop demonstrations from examples/molmo_environment.py
 lerobot_export.py    rollouts -> a LeRobot v2.1 dataset (for openpi / LeRobot)
 molmobot_repo.py     clone MolmoBot, fetch the scripts that are not in it
+train_progress.py    a progress bar, drawn from the trainer's own log lines
 finetune.py          check the data, prepare it, write the config and a run script
 ```
 
@@ -137,6 +138,27 @@ node without regenerating. Pass `--seq-len` or `--device-batch-size` to
 The table rows in `VRAM_TIERS` are **starting points, not measurements**:
 extrapolated from MolmoBot's own recipe with margin for the resident backbone.
 Turn them down for more cameras, up when a run fits with room to spare.
+
+### Watching a run
+
+MolmoBot already tracks its own progress — `Trainer.fit` prints
+`[step=N/max, eta=...]` every `LOG_INTERVAL` steps, from `Trainer.get_eta()` —
+but as the first line of a multi-line metrics dump, so the one number you want
+scrolls past. Training is piped through `train_progress.py`, which passes every
+line through untouched and appends a block whenever it sees a header:
+
+```
+  [##############------------------]  43.2%  step 12,960/30,000
+  2.41 it/s  elapsed 1:29:38  eta 1 hour, 58 minutes  (trainer's own estimate)
+```
+
+Two estimates because they answer different questions: the trainer's `eta=` is
+averaged over its whole run and is the one to trust for a finish time, while the
+`it/s` here is measured between the headers this process has seen, so it shows
+when a run has *slowed down*. The bar appends rather than repainting in place —
+no carriage returns or cursor codes — so the output stays readable when piped to
+a file or pasted into an issue. `LOG_INTERVAL` controls how often it redraws, and
+`PROGRESS=off` skips the pipe entirely.
 
 Below that, the optional trainer flags are listed commented-out with the reason
 to reach for each — `--img_aug`, `--weighted_sampling`, `--randomize_prompts`,
