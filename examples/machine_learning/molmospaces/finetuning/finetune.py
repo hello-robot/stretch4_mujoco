@@ -96,11 +96,13 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
     CAMERA_FEATURE_NAMES,
 )
 from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+    ADAMW8BIT,
     DEFAULT_CHECKOUT,
     GRIPPER_STATE_WIDTH,
     STRETCH_PRESET_NAMES,
     MolmoBotCheckout,
     MolmoBotSetupError,
+    ensure_adamw8bit,
     ensure_checkout,
     ensure_stretch_presets,
 )
@@ -1001,6 +1003,14 @@ def _molmobot_script(
         "# --------------------------------------------------------------------------",
         'step "Syncing MolmoBot dependencies"',
         "uv sync --extra train",
+        'if [ "$OPTIMIZER" = adamw8bit ]; then',
+        "    # --no-deps deliberately, and not in MolmoBot's pyproject.toml at all:",
+        "    # resolved as a project dependency, torchao pins torch back to a release",
+        "    # without Blackwell (sm_120) wheels, which silently costs you the GPU.",
+        "    # The 8-bit optimizers are pure PyTorch plus torch.compile, so nothing",
+        "    # torchao's own resolution would add is needed.",
+        "    uv pip install --no-deps torchao",
+        "fi",
         "",
         *_checkpoint_step(base_checkpoint, output_dir),
         "# --------------------------------------------------------------------------",
@@ -1068,6 +1078,18 @@ def _molmobot_script(
         ' device_batch=$DEVICE_BATCH global_batch=$GLOBAL_BATCH"',
         'mkdir -p "$SAVE_FOLDER"',
         'export PYTHONPATH="$PACKAGE${PYTHONPATH:+:$PYTHONPATH}"',
+        "",
+        'if [ "$OPTIMIZER" = adamw8bit ]; then',
+        "    # Do not drop this: with adamw8bit on a 32GiB card the run OOMs without it.",
+        "    # 8-bit moments get the run to fit, but only just -- about 28GiB deep -- and",
+        "    # the default allocator strands ~2GiB in reserved-but-unallocated blocks,",
+        "    # enough that the first backward cannot find a contiguous 2GiB even though",
+        "    # the memory is free. expandable_segments grows existing segments instead.",
+        "    # Measured both ways on a 5090: OOM without it, trains with it, nothing else",
+        "    # changed. Only set here because this is the configuration that needs it --",
+        "    # adamw has margin to spare on a card big enough to run it at all.",
+        '    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"',
+        "fi",
         "",
         "# The trainer already knows how far along it is -- Trainer.fit prints",
         "# `[step=N/max, eta=...]` every LOG_INTERVAL steps -- but as the first line",
@@ -1199,6 +1221,20 @@ def _tuning_block(
         'VIT_LR="${VIT_LR:-5e-6}"',
         'LLM_LR="${LLM_LR:-1e-5}"',
         "",
+        "# --- Where the optimizer state lives --------------------------------------",
+        "#   adamw8bit  (default) torchao's block-wise 8-bit AdamW. Same update rule",
+        "#              as adamw, moments quantized: ~2 bytes/param of trainable",
+        "#              weight instead of 8. At TRAINABLE=vision that is 918M",
+        "#              trainable params costing 1.7GiB rather than 6.8GiB, which is",
+        "#              what makes the vision tower fit on a single 32GiB card.",
+        "#              Needs torchao, installed by step 1 when this is selected.",
+        "#   adamw      fp32 moments. The stock choice when the memory is there.",
+        "#",
+        "# torchao and not bitsandbytes because this trainer runs FSDP2, so",
+        "# parameters are DTensors: torchao's optimizers shard their quantized state",
+        "# with the parameter, bitsandbytes' cannot.",
+        'OPTIMIZER="${OPTIMIZER:-adamw8bit}"',
+        "",
         "# --- Optional training flags ----------------------------------------------",
         "# Uncomment a line to turn one on. They are appended verbatim to the trainer.",
         "EXTRA_ARGS=()",
@@ -1223,7 +1259,15 @@ def _tuning_block(
         "        exit 1",
         "        ;;",
         "esac",
+        'case "$OPTIMIZER" in',
+        "    adamw|adamw8bit) ;;",
+        "    *)",
+        '        echo "OPTIMIZER must be adamw or adamw8bit (got: $OPTIMIZER)" >&2',
+        "        exit 1",
+        "        ;;",
+        "esac",
         "EXTRA_ARGS+=(",
+        '    --optimizer.name="$OPTIMIZER"',
         '    --optimizer.action_expert_learning_rate="$ACTION_EXPERT_LR"',
         '    --optimizer.vit_learning_rate="$VIT_LR"',
         '    --optimizer.llm_learning_rate="$LLM_LR"',
@@ -1611,9 +1655,10 @@ def main(
         try:
             checkout = ensure_checkout(trainer_repo or DEFAULT_CHECKOUT, clone=clone)
             registered = ensure_stretch_presets(checkout, STRETCH_ACTION_SPEC)
+            patched_optimizer = ensure_adamw8bit(checkout)
         except MolmoBotSetupError as e:
             raise click.ClickException(str(e)) from e
-        _print_checkout(checkout, registered)
+        _print_checkout(checkout, registered, patched_optimizer)
 
     script_path = write_launch_script(
         datasets=datasets,
@@ -1686,7 +1731,9 @@ def _warn_about_empty_val_splits(datasets: list[DatasetSummary]) -> None:
     )
 
 
-def _print_checkout(checkout: MolmoBotCheckout, registered: list[str]) -> None:
+def _print_checkout(
+    checkout: MolmoBotCheckout, registered: list[str], patched_optimizer: bool = False
+) -> None:
     click.echo("")
     click.secho(
         f"MolmoBot  {checkout.root}  ({'cloned just now' if checkout.cloned else 'already there'})",
@@ -1703,6 +1750,10 @@ def _print_checkout(checkout: MolmoBotCheckout, registered: list[str]) -> None:
         f"(registered in synthmanip_presets.py: {', '.join(registered)})"
         if registered
         else f"  presets: {', '.join(sorted(set(STRETCH_PRESET_NAMES.values())))} (already there)"
+    )
+    click.echo(
+        f"  optim:   {ADAMW8BIT} "
+        f"({'registered in optim.py' if patched_optimizer else 'already there'})"
     )
     click.echo(
         f"  venv:    {checkout.venv_python}"
