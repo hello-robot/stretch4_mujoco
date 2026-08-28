@@ -113,6 +113,46 @@ path to `--base-checkpoint` to use a checkpoint you already have, or follow
 MolmoBot's README to start from the Molmo2-4B VLM instead — that is the
 from-scratch recipe and wants far more data than a fine-tune does.
 
+### The tuning block, and CUDA out-of-memory
+
+Everything worth changing sits in one block at the top of the generated script,
+each value written as `${NAME:-default}` so it can be overridden for a single run
+without editing:
+
+```bash
+SEQ_LEN=1024 DEVICE_BATCH=2 bash run_molmobot.sh
+```
+
+`SEQ_LEN` and `DEVICE_BATCH` are **sized at run time from `nvidia-smi`**, off the
+smallest visible GPU, so the same script works on a 24GB workstation and an 80GB
+node without regenerating. Pass `--seq-len` or `--device-batch-size` to
+`finetune.py` to pin one instead.
+
+| variable | why it costs memory |
+| --- | --- |
+| `SEQ_LEN` | The loader is built with `pad="to_max"`, so **every sample is padded to it** whether or not any trajectory needs the room. 528 is what MolmoBot's README uses for this exact shape — two images, `crop_mode=resize`, `max_crops=1`, 3×3 pooling. |
+| `DEVICE_BATCH` | Samples per forward/backward. `Trainer.split_batch` chops the per-device batch into `ceil(batch / DEVICE_BATCH)` microbatches with no divisibility requirement, so 1 is always valid. MolmoBot's own default is 2. |
+| `GLOBAL_BATCH` | The effective batch, made up by accumulating gradients. Changes the optimisation, not the peak — lower it only if you mean to train differently. |
+
+The table rows in `VRAM_TIERS` are **starting points, not measurements**:
+extrapolated from MolmoBot's own recipe with margin for the resident backbone.
+Turn them down for more cameras, up when a run fits with room to spare.
+
+Below that, the optional trainer flags are listed commented-out with the reason
+to reach for each — `--img_aug`, `--weighted_sampling`, `--randomize_prompts`,
+`--use_point_prompts`, `--no_val`, and the `ft_*` unfreezing switches. Weights &
+Biases is `WANDB=off` by default, because its config interpolates
+`${oc.env:WANDB_PROJECT}` and `${oc.env:WANDB_ENTITY}` and would otherwise kill
+the run *after* the checkpoint and statistics load; `WANDB=on` with both exported
+turns it on, and fails immediately with a clear message if they are not.
+
+The LLM, vision tower and connector are all frozen (`ft_llm`, `ft_vit` and
+`ft_connector` default to `False` and nothing here turns them on), so only the
+action expert carries gradients and optimiser state. The resident weights are the
+floor: the base checkpoint is a ~4B-parameter model at `d_model=2560`,
+`n_layers=36`. If the smallest tier still OOMs, drop a camera — that roughly
+halves the image tokens — before dropping the batch further.
+
 ## Several tasks, one policy
 
 MolmoBot is language-conditioned on each trajectory's `task_description`, so pick

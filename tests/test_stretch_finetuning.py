@@ -985,6 +985,7 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     import subprocess
 
     from examples.machine_learning.molmospaces.finetuning.finetune import (
+        VRAM_TIERS,
         DatasetSummary,
         write_launch_script,
         write_trainer_config,
@@ -1068,10 +1069,36 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     assert '--save_folder="$SAVE_FOLDER"' in body
     assert 'mkdir -p "$SAVE_FOLDER"' in body
     assert "--wandb=null" in body
-    assert "--max_duration=1000" in body
+    assert '--max_duration="$MAX_STEPS"' in body
+    assert 'MAX_STEPS="${MAX_STEPS:-1000}"' in body
 
     # 7. the norm stats stay with the run, not in the shared MolmoBot checkout
     assert '--stats_path "$SAVE_FOLDER"/synthmanip_norm_stats.yaml' in body
+
+    # 7b. the VRAM knobs are overridable variables at the top, so an OOM is
+    #     retuned from the environment rather than by regenerating. An explicit
+    #     seq_len pins the value; device_batch_size was left to the VRAM table.
+    #     device_batch_size must reach the trainer either way -- MolmoBot's own
+    #     default is 2, not 1, so omitting the flag silently inherits it.
+    assert 'SEQ_LEN="${SEQ_LEN:-2048}"' in body
+    assert 'DEVICE_BATCH="${DEVICE_BATCH:-$DEVICE_BATCH_AUTO}"' in body
+    assert 'GLOBAL_BATCH="${GLOBAL_BATCH:-16}"' in body
+    assert '--seq_len "$SEQ_LEN"' in body
+    assert '--device_batch_size "$DEVICE_BATCH"' in body
+    assert '--global_batch_size "$GLOBAL_BATCH"' in body
+
+    # 7c. the table always assigns, including its last row: an unset
+    #     SEQ_LEN_AUTO under `set -u` would kill the run at the training line
+    assert body.count("SEQ_LEN_AUTO=") == len(VRAM_TIERS)
+    assert "else SEQ_LEN_AUTO=" in body
+    assert '-ge 0 ]' not in body
+
+    # 7d. optional flags are listed commented-out, and wandb is off by default
+    #     because its config interpolates two normally-unset environment variables
+    assert "EXTRA_ARGS=()" in body
+    assert "# EXTRA_ARGS+=(--img_aug)" in body
+    assert "EXTRA_ARGS+=(--wandb=null)" in body
+    assert '"${EXTRA_ARGS[@]}"' in body
 
     # 8. an empty split is not validated -- there is no directory to index
     solo = DatasetSummary(**{**summary.__dict__, "splits": {"train": 1, "val": 0}})

@@ -173,6 +173,118 @@ less data than starting from the Molmo2 VLM, which is the other documented route
 -- see `_checkpoint_step`.
 """
 
+VRAM_TIERS: list[tuple[int, int, int, str]] = [
+    (70000, 2048, 8, "80GB, H100/A100"),
+    (44000, 1024, 4, "48GB, A6000/L40S"),
+    (30000, 528, 2, "32GB, RTX 5090"),
+    (22000, 528, 1, "24GB, RTX 4090/3090"),
+    (0, 528, 1, "under 24GB, or no nvidia-smi"),
+]
+"""
+`(min MiB, seq_len, device_batch_size, label)`, most memory first.
+
+The generated script picks a row from what `nvidia-smi` reports for the smallest
+GPU it can see, so the same script runs on a workstation and a cluster node
+without editing. Both values are plain shell variables afterwards, so a wrong
+guess costs one edit and a re-run rather than a regeneration.
+
+These are **starting points, not measurements**. Nothing here has been profiled
+against MolmoBot; they are extrapolated from its README's own recipe (an 80GB
+card at `seq_len=528` with `device_batch_size=32` and the LLM *unfrozen*, which
+this configuration is far cheaper than) with a wide margin for the resident 4B
+backbone. Expect to turn them down for more cameras, or up when the run fits with
+room to spare.
+"""
+
+DEFAULT_SEQ_LEN = 528
+"""
+`--seq_len`, and the first thing to lower when the GPU runs out of memory.
+
+Not a ceiling: the data loader is built with `pad="to_max"`, so the preprocessor
+derives fixed output shapes from this and **every sample is padded to it**.
+Doubling it doubles the activation memory of every step whether or not any
+trajectory needs the room.
+
+528 is what MolmoBot's own README uses for the configuration this generates --
+two images, `crop_mode=resize`, `max_crops=1`, 3x3 pooling. Raise it if the
+trainer complains that a sequence does not fit; the shapes it logs on startup
+("Building ... dataset with output shapes") say how much is actually used.
+
+This is the floor the generated script falls back to when it cannot see a GPU;
+passing `--seq-len` pins it instead of letting `VRAM_TIERS` choose.
+"""
+
+DEFAULT_DEVICE_BATCH_SIZE = 1
+"""
+`--device_batch_size`: samples per forward/backward, and the second memory knob.
+
+MolmoBot micro-batches already -- `Trainer.split_batch` chops the per-device
+batch into `ceil(batch / microbatch)` pieces, with no divisibility requirement --
+but its default is 2, which is what a 4B-parameter model on a 24GB card chokes
+on. `--global_batch_size` is unaffected: the gradient accumulation just runs
+more, smaller steps for the same effective batch.
+"""
+
+MOLMOBOT_OPTIONAL_FLAGS: list[tuple[str, list[str]]] = [
+    (
+        "--img_aug",
+        [
+            "Colour and crop jitter on the input images. Cheap, and the usual",
+            "first reach for a policy that overfits a handful of houses.",
+        ],
+    ),
+    (
+        "--weighted_sampling",
+        [
+            "Grasp-aware timestep sampling: upweights the steps around a",
+            "successful grasp and downweights failed ones. MolmoBot's own",
+            "Franka and RBY1 runs both use it.",
+        ],
+    ),
+    (
+        "--randomize_prompts",
+        [
+            "Samples a phrasing per example from the scene's referral",
+            "expressions instead of always using `task_description`. Needs the",
+            "scene's `task_type` to be in MolmoBot's DEFAULT_PROMPT_TEMPLATES;",
+            "if it is not, it logs a warning and falls back, so this is safe to",
+            "try and easy to verify from the log.",
+        ],
+    ),
+    (
+        "--use_point_prompts",
+        [
+            "Appends the target's image points to the goal string. The rollouts",
+            "do carry `obs/extra/object_image_points` per camera, so this works",
+            "-- add `--point_prompt_camera <name>` if head_camera is not among",
+            "the cameras being trained on.",
+        ],
+    ),
+    (
+        "--no_val",
+        [
+            "Skip validation. Worth it when a task has one held-out house: the",
+            "number is noise, and the val pass still costs memory and time.",
+        ],
+    ),
+    (
+        "--ft_llm=True --ft_vit=True --ft_connector=True",
+        [
+            "Unfreeze the language model, vision tower and connector. Off by",
+            "default -- only the action expert trains, which is what makes this",
+            "fit on one card at all. Turning any of these on adds gradients and",
+            "Adam state for billions of parameters; MolmoBot used 8-64 H100s.",
+        ],
+    ),
+]
+"""
+Flags the generated script lists commented-out, with the reason to reach for each.
+
+Chosen from `train_molmobot.py`'s argparse for being useful *and* non-obvious:
+each either changes what the policy learns or is the thing to try when a run
+underfits, and none of them can be guessed from the flag name alone.
+"""
+
 MOLMOBOT_ACTION_TYPES = ("joint_pos_rel", "joint_pos")
 """
 MolmoBot's action types, as `serve_molmo.py --action-type` accepts them.
@@ -481,15 +593,18 @@ def trainer_command(
     config_path: Path,
     base_checkpoint: str,
     output_dir: Path,
-    batch_size: int,
-    steps: int,
+    batch_size: int | str,
+    steps: int | str,
     action_type: str,
-    seq_len: int,
+    seq_len: int | str,
     camera_names: list[str] | None = None,
     dataset_refs: list[str] | None = None,
     sample_rates: list[float] | None = None,
     launcher: list[str] | None = None,
     save_folder_ref: str | None = None,
+    device_batch_size: int | str = DEFAULT_DEVICE_BATCH_SIZE,
+    num_workers: int | str = 4,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     """The command line that runs the fine-tune in the trainer's own repository.
 
@@ -564,12 +679,16 @@ def trainer_command(
             action_type,
             "--global_batch_size",
             str(batch_size),
+            "--device_batch_size",
+            str(device_batch_size),
+            "--num_workers",
+            str(num_workers),
             "--stats_path",
             stats_path,
             f"--exp_name={experiment_name(datasets)}",
             f"--save_folder={save_folder}",
             f"--max_duration={steps}",
-            "--wandb=null",
+            *(extra_args or ["--wandb=null"]),
         ]
     if trainer == "openpi":
         return [
@@ -656,9 +775,10 @@ def write_launch_script(
     batch_size: int,
     steps: int,
     action_type: str,
-    seq_len: int,
+    seq_len: int | None,
     camera_names: list[str] | None = None,
     sample_rates: list[float] | None = None,
+    device_batch_size: int | None = None,
     checkout: MolmoBotCheckout | None = None,
 ) -> Path:
     """Write the rest of the workflow as a shell script, and return its path.
@@ -686,6 +806,7 @@ def write_launch_script(
             seq_len=seq_len,
             camera_names=camera_names,
             sample_rates=sample_rates,
+            device_batch_size=device_batch_size,
         )
         if trainer == "molmobot" and checkout is not None
         else _generic_trainer_script(
@@ -739,9 +860,10 @@ def _molmobot_script(
     batch_size: int,
     steps: int,
     action_type: str,
-    seq_len: int,
+    seq_len: int | None,
     camera_names: list[str] | None,
     sample_rates: list[float] | None = None,
+    device_batch_size: int | None = None,
 ) -> list[str]:
     """The five steps between a prepared rollout run and a MolmoBot checkpoint."""
     package = checkout.package_dir.resolve()
@@ -785,10 +907,7 @@ def _molmobot_script(
         'PYTHON="$PACKAGE"/.venv/bin/python',
         'TORCHRUN="$PACKAGE"/.venv/bin/torchrun',
         "",
-        "# One training process per GPU. Override with `NPROC=4 bash <this script>`.",
-        'NPROC="${NPROC:-$(nvidia-smi --list-gpus 2>/dev/null | wc -l)}"',
-        '[ "${NPROC:-0}" -ge 1 ] 2>/dev/null || NPROC=1',
-        "",
+        *_tuning_block(seq_len, device_batch_size, batch_size, steps),
         'cd "$PACKAGE"',
         "",
         "# --------------------------------------------------------------------------",
@@ -839,22 +958,18 @@ def _molmobot_script(
         "# --------------------------------------------------------------------------",
         "# 5. Train.",
         "#",
-        "#    --save_folder, --max_duration and --wandb are not argparse options:",
+        "#    Everything tunable comes from the block at the top of this file.",
+        "#",
+        "#    --save_folder and --max_duration are not argparse options:",
         "#    train_molmobot.py builds a TrainConfig and merges leftover --name=value",
         "#    arguments into it as an OmegaConf dotlist. save_folder is that config's",
-        "#    only mandatory field, and wandb interpolates ${oc.env:WANDB_PROJECT} and",
-        "#    ${oc.env:WANDB_ENTITY} -- both are resolved in the same call, so with",
-        "#    either missing the run dies *after* loading the checkpoint and computing",
-        "#    the statistics. To log to Weights & Biases instead, drop `--wandb=null`",
-        "#    and export WANDB_PROJECT and WANDB_ENTITY.",
+        "#    only mandatory field, so leaving it off fails at OmegaConf.to_object --",
+        "#    after the checkpoint has loaded and the statistics have been computed.",
         "#",
         "#    --stats_path is kept inside SAVE_FOLDER rather than at its relative",
         "#    default, which would write it into the shared MolmoBot checkout and",
         "#    silently reuse one mixture's normalisation for the next. Delete it to",
         "#    recompute after the data changes.",
-        "#",
-        "#    Scale --global_batch_size to the hardware; MolmoBot micro-batches with",
-        "#    --device_batch_size, and its own runs used 8-64 H100s.",
         *(
             [
                 "#",
@@ -867,6 +982,8 @@ def _molmobot_script(
         ),
         "# --------------------------------------------------------------------------",
         'step "Starting training, this may take a while"',
+        'echo "GPUs: $NPROC x ${VRAM_MIB}MiB   seq_len=$SEQ_LEN'
+        ' device_batch=$DEVICE_BATCH global_batch=$GLOBAL_BATCH"',
         'mkdir -p "$SAVE_FOLDER"',
         'export PYTHONPATH="$PACKAGE${PYTHONPATH:+:$PYTHONPATH}"',
         _shell(
@@ -876,14 +993,17 @@ def _molmobot_script(
                 config_path=config_path,
                 base_checkpoint='"$CHECKPOINT"',
                 output_dir=output_dir,
-                batch_size=batch_size,
-                steps=steps,
+                batch_size='"$GLOBAL_BATCH"',
+                steps='"$MAX_STEPS"',
                 action_type=action_type,
-                seq_len=seq_len,
+                seq_len='"$SEQ_LEN"',
                 camera_names=camera_names,
                 dataset_refs=[f'"${name}"' for name, _ in variables],
                 sample_rates=sample_rates,
                 save_folder_ref='"$SAVE_FOLDER"',
+                device_batch_size='"$DEVICE_BATCH"',
+                num_workers='"$NUM_WORKERS"',
+                extra_args=['"${EXTRA_ARGS[@]}"'],
                 launcher=[
                     '"$TORCHRUN"',
                     "--nnodes=1",
@@ -898,6 +1018,116 @@ def _molmobot_script(
         *(f"#   {_evaluation_command(d, 'molmobot')}" for d in datasets),
         f"# serving it with `--action-type {action_type}`, matching what it trained on.",
     ]
+
+
+def _tuning_block(
+    seq_len: int | None,
+    device_batch_size: int | None,
+    batch_size: int,
+    steps: int,
+) -> list[str]:
+    """The knobs, at the top of the script, sized from whatever GPU is present.
+
+    Everything here is `${NAME:-default}`, so a value can be overridden from the
+    environment for one run (`SEQ_LEN=1024 bash run_molmobot.sh`) or edited in
+    place to keep it. `seq_len` and `device_batch_size` of None mean "size it
+    from the detected VRAM"; a number pins it and skips the table.
+    """
+    tiers: list[str] = []
+    for index, (floor, tier_seq, tier_batch, label) in enumerate(VRAM_TIERS):
+        assignment = f"SEQ_LEN_AUTO={tier_seq}; DEVICE_BATCH_AUTO={tier_batch}"
+        # The last row is an unconditional `else`, so the variables are always
+        # set -- a `-ge 0` test that somehow failed would leave them unbound and
+        # `set -u` would kill the run at the training line rather than here.
+        if floor == 0 or index == len(VRAM_TIERS) - 1:
+            tiers.append(f"else {assignment}  # {label}")
+            break
+        keyword = "if" if index == 0 else "elif"
+        tiers.append(f'{keyword} [ "$VRAM_MIB" -ge {floor} ]; then {assignment}  # {label}')
+    tiers.append("fi")
+
+    return [
+        "# ==========================================================================",
+        "# Tuning. Everything worth changing is in this block.",
+        "# ==========================================================================",
+        "# Any of these can be set for one run without editing the file:",
+        "#",
+        "#     SEQ_LEN=1024 DEVICE_BATCH=2 bash <this script>",
+        "#",
+        "# Steps 1-4 below are all idempotent, so re-running after a change repeats",
+        "# no work: the venv is synced, the checkpoint is on disk, and the indices",
+        "# and statistics are rebuilt in seconds.",
+        "",
+        "# --- What hardware is actually here ---------------------------------------",
+        "# The smallest GPU's memory, because every rank runs the same microbatch.",
+        'NPROC="${NPROC:-$(nvidia-smi --list-gpus 2>/dev/null | wc -l)}"',
+        '[ "${NPROC:-0}" -ge 1 ] 2>/dev/null || NPROC=1',
+        'VRAM_MIB="${VRAM_MIB:-$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits'
+        ' 2>/dev/null | sort -n | head -1)}"',
+        '[ "${VRAM_MIB:-0}" -ge 1 ] 2>/dev/null || VRAM_MIB=0',
+        "",
+        "# --- The two VRAM knobs, sized from that ----------------------------------",
+        "# SEQ_LEN is first because the loader is built with pad=to_max: the",
+        "# preprocessor derives fixed output shapes from it, so *every sample is",
+        "# padded to it* whether or not any trajectory needs the room. Halving it",
+        "# roughly halves activation memory. 528 is what MolmoBot's README uses for",
+        "# this exact shape -- two images, crop_mode=resize, max_crops=1, 3x3 pooling.",
+        "#",
+        "# DEVICE_BATCH is samples per forward/backward. split_batch() chops the",
+        "# per-device batch into ceil(batch/DEVICE_BATCH) microbatches with no",
+        "# divisibility requirement, so 1 is always valid. MolmoBot's default is 2.",
+        "#",
+        "# These rows are starting points, not measurements -- extrapolated from",
+        "# MolmoBot's own recipe with margin for the resident 4B backbone. Turn them",
+        "# down for more cameras; up if the run fits with room to spare.",
+        *tiers,
+        "",
+        f'SEQ_LEN="${{SEQ_LEN:-{seq_len if seq_len is not None else "$SEQ_LEN_AUTO"}}}"',
+        'DEVICE_BATCH="${DEVICE_BATCH:-'
+        f'{device_batch_size if device_batch_size is not None else "$DEVICE_BATCH_AUTO"}}}"',
+        "",
+        "# The effective batch, reached by accumulating gradients over microbatches.",
+        "# This changes the optimisation, not the peak memory -- lower it only if you",
+        "# mean to train differently.",
+        f'GLOBAL_BATCH="${{GLOBAL_BATCH:-{batch_size}}}"',
+        f'MAX_STEPS="${{MAX_STEPS:-{steps}}}"',
+        "",
+        "# Dataloader worker processes. Host RAM and CPU, not VRAM -- lower it if the",
+        "# machine starts swapping while the GPU sits idle.",
+        'NUM_WORKERS="${NUM_WORKERS:-4}"',
+        "",
+        "# --- Weights & Biases ------------------------------------------------------",
+        "# Off by default, and not merely for quiet: the trainer's wandb config",
+        "# interpolates ${oc.env:WANDB_PROJECT} and ${oc.env:WANDB_ENTITY}, and both",
+        "# are resolved in the same call that validates the rest of the config -- so",
+        "# with either unset the run dies *after* loading the checkpoint and computing",
+        "# the normalisation statistics. Set WANDB=on with both exported to log.",
+        'WANDB="${WANDB:-off}"',
+        "",
+        "# --- Optional training flags ----------------------------------------------",
+        "# Uncomment a line to turn one on. They are appended verbatim to the trainer.",
+        "EXTRA_ARGS=()",
+        "",
+        *_optional_flag_lines(),
+        "if [ \"$WANDB\" = on ]; then",
+        '    : "${WANDB_PROJECT:?WANDB=on needs WANDB_PROJECT exported}"',
+        '    : "${WANDB_ENTITY:?WANDB=on needs WANDB_ENTITY exported}"',
+        "    export WANDB_PROJECT WANDB_ENTITY",
+        "else",
+        "    EXTRA_ARGS+=(--wandb=null)",
+        "fi",
+        "",
+    ]
+
+
+def _optional_flag_lines() -> list[str]:
+    """`MOLMOBOT_OPTIONAL_FLAGS` as commented-out `EXTRA_ARGS+=(...)` lines."""
+    lines: list[str] = []
+    for flag, explanation in MOLMOBOT_OPTIONAL_FLAGS:
+        lines.extend(f"# {sentence}" for sentence in explanation)
+        lines.append(f"# EXTRA_ARGS+=({flag})")
+        lines.append("")
+    return lines
 
 
 def _checkpoint_step(base_checkpoint: str, output_dir: Path) -> list[str]:
@@ -1097,8 +1327,25 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     help="Symlink houses into the train/val layout rather than copying them. Copy "
     "if the trainer runs somewhere the symlink target will not resolve.",
 )
-@click.option("--seq-len", type=int, default=2048, help="MolmoBot --seq_len.")
-@click.option("--batch-size", type=int, default=32)
+@click.option(
+    "--seq-len",
+    type=int,
+    default=None,
+    help="MolmoBot --seq_len. By default the generated script sizes this from the GPU it "
+    "finds at run time; pass a number to pin it. Every sample is padded to it, so it is "
+    "the first thing to lower when CUDA runs out of memory -- not a ceiling that costs "
+    "nothing when unused.",
+)
+@click.option(
+    "--device-batch-size",
+    type=int,
+    default=None,
+    help="MolmoBot --device_batch_size: samples per forward/backward. Sized from the "
+    "detected GPU by default; pass a number to pin it. Gradient accumulation makes "
+    "--batch-size up regardless, so this trades speed for VRAM without changing the "
+    "optimisation.",
+)
+@click.option("--batch-size", type=int, default=32, help="MolmoBot --global_batch_size.")
 @click.option("--steps", type=int, default=30000)
 @click.option("--learning-rate", type=float, default=1e-5)
 @click.option(
@@ -1120,7 +1367,8 @@ def main(
     action_type: str,
     val_fraction: float,
     link: bool,
-    seq_len: int,
+    seq_len: int | None,
+    device_batch_size: int | None,
     batch_size: int,
     steps: int,
     learning_rate: float,
@@ -1206,6 +1454,7 @@ def main(
         seq_len=seq_len,
         camera_names=selected_cameras,
         sample_rates=rates,
+        device_batch_size=device_batch_size,
         checkout=checkout,
     )
 
