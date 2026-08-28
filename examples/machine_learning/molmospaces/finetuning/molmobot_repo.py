@@ -342,7 +342,7 @@ def ensure_stretch_presets(checkout: MolmoBotCheckout, action_spec: dict[str, in
     entries from an earlier version of this function still needs `STATE_SPECS`.
 
     Returns:
-        The table names written to, empty if all of them were already there.
+        The preset names, empty if every table already had them.
     """
     path = checkout.package_dir / PRESETS_MODULE
     if not path.exists():
@@ -381,8 +381,11 @@ def ensure_stretch_presets(checkout: MolmoBotCheckout, action_spec: dict[str, in
         return []
 
     path.write_text(source)
+    # Which tables were touched goes to the log, not the return value: callers
+    # care that the presets are now there, and a checkout that already had
+    # ACTION_SPECS but not STATE_SPECS should still report the presets it gained.
     log.info(f"[molmobot] registered {', '.join(names)} in {', '.join(written)} in {path}")
-    return written
+    return names
 
 
 def _spec_block(names: list[str], spec: dict[str, int]) -> str:
@@ -405,10 +408,22 @@ def _find_dict_opening(source: str, name: str, path: Path) -> re.Match:
     """
     match = re.search(rf"^{name}\s*(?::[^=]+)?=\s*\{{[ \t]*$", source, re.MULTILINE)
     if match is None:
+        # STATE_SPECS gets its own explanation: without it the dataset falls back
+        # to ACTION_SPECS for the state width, which for Stretch is 10 against a
+        # 9-wide qpos, and every example then fails the state shape guard. Better
+        # to say so here than to let it surface as a per-example ValueError.
+        detail = (
+            "Stretch's state is narrower than its action -- see GRIPPER_STATE_WIDTH -- "
+            "and STATE_SPECS is the only way to tell MolmoBot so. Without it the "
+            "trainer rejects every example with `State shape (9,) != expected 10`. "
+            "Add the table, or the Stretch entries in it, by hand."
+            if name == "STATE_SPECS"
+            else "MolmoBot's preset file has changed shape; add them by hand, or pass "
+            "--action-preset once a real one exists upstream."
+        )
         raise MolmoBotSetupError(
             f"Could not find the `{name} = {{` table in {path}, so the Stretch presets "
-            "cannot be registered. MolmoBot's preset file has changed shape; add them by "
-            "hand, or pass --action-preset once a real one exists upstream."
+            f"cannot be registered. {detail}"
         )
     return match
 

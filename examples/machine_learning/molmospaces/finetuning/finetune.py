@@ -421,6 +421,7 @@ def prepare_molmospaces_dataset(
         camera_names: cameras to include in the dataset manifest.
     """
     from examples.machine_learning.molmospaces.hdf5_layout import (
+        DuplicateSplitError,
         arrange_train_val_split,
         count_trajectories,
         ensure_sensor_data_paths,
@@ -437,7 +438,14 @@ def prepare_molmospaces_dataset(
     # If camera_names is None, ensure_sensor_data_paths will inspect available MP4s
     ensure_sensor_data_paths(rollout_dir, camera_names=camera_names)
     task_dir = Path(task_dir) if task_dir else rollout_dir.parent / "molmobot" / rollout_dir.name
-    placed = arrange_train_val_split(rollout_dir, task_dir, val_fraction=val_fraction, link=link)
+    try:
+        placed = arrange_train_val_split(
+            rollout_dir, task_dir, val_fraction=val_fraction, link=link
+        )
+    except DuplicateSplitError as e:
+        # A traceback here would bury the one thing worth reading: which houses,
+        # and that val loss from a previous run against this layout was not real.
+        raise click.ClickException(str(e)) from e
 
     # Determine video keys (cameras) from the first house's available MP4s
     detected_cameras: list[str] = []
@@ -894,6 +902,27 @@ def write_launch_script(
         '    echo "------------------------------------------------------------"',
         "}",
         "",
+        "# Ask before doing something the caller may not have meant. Anything without a",
+        "# terminal on stdin -- CI, nohup, a pipeline -- cannot answer, so it proceeds",
+        "# rather than hanging forever waiting on a read; ASSUME_YES=1 does the same",
+        "# deliberately.",
+        "confirm() {",
+        '    if [ "${ASSUME_YES:-0}" = 1 ]; then',
+        '        echo "  -> continuing (ASSUME_YES=1)"',
+        "        return 0",
+        "    fi",
+        '    if [ ! -t 0 ]; then',
+        '        echo "  -> continuing (stdin is not a terminal, cannot prompt)"',
+        "        return 0",
+        "    fi",
+        "    printf '  %s [y/N] ' \"$1\"",
+        "    read -r _reply",
+        '    case "$_reply" in',
+        "        [yY] | [yY][eE][sS]) return 0 ;;",
+        '        *) echo "  Aborted. Nothing has been written."; exit 1 ;;',
+        "    esac",
+        "}",
+        "",
     ]
     path = mixture_root(datasets) / f"run_{trainer}.sh"
     path.write_text("\n".join(header + body) + "\n")
@@ -1073,6 +1102,86 @@ def _molmobot_script(
             else []
         ),
         "# --------------------------------------------------------------------------",
+        "# 5a. Preflight: say where things land, and ask about the two ways this run",
+        "#     can quietly not be what was intended -- too many passes over the data,",
+        "#     or resuming someone else's run.",
+        "# --------------------------------------------------------------------------",
+        'step "Preflight"',
+        "",
+        'TRAIN_FRAMES=$("$PYTHON" - "$DATASET"/train/valid_trajectory_index.json <<\'PY\'',
+        "import json, sys",
+        "index = json.load(open(sys.argv[1]))",
+        "print(sum(n for house in index.values() for f in house.values() for n in f.values()))",
+        "PY",
+        ")",
+        "SAMPLES=$((MAX_STEPS * GLOBAL_BATCH))",
+        'EPOCHS=$("$PYTHON" -c "print(f\'{$SAMPLES / $TRAIN_FRAMES:.2f}\')")',
+        "",
+        'echo "checkpoints:  $SAVE_FOLDER"',
+        'echo "              step<N>/ every save_interval, plus step<N>_bestfit/ at the"',
+        'echo "              best validation loss (kept, never rotated away)"',
+        'echo "data:         $TRAIN_FRAMES train frames"',
+        'echo "run:          $MAX_STEPS steps x $GLOBAL_BATCH = $SAMPLES samples'
+        ' = $EPOCHS passes over the data"',
+        'echo "optimizer:    $OPTIMIZER      trainable: $TRAINABLE"',
+        "",
+        "# `bc` is not guaranteed to be installed; python is, and is already resolved.",
+        'if [ "$("$PYTHON" -c "print(int($EPOCHS > $MAX_EPOCHS_WARN))")" = 1 ]; then',
+        "    echo",
+        '    echo "  WARNING: $EPOCHS passes over $TRAIN_FRAMES frames exceeds'
+        ' MAX_EPOCHS_WARN=$MAX_EPOCHS_WARN."',
+        '    echo "  For a single task this is well into the range where the policy memorises"',
+        '    echo "  trajectories instead of learning the skill. Validation loss is the check:"',
+        '    echo "  if it flattens while training loss keeps falling, that is what happened."',
+        "    echo",
+        '    echo "  To train fewer passes, set MAX_STEPS (which also shortens the LR schedule"',
+        '    echo "  to match, so the run still finishes its decay):"',
+        '    echo "    MAX_STEPS=$("$PYTHON" -c'
+        ' "print(int($MAX_EPOCHS_WARN * $TRAIN_FRAMES / $GLOBAL_BATCH))") bash $0"',
+        '    confirm "Run $MAX_STEPS steps anyway?"',
+        "fi",
+        "",
+        "# Best-fit checkpointing lives in the MolmoBot checkout, which is gitignored and",
+        "# recreated from scratch if it is ever deleted. The exports above would then be",
+        "# read by nobody and the only surviving checkpoint would be the newest one --",
+        "# a silent downgrade, and exactly the thing this is meant to prevent. Check.",
+        'if [ "$MOLMOBOT_BESTFIT" = 1 ] && ! "$PYTHON" -c \\',
+        '    "from olmo.train.trainer import Trainer',
+        "raise SystemExit(0 if hasattr(Trainer, 'maybe_save_bestfit_checkpoint') else 1)\" 2>/dev/null; then",
+        "    echo",
+        '    echo "  WARNING: this MolmoBot checkout has no best-fit checkpointing, so no"',
+        '    echo "  step<N>_bestfit/ will be written and save_num_checkpoints_to_keep will"',
+        '    echo "  leave you only the newest step<N>/ -- not the best one."',
+        '    echo "  The checkout was probably recreated. Re-run finetune.py to reapply it,"',
+        '    echo "  or set BESTFIT=0 to stop advertising it here."',
+        '    confirm "Train without best-fit checkpointing?"',
+        "fi",
+        "",
+        "# run_trainer.py resumes from the newest stepN/ in the save folder whenever",
+        "# allow_resume is on, which it is by default -- it does not start over. So a",
+        "# Ctrl-C'd run continues from its last *saved* step, losing whatever came after",
+        "# it, and a save folder from a different experiment gets silently continued.",
+        'LATEST_CHECKPOINT=""',
+        'if [ -d "$SAVE_FOLDER" ]; then',
+        "    LATEST_CHECKPOINT=$(find \"$SAVE_FOLDER\" -maxdepth 1 -type d -name 'step*' 2>/dev/null |",
+        "        sed 's/.*\\/step//' | sed 's/_bestfit//' | sort -n | tail -1)",
+        "fi",
+        'if [ -n "$LATEST_CHECKPOINT" ]; then',
+        "    echo",
+        '    echo "  This save folder already holds a checkpoint at step $LATEST_CHECKPOINT."',
+        '    echo "  Training will RESUME from it, not restart, and will overwrite the"',
+        '    echo "  checkpoints after it. Anything between step $LATEST_CHECKPOINT and where the"',
+        '    echo "  previous run stopped is already gone."',
+        "    echo",
+        '    echo "  To start clean instead, move or delete the folder first:"',
+        '    echo "    mv $SAVE_FOLDER $SAVE_FOLDER.$(date +%Y%m%d-%H%M%S)"',
+        '    confirm "Resume from step $LATEST_CHECKPOINT?"',
+        "else",
+        "    echo",
+        '    echo "  No checkpoint in the save folder; starting from $CHECKPOINT."',
+        "fi",
+        "",
+        "# --------------------------------------------------------------------------",
         'step "Starting training, this may take a while"',
         'echo "GPUs: $NPROC x ${VRAM_MIB}MiB   seq_len=$SEQ_LEN'
         ' device_batch=$DEVICE_BATCH global_batch=$GLOBAL_BATCH"',
@@ -1183,7 +1292,21 @@ def _tuning_block(
         "# This changes the optimisation, not the peak memory -- lower it only if you",
         "# mean to train differently.",
         f'GLOBAL_BATCH="${{GLOBAL_BATCH:-{batch_size}}}"',
+        "",
+        "# MAX_STEPS also sets the learning-rate horizon, not just where training stops:",
+        "# scheduler.t_max is unset, so the cosine decay to alpha_f spans exactly this",
+        "# many steps. Halving it gives a complete shorter schedule; interrupting a",
+        "# longer one leaves the run stranded mid-decay at a high LR. Change the number,",
+        "# do not Ctrl-C early.",
+        "#",
+        "# The preflight below works the real number of passes out from the trajectory",
+        "# index and asks before running anything wildly over MAX_EPOCHS_WARN.",
         f'MAX_STEPS="${{MAX_STEPS:-{steps}}}"',
+        "",
+        "# Passes over the training frames that trigger the preflight prompt. Above",
+        "# roughly ten, a 5B VLA fine-tune on one task is likelier to be memorising",
+        "# than learning -- but it depends on the data, so this asks rather than caps.",
+        'MAX_EPOCHS_WARN="${MAX_EPOCHS_WARN:-10}"',
         "",
         "# Dataloader worker processes. Host RAM and CPU, not VRAM -- lower it if the",
         "# machine starts swapping while the GPU sits idle.",
@@ -1235,6 +1358,32 @@ def _tuning_block(
         "# with the parameter, bitsandbytes' cannot.",
         'OPTIMIZER="${OPTIMIZER:-adamw8bit}"',
         "",
+        "# --- Validation, and keeping the checkpoint that is actually best -----------",
+        "# How often to run the held-out split. Each pass is the whole val set, and it",
+        "# is the only honest read on whether the policy is still learning or has",
+        "# started memorising.",
+        'EVAL_INTERVAL="${EVAL_INTERVAL:-500}"',
+        "",
+        "# save_num_checkpoints_to_keep keeps the *newest* step<N>/, which on a fine-tune",
+        "# is reliably not the best one: validation loss bottoms out partway through and",
+        "# drifts up after. So the trainer also writes step<N>_bestfit/ whenever the",
+        "# monitored validation metric improves, under its own retention -- the rotation",
+        "# cannot delete it.",
+        "#",
+        "# BESTFIT_METRIC is action_flow_loss, the flow-matching loss on the actions,",
+        "# because that is what is being trained. CrossEntropyLoss and Accuracy in the",
+        "# same dump belong to the language head, which is frozen here, and watching",
+        "# them would tell you nothing.",
+        "#",
+        "# After BESTFIT_PATIENCE evaluations with no improvement worth",
+        "# BESTFIT_MIN_DELTA (relative, so 0.005 = 0.5%), the run says so in the log and",
+        "# names the best checkpoint. It keeps training to MAX_STEPS -- the message is",
+        "# the signal to stop, not an automatic stop.",
+        'export MOLMOBOT_BESTFIT="${BESTFIT:-1}"',
+        'export MOLMOBOT_BESTFIT_METRIC="${BESTFIT_METRIC:-action_flow_loss}"',
+        'export MOLMOBOT_BESTFIT_PATIENCE="${BESTFIT_PATIENCE:-4}"',
+        'export MOLMOBOT_BESTFIT_MIN_DELTA="${BESTFIT_MIN_DELTA:-0.005}"',
+        "",
         "# --- Optional training flags ----------------------------------------------",
         "# Uncomment a line to turn one on. They are appended verbatim to the trainer.",
         "EXTRA_ARGS=()",
@@ -1268,6 +1417,7 @@ def _tuning_block(
         "esac",
         "EXTRA_ARGS+=(",
         '    --optimizer.name="$OPTIMIZER"',
+        '    --val_interval "$EVAL_INTERVAL"',
         '    --optimizer.action_expert_learning_rate="$ACTION_EXPERT_LR"',
         '    --optimizer.vit_learning_rate="$VIT_LR"',
         '    --optimizer.llm_learning_rate="$LLM_LR"',
@@ -1562,7 +1712,14 @@ def _evaluation_command(summary: DatasetSummary, trainer: str) -> str:
     "optimisation.",
 )
 @click.option("--batch-size", type=int, default=32, help="MolmoBot --global_batch_size.")
-@click.option("--steps", type=int, default=30000)
+@click.option(
+    "--steps",
+    type=int,
+    default=10000,
+    help="Optimizer steps, which is also the learning-rate horizon. 10000 x a global "
+    "batch of 32 is roughly two passes over a 150k-frame task; the generated script's "
+    "preflight computes the real number and asks before running far more.",
+)
 @click.option("--learning-rate", type=float, default=1e-5)
 @click.option(
     "--clone/--no-clone",
@@ -1746,8 +1903,7 @@ def _print_checkout(
         else "  scripts: validate_trajectories.py, calculate_stats.py (already there)"
     )
     click.echo(
-        f"  presets: {', '.join(sorted(set(STRETCH_PRESET_NAMES.values())))} "
-        f"(registered in synthmanip_presets.py: {', '.join(registered)})"
+        f"  presets: {', '.join(registered)} (registered in synthmanip_presets.py)"
         if registered
         else f"  presets: {', '.join(sorted(set(STRETCH_PRESET_NAMES.values())))} (already there)"
     )

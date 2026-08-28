@@ -380,6 +380,83 @@ def test_split_refuses_an_empty_run(tmp_path):
         hdf5_layout.arrange_train_val_split(tmp_path, tmp_path / "task")
 
 
+def _make_run(root, count):
+    import h5py
+
+    for index in range(count):
+        house = root / f"house_{index}"
+        if house.exists():
+            continue
+        house.mkdir(parents=True)
+        with h5py.File(house / "trajectories.h5", "w") as h5_file:
+            h5_file.create_group("traj_0")
+
+
+def _houses_on_disk(task):
+    return {
+        split: {p.name for p in (task / split).iterdir() if p.name.startswith("house_")}
+        for split in ("train", "val")
+    }
+
+
+def test_regrown_run_does_not_leave_a_house_in_both_splits(tmp_path):
+    """Growing a rollout directory moves houses across the split boundary.
+
+    Houses are assigned by position, so adding more reassigns some. The previous
+    placement has to go: leaving it puts the same trajectories in train and val,
+    which is what happened in data/stretch_pick (5 houses, 13% of val frames).
+    """
+    run, task = tmp_path / "run", tmp_path / "task"
+    _make_run(run, 10)
+    first_val = {p.name for p in hdf5_layout.arrange_train_val_split(run, task, val_fraction=0.2)["val"]}
+
+    _make_run(run, 25)  # regenerate larger; house_10..house_24 appear
+    second_val = {p.name for p in hdf5_layout.arrange_train_val_split(run, task, val_fraction=0.2)["val"]}
+
+    assert first_val != second_val, "test is vacuous unless the assignment actually moved"
+
+    on_disk = _houses_on_disk(task)
+    assert not (on_disk["train"] & on_disk["val"]), sorted(on_disk["train"] & on_disk["val"])
+    assert on_disk["train"] | on_disk["val"] == {f"house_{i}" for i in range(25)}
+
+
+def test_a_stray_symlink_into_the_wrong_split_is_repaired(tmp_path):
+    """A symlink is something this function could have written, so it cleans it up.
+
+    Repaired rather than raised: the layout it would produce is correct once the
+    stale link is gone, and there is nothing a person needs to decide.
+    """
+    run, task = tmp_path / "run", tmp_path / "task"
+    _make_run(run, 10)
+    placed = hdf5_layout.arrange_train_val_split(run, task, val_fraction=0.2)
+
+    # Put a train house into val/ as a stray `ln -s` would.
+    stray = placed["train"][0].name
+    (task / "val" / stray).symlink_to((run / stray).resolve(), target_is_directory=True)
+    assert stray in _houses_on_disk(task)["val"]  # the bad state really exists
+
+    hdf5_layout.arrange_train_val_split(run, task, val_fraction=0.2)
+
+    on_disk = _houses_on_disk(task)
+    assert not (on_disk["train"] & on_disk["val"])
+    assert stray in on_disk["train"] and stray not in on_disk["val"]
+
+
+def test_split_leaves_a_hand_made_directory_alone_but_still_raises(tmp_path):
+    """A real directory is not something to delete on a person's behalf."""
+    run, task = tmp_path / "run", tmp_path / "task"
+    _make_run(run, 10)
+    placed = hdf5_layout.arrange_train_val_split(run, task, val_fraction=0.2)
+
+    stray = placed["val"][0].name
+    (task / "train" / stray).mkdir()
+    (task / "train" / stray / "notes.txt").write_text("put here on purpose")
+
+    with pytest.raises(hdf5_layout.DuplicateSplitError):
+        hdf5_layout.arrange_train_val_split(run, task, val_fraction=0.2)
+    assert (task / "train" / stray / "notes.txt").read_text() == "put here on purpose"
+
+
 # =============================================================================
 # The MolmoBot adapter
 # =============================================================================
@@ -1264,6 +1341,8 @@ def test_stretch_presets_are_registered_in_a_pristine_checkout(tmp_path):
     presets = package / PRESETS_MODULE
     presets.parent.mkdir(parents=True)
     # The shape of MolmoBot's table, minus everything that does not matter here.
+    # STATE_SPECS is part of that shape: Stretch's state is a gripper narrower
+    # than its action, and this is the only place MolmoBot can be told so.
     presets.write_text(
         "from typing import Dict, List, Optional, Union\n\n"
         'ACTION_SPECS: Dict[str, Dict[str, int]] = {\n'
@@ -1271,6 +1350,9 @@ def test_stretch_presets_are_registered_in_a_pristine_checkout(tmp_path):
         "}\n\n"
         'ACTION_DATASET_KEYS: Dict[str, Union[str, Dict[str, str]]] = {\n'
         '    "franka_joint": "joint_pos",\n'
+        "}\n\n"
+        'STATE_SPECS: Dict[str, Dict[str, int]] = {\n'
+        '    "RBY1_multitask": {"base": 3, "torso": 3},\n'
         "}\n"
     )
     checkout = MolmoBotCheckout(
