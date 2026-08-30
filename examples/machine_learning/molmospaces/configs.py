@@ -264,6 +264,10 @@ class StretchMolmoBotEvalConfig(Stretch4BenchmarkEvalConfig):
         action_type = os.environ.get(MOLMOBOT_ACTION_TYPE_ENV_VAR)
         if action_type:
             self.policy_config.action_type = action_type
+            # A named action type outranks the one the checkpoint records having
+            # been trained with; `_resolve_action_type` needs to know which of
+            # the two it is looking at.
+            self.policy_config.action_type_explicit = True
 
 
 class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):

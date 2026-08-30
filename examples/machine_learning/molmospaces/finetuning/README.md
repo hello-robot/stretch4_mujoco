@@ -11,8 +11,10 @@ datagen_configs.py   Stretch versions of MolmoSpaces' data generation configs
 generate_dataset.py  run them, then optionally export -- one command
 live_recorder.py     record teleop demonstrations from examples/molmo_environment.py
 lerobot_export.py    rollouts -> a LeRobot v2.1 dataset (for openpi / LeRobot)
-molmobot_repo.py     clone MolmoBot, fetch the scripts that are not in it
+molmobot_repo.py     clone MolmoBot, fetch the scripts that are not in it, patch it
 train_progress.py    a progress bar, drawn from the trainer's own log lines
+training_report.py   what a run did: loss curves, learning rates, what to change
+hparam_probe.py      short runs that answer one hyperparameter question
 finetune.py          check the data, prepare it, write the config and a run script
 ```
 
@@ -62,10 +64,28 @@ python -m examples.machine_learning.molmospaces.finetuning.finetune \
 #    base checkpoint, builds the trajectory index its dataloader requires, trains
 bash data/stretch_pick/rollouts/molmobot/pick/run_molmobot.sh
 
-# 5. score the result -- natively, no remapping
+# 5. score the result -- natively, no remapping. The checkpoint is the step
+#    directory, the one holding config.yaml, *not* the model_and_optim/ inside
+#    it: MolmoBot's loader reads the config from the path it is given and
+#    appends model_and_optim itself.
 python -m examples.machine_learning.molmospaces.run_benchmarks \
-    --policy molmobot --checkpoint <checkpoint> --benchmark pick
+    --policy molmobot --benchmark pick \
+    --checkpoint data/stretch_pick/rollouts/molmobot/checkpoints/stretch4_pick/step9500_bestfit
 ```
+
+There is no `--cameras` on that command, and there should not be: the checkpoint
+records the cameras it was trained on, and the evaluation reads them off it. A
+camera set that disagrees with training is not an error anywhere in the stack --
+the images are the right shape, the model consumes them, and the policy acts
+confidently on a scene it cannot see -- so the answer is taken from the one place
+that cannot be wrong. Same for `--action_type`.
+
+Step 5 also needs MolmoBot's *model* dependencies in this repository's
+environment rather than the training venv inside the checkout: a rollout is a
+MolmoSpaces simulation with MolmoBot's weights inside it, in one interpreter.
+Nothing has to be exported -- `run_benchmarks.py` puts the checkout on the import
+path itself -- but the packages have to be installed, and it says which are
+missing before the benchmark loads. See `../README.md`.
 
 > Note: On a 5090, you may need to install CUDA 12.8 and also rebuild pytorch on both the third_part/MolmoBot/MolmoBot/.venv and this repo's venv:
 ```
@@ -74,7 +94,10 @@ uv pip install torch torchvision torchaudio --index-url https://download.pytorch
 python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_arch_list()); print(torch.cuda.get_device_name(0))"
 # Make sure the last command outputs sm_120, if it does, then it's set up correctly.
 
-# You may also need to comment out `uv sync --extra train` from run_molmobot.sh.
+# `uv sync --extra train` no longer has to be commented out by hand: the
+# generated script's SYNC defaults to `auto`, which syncs only when the checkout
+# has no virtualenv yet -- precisely so a torch rebuilt for this card is not
+# silently replaced by the one MolmoBot resolves. SYNC=on forces it.
 ```
 
 
@@ -130,6 +153,41 @@ Nothing past writing the script runs from here. `uv sync --extra train` pulls
 torch, the base checkpoint is ~20GB, and the fine-tune runs for a long time, so
 all three are lines in `run_<trainer>.sh` for you to launch, not side effects of
 a command that mostly inspects data.
+
+### Continuing from your own weights, and why not a resume
+
+A run that stopped while it was still improving wants more steps, and there are
+two ways to spend them. Only one of them works here.
+
+```bash
+CHECKPOINT=data/stretch_pick/rollouts/molmobot/checkpoints/stretch4_pick/step9500_bestfit \
+SAVE_FOLDER=data/stretch_pick/rollouts/molmobot/checkpoints/stretch4_pick_v2 \
+MAX_STEPS=30000 \
+bash data/stretch_pick/rollouts/molmobot/pick/run_molmobot.sh
+```
+
+That is a **new run from trained weights**: `select_checkpoint` accepts a
+`step<N>_bestfit/` exactly as it accepts a downloaded `model.pt`, and a
+checkpoint passed this way arrives as `initial_model_checkpoint`, which
+`run_trainer` handles by setting `reset_train, reset_opt = True, True`. The
+weights carry over; the optimizer and the step counter start fresh; the learning
+rate runs one clean warmup-and-cosine over the new `MAX_STEPS`. The save folder
+has to be a different one, or `allow_resume` finds the old run's `step<N>/` and
+resumes from that instead.
+
+**Resuming in place is the other way, and it is worse twice over.** `MAX_STEPS`
+is the learning-rate horizon (`scheduler.t_max` is unset, so `scheduler_max` is
+`max_steps`), so resuming at step 10,000 with `MAX_STEPS=30000` does not
+continue the old schedule — it evaluates a *new* 30,000-step schedule at step
+10,000, which jumps the action expert's rate from its decayed `1e-5` back up to
+roughly `7.8e-5` in one step. And it cannot happen anyway: `train_molmobot.py`
+sets `save_final_optim=False`, so `step<N>/` holds weights and no optimizer
+state, and the resume path asks for `load_optimizer_state=True`.
+
+Nothing is gained by deleting the old run. Keep `step<N>_bestfit/` — it is both
+the weights the next run starts from and the baseline it has to beat. The
+ordinary `step<N>/` beside it is the same size and worse (it is from after the
+best), so that one is fair game for the disk.
 
 ### The base checkpoint is a directory, not a name
 
@@ -239,12 +297,214 @@ Biases is `WANDB=off` by default, because its config interpolates
 the run *after* the checkpoint and statistics load; `WANDB=on` with both exported
 turns it on, and fails immediately with a clear message if they are not.
 
-The LLM, vision tower and connector are all frozen (`ft_llm`, `ft_vit` and
-`ft_connector` default to `False` and nothing here turns them on), so only the
-action expert carries gradients and optimiser state. The resident weights are the
-floor: the base checkpoint is a ~4B-parameter model at `d_model=2560`,
-`n_layers=36`. If the smallest tier still OOMs, drop a camera — that roughly
-halves the image tokens — before dropping the batch further.
+`TRAINABLE` decides what carries gradients and optimiser state; it defaults to
+`vision`, which unfreezes the tower alongside the action expert, because the
+~123° distorted head cameras are a long way from MolmoBot's rectilinear DROID
+pretraining. `action_expert` is the cheaper tier and the one to fall back to. The
+resident weights are the floor either way: the base checkpoint is a
+~4B-parameter model at `d_model=2560`, `n_layers=36`. If the smallest tier still
+OOMs, drop a camera — that roughly halves the image tokens — before dropping the
+batch further.
+
+## What the run measured, and what to change
+
+MolmoBot computes everything a fine-tune needs to be tuned and then keeps almost
+none of it. `log_metrics_to_console` drops every `optim/` key but
+`optim/total_grad_norm` — which this trainer never emits, since it emits
+`optim/<group>_grad_norm` — and the validation loss reaches the console as a bare
+`val` header hundreds of lines from the training block it belongs with. The rest
+exists only in Weights & Biases, which is off by default here for the reason
+above.
+
+So `molmobot_repo.ensure_metrics_log` puts one call at the top of that method,
+where the *unfiltered* metrics dict is still in hand, and the run writes
+`metrics.jsonl` beside its checkpoints: one JSON line per dump, training and
+validation alike, with the gradient norms, the throughput and the peak memory.
+`METRICS=off` turns it off; the recorder is inert when the variable is unset.
+
+```bash
+python -m examples.machine_learning.molmospaces.finetuning.training_report \
+    data/stretch_pick/rollouts/molmobot/checkpoints/stretch4_pick
+```
+
+```
+loss
+----
+  train/action_flow_loss       first 0.36909   last 0.02858   best 0.02425 @ step 9,800
+  val/action_flow_loss         first 0.27864   last 0.06702   best 0.05906 @ step 7,000
+
+optimizer
+---------
+  configured lr          action_expert 1.0e-04, vit 5.0e-06, llm 1.0e-05
+  trainable              action expert + vit   optimizer adamw8bit
+  action_expert          |grad| median 0.987  max 13.8  (6 spikes >5x)
+
+diagnostics
+-----------
+  * val: validation bottomed out at 0.05906 (step 7,000) and is 0.06702 by step 10,000.
+    That is overfitting past the best fit. The step<N>_bestfit/ checkpoint is the
+    one to evaluate; to spend the extra steps better, generate more episodes or
+    turn on --img_aug.
+```
+
+### Every checkpoint says what state training was in
+
+`step9500_bestfit/` on its own tells you which step it came from and nothing
+else. Not what the validation loss was there, not whether the run had converged
+or was still improving, not what the learning rates had decayed to — and a
+checkpoint outlives the terminal that produced it, gets copied to another
+machine, and turns up six weeks later as a path in a command.
+
+So the same patch writes a `training_metrics.json` **inside** every checkpoint
+directory the trainer saves — `step<N>/`, `step<N>_bestfit/` and the final one —
+by wrapping the two save methods, so the summary lands after the save has
+returned and one insertion covers all three:
+
+```json
+{
+  "kind": "bestfit",
+  "step": 9500, "max_steps": 10000,
+  "train": {"loss": 0.02430, "min_loss": 0.02410, "last_logged": {"...": "the whole dump"}},
+  "eval": {"synthmanip_val": {"step": 9500, "metrics": {"action_flow_loss": 0.05910}}},
+  "best": {"metric": "action_flow_loss", "loss": 0.05910, "step": 9500,
+           "evals_since_improvement": 0},
+  "learning_rates": {"action_expert": 2.3e-06, "vit": 1.1e-07},
+  "elapsed_seconds": 32271.4, "written": "2026-08-29T05:43:11"
+}
+```
+
+`evals_since_improvement` is the field to read first: `0` means this checkpoint
+was saved *because* the loss had just improved, so the run had not finished
+getting better. The learning rates are read off the optimizer rather than out of
+the metrics, because `LRMonitor` reports nothing under the 8-bit optimizer and
+the decayed rate at the moment of the save is what explains the loss.
+
+Both halves use it. The report lists the checkpoints on disk and names the one
+worth evaluating:
+
+```
+checkpoints
+-----------
+  step9500_bestfit   train 0.02430   best action_flow_loss 0.05910 @ step 9,500   (saved on an improvement)
+  step10000          train 0.02858   best action_flow_loss 0.05910 @ step 9,500   (1 evals without improvement by then)
+  -> evaluate .../checkpoints/stretch4_pick/step9500_bestfit
+```
+
+and `run_benchmarks.py --policy molmobot` logs the same line as it loads, so a
+benchmark's own output says whether it is scoring a converged policy or an early
+one. A checkpoint saved before this existed simply says less; nothing requires
+it.
+
+The generated script runs that itself when training ends, and it is re-runnable
+at any time — including while a run is going, since the file is appended to and a
+half-written last line is skipped. `--csv` writes the series long-form and
+`--compare` puts several runs in one table. Each diagnostic states the
+measurement first and the conventional reading of it second: a plateau at a loss
+you are happy with is a finished run.
+
+### The plot, redrawn as the run goes
+
+`run_molmobot.sh` starts a watcher beside the trainer and stops it when the run
+ends, so `$SAVE_FOLDER/training.png` is a current picture of the fine-tune from
+the first log line onward — leave an image viewer open on it. `PLOT=off` skips
+it; `PLOT=<path>` moves it. Standalone, over any run, finished or not:
+
+```bash
+python -m examples.machine_learning.molmospaces.finetuning.training_report \
+    data/stretch_pick/rollouts/molmobot/checkpoints/stretch4_pick --plot --watch
+```
+
+It polls the metrics file and redraws whenever it grows — every `LOG_INTERVAL`
+steps, and so at every evaluation — printing a line each time:
+
+```
+  step 12,960/30,000  train 0.04213  best val 0.05906 @ 7,000 -> .../training.png
+```
+
+Five panels, in the order the questions come up:
+
+| panel | what it answers |
+| --- | --- |
+| **loss** | Is it learning? Training loss raw and smoothed, each evaluator's validation loss, and a star on the best one. |
+| **action loss by move group** | *What* is it failing to learn? `train/flow_loss_dim_*` averaged into base, lift, arm, wrist and gripper — ten anonymous curves become five that name a joint. |
+| **learning rate** | Is the schedule doing what you set? Per parameter group, so the warmup ramp and the cosine decay are visible, and a group frozen at zero is obvious. |
+| **gradient norm** | Is the rate too high? Spikes many times the median are what stepping too far looks like from the outside. |
+| **throughput / peak GPU memory** | Has the run slowed down, and how close is it to OOM? |
+
+Two things had to be fixed for those panels to have anything in them, both
+worth knowing if you read MolmoBot's own logs. The learning rates never appeared
+anywhere: torchao's 8-bit optimizer keeps `group["lr"]` as a 0-dim
+`torch.Tensor`, and every filter in the path — MolmoBot's console formatter
+included — is an `isinstance(value, (int, float))` check, so the numbers were
+computed and dropped at every step. And the picture is written to a temporary
+and renamed into place, because a viewer reloading the file on change would
+otherwise catch it half-written.
+
+Drawing needs matplotlib, which MolmoBot's virtualenv has no reason to carry, so
+the plot runs under *this* repository's interpreter — recorded as `REPORT_PYTHON`
+when the script is generated. The text report is stdlib-only and runs under
+either.
+
+Two things it reads that are not metrics. The learning rates come from the run's
+own `config.yaml` when `LRMonitor` reported nothing — with the 8-bit optimizer it
+usually does not — and so does which components were trainable, because no metric
+records that at all.
+
+## Choosing the hyperparameters
+
+The defaults in the generated script are MolmoBot's own, chosen for DROID and
+RBY1 data. They are a starting point, not an answer, and the honest way to
+improve on them is to run a few short fine-tunes and compare:
+
+```bash
+python -m examples.machine_learning.molmospaces.finetuning.hparam_probe \
+    --script data/stretch_pick/rollouts/molmobot/pick/run_molmobot.sh \
+    --values 3e-5,1e-4,3e-4 --steps 600
+```
+
+That writes `run_probe.sh`: three runs of the **existing** script with
+`ACTION_EXPERT_LR` changed and `MAX_STEPS` shortened, each into its own save
+folder, followed by `training_report.py --compare`. Driving the real script
+rather than reimplementing the trainer command is what keeps a probe from
+drifting from the run it is supposed to predict. `--vary` takes any of the
+script's other knobs (`VIT_LR`, `TRAINABLE`, `GLOBAL_BATCH`, `SEQ_LEN`), and
+three of them make a sweep cheap: `PREPARE=off` after the first run skips the
+data preparation, `STATS_PATH` is shared so the normalisation statistics are
+computed once, and `ASSUME_YES=1` answers the preflight questions a deliberately
+short run would otherwise be asked every time.
+
+`MAX_STEPS` is the learning-rate horizon as well as the stopping point, so each
+probe run is a complete miniature schedule rather than the first tenth of a long
+one. That makes the runs comparable to each other and *not* to a full fine-tune:
+a rate that wins over 600 steps is often a little high for 10,000. Read the
+ordering, and prefer the lower of two rates that tie.
+
+**Before tuning anything, check that the model can fit the data at all.** A sweep
+compares learning rates; it cannot tell you the trajectories are mislabelled. Ask
+it to memorise a handful of episodes on purpose — out of the data you already
+have, so there is nothing to generate:
+
+```bash
+mkdir -p data/stretch_overfit/rollouts/tiny
+for h in $(ls data/stretch_pick/rollouts/pick | grep '^house_' | head -4); do
+    ln -sfn "$PWD/data/stretch_pick/rollouts/pick/$h" "data/stretch_overfit/rollouts/tiny/$h"
+done
+
+python -m examples.machine_learning.molmospaces.finetuning.finetune \
+    --rollouts data/stretch_overfit/rollouts/tiny --trainer molmobot \
+    --cameras "head_camera_right,wrist_camera_right" \
+    --steps 300 --batch-size 8 --val-fraction 0.25
+bash data/stretch_overfit/rollouts/molmobot/tiny/run_molmobot.sh
+```
+
+Sixteen or so demonstrations, three hundred steps, half an hour: the training
+loss should fall to nearly nothing. If it does not, no learning rate will help —
+the problem is in the data, the action spec or the camera names, and the report
+says which of those it looks like.
+
+Four houses rather than the one-house `--task debug` set because a split needs
+somewhere to hold a house out: `arrange_train_val_split` holds out none when
+there is only one, and the dataloader raises on a `val/` with no index in it.
 
 ## Several tasks, one policy
 

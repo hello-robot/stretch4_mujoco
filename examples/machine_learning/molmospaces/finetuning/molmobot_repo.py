@@ -33,8 +33,10 @@ where it is visible and the user runs it deliberately.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -50,6 +52,17 @@ Where the checkout goes when `--trainer-repo` is not given.
 
 Beside `robocasa` and `robosuite`. Those two are git submodules and this is a
 plain clone, so `.gitignore` carries an entry for it.
+"""
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+"""
+This repository's root, so a checkout can be found from any working directory.
+
+`DEFAULT_CHECKOUT` is relative, which is what `finetune.py` wants -- it is run
+from the repository root and its generated script records absolute paths. But
+`ensure_importable` is called from `run_benchmarks.py`, which is run from
+wherever the evaluation output is going, and a relative clone path there resolves
+to a directory that does not exist.
 """
 
 PACKAGE_SUBDIR = "MolmoBot"
@@ -89,6 +102,53 @@ PRESETS_MODULE = "olmo/data/synthmanip_presets.py"
 
 OPTIM_MODULE = "olmo/train/optim.py"
 """Where MolmoBot builds the optimizer, relative to the package directory."""
+
+EVAL_MODULE = "olmo/eval/configure_molmo_spaces.py"
+"""Where MolmoBot keeps its MolmoSpaces evaluation policy, relative to the package directory."""
+
+TRAINER_MODULE = "olmo/train/trainer.py"
+"""Where MolmoBot's training loop lives, relative to the package directory."""
+
+INFERENCE_REQUIREMENTS: dict[str, str] = {
+    "cached_path": "cached_path",
+    "cached_property": "cached_property",
+    "fiddle": "fiddle",
+    "rich": "rich",
+    "tokenizers": "tokenizers",
+    "transformers": "transformers",
+    "sentencepiece": "sentencepiece",
+    "einops": "einops",
+    "einops_exts": "einops-exts",
+    "accelerate": "accelerate",
+    "av": "av",
+}
+"""
+What MolmoBot's model has to import, mapped from module name to what installs it.
+
+Training happens in MolmoBot's own virtualenv, which `uv sync --extra train`
+builds inside the checkout from its `pyproject.toml`. *Evaluation does not.*
+`run_benchmarks.py --policy molmobot` runs MolmoSpaces and MolmoBot in the same
+interpreter -- this repository's -- because a rollout is a MolmoSpaces
+simulation with MolmoBot's weights in it, and nothing can bridge two
+interpreters mid-episode. So MolmoBot's runtime dependencies have to exist here
+too, and they are not in this repository's own dependency list because MolmoBot
+is not a dependency of it.
+
+Only what the inference path touches, not MolmoBot's whole training stack: the
+model, its tokenizer, and the checkpoint loader. Missing ones surface deep
+inside `SynthManipMolmoInferenceWrapper` as a bare ModuleNotFoundError, several
+minutes into a benchmark, once per worker -- so `missing_inference_requirements`
+is called at the command line instead, before anything loads.
+"""
+
+METRICS_ENV_VAR = "MOLMOBOT_METRICS_JSONL"
+"""
+Where `ensure_metrics_log`'s patch writes, and the switch that turns it on.
+
+An environment variable rather than a flag because the patched function is
+MolmoBot's, called from inside its training loop, and the generated run script is
+the only thing that needs to set it. Unset, the patch does nothing at all.
+"""
 
 ADAMW8BIT = "adamw8bit"
 """
@@ -535,6 +595,512 @@ def ensure_adamw8bit(checkout: MolmoBotCheckout) -> bool:
     path.write_text(source)
     log.info(f"[molmobot] registered {ADAMW8BIT} in {path}")
     return True
+
+
+_POLICY_FACTORY_FIELD = f'''    {GENERATED_MARKER}
+    # The installed molmo_spaces declares `policy_factory` on `BasePolicyConfig`
+    # with no default, and `SynthVLAPolicyConfig` never sets one, so *importing*
+    # this module fails while evaluating its own `FrankaState8ClampConfig` class
+    # body:
+    #
+    #     ValidationError: 1 validation error for SynthVLAPolicyConfig
+    #     policy_factory  Field required
+    #
+    # which reads like "MolmoBot is not installed" when it is. Annotated `object`
+    # rather than `PolicyFactory` so no import has to be added to a file this
+    # repository does not own; nothing ever calls it, because
+    # `policies/molmobot_policy.py` constructs `SynthVLAPolicy` itself rather
+    # than letting MolmoSpaces build one from this config.
+    policy_factory: object = None
+'''
+
+
+def resolve_checkout_root(root: Path | str | None = None) -> Path:
+    """Where the checkout is, for a caller that has not been told.
+
+    Prefers `third_party/MolmoBot` under the current directory -- the path
+    `finetune.py` clones into and the one a second checkout would be put at --
+    and falls back to the same path under this repository, so an evaluation run
+    from an output directory still finds the clone the fine-tune produced.
+    """
+    if root is not None:
+        return Path(root)
+    local = Path.cwd() / DEFAULT_CHECKOUT
+    if (local / PACKAGE_SUBDIR / TRAINER_SCRIPT).exists():
+        return local
+    return REPO_ROOT / DEFAULT_CHECKOUT
+
+
+def ensure_importable(root: Path | str | None = None, patch: bool = True) -> Path:
+    """Make `import olmo` work from the checkout, and return the directory that does it.
+
+    MolmoBot is not installed -- it is a clone, whose package directory holds a
+    top-level `olmo` package -- so something has to put that directory on the
+    import path. Doing it here rather than asking for `PYTHONPATH=...` on every
+    command is the difference between an evaluation that runs and one that dies
+    inside a rollout worker with an ImportError.
+
+    Both mechanisms are set, because the workers are not this process:
+    `sys.path` covers this interpreter and the `forkserver` children that
+    inherit its memory, and `PYTHONPATH` covers `spawn`, which starts a fresh
+    interpreter that reads only the environment.
+
+    Args:
+        root: the checkout, or None to find it with `resolve_checkout_root`.
+        patch: apply `ensure_policy_factory_default` first. False skips the
+            write for a caller that only wants the path.
+
+    Returns:
+        The package directory now on the path.
+
+    Raises:
+        MolmoBotSetupError: there is no MolmoBot checkout at `root`.
+    """
+    root = resolve_checkout_root(root)
+    package_dir = (root / PACKAGE_SUBDIR).resolve()
+    if not (package_dir / TRAINER_SCRIPT).exists():
+        raise MolmoBotSetupError(
+            f"No MolmoBot checkout at {root}, so `import olmo` cannot be made to work.\n"
+            f"  git clone --depth 1 {MOLMOBOT_GIT_URL} {root}\n"
+            "or run the fine-tuning setup, which clones it:\n"
+            "  python -m examples.machine_learning.molmospaces.finetuning.finetune "
+            "--rollouts <run> --trainer molmobot"
+        )
+
+    if patch:
+        ensure_policy_factory_default(
+            MolmoBotCheckout(
+                root=root,
+                package_dir=package_dir,
+                data_scripts_dir=root / DATA_SCRIPTS_SUBDIR,
+            )
+        )
+
+    entry = str(package_dir)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+    inherited = os.environ.get("PYTHONPATH", "")
+    if entry not in inherited.split(os.pathsep):
+        os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [entry, inherited]))
+    return package_dir
+
+
+def ensure_policy_factory_default(checkout: MolmoBotCheckout) -> bool:
+    """Give MolmoBot's policy configs the `policy_factory` default their base class requires.
+
+    See `_POLICY_FACTORY_FIELD` for what breaks without it. This is version skew
+    between the installed `molmo_spaces` and the MolmoBot checkout, not a
+    mistake in either, so it is fixed the same way as the presets and the
+    optimizer: insertions in a gitignored clone that `ensure_checkout` recreates
+    from scratch if it is deleted.
+
+    Every `BasePolicyConfig` subclass in the file is patched, not just the one
+    this repository instantiates: the module builds several of its own eval
+    configs at import time (`FrankaState8ClampConfig`,
+    `RBY1DoorOpeningEvalConfig`, ...), and *any* of them missing the field
+    fails the import for all of them.
+
+    Idempotent: a class that already declares `policy_factory` is left alone,
+    which is also what makes this safe against a MolmoBot that grows its own.
+
+    Returns:
+        True if this call patched the file, False if it was already fine.
+    """
+    path = checkout.package_dir / EVAL_MODULE
+    if not path.exists():
+        raise MolmoBotSetupError(
+            f"{path} not found, so this MolmoBot checkout does not keep its MolmoSpaces "
+            "evaluation policy where this expects. It may be a version whose layout has "
+            "moved; re-clone, or add `policy_factory: object = None` to its "
+            "BasePolicyConfig subclasses by hand."
+        )
+
+    source = path.read_text()
+    headers = list(
+        re.finditer(
+            r'^class (\w+)\(BasePolicyConfig\):\n(?:[ \t]*"""(?:.|\n)*?"""\n)?',
+            source,
+            re.MULTILINE,
+        )
+    )
+    if not headers:
+        raise MolmoBotSetupError(
+            f"Could not find any `class ...(BasePolicyConfig)` in {path}, so the missing "
+            "`policy_factory` default has nowhere to go. MolmoBot's evaluation module has "
+            "changed shape; add the field by hand."
+        )
+
+    # Back to front, so each insertion cannot shift the offsets of the ones
+    # still to come. Each class body is scoped to the next `class` line: the
+    # name appears in molmo_spaces' own configs elsewhere in the file, and
+    # finding one of those would report a patch that was never applied.
+    patched = []
+    for header in reversed(headers):
+        end = re.compile(r"^class ", re.MULTILINE).search(source, header.end())
+        body = source[header.end() : end.start() if end else len(source)]
+        if "policy_factory" in body:
+            continue
+        source = source[: header.end()] + _POLICY_FACTORY_FIELD + source[header.end() :]
+        patched.append(header.group(1))
+
+    if not patched:
+        return False
+
+    _write_atomic(path, source)
+    log.info(
+        f"[molmobot] gave {', '.join(reversed(patched))} a policy_factory default in {path}"
+    )
+    return True
+
+
+_METRICS_CALL = "        _stretch4_record_metrics(self, prefix, metrics)\n"
+
+CHECKPOINT_METRICS_FILENAME = "training_metrics.json"
+"""
+What the patch writes inside every checkpoint directory the trainer saves.
+
+Beside the weights rather than only in the run's `metrics.jsonl`, because a
+checkpoint outlives the terminal it was produced in. `step9500_bestfit/` on its
+own says which step it came from and nothing else -- not what the validation
+loss was there, not whether training had converged or was still improving, not
+what the learning rates had decayed to. Six weeks later, pointing `--checkpoint`
+at it, that is exactly what you want to know, and this travels with the
+directory when it is copied to another machine.
+"""
+
+_METRICS_RECORDER_TEMPLATE = '''
+
+@@MARKER@@
+_stretch4_last_metrics = {"train": None, "eval": {}}
+"""The most recent metrics dump of each kind, for `_stretch4_checkpoint_metrics`."""
+
+
+def _stretch4_record_metrics(trainer, prefix, metrics):
+    """Remember, and optionally log, one metrics dump.
+
+    Called from the top of `Trainer.log_metrics_to_console`, which is the one
+    place every metric this run computes passes through with its full numeric
+    value: the console formats them and drops most of `optim/`, and W&B is off
+    unless a project and entity are exported, so without this a run that is not
+    using W&B keeps no record of its own loss curve.
+
+    Two destinations, on separate switches. `$@@ENV@@` gets
+    a JSON line per dump, which is the whole curve. `_stretch4_last_metrics`
+    keeps the latest of each kind in memory whether or not that variable is set,
+    because the checkpoint summary is written from it and a checkpoint should
+    describe itself even when nobody asked for a log.
+
+    Deliberately incapable of failing a training run: an unwritable path or an
+    exotic metric value costs a line of the log, not eleven hours of fine-tune.
+    """
+    import datetime
+    import json
+    import os
+
+    try:
+        is_train = prefix.lstrip().startswith("[step=")
+        record = {
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "step": int(getattr(trainer, "global_step", 0) or 0),
+            "max_steps": int(getattr(trainer, "max_steps", 0) or 0),
+            "split": "train" if is_train else "eval",
+            "label": None if is_train else prefix.strip(),
+            "metrics": {
+                name: number
+                for name, value in metrics.items()
+                if (number := _stretch4_number(value)) is not None
+            },
+        }
+        if is_train:
+            _stretch4_last_metrics["train"] = record
+        else:
+            _stretch4_last_metrics["eval"][record["label"]] = record
+    except Exception:  # noqa: BLE001 - bookkeeping must never kill a run
+        return
+
+    path = os.environ.get("@@ENV@@")
+    if not path:
+        return
+    # `loss_eval` logs from every rank; only one of them should write.
+    if int(os.environ.get("RANK", "0") or 0) != 0:
+        return
+    try:
+        with open(path, "a") as handle:
+            handle.write(json.dumps(record) + "\\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stretch4_number(value):
+    """`value` as a float, if it is one -- including a scalar tensor.
+
+    The tensor case is not exotic here, it is the learning rates: torchao's
+    8-bit optimizer replaces `group["lr"]` with a 0-dim `torch.Tensor` so its
+    compiled update can read it, and `LRMonitor.check()` hands those straight
+    into the metrics dict. MolmoBot's own console filter is an `isinstance`
+    check against `(int, float)`, which is why a run with this optimizer shows
+    gradient norms and no learning rates anywhere -- the numbers are computed,
+    they just never survive being logged.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        if hasattr(value, "numel") and value.numel() != 1:
+            return None
+        return float(value)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+
+def _stretch4_finite(value):
+    """`value` as a JSON-safe float, or None -- `best_eval_loss` starts at inf."""
+    import math
+
+    number = _stretch4_number(value)
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _stretch4_checkpoint_metrics(trainer, kind):
+    """The state training was in at the moment a checkpoint was written."""
+    import datetime
+    import os
+    import time
+
+    payload = {
+        "written": datetime.datetime.now().isoformat(timespec="seconds"),
+        "kind": kind,
+        "step": int(getattr(trainer, "global_step", 0) or 0),
+        "max_steps": int(getattr(trainer, "max_steps", 0) or 0),
+        "epoch": getattr(trainer, "epoch", None),
+        "tokens_seen": getattr(trainer, "global_train_tokens_seen", None),
+        "train": {
+            "loss": _stretch4_finite(getattr(trainer, "cur_train_loss", None)),
+            "min_loss": _stretch4_finite(getattr(trainer, "min_train_loss", None)),
+            "last_logged": _stretch4_last_metrics["train"],
+        },
+        "eval": _stretch4_last_metrics["eval"],
+        "metrics_file": os.environ.get("@@ENV@@") or None,
+    }
+
+    # The best-fit bookkeeping, when this checkout has it: what the best
+    # validation loss was, where, and how long it has been since it moved --
+    # which is what says whether this checkpoint is the converged one or just
+    # the newest one.
+    best_loss = _stretch4_finite(getattr(trainer, "best_eval_loss", None))
+    if best_loss is not None or hasattr(trainer, "best_eval_step"):
+        payload["best"] = {
+            "metric": os.environ.get("MOLMOBOT_BESTFIT_METRIC", "action_flow_loss"),
+            "loss": best_loss,
+            "step": getattr(trainer, "best_eval_step", None),
+            "evals_since_improvement": getattr(trainer, "evals_since_improvement", None),
+        }
+
+    # Read off the optimizer rather than from the metrics: `LRMonitor` reports
+    # nothing under some optimizers (the 8-bit one included), and the decayed
+    # rate at the moment of the save is the number that explains the loss.
+    try:
+        rates = {}
+        for group in trainer.optim.param_groups:
+            name = group.get("group_name", "all")
+            rate = _stretch4_finite(group.get("lr"))
+            if rate is not None:
+                rates.setdefault(name, rate)
+        if rates:
+            payload["learning_rates"] = rates
+    except Exception:  # noqa: BLE001
+        pass
+
+    started = getattr(trainer, "_train_start_time", None)
+    if started is not None:
+        payload["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    return payload
+
+
+def _stretch4_write_checkpoint_metrics(trainer, checkpoint_dir, kind):
+    """Write `@@SUMMARY@@` into a checkpoint directory that has just been saved."""
+    import json
+    import os
+
+    if int(os.environ.get("RANK", "0") or 0) != 0:
+        return
+    try:
+        directory = str(checkpoint_dir)
+        # Remote checkpoints (s3://, gs://) are written through a client this
+        # has no handle on; a local directory is the case worth covering.
+        if not os.path.isdir(directory):
+            return
+        payload = _stretch4_checkpoint_metrics(trainer, kind)
+        with open(os.path.join(directory, "@@SUMMARY@@"), "w") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+    except Exception:  # noqa: BLE001 - a checkpoint that saved must not fail here
+        pass
+
+
+def _stretch4_summarising(original, kind):
+    """Wrap a Trainer save method so the summary lands beside the weights.
+
+    Wrapping the two save methods rather than editing inside them: the summary
+    is then written after the save has returned -- past its barriers, with the
+    directory certainly on disk -- and one insertion covers `step<N>/`,
+    `step<N>_bestfit/` and the final checkpoint alike.
+    """
+    import functools
+
+    @functools.wraps(original)
+    def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        # `save_checkpoint` returns (checkpoint_dir, unsharded_dir);
+        # `save_bestfit_checkpoint` returns the directory itself.
+        directory = result[0] if isinstance(result, tuple) else result
+        _stretch4_write_checkpoint_metrics(self, directory, kind)
+        return result
+
+    return wrapper
+
+
+Trainer.save_checkpoint = _stretch4_summarising(Trainer.save_checkpoint, "periodic")
+if hasattr(Trainer, "save_bestfit_checkpoint"):
+    Trainer.save_bestfit_checkpoint = _stretch4_summarising(
+        Trainer.save_bestfit_checkpoint, "bestfit"
+    )
+'''
+
+_METRICS_RECORDER = (
+    _METRICS_RECORDER_TEMPLATE.replace("@@MARKER@@", GENERATED_MARKER)
+    .replace("@@ENV@@", METRICS_ENV_VAR)
+    .replace("@@SUMMARY@@", CHECKPOINT_METRICS_FILENAME)
+)
+"""
+The recorder, appended at module level to MolmoBot's `trainer.py`.
+
+Built by substitution rather than as an f-string because the block is mostly
+JSON-shaped dict literals and docstrings; doubling every brace to survive
+`str.format` would make it unreadable in the one place it has to stay readable.
+"""
+
+
+def missing_inference_requirements() -> list[str]:
+    """Which of `INFERENCE_REQUIREMENTS` this interpreter cannot import.
+
+    Returns the *installable* names, in the order they would go on a pip
+    command line, so a caller can quote the fix rather than describe it.
+    """
+    import importlib.util
+
+    missing = []
+    for module, package in INFERENCE_REQUIREMENTS.items():
+        try:
+            found = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(package)
+    return missing
+
+
+def inference_requirements_message(missing: list[str]) -> str:
+    """How to fix a missing inference requirement, as one paragraph."""
+    return (
+        "MolmoBot's model cannot be loaded in this environment: "
+        + ", ".join(missing)
+        + " missing. Evaluation runs MolmoSpaces and MolmoBot in one interpreter -- this "
+        "repository's, not the training venv inside the checkout -- so MolmoBot's runtime "
+        "dependencies have to be installed here:\n"
+        "  uv pip install " + " ".join(missing)
+    )
+
+
+def ensure_metrics_log(checkout: MolmoBotCheckout) -> bool:
+    """Teach MolmoBot to write its own metrics to a file, and into its checkpoints.
+
+    MolmoBot computes everything a fine-tune needs to be tuned -- the flow
+    loss, the per-group learning rates and gradient norms, throughput, and the
+    validation loss from each evaluator -- and then throws most of it away
+    unless Weights & Biases is configured: `log_metrics_to_console` filters out
+    `optim/*` (there are too many for a terminal) and the console is the only
+    other destination. `finetuning/README.md` explains why W&B is off by
+    default here, and "turn on W&B" is a poor answer to "what learning rate
+    should I use" anyway, because it does not work offline and leaves nothing on
+    disk beside the checkpoint it describes.
+
+    So one call is inserted at the top of that method, where the *unfiltered*
+    metrics dict is still in hand, and a block at the end of the module does two
+    things with it: writes a JSON line per dump to `METRICS_ENV_VAR`, which
+    `training_report.py` reads, and keeps the latest dump of each kind so that
+    every checkpoint the trainer saves gets a `CHECKPOINT_METRICS_FILENAME`
+    written inside it. The second is the one that survives the run -- see that
+    constant.
+
+    Same terms as `ensure_stretch_presets` and `ensure_adamw8bit`: insertions in
+    a gitignored clone, and inert -- the recorder returns immediately, the
+    summary is still written -- when the environment variable is not set.
+
+    Idempotent, and self-upgrading: a checkout carrying an older version of the
+    block has it replaced rather than left alone, because the block is generated
+    from this module and a stale copy is a bug that hides in a directory nobody
+    reads.
+
+    Returns:
+        True if this call wrote to the file, False if it was already current.
+    """
+    path = checkout.package_dir / TRAINER_MODULE
+    if not path.exists():
+        raise MolmoBotSetupError(
+            f"{path} not found, so this MolmoBot checkout does not keep its trainer where "
+            "this expects. It may be a version whose layout has moved; re-clone, or run "
+            "with WANDB=on and read the metrics there."
+        )
+
+    source = path.read_text()
+    # Everything before the marker is MolmoBot's own file plus the one call
+    # line; everything from it on is this module's, and is regenerated wholesale.
+    body, marker, _ = source.partition(GENERATED_MARKER)
+    if not marker:
+        body = source
+
+    if _METRICS_CALL not in body:
+        signature = re.search(
+            r"^[ \t]+def log_metrics_to_console\(self[^)]*\):[ \t]*\n", body, re.MULTILINE
+        )
+        if signature is None:
+            raise MolmoBotSetupError(
+                f"Could not find `def log_metrics_to_console` in {path}, so there is nowhere "
+                "to record metrics from. MolmoBot's trainer has changed shape; run with "
+                "WANDB=on instead, or add the call by hand."
+            )
+        body = body[: signature.end()] + _METRICS_CALL + body[signature.end() :]
+
+    # The recorder goes at module level at the end of the file rather than
+    # beside the method: names in a function body are resolved when it runs, so
+    # ordering does not matter, and appending cannot disturb a line of the
+    # trainer itself.
+    desired = body.rstrip("\n") + "\n" + _METRICS_RECORDER
+    if desired == source:
+        return False
+
+    _write_atomic(path, desired)
+    log.info(
+        f"[molmobot] metrics logging and checkpoint summaries "
+        f"{'updated in' if marker else 'patched into'} {path}"
+    )
+    return True
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace `path`'s contents in one step.
+
+    `ensure_policy_factory_default` runs from `ensure_importable`, which runs in
+    every rollout worker as well as the process that started them -- so on a
+    fresh checkout several processes can decide to patch the same file at the
+    same moment. A half-written module is a syntax error in a dependency, which
+    is a bad afternoon; a rename is atomic, so the losers of that race overwrite
+    with an identical file instead.
+    """
+    temporary = path.with_name(f"{path.name}.stretch4-{os.getpid()}.tmp")
+    temporary.write_text(text)
+    temporary.replace(path)
 
 
 def _clone(root: Path) -> None:

@@ -53,6 +53,12 @@ from examples.machine_learning.molmospaces.configs import (
     VIEWER_ENV_VAR,
     qualified_config_name,
 )
+from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+    MolmoBotSetupError,
+    ensure_importable,
+    inference_requirements_message,
+    missing_inference_requirements,
+)
 
 log = logging.getLogger(__name__)
 
@@ -321,6 +327,23 @@ def main(
         raise click.UsageError("--molmobot-action-type only applies to --policy molmobot.")
     if molmobot_action_type:
         os.environ[MOLMOBOT_ACTION_TYPE_ENV_VAR] = molmobot_action_type
+
+    if policy == "molmobot":
+        # MolmoBot is a clone, not a dependency, so nothing puts its `olmo`
+        # package on the import path. Done before the first rollout rather than
+        # inside the policy so a missing checkout is a message here, at the
+        # command line, instead of the same ImportError once per worker after
+        # the benchmark has loaded -- and so `sys.path` is already set when the
+        # workers are forked from this process.
+        try:
+            package_dir = ensure_importable()
+        except MolmoBotSetupError as error:
+            raise click.UsageError(str(error)) from error
+        log.info(f"[molmobot] importing from {package_dir}")
+
+        missing = missing_inference_requirements()
+        if missing:
+            raise click.UsageError(inference_requirements_message(missing))
 
     # MolmoSpaces renders off-screen through EGL; without this a headless run
     # fails inside the camera manager rather than at startup.
