@@ -133,6 +133,23 @@ def video_filename(episode_index: int, camera: str, batch_suffix: str = "") -> s
 # =============================================================================
 
 
+def trajectory_files(rollout_dir: Path | str) -> list[Path]:
+    """Every `trajectories*.h5` under a run, following symlinked house directories.
+
+    `Path.rglob`'s `**` deliberately does not descend into symlinks, and houses
+    are symlinked in the two places that matter here: `arrange_train_val_split`
+    builds `train/` and `val/` that way, and picking a handful of houses out of
+    a large run -- to overfit them on purpose, which is the first check on a
+    fine-tune that is not learning -- is the same move made by hand. Globbing
+    the one level houses actually live at does follow them; the recursive glob
+    stays as the fallback for a run whose files sit somewhere else.
+    """
+    rollout_dir = Path(rollout_dir)
+    return sorted(rollout_dir.glob("*/trajectories*.h5")) or sorted(
+        rollout_dir.rglob("trajectories*.h5")
+    )
+
+
 def ensure_sensor_data_paths(
     rollout_dir: Path,
     camera_names: list[str] | None = None,
@@ -159,7 +176,7 @@ def ensure_sensor_data_paths(
     import h5py
 
     counts = {"trajectories": 0, "entries": 0, "already_present": 0, "missing_video": 0}
-    for h5_path in sorted(Path(rollout_dir).rglob("trajectories*.h5")):
+    for h5_path in trajectory_files(rollout_dir):
         match = TRAJECTORY_FILE_PATTERN.match(h5_path.name)
         if match is None:
             continue
@@ -392,7 +409,7 @@ def count_trajectories(rollout_dir: Path, successful_only: bool = False) -> int:
     import h5py
 
     total = 0
-    for h5_path in sorted(Path(rollout_dir).rglob("trajectories*.h5")):
+    for h5_path in trajectory_files(rollout_dir):
         with h5py.File(h5_path, "r") as h5_file:
             for traj_key in h5_file:
                 if TRAJECTORY_KEY_PATTERN.match(traj_key) is None:

@@ -13,6 +13,9 @@ malformed does not fail -- it trains a worse policy.
 Requires the optional MolmoSpaces dependency:  pip install -e ".[molmo]"
 """
 
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -474,17 +477,308 @@ def test_molmobot_config_rejects_a_group_mismatch():
         )
 
 
-def test_molmobot_policy_says_how_to_install_molmobot():
-    """MolmoBot is not a dependency, so the failure has to be actionable."""
-    from examples.machine_learning.molmospaces.policies.molmobot_policy import (
-        StretchMolmoBotPolicy,
+def test_molmobot_setup_error_says_how_to_clone(tmp_path):
+    """MolmoBot is not a dependency, so a missing checkout has to be actionable."""
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        MolmoBotSetupError,
+        ensure_importable,
     )
 
-    with pytest.raises(ImportError) as error:
-        StretchMolmoBotPolicy._import_molmobot()
+    with pytest.raises(MolmoBotSetupError) as error:
+        ensure_importable(tmp_path / "no-checkout-here")
     message = str(error.value)
-    assert "git clone https://github.com/allenai/MolmoBot" in message
-    assert "PYTHONPATH" in message
+    assert "git clone" in message
+    assert "allenai/MolmoBot" in message
+
+
+def test_molmobot_import_failure_names_what_it_tried(monkeypatch):
+    """The ImportError has to distinguish "not cloned" from "cloned and broken"."""
+    from examples.machine_learning.molmospaces.policies import molmobot_policy
+
+    def no_checkout(*args, **kwargs):
+        raise molmobot_policy.MolmoBotSetupError("no checkout at third_party/MolmoBot")
+
+    monkeypatch.setattr(molmobot_policy, "ensure_importable", no_checkout)
+    monkeypatch.setattr(molmobot_policy, "MOLMOBOT_MODULES", ("stretch4_not_molmobot",))
+
+    with pytest.raises(ImportError) as error:
+        molmobot_policy.StretchMolmoBotPolicy._import_molmobot()
+    message = str(error.value)
+    assert "no checkout at third_party/MolmoBot" in message
+    assert "stretch4_not_molmobot" in message
+
+
+def test_molmobot_import_puts_the_checkout_on_the_path(monkeypatch, tmp_path):
+    """`--policy molmobot` must work without anyone exporting PYTHONPATH."""
+    import os
+    import sys
+
+    from examples.machine_learning.molmospaces.finetuning import molmobot_repo
+
+    package_dir = tmp_path / "third_party" / "MolmoBot" / "MolmoBot"
+    (package_dir / "launch_scripts").mkdir(parents=True)
+    (package_dir / molmobot_repo.TRAINER_SCRIPT).write_text("")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setenv("PYTHONPATH", "")
+
+    returned = molmobot_repo.ensure_importable(tmp_path / "third_party" / "MolmoBot", patch=False)
+
+    assert returned == package_dir.resolve()
+    # sys.path for this interpreter and the forkserver children that inherit it;
+    # PYTHONPATH for spawn, which starts a fresh one that reads only the
+    # environment.
+    assert str(package_dir.resolve()) in sys.path
+    assert str(package_dir.resolve()) in os.environ["PYTHONPATH"].split(os.pathsep)
+
+
+def test_molmobot_policy_factory_patch_is_scoped_and_idempotent(tmp_path):
+    """Every BasePolicyConfig subclass in MolmoBot's eval module needs the default.
+
+    The module builds several of its own eval configs at import time, so one
+    unpatched class fails the import for all of them -- which surfaces as
+    "MolmoBot is not importable" when it is.
+    """
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        EVAL_MODULE,
+        MolmoBotCheckout,
+        ensure_policy_factory_default,
+    )
+
+    package_dir = tmp_path / "MolmoBot"
+    module = package_dir / EVAL_MODULE
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        'class SynthVLAPolicyConfig(BasePolicyConfig):\n'
+        '    """Doc."""\n'
+        '    policy_type: str = "learned"\n'
+        "\n"
+        "\n"
+        "class SynthVLARBY1PolicyConfig(BasePolicyConfig):\n"
+        '    policy_type: str = "learned"\n'
+        "\n"
+        "\n"
+        "class NotAPolicyConfig(JsonBenchmarkEvalConfig):\n"
+        "    policy_dt_ms: float = 66.0\n"
+    )
+    checkout = MolmoBotCheckout(
+        root=tmp_path, package_dir=package_dir, data_scripts_dir=tmp_path / "data_scripts"
+    )
+
+    assert ensure_policy_factory_default(checkout) is True
+    patched = module.read_text()
+    assert patched.count("policy_factory: object = None") == 2
+    # The docstring stays a docstring: the field goes after it, not before.
+    assert patched.index('"""Doc."""') < patched.index("policy_factory: object = None")
+    assert "NotAPolicyConfig(JsonBenchmarkEvalConfig):\n    policy_dt_ms" in patched
+
+    assert ensure_policy_factory_default(checkout) is False
+    assert module.read_text() == patched
+
+
+# =============================================================================
+# What a checkpoint says about how it was trained
+# =============================================================================
+
+
+def _write_checkpoint_config(directory, args, action_dim=10, states_mode="cross_attn"):
+    """A `config.yaml` shaped like the one `train_molmobot.py` saves."""
+    import yaml
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {"action_dim": action_dim, "states_mode": states_mode},
+                "runtime_data": {"args": args, "hostname": "test"},
+            }
+        )
+    )
+    return directory
+
+
+def test_reads_the_cameras_and_action_type_a_checkpoint_was_trained_with(tmp_path):
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import (
+        read_training_args,
+    )
+
+    checkpoint = _write_checkpoint_config(
+        tmp_path / "step9500_bestfit",
+        "launch_scripts/train_molmobot.py /base --data_paths /data --seq_len 528 "
+        "--action_dim 10 --action_preset stretch_jointdelta --camera_names "
+        "head_camera_right wrist_camera_right --action_type joint_pos_rel "
+        "--exp_name=stretch4_pick --ft_vit=True",
+    )
+
+    training = read_training_args(checkpoint)
+
+    # The list flag stops at the next `--`, and the scalar one before it does not
+    # swallow its neighbour.
+    assert training.camera_names == ["head_camera_right", "wrist_camera_right"]
+    assert training.action_type == "joint_pos_rel"
+    assert training.action_preset == "stretch_jointdelta"
+    assert training.action_dim == 10
+    assert training.states_mode == "cross_attn"
+    assert bool(training) is True
+
+
+def test_a_checkpoint_that_records_nothing_is_not_an_error(tmp_path):
+    """Every field is optional: "did not say" is not "said no"."""
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import (
+        read_training_args,
+    )
+
+    (tmp_path / "empty").mkdir()
+    assert bool(read_training_args(tmp_path / "empty")) is False
+    assert bool(read_training_args(tmp_path / "does-not-exist")) is False
+
+    (tmp_path / "unparseable").mkdir()
+    (tmp_path / "unparseable" / "config.yaml").write_text("model: [unclosed\n")
+    assert bool(read_training_args(tmp_path / "unparseable")) is False
+
+
+def _adapter(**policy_config_kwargs):
+    """A `StretchMolmoBotPolicy` with only the fields the reconciliation reads.
+
+    Constructed without `__init__`, which would build MolmoBot's policy and load
+    a checkpoint. What is under test is the part that runs before that.
+    """
+    from types import SimpleNamespace
+
+    from examples.machine_learning.molmospaces.policies.molmobot_policy import (
+        StretchMolmoBotPolicy,
+        StretchMolmoBotPolicyConfig,
+    )
+
+    policy = object.__new__(StretchMolmoBotPolicy)
+    policy.config = SimpleNamespace(
+        policy_config=StretchMolmoBotPolicyConfig(**policy_config_kwargs)
+    )
+    return policy
+
+
+def test_the_checkpoints_cameras_win_over_the_configured_ones():
+    """Serving a VLA the wrong cameras raises nothing; it just stops working."""
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import TrainingArgs
+
+    trained_on = ["head_camera_right", "wrist_camera_right"]
+    policy = _adapter(camera_names=[HEAD_CAMERA, WRIST_CAMERA_LEFT])
+
+    assert policy._resolve_camera_names(TrainingArgs(camera_names=trained_on)) == trained_on
+    # Including the order, which is part of the model's input layout.
+    assert policy._resolve_camera_names(TrainingArgs(camera_names=trained_on[::-1])) == (
+        trained_on[::-1]
+    )
+    # Nothing recorded, or explicitly switched off, leaves the config in force.
+    assert policy._resolve_camera_names(TrainingArgs()) == [HEAD_CAMERA, WRIST_CAMERA_LEFT]
+    pinned = _adapter(camera_names=[HEAD_CAMERA], configure_from_checkpoint=False)
+    assert pinned._resolve_camera_names(TrainingArgs(camera_names=trained_on)) == [HEAD_CAMERA]
+
+
+def test_an_explicit_action_type_outranks_the_checkpoint():
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import TrainingArgs
+
+    trained = TrainingArgs(action_type="joint_pos_rel")
+    assert _adapter(action_type="joint_pos")._resolve_action_type(trained) == "joint_pos_rel"
+    named = _adapter(action_type="joint_pos", action_type_explicit=True)
+    assert named._resolve_action_type(trained) == "joint_pos"
+
+
+def test_a_checkpoint_of_the_wrong_action_width_is_refused():
+    """MolmoBot-DROID emits eight numbers; unpacking them into ten shifts every joint."""
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import TrainingArgs
+
+    policy = _adapter()
+    with pytest.raises(ValueError, match="misassign"):
+        policy._check_action_width(TrainingArgs(action_dim=8))
+    policy._check_action_width(TrainingArgs(action_dim=10))
+    policy._check_action_width(TrainingArgs())
+
+
+def test_relative_actions_become_the_absolute_targets_stretch_is_commanded_with():
+    """`qpos + delta` inverts how `actions/joint_pos_rel` was recorded."""
+    policy = _adapter()
+    policy._action_type = "joint_pos_rel"
+    reference = {
+        "base": np.array([1.0, 2.0, 0.5]),
+        "lift": np.array([0.6]),
+        "arm": np.array([0.2]),
+        "wrist": np.array([3.14, -0.4, 0.0]),
+        "gripper": np.array([0.1, 0.1]),
+    }
+    action = {
+        "base": np.array([0.01, 0.0, -0.02]),
+        "lift": np.array([0.05]),
+        "arm": np.array([-0.01]),
+        "wrist": np.array([0.0, 0.1, 0.0]),
+        "gripper": np.array([-0.3, -0.3]),
+        "done": False,
+    }
+
+    absolute = policy._to_absolute_targets(action, reference)
+
+    assert np.allclose(absolute["base"], [1.01, 2.0, 0.48])
+    assert np.allclose(absolute["lift"], [0.65])
+    assert np.allclose(absolute["arm"], [0.19])
+    # The gripper squeeze: a delta past where the fingers can go is what holds a
+    # grasp, and it only survives as an absolute target.
+    assert np.allclose(absolute["gripper"], [-0.2, -0.2])
+    assert absolute["done"] is False
+
+
+def test_a_relative_action_is_measured_from_the_previous_step(monkeypatch):
+    """`joint_pos_rel[t]` is `commanded[t] - qpos[t-1]`, and the off-by-one is not free.
+
+    `LastCommandedRelativeJointPosSensor` keeps the qpos from its previous call
+    and differences the newly commanded position against *that*. Over a real
+    pick episode, inverting it against this step's qpos instead misses the
+    recorded command by up to 0.23 rad of lift.
+    """
+    import types
+
+    policy = _adapter()
+    policy._action_type = "joint_pos_rel"
+    policy._previous_qpos = None
+    policy._clipper = types.SimpleNamespace(clip_action=lambda action: action)
+
+    states = [
+        {"lift": np.array([0.50]), "arm": np.array([0.10])},
+        {"lift": np.array([0.62]), "arm": np.array([0.13])},
+        {"lift": np.array([0.71]), "arm": np.array([0.15])},
+    ]
+    policy.task = types.SimpleNamespace(
+        env=types.SimpleNamespace(
+            current_robot=types.SimpleNamespace(
+                robot_view=types.SimpleNamespace(get_qpos_dict=lambda: states[0])
+            )
+        )
+    )
+    deltas = [
+        {"lift": np.array([0.15]), "arm": np.array([0.04])},
+        {"lift": np.array([0.10]), "arm": np.array([0.03])},
+        {"lift": np.array([0.05]), "arm": np.array([0.01])},
+    ]
+    policy._inner = types.SimpleNamespace(
+        camera_names=[], get_action=lambda observation: deltas.pop(0)
+    )
+
+    targets = []
+    for state in states:
+        policy.task.env.current_robot.robot_view.get_qpos_dict = lambda state=state: state
+        targets.append(policy.get_action({}))
+
+    # First step: no previous observation, so this one stands in -- which is also
+    # the step whose recorded action is zeros.
+    assert np.allclose(targets[0]["lift"], [0.65])
+    # Second and third: the *previous* state, not the one just measured.
+    assert np.allclose(targets[1]["lift"], [0.60])  # 0.50 + 0.10, not 0.62 + 0.10
+    assert np.allclose(targets[2]["arm"], [0.14])  # 0.13 + 0.01, not 0.15 + 0.01
+
+
+def test_absolute_checkpoints_are_passed_through_untouched():
+    policy = _adapter(action_type="joint_pos")
+    policy._action_type = "joint_pos"
+    action = {"lift": np.array([0.6])}
+    assert policy._to_absolute_targets(action, {"lift": np.array([0.2])}) is action
 
 
 def test_molmobot_eval_config_defaults_to_the_trained_action_type():
@@ -494,6 +788,556 @@ def test_molmobot_eval_config_defaults_to_the_trained_action_type():
     config = StretchMolmoBotEvalConfig()
     assert config.policy_config.action_type == MOLMOBOT_ACTION_TYPES[0] == "joint_pos_rel"
     assert config.tag == "stretch4_molmobot"
+
+
+def test_a_run_of_symlinked_houses_is_still_a_run(tmp_path):
+    """Picking a few houses out of a big run is how the overfit check is built.
+
+    `rglob`'s `**` does not descend into symlinks, so the obvious way to make a
+    tiny dataset -- symlink four houses into a directory of their own -- used to
+    look like an empty run, and `arrange_train_val_split` symlinks houses too.
+    """
+    from examples.machine_learning.molmospaces.hdf5_layout import trajectory_files
+
+    source = tmp_path / "pick"
+    for name in ("house_0", "house_1"):
+        (source / name).mkdir(parents=True)
+        (source / name / "trajectories_batch_1_of_1.h5").write_bytes(b"")
+
+    assert len(trajectory_files(source)) == 2
+
+    tiny = tmp_path / "tiny"
+    tiny.mkdir()
+    for name in ("house_0", "house_1"):
+        (tiny / name).symlink_to(source / name, target_is_directory=True)
+
+    assert len(trajectory_files(tiny)) == 2
+    assert [path.parent.name for path in trajectory_files(tiny)] == ["house_0", "house_1"]
+
+
+# =============================================================================
+# Metrics: recording them, reporting on them, sweeping over them
+# =============================================================================
+
+
+def _patched_trainer_module(tmp_path):
+    """A synthetic MolmoBot trainer, patched, with its module namespace exec'd.
+
+    Returns `(namespace, patched_source, checkout)`. The stub carries the
+    attributes the recorder reads off a real `Trainer` -- and the two save
+    methods, since the patch wraps them.
+    """
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        TRAINER_MODULE,
+        MolmoBotCheckout,
+        ensure_metrics_log,
+    )
+
+    package_dir = tmp_path / "MolmoBot"
+    trainer = package_dir / TRAINER_MODULE
+    trainer.parent.mkdir(parents=True)
+    trainer.write_text(
+        "class Trainer:\n"
+        "    def log_metrics_to_console(self, prefix: str, metrics):\n"
+        "        print(prefix, metrics)\n"
+        "\n"
+        "    def save_checkpoint(self, checkpoint_type, optim=True):\n"
+        "        return (self.destination, None)\n"
+        "\n"
+        "    def save_bestfit_checkpoint(self):\n"
+        "        return self.destination\n"
+    )
+    checkout = MolmoBotCheckout(
+        root=tmp_path, package_dir=package_dir, data_scripts_dir=tmp_path / "data_scripts"
+    )
+    assert ensure_metrics_log(checkout) is True
+
+    namespace: dict = {}
+    exec(trainer.read_text(), namespace)  # noqa: S102
+    return namespace, trainer, checkout
+
+
+def test_metrics_patch_is_inserted_once_and_records_what_the_console_drops(tmp_path):
+    """The trainer's metrics dict is captured before `log_metrics_to_console` filters it.
+
+    That filter is the whole reason for the patch: it drops every `optim/` key
+    but `optim/total_grad_norm`, which this trainer never emits, so the learning
+    rates and gradient norms exist only in W&B -- which is off by default.
+    """
+    import json
+
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        METRICS_ENV_VAR,
+        ensure_metrics_log,
+    )
+
+    namespace, trainer_file, checkout = _patched_trainer_module(tmp_path)
+    patched = trainer_file.read_text()
+    assert ensure_metrics_log(checkout) is False
+    assert trainer_file.read_text() == patched
+
+    # The call is the first statement of the method, and the recorder is at
+    # module level -- name resolution happens at call time, so its position
+    # after the class is fine and cannot disturb a line of the trainer.
+    assert (
+        "    def log_metrics_to_console(self, prefix: str, metrics):\n"
+        "        _stretch4_record_metrics(self, prefix, metrics)\n" in patched
+    )
+
+    destination = tmp_path / "metrics.jsonl"
+    os.environ[METRICS_ENV_VAR] = str(destination)
+    try:
+        fake = namespace["Trainer"]()
+        fake.global_step, fake.max_steps = 120, 10000
+        namespace["_stretch4_record_metrics"](
+            fake,
+            "[step=120/10000, eta=1 hour]",
+            {"train/action_flow_loss": 0.042, "optim/action_expert_lr": 1e-4, "label": "x"},
+        )
+        namespace["_stretch4_record_metrics"](fake, "val", {"action_flow_loss": 0.051})
+    finally:
+        del os.environ[METRICS_ENV_VAR]
+
+    records = [json.loads(line) for line in destination.read_text().splitlines()]
+    assert [record["split"] for record in records] == ["train", "eval"]
+    assert records[0]["step"] == 120
+    assert records[0]["metrics"]["optim/action_expert_lr"] == 1e-4
+    # Non-numeric values are dropped rather than breaking the line.
+    assert "label" not in records[0]["metrics"]
+    assert records[1]["label"] == "val"
+
+
+def test_a_saved_checkpoint_carries_the_state_training_was_in(tmp_path):
+    """`step<N>_bestfit/` on its own says which step it came from and nothing else.
+
+    The summary is what makes an old checkpoint interpretable: whether the run
+    had converged there or was still improving, and at what loss.
+    """
+    import types
+
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        CHECKPOINT_METRICS_FILENAME,
+    )
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import (
+        read_training_state,
+    )
+
+    namespace, _, _ = _patched_trainer_module(tmp_path)
+    checkpoint = tmp_path / "step9500_bestfit"
+    checkpoint.mkdir()
+
+    trainer = namespace["Trainer"]()
+    trainer.destination = str(checkpoint)
+    trainer.global_step, trainer.max_steps = 9500, 10000
+    trainer.cur_train_loss, trainer.min_train_loss = 0.0243, 0.0241
+    trainer.best_eval_loss, trainer.best_eval_step = 0.0591, 9500
+    trainer.evals_since_improvement = 0
+    trainer.optim = types.SimpleNamespace(
+        param_groups=[{"group_name": "action_expert", "lr": 2.3e-6}]
+    )
+    namespace["_stretch4_record_metrics"](
+        trainer, "[step=9500/10000]", {"train/action_flow_loss": 0.0243}
+    )
+    namespace["_stretch4_record_metrics"](trainer, "synthmanip_val", {"action_flow_loss": 0.0591})
+
+    # Saving is what writes it -- both kinds of save, since both are wrapped.
+    trainer.save_bestfit_checkpoint()
+    assert (checkpoint / CHECKPOINT_METRICS_FILENAME).is_file()
+
+    state = read_training_state(checkpoint)
+    assert state.step == 9500
+    assert state.kind == "bestfit"
+    assert state.train_loss == 0.0243
+    assert state.best_loss == 0.0591
+    assert state.eval_losses == {"synthmanip_val": 0.0591}
+    assert state.learning_rates == {"action_expert": 2.3e-6}
+    # The best loss is this very step's, so the run had not stopped improving.
+    assert state.converged is False
+    assert "still improving when saved" in state.summary()
+
+    periodic = tmp_path / "step10000"
+    periodic.mkdir()
+    trainer.destination = str(periodic)
+    trainer.global_step = 10000
+    trainer.evals_since_improvement = 2
+    trainer.save_checkpoint("sharded")
+    later = read_training_state(periodic)
+    assert later.kind == "periodic"
+    assert later.converged is True
+    assert later.best_step == 9500  # the good weights are in the other directory
+
+
+def test_a_checkpoint_without_a_summary_is_not_an_error(tmp_path):
+    """Checkpoints saved before the patch existed still evaluate; they just say less."""
+    from examples.machine_learning.molmospaces.policies.molmobot_checkpoint import (
+        read_training_state,
+    )
+
+    (tmp_path / "step100").mkdir()
+    assert not read_training_state(tmp_path / "step100")
+    assert not read_training_state(tmp_path / "does-not-exist")
+
+    (tmp_path / "step100" / "training_metrics.json").write_text("{not json")
+    assert not read_training_state(tmp_path / "step100")
+
+
+def test_the_metrics_patch_upgrades_an_older_copy_of_itself(tmp_path):
+    """The block is generated, so a stale one in a clone is a bug that hides."""
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        GENERATED_MARKER,
+        TRAINER_MODULE,
+        ensure_metrics_log,
+    )
+
+    _, trainer_file, checkout = _patched_trainer_module(tmp_path)
+    current = trainer_file.read_text()
+
+    # An older patch: the call line in place, a different block at the end.
+    stale = current[: current.index(GENERATED_MARKER)] + GENERATED_MARKER + (
+        "\ndef _stretch4_record_metrics(trainer, prefix, metrics):\n    pass\n"
+    )
+    trainer_file.write_text(stale)
+
+    assert ensure_metrics_log(checkout) is True
+    assert trainer_file.read_text() == current
+    assert ensure_metrics_log(checkout) is False
+    # MolmoBot's own code is untouched by the round trip.
+    assert "    def save_bestfit_checkpoint(self):" in trainer_file.read_text()
+    assert (checkout.package_dir / TRAINER_MODULE).read_text().count(GENERATED_MARKER) == 1
+
+
+def _write_metrics(path, points, val_points=(), max_steps=1000):
+    """A metrics.jsonl in the shape the patched trainer writes."""
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for step, loss, grad_norm, lr in points:
+        lines.append(
+            json.dumps(
+                {
+                    "time": f"2026-08-28T11:{step % 60:02d}:00",
+                    "step": step,
+                    "max_steps": max_steps,
+                    "split": "train",
+                    "label": None,
+                    "metrics": {
+                        "train/action_flow_loss": loss,
+                        "optim/action_expert_grad_norm": grad_norm,
+                        "optim/action_expert_lr": lr,
+                    },
+                }
+            )
+        )
+    for step, loss in val_points:
+        lines.append(
+            json.dumps(
+                {
+                    "time": f"2026-08-28T11:{step % 60:02d}:30",
+                    "step": step,
+                    "max_steps": max_steps,
+                    "split": "eval",
+                    "label": "val",
+                    "metrics": {"action_flow_loss": loss},
+                }
+            )
+        )
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_training_report_names_the_best_checkpoint_and_the_overfit(tmp_path):
+    """Validation turning back up is the finding the whole report exists for."""
+    from examples.machine_learning.molmospaces.finetuning.training_report import (
+        diagnose,
+        format_run,
+        read_run,
+    )
+
+    run = tmp_path / "stretch4_pick"
+    _write_metrics(
+        run / "metrics.jsonl",
+        [(step, 0.4 - step * 0.00035, 1.0, 1e-4) for step in range(20, 1001, 20)],
+        val_points=[(100, 0.20), (200, 0.14), (300, 0.11), (400, 0.13), (500, 0.15), (600, 0.18)],
+    )
+
+    loaded = read_run(run)
+    assert loaded.steps == 1000
+    assert "val" in loaded.evals
+
+    text = format_run(loaded)
+    assert "best 0.11000 @ step 300" in text
+
+    findings = [observation for observation, _ in diagnose(loaded)]
+    assert any("bottomed out at 0.11000 (step 300)" in finding for finding in findings)
+
+
+def test_the_report_lists_the_checkpoints_and_points_at_the_best(tmp_path):
+    """A run's checkpoints are the thing you act on; the report says which one."""
+    import json
+
+    from examples.machine_learning.molmospaces.finetuning import training_report
+    from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        CHECKPOINT_METRICS_FILENAME,
+    )
+    from examples.machine_learning.molmospaces.policies import molmobot_checkpoint
+
+    # The three copies of this filename have to agree: the trainer patch writes
+    # it, the evaluation reads it, and the report -- which runs under MolmoBot's
+    # interpreter, where this repository cannot be imported -- spells it out.
+    assert (
+        CHECKPOINT_METRICS_FILENAME
+        == training_report.CHECKPOINT_METRICS_FILENAME
+        == molmobot_checkpoint.TRAINING_METRICS_FILENAME
+    )
+
+    run = tmp_path / "stretch4_pick"
+    _write_metrics(
+        run / "metrics.jsonl",
+        [(step, 0.4 - step * 0.0003, 1.0, 1e-4) for step in range(20, 1001, 20)],
+        val_points=[(500, 0.12), (1000, 0.15)],
+    )
+    for name, step, since in (("step500_bestfit", 500, 0), ("step1000", 1000, 1)):
+        directory = run / name
+        directory.mkdir()
+        (directory / CHECKPOINT_METRICS_FILENAME).write_text(
+            json.dumps(
+                {
+                    "step": step,
+                    "max_steps": 1000,
+                    "kind": "bestfit" if step == 500 else "periodic",
+                    "train": {"loss": 0.1 if step == 500 else 0.05},
+                    "best": {
+                        "metric": "action_flow_loss",
+                        "loss": 0.12,
+                        "step": 500,
+                        "evals_since_improvement": since,
+                    },
+                }
+            )
+        )
+
+    text = training_report.format_run(training_report.read_run(run))
+
+    assert "step500_bestfit" in text and "step1000" in text
+    assert "(saved on an improvement)" in text
+    assert "(1 evals without improvement by then)" in text
+    # The newest checkpoint is not the one to evaluate, and the report says so.
+    assert f"-> evaluate {run / 'step500_bestfit'}" in text
+
+
+def test_training_report_says_when_nothing_was_validated(tmp_path):
+    """A run with no val loss cannot be tuned, and should say so rather than look fine."""
+    from examples.machine_learning.molmospaces.finetuning.training_report import (
+        diagnose,
+        read_run,
+    )
+
+    run = tmp_path / "no_val"
+    _write_metrics(
+        run / "metrics.jsonl", [(step, 0.4 - step * 0.0003, 1.0, 1e-4) for step in range(20, 401, 20)]
+    )
+
+    findings = diagnose(read_run(run))
+    assert any("No validation loss was recorded." == observation for observation, _ in findings)
+
+
+def test_training_report_reads_a_run_that_is_still_going(tmp_path):
+    """The file is appended to while training; a half-written last line is normal."""
+    from examples.machine_learning.molmospaces.finetuning.training_report import read_run
+
+    run = tmp_path / "partial"
+    path = _write_metrics(
+        run / "metrics.jsonl", [(step, 0.4, 1.0, 1e-4) for step in range(20, 201, 20)]
+    )
+    path.write_text(path.read_text() + '{"step": 220, "split": "train", "metr')
+
+    assert read_run(run).steps == 200
+
+
+def test_training_report_orders_a_sweep_by_validation_loss(tmp_path):
+    """What a probe is for: which value won, and by how much."""
+    from examples.machine_learning.molmospaces.finetuning.training_report import (
+        format_comparison,
+        read_run,
+    )
+
+    for name, best in (("lr_3e-5", 0.20), ("lr_1e-4", 0.09), ("lr_3e-4", 0.31)):
+        _write_metrics(
+            tmp_path / name / "metrics.jsonl",
+            [(step, 0.4, 1.0, 1e-4) for step in range(20, 201, 20)],
+            val_points=[(100, best + 0.05), (200, best)],
+        )
+    runs = [read_run(tmp_path / name) for name in ("lr_3e-5", "lr_1e-4", "lr_3e-4")]
+
+    table = format_comparison(runs)
+    rows = [line.split()[0] for line in table.splitlines()[2:5]]
+    assert rows == ["lr_1e-4", "lr_3e-5", "lr_3e-4"]
+
+
+def test_the_plot_names_the_move_groups_the_action_dimensions_belong_to(tmp_path):
+    """`flow_loss_dim_7` means nothing; "wrist" means something."""
+    from examples.machine_learning.molmospaces.finetuning import training_report
+    from examples.machine_learning.molmospaces.policies.molmobot_policy import (
+        STRETCH_ACTION_SPEC,
+    )
+
+    # The report runs under MolmoBot's interpreter, where this repository is not
+    # importable, so it carries its own copy of the layout. It has to be the
+    # same layout, or the panel labels a curve with the wrong joints.
+    assert dict(training_report.MOVE_GROUP_DIMENSIONS) == STRETCH_ACTION_SPEC
+    assert list(dict(training_report.MOVE_GROUP_DIMENSIONS)) == list(STRETCH_ACTION_SPEC)
+
+    assert training_report.move_group_dimensions() == {
+        "base": [0, 1, 2],
+        "lift": [3],
+        "arm": [4],
+        "wrist": [5, 6, 7],
+        "gripper": [8, 9],
+    }
+
+
+def test_smoothing_follows_the_series_without_shortening_it():
+    """The raw flow loss is noisy per step; the eye needs a line, not a cloud."""
+    from examples.machine_learning.molmospaces.finetuning.training_report import smoothed
+
+    points = [(step, 1.0 if step % 2 else 0.0) for step in range(100)]
+    curve = smoothed(points, span=10)
+
+    assert [step for step, _ in curve] == [step for step, _ in points]
+    # The average of an alternating series settles near its mean, and the noise
+    # is gone: no smoothed value sits at either extreme by the end.
+    assert 0.3 < curve[-1][1] < 0.7
+    assert all(0.0 < value < 1.0 for _, value in curve[20:])
+
+
+def test_the_plot_is_written_whole_and_beside_the_metrics(tmp_path):
+    """An image viewer left open on the file must never catch a half-written PNG."""
+    pytest.importorskip("matplotlib")
+
+    from examples.machine_learning.molmospaces.finetuning import training_report
+
+    run = tmp_path / "stretch4_pick"
+    _write_metrics(
+        run / "metrics.jsonl",
+        [(step, 0.4 - step * 0.0003, 1.0, 1e-4) for step in range(20, 401, 20)],
+        val_points=[(100, 0.2), (200, 0.15), (300, 0.14), (400, 0.16)],
+    )
+
+    # A bare --plot puts it beside the metrics, which is where a run in progress
+    # wants it: in the save folder, at a path that does not change.
+    assert training_report.main([str(run), "--plot"]) == 0
+    written = run / "training.png"
+    assert written.is_file()
+    assert written.stat().st_size > 10_000
+    # The temporary it was renamed from is not left behind.
+    assert not list(run.glob(".training.png*"))
+
+
+def test_watching_redraws_when_the_metrics_grow(tmp_path, monkeypatch):
+    """What runs beside a fine-tune: redraw on change, and say what it drew."""
+    pytest.importorskip("matplotlib")
+
+    from examples.machine_learning.molmospaces.finetuning import training_report
+
+    run = tmp_path / "stretch4_pick"
+    _write_metrics(
+        run / "metrics.jsonl",
+        [(step, 0.4 - step * 0.0003, 1.0, 1e-4) for step in range(20, 201, 20)],
+        val_points=[(100, 0.2), (200, 0.15)],
+    )
+    plot = tmp_path / "training.png"
+
+    # One pass, then out: the loop is otherwise deliberately endless.
+    def stop(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(training_report.time, "sleep", stop)
+    assert training_report.watch_plot([run], plot, interval=0.01) == 0
+    assert plot.is_file()
+
+    first = plot.stat().st_mtime_ns
+    _write_metrics(
+        run / "metrics.jsonl",
+        [(step, 0.4 - step * 0.0003, 1.0, 1e-4) for step in range(20, 401, 20)],
+        val_points=[(100, 0.2), (200, 0.15), (300, 0.13), (400, 0.12)],
+    )
+    assert training_report.watch_plot([run], plot, interval=0.01) == 0
+    assert plot.stat().st_mtime_ns != first
+
+
+def _fake_run_script(path):
+    """A run_molmobot.sh with the knobs a probe drives, and nothing else."""
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        'SAVE_FOLDER="${SAVE_FOLDER:-/tmp/checkpoints}"\n'
+        'METRICS="${METRICS:-$SAVE_FOLDER/metrics.jsonl}"\n'
+        'STATS_PATH="${STATS_PATH:-$SAVE_FOLDER/stats.yaml}"\n'
+        'PREPARE="${PREPARE:-on}"\n'
+        'MAX_STEPS="${MAX_STEPS:-10000}"\n'
+        'EVAL_INTERVAL="${EVAL_INTERVAL:-500}"\n'
+        'ACTION_EXPERT_LR="${ACTION_EXPERT_LR:-1e-4}"\n'
+    )
+    return path
+
+
+def test_hparam_probe_writes_one_run_per_value_over_the_real_script(tmp_path):
+    """A probe is the generated script with one variable changed -- not a copy of it."""
+    import subprocess
+
+    from examples.machine_learning.molmospaces.finetuning.hparam_probe import probe_script
+
+    script = _fake_run_script(tmp_path / "run_molmobot.sh")
+    body = probe_script(
+        script=script,
+        variable="ACTION_EXPERT_LR",
+        values=["3e-5", "1e-4"],
+        steps=600,
+        eval_interval=100,
+        output_dir=tmp_path / "probe",
+        report=Path("training_report.py"),
+    )
+    probe = tmp_path / "probe" / "run_probe.sh"
+    probe.parent.mkdir()
+    probe.write_text(body)
+    assert subprocess.run(["bash", "-n", str(probe)], capture_output=True).returncode == 0
+
+    # Each value gets its own save folder and metrics file, or the comparison
+    # would be over one run overwritten twice.
+    assert body.count("ACTION_EXPERT_LR=3e-5") >= 1
+    assert "action_expert_lr_3e-5/metrics.jsonl" in body
+    assert "action_expert_lr_1e-4/metrics.jsonl" in body
+    # The data preparation happens once, not once per value.
+    assert body.count("PREPARE=on") == 1
+    assert body.count("PREPARE=off") == 1
+    assert body.count('STATS_PATH="$SHARED_STATS"') == 2
+    # The preflight questions are about running fewer steps than a real
+    # fine-tune, which is exactly what a probe does on purpose.
+    assert body.count("ASSUME_YES=1") == 2
+    assert "--compare" in body
+
+
+def test_hparam_probe_refuses_a_script_it_cannot_drive(tmp_path):
+    """Setting an environment variable a script does not read is a silent no-op."""
+    from click.testing import CliRunner
+
+    from examples.machine_learning.molmospaces.finetuning.hparam_probe import main
+
+    script = _fake_run_script(tmp_path / "run_molmobot.sh")
+    runner = CliRunner()
+
+    unknown = runner.invoke(main, ["--script", str(script), "--vary", "NOT_A_KNOB"])
+    assert unknown.exit_code != 0
+    assert "NOT_A_KNOB" in unknown.output
+
+    # A script generated before the metrics recording existed: it has the knob
+    # being swept, but nothing to compare the runs with afterwards.
+    (tmp_path / "old.sh").write_text(
+        'SAVE_FOLDER="${SAVE_FOLDER:-/tmp}"\nACTION_EXPERT_LR="${ACTION_EXPERT_LR:-1e-4}"\n'
+    )
+    stale = runner.invoke(main, ["--script", str(tmp_path / "old.sh")])
+    assert stale.exit_code != 0
+    assert "Regenerate it" in stale.output
 
 
 # =============================================================================
@@ -1069,6 +1913,7 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
         write_trainer_config,
     )
     from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
+        METRICS_ENV_VAR,
         PACKAGE_SUBDIR,
         TRAINER_SCRIPT,
         MolmoBotCheckout,
@@ -1150,8 +1995,22 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     assert '--max_duration="$MAX_STEPS"' in body
     assert 'MAX_STEPS="${MAX_STEPS:-1000}"' in body
 
-    # 7. the norm stats stay with the run, not in the shared MolmoBot checkout
-    assert '--stats_path "$SAVE_FOLDER"/synthmanip_norm_stats.yaml' in body
+    # 7. the norm stats stay with the run, not in the shared MolmoBot checkout --
+    #    through a variable, so a sweep over one dataset can share one file
+    assert '--stats_path "$STATS_PATH"' in body
+    assert 'STATS_PATH="${STATS_PATH:-$SAVE_FOLDER/synthmanip_norm_stats.yaml}"' in body
+
+    # 7a-ii. the run records its own metrics, because with W&B off nothing else
+    #        keeps the validation loss, the learning rates or the gradient norms
+    #        -- log_metrics_to_console filters the last two out entirely.
+    assert 'METRICS="${METRICS:-$SAVE_FOLDER/metrics.jsonl}"' in body
+    assert f'export {METRICS_ENV_VAR}="$METRICS"' in body
+    assert '"$PYTHON" "$TRAINING_REPORT" "$METRICS"' in body
+
+    # 7a-iii. and everything a second run over the same data would repeat is
+    #         skippable, which is what makes a sweep cheap
+    assert 'PREPARE="${PREPARE:-on}"' in body
+    assert 'SAVE_FOLDER="${SAVE_FOLDER:-' in body
 
     # 7b. the VRAM knobs are overridable variables at the top, so an OOM is
     #     retuned from the environment rather than by regenerating. An explicit
@@ -1181,7 +2040,9 @@ def test_finetune_writes_a_runnable_molmobot_script(tmp_path):
     # 7d-ii. the freezing tiers reach the trainer as real ft_* dotlist fields,
     #        and the per-component learning rates are exposed. There is no LoRA
     #        flag because MolmoBot has no LoRA -- do not invent one.
-    assert 'TRAINABLE="${TRAINABLE:-action_expert}"' in body
+    # Defaults to `vision`: the ~123 degree distorted head cameras are far enough
+    # from MolmoBot's rectilinear DROID pretraining that the tower has to adapt.
+    assert 'TRAINABLE="${TRAINABLE:-vision}"' in body
     assert "EXTRA_ARGS+=(--ft_vit=True)" in body
     assert "--ft_vit=True --ft_llm=True --ft_connector=True" in body
     assert '--optimizer.action_expert_learning_rate="$ACTION_EXPERT_LR"' in body
@@ -1307,7 +2168,7 @@ def test_generated_script_never_rewarps_an_already_fisheye_camera(tmp_path):
 
     # 2. the wide lens is also the argument for unfreezing the vision tower,
     #    which TRAINABLE=vision does
-    assert 'TRAINABLE="${TRAINABLE:-action_expert}"' in wide
+    assert 'TRAINABLE="${TRAINABLE:-vision}"' in wide
     assert "vision         + the vision tower" in wide
 
     # 3. an all-rectilinear selection gets the opposite advice, and is still
@@ -1556,7 +2417,7 @@ def test_finetune_trains_several_tasks_as_one_mixture(tmp_path):
     # 4b. the mixture gets its own save folder and its own normalisation stats,
     #     so a pick-only run and a pick+pnp run cannot overwrite each other
     assert body.count("checkpoints/stretch4_pick_pnp") >= 1
-    assert '--stats_path "$SAVE_FOLDER"/synthmanip_norm_stats.yaml' in body
+    assert 'STATS_PATH="${STATS_PATH:-$SAVE_FOLDER/synthmanip_norm_stats.yaml}"' in body
 
     # 5. the base checkpoint is downloaded, because the trainer resolves no names
     assert "hf download allenai/MolmoBot-DROID" in body

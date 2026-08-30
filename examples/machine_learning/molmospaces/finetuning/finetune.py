@@ -61,6 +61,7 @@ import json
 import logging
 import re
 import shlex
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -102,8 +103,10 @@ from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     STRETCH_PRESET_NAMES,
     MolmoBotCheckout,
     MolmoBotSetupError,
+    METRICS_ENV_VAR,
     ensure_adamw8bit,
     ensure_checkout,
+    ensure_metrics_log,
     ensure_stretch_presets,
 )
 
@@ -261,6 +264,26 @@ A file in this repository rather than shell generated into the script: it is a
 hundred lines of Python with a regex in it, and that belongs somewhere it can be
 linted, tested and read on its own. Stdlib-only, so running it under MolmoBot's
 virtualenv interpreter costs nothing.
+"""
+
+TRAINING_REPORT = Path(__file__).resolve().parent / "training_report.py"
+"""
+The report over `metrics.jsonl`, run from the generated script when training ends.
+
+Called by path with MolmoBot's own interpreter, like `train_progress.py` and for
+the same reason: the script runs inside the checkout's virtualenv, and neither
+file imports anything this repository provides.
+"""
+
+REPORT_PYTHON = sys.executable
+"""
+The interpreter the *plots* are drawn with: this repository's, not the checkout's.
+
+The text report is stdlib-only and runs under either. Drawing needs matplotlib,
+which MolmoBot's virtualenv does not have and has no reason to -- so the live
+plot is launched with whatever interpreter generated the script, recorded here
+as an absolute path. If that interpreter is gone by the time the script runs,
+the script says so and trains anyway.
 """
 
 MOLMOBOT_OPTIONAL_FLAGS: list[tuple[str, list[str]]] = [
@@ -425,10 +448,11 @@ def prepare_molmospaces_dataset(
         arrange_train_val_split,
         count_trajectories,
         ensure_sensor_data_paths,
+        trajectory_files,
     )
 
     rollout_dir = Path(rollout_dir)
-    if not any(rollout_dir.rglob("trajectories*.h5")):
+    if not trajectory_files(rollout_dir):
         raise click.ClickException(
             f"No house_*/trajectories*.h5 under {rollout_dir}. Generate some with\n"
             "  python -m examples.machine_learning.molmospaces.finetuning.generate_dataset "
@@ -449,7 +473,7 @@ def prepare_molmospaces_dataset(
 
     # Determine video keys (cameras) from the first house's available MP4s
     detected_cameras: list[str] = []
-    first_h5 = next(rollout_dir.rglob("trajectories*.h5"), None)
+    first_h5 = next(iter(trajectory_files(rollout_dir)), None)
     if first_h5 is not None:
         for mp4 in first_h5.parent.glob("episode_00000000_*.mp4"):
             cam_name = mp4.stem.replace("episode_00000000_", "").split("_batch_")[0]
@@ -701,8 +725,12 @@ def trainer_command(
     if trainer == "molmobot":
         selected = camera_names or summary.video_keys or list(DEFAULT_CAMERA_NAMES)
         save_folder = save_folder_ref or str(output_dir / experiment_name(datasets))
+        # In the generated script the path is its own variable, so a sweep over
+        # one dataset can compute the normalisation statistics once and point
+        # every run at them; the printed command (no `$SAVE_FOLDER`) spells the
+        # default out instead, because it has no variables to refer to.
         stats_path = (
-            f"{save_folder}/synthmanip_norm_stats.yaml"
+            '"$STATS_PATH"'
             if save_folder.startswith('"$')
             else str(Path(save_folder) / "synthmanip_norm_stats.yaml")
         )
@@ -1009,8 +1037,14 @@ def _molmobot_script(
         f"PACKAGE={shlex.quote(str(package))}",
         f"SCRIPTS={shlex.quote(str(scripts))}",
         *(f"{name}={shlex.quote(str(d.root.resolve()))}" for name, d in variables),
-        f"SAVE_FOLDER={shlex.quote(str((output_dir / experiment_name(datasets)).resolve()))}",
+        # Overridable so a sweep can point several runs of this one script at
+        # save folders of their own -- see hparam_probe.py.
+        'SAVE_FOLDER="${SAVE_FOLDER:-'
+        + shlex.quote(str((output_dir / experiment_name(datasets)).resolve()))
+        + '}"',
         f"PROGRESS_FILTER={shlex.quote(str(PROGRESS_FILTER))}",
+        f"TRAINING_REPORT={shlex.quote(str(TRAINING_REPORT))}",
+        f"REPORT_PYTHON={shlex.quote(str(REPORT_PYTHON))}",
         'PYTHON="$PACKAGE"/.venv/bin/python',
         'TORCHRUN="$PACKAGE"/.venv/bin/torchrun',
         "",
@@ -1029,16 +1063,26 @@ def _molmobot_script(
         "#    `--extra train` is the extra that carries h5py, which both postprocessing",
         "#    scripts import; decord and tqdm are already core dependencies. This is the",
         "#    step that downloads torch, so it is the slow one.",
+        "#",
+        "#    SYNC=auto runs it only when there is no virtualenv yet. That default is",
+        "#    there to protect a hand-built one: on a 5090 the wheels MolmoBot resolves",
+        "#    have no Blackwell (sm_120) kernels, so the venv gets torch reinstalled",
+        "#    from the cu128 index by hand -- and `uv sync` would put the resolved",
+        "#    version back, silently, costing the GPU. SYNC=on to sync anyway.",
         "# --------------------------------------------------------------------------",
-        'step "Syncing MolmoBot dependencies"',
-        "uv sync --extra train",
-        'if [ "$OPTIMIZER" = adamw8bit ]; then',
-        "    # --no-deps deliberately, and not in MolmoBot's pyproject.toml at all:",
-        "    # resolved as a project dependency, torchao pins torch back to a release",
-        "    # without Blackwell (sm_120) wheels, which silently costs you the GPU.",
-        "    # The 8-bit optimizers are pure PyTorch plus torch.compile, so nothing",
-        "    # torchao's own resolution would add is needed.",
-        "    uv pip install --no-deps torchao",
+        'if [ "$SYNC" = on ] || { [ "$SYNC" = auto ] && [ ! -x "$PYTHON" ]; }; then',
+        '    step "Syncing MolmoBot dependencies"',
+        "    uv sync --extra train",
+        '    if [ "$OPTIMIZER" = adamw8bit ]; then',
+        "        # --no-deps deliberately, and not in MolmoBot's pyproject.toml at all:",
+        "        # resolved as a project dependency, torchao pins torch back to a release",
+        "        # without Blackwell (sm_120) wheels, which silently costs you the GPU.",
+        "        # The 8-bit optimizers are pure PyTorch plus torch.compile, so nothing",
+        "        # torchao's own resolution would add is needed.",
+        "        uv pip install --no-deps torchao",
+        "    fi",
+        'elif [ "$SYNC" = auto ]; then',
+        '    echo "MolmoBot venv already there; not syncing (SYNC=on to sync anyway)."',
         "fi",
         "",
         *_checkpoint_step(base_checkpoint, output_dir),
@@ -1055,8 +1099,10 @@ def _molmobot_script(
         "#    episodes where the target object is not in frame at the first step. Left",
         "#    off here because it discards data, and how much depends on the task.",
         "# --------------------------------------------------------------------------",
+        'if [ "$PREPARE" = on ]; then',
         'step "Validating trajectories"',
         *validate,
+        "fi",
         "",
         "# --------------------------------------------------------------------------",
         "# 4. Per-trajectory statistics, into a `stats` group in each HDF5 plus an",
@@ -1073,8 +1119,10 @@ def _molmobot_script(
         "#    because the min_max path looks the gripper up under joint_pos regardless",
         "#    of the action type, and silently yields nothing when it is absent.",
         "# --------------------------------------------------------------------------",
+        'if [ "$PREPARE" = on ]; then',
         'step "Calculating statistics"',
         *statistics,
+        "fi",
         "",
         "# --------------------------------------------------------------------------",
         "# 5. Train.",
@@ -1208,10 +1256,61 @@ def _molmobot_script(
         "# `set -o pipefail` is on, so a training failure still fails this script even",
         "# though the trainer is no longer the last command in the pipeline. 2>&1",
         "# because the headers go to the logging handler's stream, not stdout.",
+        "# METRICS is read by the recorder molmobot_repo.ensure_metrics_log patched",
+        "# into the trainer: one JSON line per metrics dump, with the numbers the",
+        "# console filters out -- the per-group learning rates and gradient norms, and",
+        "# the validation loss, which otherwise only exists in W&B. Unset it and the",
+        "# recorder returns immediately.",
+        'if [ "$METRICS" != off ]; then',
+        f'    export {METRICS_ENV_VAR}="$METRICS"',
+        '    echo "metrics:      $METRICS"',
+        "fi",
+        "",
+        "# The live plot. Backgrounded, so it redraws while the trainer has the GPU,",
+        "# and killed on the way out however this script ends -- a stray watcher",
+        "# polling a finished run is a confusing thing to find days later.",
+        'if [ "$METRICS" != off ] && [ "$PLOT" != off ]; then',
+        '    if [ -x "$REPORT_PYTHON" ]; then',
+        '        "$REPORT_PYTHON" "$TRAINING_REPORT" "$METRICS" --plot "$PLOT" --watch &',
+        "        PLOT_PID=$!",
+        "        # shellcheck disable=SC2064  -- PLOT_PID is wanted now, not at signal time",
+        "        trap \"kill $PLOT_PID 2>/dev/null || true\" EXIT",
+        '        echo "plot:         $PLOT (redrawn as the run goes)"',
+        "    else",
+        '        echo "plot:         skipped -- no interpreter at $REPORT_PYTHON."',
+        '        echo "              Plots need matplotlib, which MolmoBot\'s venv has no"',
+        '        echo "              reason to carry; re-run finetune.py to regenerate this"',
+        '        echo "              script against the interpreter you have now."',
+        "    fi",
+        "fi",
+        "",
         'if [ "$PROGRESS" = on ]; then',
         f"    {training_command} 2>&1 | \"$PYTHON\" -u \"$PROGRESS_FILTER\"",
         "else",
         f"    {training_command}",
+        "fi",
+        "",
+        "# --------------------------------------------------------------------------",
+        "# 6. What the run did.",
+        "#",
+        "#    Reads the metrics file back and says whether it converged, whether it",
+        "#    overfitted, and whether the learning rates look right -- the questions",
+        "#    that are unanswerable from a scrollback of loss values. Re-runnable at",
+        "#    any time, including while a run is still going.",
+        "# --------------------------------------------------------------------------",
+        "# The watcher stops first: the last evaluation of the run lands after its",
+        "# final redraw, and the report below is what puts it in the picture.",
+        'if [ -n "${PLOT_PID:-}" ]; then',
+        '    kill "$PLOT_PID" 2>/dev/null || true',
+        '    wait "$PLOT_PID" 2>/dev/null || true',
+        "    PLOT_PID=",
+        "fi",
+        'if [ "$METRICS" != off ] && [ -s "$METRICS" ]; then',
+        '    if [ "$PLOT" != off ] && [ -x "$REPORT_PYTHON" ]; then',
+        '        "$REPORT_PYTHON" "$TRAINING_REPORT" "$METRICS" --plot "$PLOT" || true',
+        "    else",
+        '        "$PYTHON" "$TRAINING_REPORT" "$METRICS" || true',
+        "    fi",
         "fi",
         "",
         "# Then score the checkpoint, back in the stretch4_mujoco repo -- natively, with",
@@ -1317,6 +1416,35 @@ def _tuning_block(
         "# progress bar can redraw. Every header costs a host-device sync for the",
         "# metrics behind it, so this is a real (small) throughput trade.",
         'LOG_INTERVAL="${LOG_INTERVAL:-20}"',
+        "",
+        "# PREPARE=off skips the two steps that only depend on the *data* -- the",
+        "# trajectory index and the statistics pass. They are idempotent, so skipping",
+        "# them changes nothing except the minutes they take; it is what makes running",
+        "# this script several times over one dataset cheap, which is what a",
+        "# hyperparameter sweep does.",
+        'PREPARE="${PREPARE:-on}"',
+        "",
+        "# SYNC=auto installs MolmoBot's dependencies only when its virtualenv is",
+        "# missing, so a torch rebuilt by hand for this GPU is not silently replaced by",
+        "# the one MolmoBot resolves. on syncs every run; off never does.",
+        'SYNC="${SYNC:-auto}"',
+        "",
+        "# The normalisation statistics the trainer computes at startup. Inside",
+        "# SAVE_FOLDER by default so two mixtures cannot share one file by accident;",
+        "# point several runs over the *same* data at one path to compute it once.",
+        'STATS_PATH="${STATS_PATH:-$SAVE_FOLDER/synthmanip_norm_stats.yaml}"',
+        "",
+        "# Where the metrics recorder writes, one JSON line per dump; METRICS=off turns",
+        "# it off. training_report.py reads this file -- and so does hparam_probe.py,",
+        "# which is how two runs at different learning rates are compared.",
+        'METRICS="${METRICS:-$SAVE_FOLDER/metrics.jsonl}"',
+        "",
+        "# PLOT is a picture of the run, redrawn every time the metrics file grows --",
+        "# loss, per-move-group action loss, learning rates, gradient norms, throughput.",
+        "# Written to the same path throughout, so an image viewer left open on it",
+        "# follows the run. PLOT=off skips it; it costs a second of CPU per redraw and",
+        "# nothing of the GPU.",
+        'PLOT="${PLOT:-$SAVE_FOLDER/training.png}"',
         "",
         "# PROGRESS=off pipes the trainer straight to the terminal instead of through",
         "# train_progress.py. The filter only passes lines through and appends a bar,",
@@ -1534,9 +1662,29 @@ def _checkpoint_step(base_checkpoint: str, output_dir: Path) -> list[str]:
         "#    MolmoBot's README: untar Molmo2-4B and run launch_scripts/convert_to_",
         "#    unsharded.py, then point CHECKPOINT at the unsharded directory. That is",
         "#    the from-scratch recipe and wants far more data than a fine-tune does.",
+        "#",
+        "#    CHECKPOINT is also how a run continues from weights of your own:",
+        "#",
+        "#      CHECKPOINT=<save folder>/step9500_bestfit \\",
+        "#      SAVE_FOLDER=<save folder>_v2 MAX_STEPS=30000 bash run_molmobot.sh",
+        "#",
+        "#    select_checkpoint takes either shape -- a model.pt or a model_and_optim/ --",
+        "#    and a checkpoint passed this way arrives as initial_model_checkpoint, which",
+        "#    resets the optimizer and the step counter. So the weights carry over and",
+        "#    the run gets one clean schedule over the new MAX_STEPS, instead of the",
+        "#    learning-rate jump a resume into a longer horizon produces. Give it a save",
+        "#    folder of its own, or allow_resume will find the old run's step<N>/ and",
+        "#    resume from that instead.",
         "# --------------------------------------------------------------------------",
-        f"CHECKPOINT={shlex.quote(str(local))}",
-        'if [ ! -e "$CHECKPOINT"/model.pt ]; then',
+        f"CHECKPOINT_DEFAULT={shlex.quote(str(local))}",
+        'CHECKPOINT="${CHECKPOINT:-$CHECKPOINT_DEFAULT}"',
+        'if [ ! -e "$CHECKPOINT"/model.pt ] && [ ! -d "$CHECKPOINT"/model_and_optim ]; then',
+        '    if [ "$CHECKPOINT" != "$CHECKPOINT_DEFAULT" ]; then',
+        "        # Only the default is downloadable; anything else was named by hand,",
+        "        # and filling a mistyped path with a 19GB download helps nobody.",
+        '        echo "No checkpoint at $CHECKPOINT (expected model.pt or model_and_optim/)." >&2',
+        "        exit 1",
+        "    fi",
         f'    step "Downloading {base_checkpoint}"',
         f'    "$PACKAGE"/.venv/bin/hf download {shlex.quote(base_checkpoint)} '
         '--local-dir "$CHECKPOINT"',
@@ -1813,9 +1961,10 @@ def main(
             checkout = ensure_checkout(trainer_repo or DEFAULT_CHECKOUT, clone=clone)
             registered = ensure_stretch_presets(checkout, STRETCH_ACTION_SPEC)
             patched_optimizer = ensure_adamw8bit(checkout)
+            patched_metrics = ensure_metrics_log(checkout)
         except MolmoBotSetupError as e:
             raise click.ClickException(str(e)) from e
-        _print_checkout(checkout, registered, patched_optimizer)
+        _print_checkout(checkout, registered, patched_optimizer, patched_metrics)
 
     script_path = write_launch_script(
         datasets=datasets,
@@ -1889,7 +2038,10 @@ def _warn_about_empty_val_splits(datasets: list[DatasetSummary]) -> None:
 
 
 def _print_checkout(
-    checkout: MolmoBotCheckout, registered: list[str], patched_optimizer: bool = False
+    checkout: MolmoBotCheckout,
+    registered: list[str],
+    patched_optimizer: bool = False,
+    patched_metrics: bool = False,
 ) -> None:
     click.echo("")
     click.secho(
@@ -1910,6 +2062,10 @@ def _print_checkout(
     click.echo(
         f"  optim:   {ADAMW8BIT} "
         f"({'registered in optim.py' if patched_optimizer else 'already there'})"
+    )
+    click.echo(
+        "  metrics: metrics.jsonl "
+        f"({'logging patched into trainer.py' if patched_metrics else 'already there'})"
     )
     click.echo(
         f"  venv:    {checkout.venv_python}"

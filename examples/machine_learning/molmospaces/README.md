@@ -35,6 +35,7 @@ policies/
   checkpoint.py         loading and running a checkpoint, robot-stack agnostic
   bc_policy.py          the trained policy, as a MolmoSpaces InferencePolicy
   molmobot_policy.py    a MolmoBot checkpoint driving Stretch natively
+  molmobot_checkpoint.py what a checkpoint records about how it was trained
 training/               behaviour-clone from scratch -- see training/README.md
   collect.py            rollouts -> training shards, keeping what worked
   dataset.py            the shard format, and the torch-side reader
@@ -331,18 +332,69 @@ translates another robot's joint vector.
 | `allenai/MolmoBot-DROID`, pi0.5 / pi0 DROID, DreamZero | 7 Franka joints + gripper | not runnable as released — fine-tune it first |
 
 ```bash
-# a MolmoBot checkpoint fine-tuned on Stretch's own move groups
+# a MolmoBot checkpoint fine-tuned on Stretch's own move groups. The checkpoint
+# is the step directory -- the one holding config.yaml, not the model_and_optim/
+# inside it, which is where MolmoBot's loader looks by itself.
 python -m examples.machine_learning.molmospaces.run_benchmarks \
-    --policy molmobot --checkpoint /path/to/checkpoint --benchmark pick
+    --policy molmobot \
+    --checkpoint data/stretch_pick/rollouts/molmobot/checkpoints/stretch4_pick/step9500_bestfit \
+    --benchmark pick
 ```
 
-`--policy molmobot` needs MolmoBot importable
-(`git clone https://github.com/allenai/MolmoBot`, then that repo's inner
-`MolmoBot/` directory on `PYTHONPATH`); it is not a dependency here.
 `policies/molmobot_policy.py` supplies Stretch's move-group spec and delegates to
 MolmoBot's own `SynthVLAPolicy`, which already returns an action dict keyed by
 move group — exactly what Stretch's controllers take. See `finetuning/README.md`
 for how to produce such a checkpoint.
+
+**No `PYTHONPATH` to export.** MolmoBot is a clone rather than a dependency, so
+`run_benchmarks.py --policy molmobot` puts `third_party/MolmoBot/MolmoBot` on the
+import path itself — in `sys.path` for this process and the forked rollout
+workers, and in `PYTHONPATH` for the spawned ones
+(`finetuning/molmobot_repo.ensure_importable`). A missing checkout is a message
+at the command line with the `git clone` in it, not an ImportError once per
+worker; `finetune.py` is what clones. What neither can do is install MolmoBot's
+*runtime* dependencies: evaluation runs MolmoSpaces and
+MolmoBot in one interpreter, so `cached_path`, `transformers` and the rest have to
+be in this environment, not in the training venv inside the checkout. The command
+says which are missing, before the benchmark loads:
+
+```bash
+uv pip install -e ".[molmobot]"   # or the packages it names, one by one
+```
+
+**The checkpoint configures the evaluation.** `train_molmobot.py` records its
+whole launch line in the `config.yaml` it saves, so the cameras and the action
+type come off the checkpoint rather than out of a flag — see
+`policies/molmobot_checkpoint.py`. This matters more than it sounds like it
+should: serving a VLA a different camera set, or the same set in a different
+order, raises nothing anywhere. The policy simply acts on a scene it is not
+looking at. Any disagreement with the eval config is logged, and
+`configure_from_checkpoint=False` turns the inference off.
+
+**The checkpoint says what state training was in.** Every checkpoint a Stretch
+fine-tune writes carries a `training_metrics.json` — step, training loss, best
+validation loss and where it happened, learning rates as they had decayed — and
+the evaluation logs it as it loads:
+
+```
+[molmobot] checkpoint saved at step 9,500/10,000, bestfit, train loss 0.02430,
+           best action_flow_loss 0.05910 @ step 9,500, still improving when saved
+```
+
+That last clause is the one that matters when a benchmark scores badly: it
+separates a policy that is bad from a policy that is early. See
+`finetuning/README.md`.
+
+**Relative actions become absolute targets here.** A `joint_pos_rel` checkpoint
+emits deltas, and every Stretch move group is commanded absolutely — the gripper
+has to be, since a relative finger command cannot hold a grasp. The inversion is
+the one MolmoSpaces' own sensor defines, off-by-one and all:
+`LastCommandedRelativeJointPosSensor` records
+`delta[t] = commanded[t] - qpos[t-1]`, differencing against the qpos it saw on
+its *previous* call, so the adapter adds the previous step's measurement rather
+than the current one. Over a real pick episode the difference is up to 0.23 rad
+of lift and 1.17 rad of wrist per step — enough to reach consistently short with
+nothing in the logs to say why.
 
 ### Why a Franka-space model is not simply remapped
 
