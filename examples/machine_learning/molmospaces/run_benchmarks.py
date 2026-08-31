@@ -75,7 +75,7 @@ from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     inference_requirements_message,
     missing_inference_requirements,
 )
-from examples.machine_learning.molmospaces.rerun_viz import install_rerun_eval_hook
+from examples.machine_learning.molmospaces.visualize import install_eval_visualize_hook
 
 log = logging.getLogger(__name__)
 
@@ -275,9 +275,9 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
 @click.option(
     "--visualize",
     is_flag=True,
-    help="Watch the evaluation in MuJoCo's passive viewer, with the same Rerun "
-    "stream data generation shows (target grasp, waypoint plan, IK frames, camera "
-    "feeds). Forces --num-workers 1.",
+    help="Watch the evaluation in MuJoCo's passive viewer, on a free camera aimed "
+    "at the robot, with the same Rerun stream data generation shows (target grasp, "
+    "waypoint plan, IK frames, camera feeds). Forces --num-workers 1.",
 )
 @click.option(
     "--report/--no-report",
@@ -371,11 +371,12 @@ def main(
         if num_workers != 1:
             click.secho("--visualize forces --num-workers 1.", fg="yellow")
             num_workers = 1
-        # Alongside MuJoCo's passive viewer, the same Rerun stream datagen shows:
-        # target grasp, waypoint plan and its progress, the IK frames, camera
-        # feeds. Installed here rather than in `configs.py` because a single
-        # worker runs the rollouts in this very process.
-        install_rerun_eval_hook()
+        # Aims the viewer's free camera at the robot each episode, and streams the
+        # same Rerun view datagen shows: target grasp, waypoint plan and its
+        # progress, the IK frames, camera feeds. Installed here rather than in
+        # `configs.py` because a single worker runs the rollouts in this very
+        # process.
+        install_eval_visualize_hook()
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(output_dir) if output_dir else Path("eval_output") / "stretch4" / timestamp

@@ -128,13 +128,18 @@ class Stretch4BenchmarkEvalConfig(JsonBenchmarkEvalConfig):
 
     end_on_success: bool = True
 
-    # What `--viewer` points the camera at. `setup_viewer` in MolmoSpaces'
-    # rollout pipeline only accepts a fixed MJCF camera here, and without one it
-    # leaves Mujoco's default framing of the whole model -- which for a benchmark
-    # house, loaded in its "ceiling" variant, is a sealed building seen from 70m
-    # away with the robot invisible inside. `Stretch4Robot` mounts this camera on
-    # the base for exactly this purpose; see `_add_chase_camera()`. Swap in
-    # "robot_0/camera_center_link" for the robot's own egocentric view.
+    # Where the passive viewer starts if nothing moves it afterwards. `setup_viewer`
+    # in MolmoSpaces' rollout pipeline only accepts a fixed MJCF camera here, and
+    # without one it leaves Mujoco's default framing of the whole model -- which
+    # for a benchmark house, loaded in its "ceiling" variant, is a sealed building
+    # seen from 70m away with the robot invisible inside. `Stretch4Robot` mounts
+    # this camera on the base for exactly this purpose; see `_add_chase_camera()`.
+    # Swap in "robot_0/camera_center_link" for the robot's own egocentric view.
+    #
+    # `run_benchmarks.py --visualize` then switches to a free camera aimed at the
+    # robot (see `visualize.snap_free_camera_to_robot`), which is the nicer thing
+    # to watch since the mouse still works. This fixed camera is what an
+    # `eval_main.py` run, which installs no such hook, is left with.
     viewer_cam_dict: dict = {"camera": f"{Stretch4RobotConfig().robot_namespace}{CHASE_CAMERA}"}
 
     @property

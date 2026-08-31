@@ -600,10 +600,12 @@ def record_frame(recorder, sim: Stretch4MujocoSimulator, camera_data) -> None:
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
 @click.option(
     "--follow-robot/--no-follow-robot",
-    default=True,
-    help="Point the viewer camera at the robot and keep it there as it drives. On "
-    "by default because a house is large and not centred on the origin, so MuJoCo's "
-    "default framing of the whole scene leaves the robot a few pixels across.",
+    default=False,
+    help="Keep the viewer camera glued to the robot as it drives, instead of the "
+    "default free camera that starts aimed at the robot and then stays wherever you "
+    "put it. Either beats MuJoCo's own default framing of the whole scene, which "
+    "leaves the robot a few pixels across somewhere in a house that is not centred "
+    "on the origin.",
 )
 @click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
 @click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
@@ -673,9 +675,13 @@ def main(
         cameras_to_use=cameras_to_use,
         camera_hz=10.0 if lidar else 30.0,
     )
+    # Free by default, and only aimed at the robot rather than tied to it: a
+    # tracking camera rewrites `lookat` from the robot's position every frame, so
+    # it cannot be panned away and the robot cannot leave the centre of the shot.
     sim.start(
         headless=headless,
         viewer_track_body=STRETCH_ROOT_BODY if follow_robot else None,
+        viewer_look_at_body=None if follow_robot else STRETCH_ROOT_BODY,
     )
 
     if lidar or not opencv:

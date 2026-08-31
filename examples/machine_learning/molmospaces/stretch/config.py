@@ -222,9 +222,9 @@ class Stretch4RobotConfig(BaseRobotConfig):
         # This is the "stow" pose in `keyframes.xml`
         # with base x moved 1m away so the robot spawns a little far away from the workspace.
         "base": [0.0, 0.0, 0.0],
-        "lift": [0.35],
+        "lift": [1.0],
         "arm": [0.0],
-        "wrist": [3.14, -0.4, 0.0],
+        "wrist": [0, 0, 0.0],
         "gripper": [0.0, 0.0],
     }
     init_qpos_noise_range: dict[str, list[float]] | None = None
