@@ -130,6 +130,60 @@ python -m examples.machine_learning.molmospaces.run_benchmarks \
     --benchmark potato --policy molmobot --checkpoint <ckpt>
 ```
 
+### The arguments
+
+`--rollouts` wants the **task directory** — the one holding `house_*/`, which is
+`<output-dir>/rollouts/<task>`. Not the `--output-dir` you handed the generator,
+and not a single house. It is repeatable, so several runs can be pooled into one
+benchmark.
+
+Exactly one destination, and they are mutually exclusive:
+
+- **`--benchmark <key>`** writes to `<assets>/benchmarks/stretch-local/<key>/`,
+  which is where `run_benchmarks.py --benchmark <key>` looks. Only keys
+  registered with `locally_built=True` are offered.
+- **`--output-dir <path>`** writes anywhere. Use it for a scratch build you do
+  not intend to score against.
+
+| flag | when you want it |
+| ---- | ---------------- |
+| `--force` | Required to replace an existing benchmark. Without it you get a refusal, deliberately — changing a benchmark's episodes invalidates every number already recorded against it. |
+| `--limit N` | Cap the size. Handy for cutting a 20-episode smoke benchmark out of a large run. |
+| `--include-failures` | Keep episodes the expert did not solve. Off by default; at a high expert success rate it changes nothing. |
+| `--task-horizon-sec` | Per-episode step budget. Leave at 20 to stay comparable with the released pick benchmarks. |
+
+Two traps worth naming, because the script will do both without erroring:
+
+- **Pointing `--rollouts` at the training run.** `data/stretch_potato` is
+  `--data-split train`; a benchmark built from it scores a fine-tuned policy on
+  the houses it trained in. The builder prints a yellow warning when the episodes
+  it was handed came from `train`, but it cannot know what you trained on, so
+  that warning is the only signal you get. Keep the evaluation run in its own
+  `--output-dir`.
+- **Expecting `--data-split` to change what gets generated.** On *this* script it
+  only overrides the label written into the JSON, for runs whose
+  `experiment_config_*.pkl` is missing. The split is chosen at generation time,
+  in step 1. Do not use it to relabel train episodes as val.
+
+### Checking a build before you trust it
+
+Score the expert on what you just built:
+
+```bash
+python -m examples.machine_learning.molmospaces.run_benchmarks --benchmark potato
+```
+
+`--policy baseline` (the default) is the same simple_ik expert that generated the
+episodes, and every episode in the benchmark is one it solved — so it should come
+back near 100%. Anything much lower means the replay is not reconstructing the
+scene the rollout ran in, which is a benchmark bug rather than a policy result.
+
+It is the check that caught the one real bug here, and nothing else would have:
+the potato benchmark read 0/3 because the eval path rebuilt the added target
+object from the raw asset without the mass correction data generation applies, so
+the potato weighed 20kg on replay and no policy could have lifted it. See
+[added_pickup_repair.py](added_pickup_repair.py).
+
 This works because **every rollout already carries its own initial conditions.**
 `BaseMujocoTask.reset()` calls `MlSpacesExpConfig.freeze_task_config()`, which
 pickles camera extrinsics resolved to fixed values, the robot's start joint
@@ -140,13 +194,6 @@ pose, and the referral expressions — and stores it base64-encoded under
 reconstruction: the poses it writes are the ones the rollout actually ran from.
 Verified: a benchmark built from three episodes the expert solved during
 generation replays at **3/3**.
-
-That check is worth repeating whenever you build a benchmark for a new task,
-because it is the one that catches a scene the replay cannot rebuild faithfully.
-It initially came out 0/3 here: the eval path was reconstructing the added target
-object from the raw asset, without the mass correction data generation applies, so
-the potato weighed 20kg on replay and nothing could lift it. See
-[added_pickup_repair.py](added_pickup_repair.py).
 
 Two things make an episode set a benchmark rather than more training data, and
 only one of them can be enforced here:

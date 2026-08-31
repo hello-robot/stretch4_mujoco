@@ -256,9 +256,9 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     help="Where to write results. Defaults to eval_output/stretch4/<timestamp>.",
 )
 @click.option(
-    "--viewer",
+    "--visualize",
     is_flag=True,
-    help="Watch the evaluation in MuJoCo's passive viewer. Forces --num-workers 1.",
+    help="Watch the evaluation in MuJoCo's passive visualize. Forces --num-workers 1.",
 )
 @click.option(
     "--report/--no-report",
@@ -278,7 +278,7 @@ def main(
     task_horizon_steps: int | None,
     alternate: str | None,
     output_dir: Path | None,
-    viewer: bool,
+    visualize: bool,
     want_report: bool,
     list_only: bool,
 ) -> None:
@@ -350,10 +350,10 @@ def main(
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-    if viewer:
+    if visualize:
         os.environ[VIEWER_ENV_VAR] = "1"
         if num_workers != 1:
-            click.secho("--viewer forces --num-workers 1.", fg="yellow")
+            click.secho("--visualize forces --num-workers 1.", fg="yellow")
             num_workers = 1
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
