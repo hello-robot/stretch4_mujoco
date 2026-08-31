@@ -35,11 +35,27 @@ import datetime
 import json
 import logging
 import os
+import sys
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import click
+
+# MolmoSpaces renders its cameras off-screen, and on Linux `stretch4_mujoco`
+# defaults that to EGL. But an EGL context cannot be *created* while MuJoCo's
+# passive viewer holds a GLFW window open -- `eglMakeCurrent` fails with
+# "Failed to make the EGL context current", and the evaluation loop builds a
+# fresh off-screen context for every scene it loads. GLFW's own backend renders
+# off-screen just as happily and shares the viewer's context, so `--visualize`
+# switches to it. Done here, above the imports, because MuJoCo binds the backend
+# named by MUJOCO_GL when `mujoco` is first imported -- which the imports below
+# trigger, long before `main()` gets to parse the flag.
+if "--visualize" in sys.argv:
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+else:
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 from examples.machine_learning.molmospaces.benchmarks import (
     ALL_BENCHMARK_KEYS,
@@ -345,13 +361,10 @@ def main(
         if missing:
             raise click.UsageError(inference_requirements_message(missing))
 
-    # MolmoSpaces renders off-screen through EGL; without this a headless run
-    # fails inside the camera manager rather than at startup.
-    os.environ.setdefault("MUJOCO_GL", "egl")
-    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-
+    # The GL backend itself is chosen at import time; see the top of this module.
     if visualize:
         os.environ[VIEWER_ENV_VAR] = "1"
+        log.info(f"[visualize] rendering through MUJOCO_GL={os.environ.get('MUJOCO_GL')}")
         if num_workers != 1:
             click.secho("--visualize forces --num-workers 1.", fg="yellow")
             num_workers = 1
