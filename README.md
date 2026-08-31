@@ -105,6 +105,32 @@ uv run examples/robocasa_environment.py
 
 Ignore any warnings.
 
+[MolmoSpaces environments](./examples/molmo_environment.py)
+
+Drive Stretch inside a [MolmoSpaces](https://github.com/allenai/molmospaces) house.
+
+```
+uv pip install -e ".[molmo]"
+uv run python -m examples.molmo_environment --dataset procthor-10k --house-index 0 --keyboard
+```
+
+[MolmoSpaces benchmarks](./examples/machine_learning/molmospaces/README.md)
+
+Score Stretch on the eight MolmoSpaces benchmark evaluations, with a simple ik
+baseline and a behaviour-cloning training pipeline.
+
+```
+uv run python -m examples.machine_learning.molmospaces.run_benchmarks --list
+uv run python -m examples.machine_learning.molmospaces.run_benchmarks --episodes 5 --viewer --report
+```
+
+Run a trained checkpoint in the interactive sim, SPACE to hand over from teleop:
+
+```
+uv run python -m examples.machine_learning.molmospaces.live_policy \
+    --checkpoint checkpoints/stretch_manip.pt --scene default --rerun
+```
+
 ## Writing Code
 
 Use the Stretch4MujocoSimulator class to:

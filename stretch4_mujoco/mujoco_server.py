@@ -504,9 +504,10 @@ class MujocoServer:
         data_proxies: MujocoServerProxies,
         cameras_to_use: list[StretchCameras],
         start_translation: list|None,
-        start_rotation_quat: list|None
+        start_rotation_quat: list|None,
+        viewer_track_body: str|None = None,
     ):
-        server = cls(scene_xml_path, model, stop_mujoco_process_event, data_proxies, start_translation, start_rotation_quat)
+        server = cls(scene_xml_path, model, stop_mujoco_process_event, data_proxies, start_translation, start_rotation_quat, viewer_track_body)
         server.run(
             show_viewer_ui=show_viewer_ui,
             camera_hz=camera_hz,
@@ -520,13 +521,18 @@ class MujocoServer:
         stop_mujoco_process_event: threading.Event,
         data_proxies: MujocoServerProxies,
         start_translation: list|None,
-        start_rotation_quat: list|None
+        start_rotation_quat: list|None,
+        viewer_track_body: str|None = None,
     ):
         """
         Initialize the Simulator handle with a scene
         Args:
             scene_xml_path: str, path to the scene xml file
             model: MjModel, Mujoco model object
+            viewer_track_body: name of a body for the viewer camera to follow, or
+                None to leave the camera at Mujoco's default framing of the whole
+                scene. Only the passive viewer honours this. See
+                MujocoServerPassive._track_body_with_viewer_camera().
         """
         if model is not None and scene_xml_path is not None:
             raise ValueError("You should not provide both a model and a scene_xml_path. Please provide only one.")
@@ -557,6 +563,8 @@ class MujocoServer:
                 break
 
         self._base_in_pos_motion = False
+
+        self.viewer_track_body = viewer_track_body
 
         self._stop_mujoco_process_event = stop_mujoco_process_event
 
