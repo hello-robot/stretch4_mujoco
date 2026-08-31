@@ -77,7 +77,10 @@ from examples.machine_learning.molmospaces.finetuning.lerobot_export import (
     ACTION_SPACES,
     export_lerobot_dataset,
 )
-from examples.machine_learning.molmospaces.rerun_viz import StretchRerunVisualizer
+from examples.machine_learning.molmospaces.visualize import (
+    StretchRerunVisualizer,
+    snap_free_camera_to_robot,
+)
 from molmo_spaces.data_generation.config_registry import get_config_class
 from molmo_spaces.data_generation.pipeline import (
     ParallelRolloutRunner,
@@ -330,42 +333,6 @@ def save_prepared_trajectories(
     except Exception as e:
         worker_logger.error(f"Failed to save trajectory data for {save_dir.name}: {e}")
         traceback.print_exc()
-
-
-def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
-    """Configures MuJoCo passive viewer in free camera mode snapped to the robot."""
-    if viewer is None:
-        return
-    try:
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        viewer.cam.fixedcamid = -1
-
-        robot_pos = None
-        if hasattr(task, "env") and hasattr(task.env, "current_model") and hasattr(task.env, "mj_datas"):
-            m = task.env.current_model
-            d = task.env.mj_datas[task.env.current_batch_index]
-            for candidate in ["robot_0/base_link", "robot_0/base", "base_link", "robot_0/lift_link"]:
-                try:
-                    bid = m.body(candidate).id
-                    robot_pos = d.xpos[bid]
-                    break
-                except Exception:
-                    pass
-
-        if robot_pos is None and hasattr(task, "robot") and task.robot:
-            base_pose = getattr(task.robot, "base_pose", None)
-            if base_pose is not None:
-                robot_pos = base_pose[:3]
-
-        if robot_pos is not None:
-            viewer.cam.lookat[0] = float(robot_pos[0])
-            viewer.cam.lookat[1] = float(robot_pos[1])
-            viewer.cam.lookat[2] = float(robot_pos[2]) + 0.6
-            viewer.cam.distance = 2.5
-            viewer.cam.elevation = -20.0
-            viewer.cam.azimuth = 135.0
-    except Exception as e:
-        log.warning(f"Failed to snap free camera to robot: {e}")
 
 
 def stretch_house_processing_worker(

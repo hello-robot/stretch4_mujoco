@@ -41,7 +41,7 @@ training/               behaviour-clone from scratch -- see training/README.md
   dataset.py            the shard format, and the torch-side reader
   train_bc.py           fit the network, write a checkpoint
 report.py               a finished run -> captioned video, telemetry, summary
-rerun_viz.py            the --visualize Rerun stream, shared by datagen and eval
+visualize.py            what --visualize shows, shared by datagen and eval
 telemetry.py            live Rerun streaming and recording
 live_policy.py          run a checkpoint in the interactive sim
 ```
@@ -512,28 +512,33 @@ Internally it sets `STRETCH_MOLMOSPACES_VIEWER=1`, which the eval config reads -
 `run_evaluation()` builds the config from a class and takes no override, so an
 environment variable is the only injection point it leaves open.
 
+The camera is MuJoCo's **free** camera, aimed at the robot at the start of every
+episode. Framing it at all is not optional: left alone MuJoCo frames the whole
+model, and since benchmark houses load in their **ceiling** variant, that is a
+sealed building photographed from ~70m away with the robot invisible inside it.
+Free rather than tracking or fixed is what keeps the mouse in charge — a tracking
+camera rewrites `lookat` from the robot's position every frame, so it cannot be
+panned away and the robot can never leave the centre of the shot. Press `[` / `]`
+to cycle to the model's own cameras (`Stretch4Robot` mounts a chase camera on the
+base, and there is the robot's egocentric `robot_0/camera_center_link`), Esc to
+come back.
+
+`viewer_cam_dict` on the eval config still names the chase camera, since
+MolmoSpaces' `setup_viewer` will only aim the viewer at a *fixed MJCF camera* and
+that is the best framing available to an `eval_main.py` run, which installs no
+hook of ours. `--visualize` overrides it per episode.
+
 Alongside the viewer it streams the episode to Rerun, exactly as
 `generate_dataset.py --visualize` does: the scene as meshes, the wrist/tool/object
 frames, the target grasp, the waypoint plan with its progress checklist and log,
-and whatever camera images the observation carries. `rerun_viz.py` holds the
-visualizer both paths share. Datagen drives it from its own rollout runner;
-evaluation cannot, since `run_evaluation()` instantiates `JsonEvalRunner` itself,
-so `install_rerun_eval_hook()` wraps that runner's `run_single_rollout` and logs
-from the task's `reset`/`step_chunk` rather than from a second copy of the
-rollout loop.
+and whatever camera images the observation carries.
 
-The view is a chase camera mounted on the robot's base, because MolmoSpaces'
-`setup_viewer` will only aim the viewer at a *fixed MJCF camera*
-(`viewer_cam_dict["camera"]`). Left alone it keeps MuJoCo's default framing of
-the whole model, and since benchmark houses load in their **ceiling** variant,
-that is a sealed building photographed from ~70m away with the robot invisible
-inside it. `Stretch4Robot._add_chase_camera()` mounts the camera; the offset was
-picked by ray-casting to the robot across six episodes, which showed anything
-much beyond a metre behind the robot is inside a wall every time. Roughly one
-episode in six still ends up with something between the camera and the robot;
-press `[` / `]` in the viewer to cycle to another camera, or Esc for the free
-camera. Set `viewer_cam_dict = {"camera": "robot_0/camera_center_link"}` on your
-eval config for the robot's own egocentric view instead.
+`visualize.py` holds both halves — the camera snap and the Rerun visualizer — so
+datagen and evaluation show the same thing. Datagen drives them from its own
+rollout runner; evaluation cannot, since `run_evaluation()` instantiates
+`JsonEvalRunner` itself, so `install_eval_visualize_hook()` wraps that runner's
+`run_single_rollout` and works from the task's `reset`/`step_chunk` rather than
+from a second copy of the rollout loop.
 
 **Export proof of a run.** `report.py` turns MolmoSpaces' raw output — JSON blobs
 in HDF5 and unlabelled per-camera MP4s — into artifacts someone else can look at
@@ -578,8 +583,9 @@ The viewer camera follows the robot rather than framing the whole house — a
 procthor house is ~30m across and not centred on the origin, so MuJoCo's default
 framing leaves the robot a few pixels wide, or off screen. Orbiting and zooming
 still work; the camera keeps a fixed world heading as the base turns.
-`examples/molmo_environment.py` does the same, and takes `--no-follow-robot` if
-you would rather see the whole floorplan.
+`examples/molmo_environment.py` starts from the same problem but solves it with a
+free camera aimed at the robot once, which can then be panned anywhere; pass
+`--follow-robot` there for the tracking camera this uses.
 
 SPACE toggles the policy; while it is off you keep the full keyboard teleop, so
 you can put the robot somewhere interesting and then hand over. `--rerun` opens a

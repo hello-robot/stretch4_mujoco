@@ -1,20 +1,27 @@
 """
-Stream a Stretch rollout to Rerun: meshes, coordinate frames, waypoints, cameras.
+What `--visualize` shows of a Stretch rollout, shared by datagen and evaluation.
 
-`StretchRerunVisualizer` is the shared half of `--visualize`. Data generation
-(`finetuning/generate_dataset.py`) and benchmark evaluation (`run_benchmarks.py`)
-both drive it, so a rollout looks the same whichever produced it. MuJoCo's passive
-viewer shows the scene; this shows what the policy is working from -- the target
-grasp, the waypoint plan and its progress, the frames the IK solves in, and
-whatever camera images the observation carries.
+Two views of the same episode, and both halves are shared so a rollout looks the
+same whichever pipeline produced it -- `finetuning/generate_dataset.py --visualize`
+or `run_benchmarks.py --visualize`:
 
-Datagen drives it directly, from its own `ParallelRolloutRunner` subclass.
+* MuJoCo's passive viewer shows the scene. `snap_free_camera_to_robot()` aims its
+  *free* camera at the robot at the start of each episode, which is the framing
+  worth having: MuJoCo's own default frames the whole model, and a benchmark house
+  loaded in its "ceiling" variant is then a sealed building seen from ~70m away
+  with the robot invisible inside. Free rather than tracking or fixed, so orbiting,
+  panning and zooming all still do what you expect once you take the camera over.
+* `StretchRerunVisualizer` streams what the policy is working from -- the target
+  grasp, the waypoint plan and its progress, the frames the IK solves in, and
+  whatever camera images the observation carries.
+
+Datagen drives both directly, from its own `ParallelRolloutRunner` subclass.
 Evaluation cannot: `run_evaluation()` constructs and runs `JsonEvalRunner` itself
 and takes no `runner_class`, so there is nothing to subclass into the loop.
-`install_rerun_eval_hook()` wraps `JsonEvalRunner.run_single_rollout` instead --
-the same seam `added_pickup_repair` patches on the eval path -- and logs from the
-task's own `reset`/`step_chunk` rather than from a copy of the rollout loop, so it
-inherits upstream changes to that loop instead of drifting from them.
+`install_eval_visualize_hook()` wraps `JsonEvalRunner.run_single_rollout` instead
+-- the same seam `added_pickup_repair` patches on the eval path -- and works from
+the task's own `reset`/`step_chunk` rather than from a copy of the rollout loop, so
+it inherits upstream changes to that loop instead of drifting from them.
 """
 
 from __future__ import annotations
@@ -729,14 +736,62 @@ All waypoints finished execution. Holding final posture/grip.
             log.debug(f"Error logging to Rerun: {e}")
 
 
+def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
+    """Put MuJoCo's passive viewer on a free camera, aimed at the robot.
+
+    Called once per episode, since the framing is only right for the pose the
+    robot resets into. It stays a *free* camera afterwards -- not tracking, not
+    fixed -- so the mouse keeps full control from that starting point, and it does
+    not swing around as the base turns. Press `[` / `]` in the viewer to cycle to
+    the model's own cameras (Stretch mounts a chase camera and its head camera),
+    or Esc to come back here.
+    """
+    if viewer is None:
+        return
+    try:
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        viewer.cam.fixedcamid = -1
+
+        robot_pos = None
+        if hasattr(task, "env") and hasattr(task.env, "current_model") and hasattr(task.env, "mj_datas"):
+            m = task.env.current_model
+            d = task.env.mj_datas[task.env.current_batch_index]
+            for candidate in ["robot_0/base_link", "robot_0/base", "base_link", "robot_0/lift_link"]:
+                try:
+                    bid = m.body(candidate).id
+                    robot_pos = d.xpos[bid]
+                    break
+                except Exception:
+                    pass
+
+        if robot_pos is None and hasattr(task, "robot") and task.robot:
+            base_pose = getattr(task.robot, "base_pose", None)
+            if base_pose is not None:
+                robot_pos = base_pose[:3]
+
+        if robot_pos is not None:
+            viewer.cam.lookat[0] = float(robot_pos[0])
+            viewer.cam.lookat[1] = float(robot_pos[1])
+            viewer.cam.lookat[2] = float(robot_pos[2]) + 0.6
+            viewer.cam.distance = 2.5
+            viewer.cam.elevation = -20.0
+            viewer.cam.azimuth = 135.0
+    except Exception as e:
+        log.warning(f"Failed to snap free camera to robot: {e}")
+
+
 @contextlib.contextmanager
-def _log_every_step(visualizer: StretchRerunVisualizer, task: Any, policy: Any):
-    """Log to Rerun from `task.reset` and `task.step_chunk` for the duration of a rollout.
+def _visualize_rollout(
+    visualizer: StretchRerunVisualizer, task: Any, policy: Any, viewer: Any = None
+):
+    """Drive both views from `task.reset` and `task.step_chunk`, for one rollout.
 
     Shadowing the two methods on the task instance, rather than reimplementing
     `run_single_rollout`, is what keeps this hook thin: the step count, the chunk
     length and the observation are all right here, and the rollout loop upstream
-    stays the one actually running the episode.
+    stays the one actually running the episode. `reset` is also the earliest point
+    at which the robot is standing where the episode wants it, so it is where the
+    viewer camera gets aimed.
     """
     original_reset = task.reset
     original_step_chunk = task.step_chunk
@@ -745,6 +800,7 @@ def _log_every_step(visualizer: StretchRerunVisualizer, task: Any, policy: Any):
     def reset(*args: Any, **kwargs: Any) -> Any:
         result = original_reset(*args, **kwargs)
         observation = result[0] if isinstance(result, tuple) else result
+        snap_free_camera_to_robot(viewer, task)
         visualizer.log_step(0, task, observation, policy=policy)
         return result
 
@@ -767,8 +823,8 @@ def _log_every_step(visualizer: StretchRerunVisualizer, task: Any, policy: Any):
             task.__dict__.pop(name, None)
 
 
-def install_rerun_eval_hook(spawn: bool = True, port: int = 9876) -> None:
-    """Stream every evaluation rollout to Rerun, as datagen's `--visualize` does.
+def install_eval_visualize_hook(spawn: bool = True, port: int = 9876) -> None:
+    """Give evaluation rollouts the same two views datagen's `--visualize` gets.
 
     Idempotent: eval configs are re-imported when MolmoSpaces resolves a
     "module:Class" string, and the workers import them again, so this gets called
@@ -776,7 +832,7 @@ def install_rerun_eval_hook(spawn: bool = True, port: int = 9876) -> None:
     """
     from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
 
-    if getattr(JsonEvalRunner.run_single_rollout, "_stretch_rerun_hook", False):
+    if getattr(JsonEvalRunner.run_single_rollout, "_stretch_visualize_hook", False):
         return
 
     original_run_single_rollout = JsonEvalRunner.run_single_rollout
@@ -788,11 +844,11 @@ def install_rerun_eval_hook(spawn: bool = True, port: int = 9876) -> None:
     @functools.wraps(original_run_single_rollout)
     def run_single_rollout(episode_seed: int, task: Any, policy: Any, **kwargs: Any) -> bool:
         visualizer.start_episode(episode_seed, task, policy=policy)
-        with _log_every_step(visualizer, task, policy):
+        with _visualize_rollout(visualizer, task, policy, viewer=kwargs.get("viewer")):
             return original_run_single_rollout(
                 episode_seed=episode_seed, task=task, policy=policy, **kwargs
             )
 
-    run_single_rollout._stretch_rerun_hook = True
+    run_single_rollout._stretch_visualize_hook = True
     JsonEvalRunner.run_single_rollout = staticmethod(run_single_rollout)
-    log.info(f"[rerun] evaluation rollouts stream to Rerun on port {port}")
+    log.info(f"[visualize] evaluation rollouts stream to Rerun on port {port}")

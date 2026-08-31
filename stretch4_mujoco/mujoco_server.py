@@ -506,8 +506,9 @@ class MujocoServer:
         start_translation: list|None,
         start_rotation_quat: list|None,
         viewer_track_body: str|None = None,
+        viewer_look_at_body: str|None = None,
     ):
-        server = cls(scene_xml_path, model, stop_mujoco_process_event, data_proxies, start_translation, start_rotation_quat, viewer_track_body)
+        server = cls(scene_xml_path, model, stop_mujoco_process_event, data_proxies, start_translation, start_rotation_quat, viewer_track_body, viewer_look_at_body)
         server.run(
             show_viewer_ui=show_viewer_ui,
             camera_hz=camera_hz,
@@ -523,6 +524,7 @@ class MujocoServer:
         start_translation: list|None,
         start_rotation_quat: list|None,
         viewer_track_body: str|None = None,
+        viewer_look_at_body: str|None = None,
     ):
         """
         Initialize the Simulator handle with a scene
@@ -533,6 +535,10 @@ class MujocoServer:
                 None to leave the camera at Mujoco's default framing of the whole
                 scene. Only the passive viewer honours this. See
                 MujocoServerPassive._track_body_with_viewer_camera().
+            viewer_look_at_body: name of a body to aim the viewer's free camera at
+                once, at startup, leaving it free afterwards. Only the passive
+                viewer honours this, and viewer_track_body wins if both are given.
+                See MujocoServerPassive._point_free_camera_at_body().
         """
         if model is not None and scene_xml_path is not None:
             raise ValueError("You should not provide both a model and a scene_xml_path. Please provide only one.")
@@ -565,6 +571,7 @@ class MujocoServer:
         self._base_in_pos_motion = False
 
         self.viewer_track_body = viewer_track_body
+        self.viewer_look_at_body = viewer_look_at_body
 
         self._stop_mujoco_process_event = stop_mujoco_process_event
 

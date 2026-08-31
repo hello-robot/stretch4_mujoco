@@ -119,6 +119,7 @@ class StretchMujocoSimulator:
         headless: bool = False,
         use_passive_viewer: bool = True,
         viewer_track_body: str | None = None,
+        viewer_look_at_body: str | None = None,
     ) -> None:
         """
         Start the simulator
@@ -133,6 +134,11 @@ class StretchMujocoSimulator:
                 across. Only the passive viewer honours it; the managed viewer
                 gives no handle to configure. You can still orbit and zoom
                 normally afterwards.
+            viewer_look_at_body: name of a body to aim the viewer's *free* camera
+                at once, at startup. Same fix as viewer_track_body for the same
+                problem, but the camera then stays where the mouse leaves it
+                instead of following the body -- panning included, which a
+                tracking camera overrides. Ignored if viewer_track_body is set.
         """
         self.is_stop_called = False
 
@@ -165,6 +171,7 @@ class StretchMujocoSimulator:
                 self._start_translation,
                 self._start_rotation_quat,
                 viewer_track_body,
+                viewer_look_at_body,
             ),
             daemon=False,  # We're gonna handle terminating this in stop_mujoco_process()
         )
