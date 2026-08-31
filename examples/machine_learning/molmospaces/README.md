@@ -41,6 +41,7 @@ training/               behaviour-clone from scratch -- see training/README.md
   dataset.py            the shard format, and the torch-side reader
   train_bc.py           fit the network, write a checkpoint
 report.py               a finished run -> captioned video, telemetry, summary
+rerun_viz.py            the --visualize Rerun stream, shared by datagen and eval
 telemetry.py            live Rerun streaming and recording
 live_policy.py          run a checkpoint in the interactive sim
 ```
@@ -498,18 +499,28 @@ it, write the trainer config, print or run the command.
 
 Three different questions, three answers.
 
-**Watch an evaluation as it happens.** `--viewer` launches MuJoCo's passive
+**Watch an evaluation as it happens.** `--visualize` launches MuJoCo's passive
 viewer for each episode:
 
 ```bash
 python -m examples.machine_learning.molmospaces.run_benchmarks \
-    --benchmark pick --episodes 5 --viewer
+    --benchmark pick --episodes 5 --visualize
 ```
 
 It forces single-worker, since eight workers would open eight windows.
 Internally it sets `STRETCH_MOLMOSPACES_VIEWER=1`, which the eval config reads --
 `run_evaluation()` builds the config from a class and takes no override, so an
 environment variable is the only injection point it leaves open.
+
+Alongside the viewer it streams the episode to Rerun, exactly as
+`generate_dataset.py --visualize` does: the scene as meshes, the wrist/tool/object
+frames, the target grasp, the waypoint plan with its progress checklist and log,
+and whatever camera images the observation carries. `rerun_viz.py` holds the
+visualizer both paths share. Datagen drives it from its own rollout runner;
+evaluation cannot, since `run_evaluation()` instantiates `JsonEvalRunner` itself,
+so `install_rerun_eval_hook()` wraps that runner's `run_single_rollout` and logs
+from the task's `reset`/`step_chunk` rather than from a second copy of the
+rollout loop.
 
 The view is a chase camera mounted on the robot's base, because MolmoSpaces'
 `setup_viewer` will only aim the viewer at a *fixed MJCF camera*
