@@ -991,8 +991,16 @@ def write_plot(runs: list[Run], path: Path) -> bool:
                 rates.plot(*_xy(points), linewidth=1.2, label=f"{prefix}{group}")
         for group, points in grad_norms(run).items():
             if points:
-                norms.plot(*_xy(points), linewidth=0.8, alpha=0.4)
-                norms.plot(*_xy(smoothed(points)), linewidth=1.4, label=f"{prefix}{group}")
+                # The raw trace takes the next colour from the cycle and the smoothed
+                # line reuses it, so a faint curve and the bold one drawn over it are
+                # visibly the same group rather than two unrelated colours.
+                raw = norms.plot(*_xy(points), linewidth=0.8, alpha=0.4)
+                norms.plot(
+                    *_xy(smoothed(points)),
+                    color=raw[0].get_color(),
+                    linewidth=1.4,
+                    label=f"{prefix}{group}",
+                )
 
         rate_points = series(run.train, "throughput/device/batches_per_second")
         if rate_points:
