@@ -598,6 +598,8 @@ class MujocoServer:
         print(f"Physics dt: {self.physics_dt}, Control rate: {self.control_rate_hz}Hz, "
               f"Physics steps per control step: {self.physics_steps_per_control_step}")
 
+        self.joint_profiles = self._build_joint_profiles()
+
         signal.signal(signal.SIGTERM, lambda num, h: self.request_to_stop())
         signal.signal(signal.SIGINT, lambda num, h: self.request_to_stop())
 
@@ -608,6 +610,85 @@ class MujocoServer:
         if self.use_diff_drive:
             return config.robot_settings
         return config.robot_settings_se4
+
+    def _build_joint_profiles(self) -> dict[str, TrapezoidalProfile]:
+        """One trapezoidal profile per position actuator with recorded limits.
+
+        MuJoCo has no joint velocity or acceleration limit -- a position actuator
+        chases whatever `ctrl` says as hard as its gains and `forcerange` allow --
+        so a `move_to` written straight into `ctrl` is a step input, and the joint
+        crosses its whole range as fast as the physics will let it. Shaping the
+        setpoint here is what makes a sim move take as long as the same move on
+        hardware; the limits themselves come from `config.robot_settings_se4`,
+        mirrored from stretch_body's `robot_params_SE4.py`.
+
+        Note that the profile ramps the *commanded* position, not the measured
+        one. That matters for the gripper: when the fingers stall on an object
+        the setpoint keeps advancing to the commanded target, so position error
+        -- and with it grip force -- still builds exactly as before.
+
+        Actuators without recorded limits (the wheels, and everything on Stretch
+        3) get no profile and are written through untouched.
+        """
+        profiles: dict[str, TrapezoidalProfile] = {}
+        for i in range(self.mjmodel.nu):
+            name = mujoco._functions.mj_id2name(
+                self.mjmodel, mujoco._enums.mjtObj.mjOBJ_ACTUATOR, i
+            )
+            if not name:
+                continue
+            limits = config.get_actuator_motion_limits(name, settings=self.robot_settings)
+            if limits is None:
+                continue
+            max_vel, max_accel = limits
+            profile = TrapezoidalProfile(max_vel=max_vel, max_accel=max_accel)
+            profile.set_position(float(self.mjdata.ctrl[i]))
+            profiles[name] = profile
+        return profiles
+
+    def _commanded_position(self, actuator_name: str) -> float:
+        """Where the actuator has been *told* to go, profile ramp included.
+
+        Relative commands chain off this rather than off the measured position so
+        that a burst of `move_by`s covers the distance asked for: measured
+        position lags the setpoint by design once the setpoint is rate limited.
+        """
+        profile = self.joint_profiles.get(actuator_name)
+        if profile is not None:
+            return profile.target_pos
+        return float(self.mjdata.actuator(actuator_name).ctrl[0])
+
+    def _set_actuator_position(self, actuator_name: str, pos: float) -> None:
+        """Command an absolute position, rate limited if the actuator has limits."""
+        profile = self.joint_profiles.get(actuator_name)
+        if profile is None:
+            self.mjdata.actuator(actuator_name).ctrl = pos
+        else:
+            profile.set_target_position(pos)
+
+    def _set_actuator_velocity(self, actuator_name: str, vel: float, dt: float) -> None:
+        """Jog an actuator, rate limited if the actuator has limits."""
+        profile = self.joint_profiles.get(actuator_name)
+        if profile is None:
+            current = float(self.mjdata.actuator(actuator_name).ctrl[0])
+            self.mjdata.actuator(actuator_name).ctrl = current + vel * dt
+        else:
+            profile.set_target_velocity(vel)
+
+    def _resync_joint_profiles(self) -> None:
+        """Snap every profile to whatever is in `ctrl` now.
+
+        For the paths that write `mjdata.ctrl` wholesale -- a keyframe -- where
+        the profiles' idea of the setpoint would otherwise be a whole pose stale.
+        """
+        for name, profile in self.joint_profiles.items():
+            profile.set_position(float(self.mjdata.actuator(name).ctrl[0]))
+            profile.current_vel = 0.0
+
+    def _update_joint_profiles(self, dt: float) -> None:
+        """Advance every profile one control interval and write out the setpoints."""
+        for name, profile in self.joint_profiles.items():
+            self.mjdata.actuator(name).ctrl = profile.update(dt)
 
     def update_joint_limits(self):
         limits = {}
@@ -944,6 +1025,10 @@ class MujocoServer:
 
 
 
+        new_status.actuators_in_motion = [
+            name for name, profile in self.joint_profiles.items() if not profile.is_settled
+        ]
+
         new_status.is_self_colliding = False
         for i in range(self.mjdata.ncon):
             contact = self.mjdata.contact[i]
@@ -998,15 +1083,17 @@ class MujocoServer:
                             current_value + pos
                         )
                     else:
-                        current_ctrl_left = self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl[0]
+                        current_ctrl_left = self._commanded_position(
+                            Actuators.gripper_left_finger.name
+                        )
                         current_aperture = self.urdf_angle_radians_to_aperture_angle_radians(current_ctrl_left)
                         target_aperture = current_aperture + pos
                         finger_pos = self.aperture_angle_radians_to_urdf_angle_radians(target_aperture)
-                        self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl = finger_pos
-                        self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl = finger_pos
+                        self._set_actuator_position(Actuators.gripper_left_finger.name, finger_pos)
+                        self._set_actuator_position(Actuators.gripper_right_finger.name, finger_pos)
                 else:
-                    current_value = self.mjdata.actuator(actuator_name).length[0]
-                    self.mjdata.actuator(actuator_name).ctrl = current_value + pos
+                    current_value = self._commanded_position(actuator_name)
+                    self._set_actuator_position(actuator_name, current_value + pos)
 
         # move_to
         for _, command in command_status.move_to.items():
@@ -1025,33 +1112,45 @@ class MujocoServer:
                         self.mjdata.actuator(actuator_name).ctrl = self._to_sim_gripper_range(pos)
                     else:
                         finger_pos = self.aperture_angle_radians_to_urdf_angle_radians(pos)
-                        self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl = finger_pos
-                        self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl = finger_pos
+                        self._set_actuator_position(Actuators.gripper_left_finger.name, finger_pos)
+                        self._set_actuator_position(Actuators.gripper_right_finger.name, finger_pos)
                 else:
-                    self.mjdata.actuator(actuator_name).ctrl = pos
+                    self._set_actuator_position(actuator_name, pos)
 
         # joint_velocities (continuous integration control)
+        #
+        # A zero here is a real command -- "stop" -- rather than a no-op, so that
+        # releasing a jog decelerates through the profile instead of freezing the
+        # setpoint mid-ramp. Entries are removed outright by `set_move_to()` /
+        # `set_move_by()`, which is what hands the joint back to position mode.
         dt = 1.0 / self.control_rate_hz
         for actuator_name, target_vel in list(command_status.joint_velocities.items()):
-            if target_vel != 0.0:
-                if actuator_name == Actuators.gripper.name:
-                    if self.use_diff_drive:
-                        current_ctrl = self._to_real_gripper_range(
-                            self.mjdata.actuator(actuator_name).ctrl[0]
-                        )
-                        self.mjdata.actuator(actuator_name).ctrl = self._to_sim_gripper_range(
-                            current_ctrl + target_vel * dt
-                        )
-                    else:
-                        current_ctrl_left = self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl[0]
-                        current_aperture = self.urdf_angle_radians_to_aperture_angle_radians(current_ctrl_left)
-                        target_aperture = current_aperture + target_vel * dt
-                        finger_pos = self.aperture_angle_radians_to_urdf_angle_radians(target_aperture)
-                        self.mjdata.actuator(Actuators.gripper_left_finger.name).ctrl = finger_pos
-                        self.mjdata.actuator(Actuators.gripper_right_finger.name).ctrl = finger_pos
+            if actuator_name == Actuators.gripper.name:
+                if self.use_diff_drive:
+                    if target_vel == 0.0:
+                        continue
+                    current_ctrl = self._to_real_gripper_range(
+                        self.mjdata.actuator(actuator_name).ctrl[0]
+                    )
+                    self.mjdata.actuator(actuator_name).ctrl = self._to_sim_gripper_range(
+                        current_ctrl + target_vel * dt
+                    )
                 else:
-                    current_ctrl = self.mjdata.actuator(actuator_name).ctrl[0]
-                    self.mjdata.actuator(actuator_name).ctrl = current_ctrl + target_vel * dt
+                    # The jog is given in aperture radians; the fingers are
+                    # commanded in URDF radians, and the two are related by a
+                    # fixed linear map, so the rate scales by the same factor.
+                    aperture_to_finger = self.aperture_angle_radians_to_urdf_angle_radians(
+                        1.0
+                    ) - self.aperture_angle_radians_to_urdf_angle_radians(0.0)
+                    finger_vel = target_vel * aperture_to_finger
+                    self._set_actuator_velocity(
+                        Actuators.gripper_left_finger.name, finger_vel, dt
+                    )
+                    self._set_actuator_velocity(
+                        Actuators.gripper_right_finger.name, finger_vel, dt
+                    )
+            else:
+                self._set_actuator_velocity(actuator_name, target_vel, dt)
 
         # set_base_velocity
         if command_status.base_velocity is not None and command_status.base_velocity.trigger:
@@ -1064,7 +1163,9 @@ class MujocoServer:
             command_status.keyframe.trigger = False
             modified = True
             self.mjdata.ctrl = self.mjmodel.keyframe(command_status.keyframe.name).ctrl
+            self._resync_joint_profiles()
 
+        self._update_joint_profiles(dt)
         self.base_controller.update()
 
         if modified:

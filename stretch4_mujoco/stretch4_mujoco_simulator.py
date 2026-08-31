@@ -194,6 +194,9 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             """Checks movement, returns True if movement is detected."""
             time.sleep(check_interval)
 
+            if self._has_move_in_flight(actuator, self.pull_status()):
+                return True
+
             if actuator in [
                 Actuators.left_wheel_vel,
                 Actuators.right_wheel_vel,
