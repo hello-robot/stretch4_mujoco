@@ -7,78 +7,146 @@ listening to the gamepad's USB dongle, processes them, and makes an easy to
 consume gamepad state available as a dictionary - `GamePadController.get_state()`.
 
 Kept deliberately close to the robot-side file so the two can be diffed. The
-only removals are the `stretch4_body` dependencies (`Device`, `LoopStats` and
-the `/tmp` teleop singleton lock), which have no meaning in simulation.
+removals are the `stretch4_body` dependencies (`Device`, `LoopStats` and the
+`/tmp` teleop singleton lock), which have no meaning in simulation.
+
+The other departure is the input backend. The robot reads the pad straight off
+`/dev/input` with evdev, which only exists on Linux, while the sim is expected
+to run on Linux, macOS and Windows too. This file therefore reads the pad
+through pygame/SDL2 and re-synthesises the evdev-style events it would have
+seen (`ABS_X`, `BTN_SOUTH`, ...), so `update_button_encodings()` and everything
+downstream of it stays the robot's code.
 """
 
-import glob
 import logging
+import math
+import os
 import threading
 import time
 from dataclasses import dataclass
-from select import select
 from typing import Callable
 
-from evdev import InputDevice, ecodes, list_devices
+# SDL only runs its event pump - which is also what refreshes joystick state -
+# once a video subsystem exists, but the sim's window belongs to MuJoCo/GLFW, so
+# ask SDL for the headless "dummy" driver rather than have it open a window of
+# its own. That also keeps the pump off macOS' Cocoa backend, which insists on
+# being pumped from the main thread; `_poll_thread` below is not it.
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# Without an SDL window there is nothing to hold keyboard/controller focus, so
+# ask SDL to keep delivering pad events regardless of which window has it.
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+import pygame
+
+try:  # pragma: no cover - depends on how pygame was built
+    from pygame._sdl2 import controller as sdl2_controller
+except ImportError:  # pragma: no cover
+    sdl2_controller = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
-# --- Utilities to discover a joystick device --------------------------------
-WANTED_KEY_CODES = {
-    ecodes.BTN_SOUTH,
-    ecodes.BTN_EAST,
-    ecodes.BTN_NORTH,
-    ecodes.BTN_WEST,
-    ecodes.BTN_TL,
-    ecodes.BTN_TR,
-    ecodes.BTN_THUMBL,
-    ecodes.BTN_THUMBR,
-    ecodes.BTN_SELECT,
-    ecodes.BTN_START,
-    getattr(ecodes, "BTN_MODE", 0),
-}
-WANTED_ABS_CODES = {
-    ecodes.ABS_X,
-    ecodes.ABS_Y,
-    ecodes.ABS_RX,
-    ecodes.ABS_RY,
-    ecodes.ABS_Z,
-    ecodes.ABS_RZ,
-    ecodes.ABS_HAT0X,
-    ecodes.ABS_HAT0Y,
-}
+# --- SDL2 constants ---------------------------------------------------------
+# SDL_GameControllerButton / SDL_GameControllerAxis values. Spelled out because
+# pygame only re-exports them as `pygame.CONTROLLER_*` on some builds; they are
+# part of SDL2's stable ABI, so hardcoding them is safe.
+SDL_BUTTON_A = 0
+SDL_BUTTON_B = 1
+SDL_BUTTON_X = 2
+SDL_BUTTON_Y = 3
+SDL_BUTTON_BACK = 4
+SDL_BUTTON_GUIDE = 5
+SDL_BUTTON_START = 6
+SDL_BUTTON_LEFTSTICK = 7
+SDL_BUTTON_RIGHTSTICK = 8
+SDL_BUTTON_LEFTSHOULDER = 9
+SDL_BUTTON_RIGHTSHOULDER = 10
+SDL_BUTTON_DPAD_UP = 11
+SDL_BUTTON_DPAD_DOWN = 12
+SDL_BUTTON_DPAD_LEFT = 13
+SDL_BUTTON_DPAD_RIGHT = 14
+
+SDL_AXIS_LEFTX = 0
+SDL_AXIS_LEFTY = 1
+SDL_AXIS_RIGHTX = 2
+SDL_AXIS_RIGHTY = 3
+SDL_AXIS_TRIGGERLEFT = 4
+SDL_AXIS_TRIGGERRIGHT = 5
+
+# --- Event synthesis tuning -------------------------------------------------
+# Scales the normalized [-1, 1] SDL axis onto the 16-bit range `Stick` divides
+# by (`Stick.norm == 2**15`), i.e. the range evdev reported.
+STICK_EVENT_SCALE = 32767
+# Likewise for `Trigger`, whose 8-bit `norm` is what an evdev pad reported.
+TRIGGER_EVENT_SCALE = 255
+# evdev pads come out of a kernel driver that has already been told the stick's
+# resting slop; SDL hands over the raw HID value, which on a used pad can sit a
+# couple of percent off centre forever. The joint commands downstream use a
+# dead zone of 1e-4, so without one here the base would creep on its own.
+STICK_DEADZONE = 0.06
+# Quantize axes before diffing them, so resting jitter doesn't synthesise a
+# stream of events (which `get_state()` would read as "the pad is being used").
+AXIS_QUANTUM = 0.01
 
 
-def is_probable_gamepad(dev: InputDevice) -> bool:
-    caps = dev.capabilities()
-    if ecodes.EV_ABS not in caps or ecodes.EV_KEY not in caps:
-        return False
-    keyset = set(caps.get(ecodes.EV_KEY, []))
-    absset = set(a if isinstance(a, int) else a[0] for a in caps.get(ecodes.EV_ABS, []))
-    # Must have at least one face button and a stick axis
-    return (len(keyset & WANTED_KEY_CODES) >= 1) and (len(absset & WANTED_ABS_CODES) >= 2)
+def ensure_pygame_ready() -> None:
+    """Bring up the pygame subsystems the gamepad needs, once per process."""
+    if not pygame.display.get_init():
+        # Needed for `pygame.event`; see the SDL_VIDEODRIVER note above.
+        pygame.display.init()
+    if not pygame.joystick.get_init():
+        pygame.joystick.init()
+    if sdl2_controller is not None and not sdl2_controller.get_init():
+        sdl2_controller.init()
 
 
-def find_first_gamepad() -> str | None:
-    # Prefer stable by-id symlinks when present
-    for path in sorted(glob.glob("/dev/input/by-id/*-event-joystick")):
+def _normalize_axis(raw: float) -> float:
+    """Put an axis sample on [-1, 1].
+
+    `pygame.joystick.Joystick.get_axis()` already returns a float there, while
+    the SDL game-controller API returns the raw signed 16-bit int, so which one
+    this is has to be told from the sample's *type*: the two ranges overlap at
+    -1, 0 and 1, and a stick resting one count off centre reports exactly that.
+    Reading a raw 1 as a normalized 1.0 would peg the axis at full deflection
+    for as long as it rested there.
+    """
+    value = float(raw)
+    if isinstance(raw, int):
+        value /= 32767.0
+    return max(-1.0, min(1.0, value))
+
+
+def is_probable_gamepad(joystick: "pygame.joystick.Joystick") -> bool:
+    """Heuristic for "this is a gamepad, not a wheel/throttle/3D mouse"."""
+    # Two sticks' worth of axes and at least the four face buttons plus shoulders.
+    return joystick.get_numaxes() >= 4 and joystick.get_numbuttons() >= 6
+
+
+def find_first_gamepad() -> int | None:
+    """Return the pygame joystick index of the first attached gamepad, or None.
+
+    Pads that SDL recognises - i.e. that have an Xbox-style entry in its game
+    controller database - are preferred, since for those SDL normalises the
+    axis/button numbering for us instead of us guessing at the driver's layout.
+    """
+    ensure_pygame_ready()
+    indices = list(range(pygame.joystick.get_count()))
+
+    if sdl2_controller is not None:
+        for index in indices:
+            try:
+                if sdl2_controller.is_controller(index):
+                    return index
+            except Exception:
+                pass
+
+    for index in indices:
         try:
-            dev = InputDevice(path)
-            ok = is_probable_gamepad(dev)
-            dev.close()
+            joystick = pygame.joystick.Joystick(index)
+            ok = is_probable_gamepad(joystick)
+            joystick.quit()
             if ok:
-                return path
-        except Exception:
-            pass
-
-    # Fallback: scan all event devices
-    for path in list_devices():
-        try:
-            dev = InputDevice(path)
-            ok = is_probable_gamepad(dev)
-            dev.close()
-            if ok:
-                return path
+                return index
         except Exception:
             pass
     return None
@@ -94,6 +162,279 @@ class GPEvent:
     code: str
     state: int
     ev_type: str = ""  # not required, but used by the optional print
+
+
+class GamepadSource:
+    """Reads one pad through pygame and reports it as evdev-style `GPEvent`s.
+
+    Subclasses supply `read()`, a snapshot in gamepad terms; this class turns
+    the snapshot into the codes and integer ranges `update_button_encodings()`
+    expects, emitting an event only where a value actually changed - which is
+    what evdev did, and what `GamePadController`'s activity timeout assumes.
+    """
+
+    BUTTON_CODES = {
+        # The Linux names are rotated relative to the Xbox labels: input-event-codes.h
+        # aliases BTN_NORTH to BTN_X and BTN_WEST to BTN_Y, and the mapping below
+        # keeps `update_button_encodings()`'s comments true.
+        "a": "BTN_SOUTH",
+        "b": "BTN_EAST",
+        "x": "BTN_NORTH",
+        "y": "BTN_WEST",
+        "lb": "BTN_TL",
+        "rb": "BTN_TR",
+        "back": "BTN_SELECT",
+        "start": "BTN_START",
+        "guide": "BTN_MODE",
+        "left_stick": "BTN_THUMBL",
+        "right_stick": "BTN_THUMBR",
+    }
+    STICK_CODES = {
+        "left_x": "ABS_X",
+        "left_y": "ABS_Y",
+        "right_x": "ABS_RX",
+        "right_y": "ABS_RY",
+    }
+    TRIGGER_CODES = {"left_trigger": "ABS_Z", "right_trigger": "ABS_RZ"}
+    # `dpad_y` is reported the evdev way round, +1 meaning down.
+    DPAD_CODES = {"dpad_x": "ABS_HAT0X", "dpad_y": "ABS_HAT0Y"}
+
+    def __init__(self, name: str, instance_id: int, stick_deadzone: float = STICK_DEADZONE):
+        self.name = name
+        self.instance_id = instance_id
+        self.stick_deadzone = stick_deadzone
+        self._last: dict[str, int] = {}
+
+    # -- to be provided by the backend --
+    def read(self) -> dict[str, float]:
+        raise NotImplementedError
+
+    def rumble(self, low_frequency: float, high_frequency: float, duration_ms: int) -> bool:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    # -- snapshot -> events --
+    def _apply_deadzone(self, value: float) -> float:
+        if abs(value) <= self.stick_deadzone:
+            return 0.0
+        # Rescale the live part of the travel back onto [-1, 1] so the dead zone
+        # doesn't introduce a step at its edge.
+        scaled = (abs(value) - self.stick_deadzone) / (1.0 - self.stick_deadzone)
+        return math.copysign(min(scaled, 1.0), value)
+
+    def _diff(self, events: list[GPEvent], code: str, state: int, ev_type: str) -> None:
+        if self._last.get(code) == state:
+            return
+        self._last[code] = state
+        events.append(GPEvent(code=code, state=state, ev_type=ev_type))
+
+    def poll(self) -> list[GPEvent]:
+        snapshot = self.read()
+        events: list[GPEvent] = []
+
+        for key, code in self.STICK_CODES.items():
+            value = self._apply_deadzone(snapshot[key])
+            state = int(round(round(value / AXIS_QUANTUM) * AXIS_QUANTUM * STICK_EVENT_SCALE))
+            self._diff(events, code, state, "EV_ABS")
+
+        for key, code in self.TRIGGER_CODES.items():
+            value = max(0.0, min(1.0, snapshot[key]))
+            state = int(round(round(value / AXIS_QUANTUM) * AXIS_QUANTUM * TRIGGER_EVENT_SCALE))
+            self._diff(events, code, state, "EV_ABS")
+
+        for key, code in self.DPAD_CODES.items():
+            self._diff(events, code, int(snapshot[key]), "EV_ABS")
+
+        for key, code in self.BUTTON_CODES.items():
+            self._diff(events, code, int(bool(snapshot[key])), "EV_KEY")
+
+        return events
+
+
+class ControllerSource(GamepadSource):
+    """Backend for a pad SDL has a game-controller mapping for.
+
+    This is the good case: SDL has already normalised the pad onto the Xbox
+    layout, so the axis and button numbers below mean the same thing on every
+    platform and for every pad in its database.
+    """
+
+    def __init__(self, index: int, stick_deadzone: float = STICK_DEADZONE):
+        assert sdl2_controller is not None
+        self._controller = sdl2_controller.Controller(index)
+        joystick = pygame.joystick.Joystick(index)
+        super().__init__(
+            name=joystick.get_name(),
+            instance_id=joystick.get_instance_id(),
+            stick_deadzone=stick_deadzone,
+        )
+        self._joystick = joystick
+
+    def read(self) -> dict[str, float]:
+        controller = self._controller
+
+        def axis(which: int) -> float:
+            return _normalize_axis(controller.get_axis(which))
+
+        def trigger(which: int) -> float:
+            # SDL reports triggers over the positive half of the axis only.
+            return max(0.0, axis(which))
+
+        def button(which: int) -> bool:
+            return bool(controller.get_button(which))
+
+        return {
+            "left_x": axis(SDL_AXIS_LEFTX),
+            "left_y": axis(SDL_AXIS_LEFTY),
+            "right_x": axis(SDL_AXIS_RIGHTX),
+            "right_y": axis(SDL_AXIS_RIGHTY),
+            "left_trigger": trigger(SDL_AXIS_TRIGGERLEFT),
+            "right_trigger": trigger(SDL_AXIS_TRIGGERRIGHT),
+            "a": button(SDL_BUTTON_A),
+            "b": button(SDL_BUTTON_B),
+            "x": button(SDL_BUTTON_X),
+            "y": button(SDL_BUTTON_Y),
+            "lb": button(SDL_BUTTON_LEFTSHOULDER),
+            "rb": button(SDL_BUTTON_RIGHTSHOULDER),
+            "back": button(SDL_BUTTON_BACK),
+            "start": button(SDL_BUTTON_START),
+            "guide": button(SDL_BUTTON_GUIDE),
+            "left_stick": button(SDL_BUTTON_LEFTSTICK),
+            "right_stick": button(SDL_BUTTON_RIGHTSTICK),
+            # The controller API exposes the d-pad as four buttons rather than a hat.
+            "dpad_x": int(button(SDL_BUTTON_DPAD_RIGHT)) - int(button(SDL_BUTTON_DPAD_LEFT)),
+            "dpad_y": int(button(SDL_BUTTON_DPAD_DOWN)) - int(button(SDL_BUTTON_DPAD_UP)),
+        }
+
+    def rumble(self, low_frequency: float, high_frequency: float, duration_ms: int) -> bool:
+        for device in (self._controller, self._joystick):
+            rumble = getattr(device, "rumble", None)
+            if rumble is None:
+                continue
+            try:
+                if rumble(low_frequency, high_frequency, duration_ms):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def close(self) -> None:
+        for device in (self._controller, self._joystick):
+            try:
+                device.quit()
+            except Exception:
+                pass
+
+
+class JoystickSource(GamepadSource):
+    """Fallback backend for a pad SDL has no game-controller mapping for.
+
+    The axis/button numbers are then whatever the platform's driver chose, so
+    all this can do is assume the near-universal XInput ordering. Preferring
+    `ControllerSource` keeps this to genuinely unknown hardware.
+    """
+
+    AXES = {
+        "left_x": 0,
+        "left_y": 1,
+        "left_trigger": 2,
+        "right_x": 3,
+        "right_y": 4,
+        "right_trigger": 5,
+    }
+    BUTTONS = {
+        "a": 0,
+        "b": 1,
+        "x": 2,
+        "y": 3,
+        "lb": 4,
+        "rb": 5,
+        "back": 6,
+        "start": 7,
+        "guide": 8,
+        "left_stick": 9,
+        "right_stick": 10,
+    }
+
+    def __init__(self, index: int, stick_deadzone: float = STICK_DEADZONE):
+        joystick = pygame.joystick.Joystick(index)
+        joystick.init()
+        super().__init__(
+            name=joystick.get_name(),
+            instance_id=joystick.get_instance_id(),
+            stick_deadzone=stick_deadzone,
+        )
+        self._joystick = joystick
+        # Some drivers rest a trigger at -1 and others at 0; see `_trigger()`.
+        self._bipolar_triggers: dict[int, bool] = {}
+
+    def _axis(self, which: int) -> float:
+        if which >= self._joystick.get_numaxes():
+            return 0.0
+        return _normalize_axis(self._joystick.get_axis(which))
+
+    def _trigger(self, which: int) -> float:
+        value = self._axis(which)
+        # A trigger that has ever reported a strongly negative value must span
+        # [-1, 1] rather than [0, 1]. Latching it this way means a pad SDL has
+        # not yet sampled (all axes read 0) corrects itself on the first pull
+        # instead of sitting at half-pulled.
+        if value <= -0.5:
+            self._bipolar_triggers[which] = True
+        if self._bipolar_triggers.get(which):
+            return (value + 1.0) / 2.0
+        return max(0.0, value)
+
+    def _button(self, which: int) -> bool:
+        if which >= self._joystick.get_numbuttons():
+            return False
+        return bool(self._joystick.get_button(which))
+
+    def read(self) -> dict[str, float]:
+        hat_x, hat_y = self._joystick.get_hat(0) if self._joystick.get_numhats() else (0, 0)
+
+        snapshot: dict[str, float] = {
+            "left_x": self._axis(self.AXES["left_x"]),
+            "left_y": self._axis(self.AXES["left_y"]),
+            "right_x": self._axis(self.AXES["right_x"]),
+            "right_y": self._axis(self.AXES["right_y"]),
+            "left_trigger": self._trigger(self.AXES["left_trigger"]),
+            "right_trigger": self._trigger(self.AXES["right_trigger"]),
+            "dpad_x": hat_x,
+            # SDL's hat has +1 up; evdev's ABS_HAT0Y has +1 down.
+            "dpad_y": -hat_y,
+        }
+        for key, index in self.BUTTONS.items():
+            snapshot[key] = self._button(index)
+        return snapshot
+
+    def rumble(self, low_frequency: float, high_frequency: float, duration_ms: int) -> bool:
+        rumble = getattr(self._joystick, "rumble", None)
+        if rumble is None:
+            return False
+        try:
+            return bool(rumble(low_frequency, high_frequency, duration_ms))
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        try:
+            self._joystick.quit()
+        except Exception:
+            pass
+
+
+def open_gamepad(index: int, stick_deadzone: float = STICK_DEADZONE) -> GamepadSource:
+    """Open a pad by pygame joystick index, preferring SDL's controller mapping."""
+    if sdl2_controller is not None:
+        try:
+            if sdl2_controller.is_controller(index):
+                return ControllerSource(index, stick_deadzone=stick_deadzone)
+        except Exception:
+            pass
+    return JoystickSource(index, stick_deadzone=stick_deadzone)
 
 
 class Stick:
@@ -141,19 +482,15 @@ class Trigger:
 class GamePadController:
     """Interface to gamepad controllers.
 
-    Successfully tested with the following controllers:
-        + Xbox One Controller connected using a USB cable (change xbox_one parameter to True
-          for full 10 bit trigger information)
-        + EasySMX wireless controller set to appropriate mode (Xbox 360 mode with upper half
-          of ring LED illuminated - top two LED quarter circle arcs)
-        + JAMSWALL Xbox 360 Wireless Controller
+    Reads the pad through pygame/SDL2, so it works on Linux, macOS and Windows.
+    Any pad in SDL's game controller database (every Xbox/PlayStation-style pad,
+    wired or wireless) is picked up with the correct button layout; anything
+    else falls back to the XInput layout, see `JoystickSource`.
     """
 
     def __init__(self, print_events=False, is_xbox_one=False):
         self.name = "gamepad_controller"
         self.print_events = print_events
-
-        self.rumble_effect_id = -1
 
         self.left_stick = Stick()
         self.right_stick = Stick()
@@ -174,8 +511,11 @@ class GamePadController:
         self.select_button = Button()
         self.start_button = Button()
 
-        self.left_trigger = Trigger(xbox_one=is_xbox_one)
-        self.right_trigger = Trigger(xbox_one=is_xbox_one)
+        # `is_xbox_one` is accepted for parity with the robot-side signature but no
+        # longer selects a trigger resolution: SDL hands over a normalized trigger,
+        # which `GamepadSource` re-scales onto the 8-bit range regardless of pad.
+        self.left_trigger = Trigger(xbox_one=False)
+        self.right_trigger = Trigger(xbox_one=False)
 
         self.left_pad = Button()
         self.right_pad = Button()
@@ -184,8 +524,8 @@ class GamePadController:
 
         self.lock = threading.Lock()
 
-        self.device_path = None
-        self.dev: InputDevice | None = None
+        self.device_path = None  # the pad's SDL name, once one is found
+        self.dev: GamepadSource | None = None
         self.is_gamepad_active = False
 
         self._last_vibrated_tags = {}
@@ -202,6 +542,10 @@ class GamePadController:
         self.thread_shutdown_flag = threading.Event()
 
     def startup(self):
+        # SDL wants its video subsystem brought up on the process' main thread on
+        # macOS, so do it here rather than from `_thread_target`.
+        ensure_pygame_ready()
+
         if self.thread is not None:
             self.thread_shutdown_flag.set()
             self.thread.join(1)
@@ -220,7 +564,14 @@ class GamePadController:
         period = 1.0 / self.thread_rate_hz
         while not self.thread_shutdown_flag.is_set():
             start = time.perf_counter()
-            self.update()
+            try:
+                self.update()
+            except Exception:
+                # Letting this thread die would freeze the pad state at whatever
+                # it last read, and a state frozen mid-deflection reads as a
+                # stick held down forever - i.e. the robot would keep moving.
+                logger.exception("Gamepad polling failed; zeroing the gamepad state.")
+                self.set_zero_state()
             elapsed = time.perf_counter() - start
             if not self.thread_shutdown_flag.is_set() and elapsed < period:
                 time.sleep(period - elapsed)
@@ -230,20 +581,31 @@ class GamePadController:
         if self.thread is not None:
             self.thread.join(1)
             self.thread = None
-        try:
+        if self.dev is not None:
             self.dev.close()
-        except Exception:
-            pass
+            self.dev = None
+
+    def _pump_sdl_events(self) -> None:
+        """Run SDL's event pump, which is what refreshes the pad's state.
+
+        The queue is drained rather than just pumped (`pygame.event.pump()`)
+        because nothing else in the sim consumes SDL events, and an undrained
+        queue eventually fills up and starts dropping the hotplug events below.
+        """
+        for event in pygame.event.get():
+            if event.type == pygame.JOYDEVICEREMOVED and self.dev is not None:
+                if getattr(event, "instance_id", None) == self.dev.instance_id:
+                    raise UnpluggedError("Gamepad disconnected.")
 
     def poll_till_gamepad_dongle_present(self):
         with self.lock:
             self.is_gamepad_active = False
         try:
-            self.device_path = find_first_gamepad()
-            if self.device_path:
-                # Open non-blocking; do NOT grab to allow other readers if needed
-                self.dev = InputDevice(self.device_path)
-                self.rumble_effect_id = -1
+            self._pump_sdl_events()  # picks up hotplugged pads
+            index = find_first_gamepad()
+            if index is not None:
+                self.dev = open_gamepad(index)
+                self.device_path = self.dev.name
                 logger.info(f"Gamepad Dongle FOUND! ({self.dev.name})")
                 with self.lock:
                     self.is_gamepad_active = True
@@ -255,29 +617,12 @@ class GamePadController:
     def get_gamepad_events(self) -> list[GPEvent]:
         if not self.dev:
             raise UnpluggedError("No gamepad found.")
-        # Wait briefly for readiness; 20ms timeout keeps thread responsive
-        r, _, _ = select([self.dev.fd], [], [], 0.02)
-        if not r:
-            return []
-        events = []
+        self._pump_sdl_events()
         try:
-            for ev in self.dev.read():
-                if ev.type not in (ecodes.EV_KEY, ecodes.EV_ABS):
-                    continue
-                code_name = ecodes.bytype[ev.type][ev.code]  # e.g., 'ABS_X', 'BTN_SOUTH'
-                events.append(
-                    GPEvent(
-                        code=code_name,
-                        state=ev.value,
-                        ev_type="EV_KEY" if ev.type == ecodes.EV_KEY else "EV_ABS",
-                    )
-                )
-        except BlockingIOError:
-            pass
-        except OSError:
+            return self.dev.poll()
+        except pygame.error as e:
             # device likely went away
-            raise UnpluggedError("Gamepad disconnected.")
-        return events
+            raise UnpluggedError("Gamepad disconnected.") from e
 
     def update(self):
         if not self.is_gamepad_active:
@@ -289,12 +634,10 @@ class GamePadController:
             if events:
                 self.last_event_ts = time.monotonic()
             self.update_button_encodings(events)
-        except (UnpluggedError, OSError):
+        except (UnpluggedError, OSError, pygame.error):
             logger.error("Gamepad Dongle DISCONNECTED...")
-            try:
+            if self.dev is not None:
                 self.dev.close()
-            except Exception:
-                pass
             self.dev = None
             with self.lock:
                 self.is_gamepad_active = False
@@ -326,28 +669,12 @@ class GamePadController:
         with self.lock:
             if not self.dev:
                 return
-            try:
-                from evdev import ff
-
-                strong = max(0, min(int(strong_magnitude * 65535), 65535))
-                weak = max(0, min(int(weak_magnitude * 65535), 65535))
-
-                rumble = ff.Rumble(strong_magnitude=strong, weak_magnitude=weak)
-                effect_type = ff.EffectType(ff_rumble_effect=rumble)
-
-                effect = ff.Effect(
-                    ecodes.FF_RUMBLE,
-                    self.rumble_effect_id if self.rumble_effect_id != -1 else -1,
-                    0,
-                    ff.Trigger(0, 0),
-                    ff.Replay(int(duration_ms), 0),
-                    effect_type,
-                )
-
-                self.rumble_effect_id = self.dev.upload_effect(effect)
-                self.dev.write(ecodes.EV_FF, self.rumble_effect_id, 1)
-            except Exception:
-                pass
+            # SDL's low/high frequency motors are the strong/weak ones respectively.
+            self.dev.rumble(
+                max(0.0, min(strong_magnitude, 1.0)),
+                max(0.0, min(weak_magnitude, 1.0)),
+                int(duration_ms),
+            )
 
     def vibrate_sequence(
         self,
@@ -405,13 +732,13 @@ class GamePadController:
                 if event.code == "BTN_MODE":
                     self.middle_led_ring_button.update(event.state)
 
-                if "BTN_SOUTH" in list(event.code):  # green A, bottom button
+                if event.code == "BTN_SOUTH":  # green A, bottom button
                     self.bottom_button.update(event.state)
-                if "BTN_WEST" in list(event.code):  # yellow Y, top button
+                if event.code == "BTN_WEST":  # yellow Y, top button
                     self.top_button.update(event.state)
-                if "BTN_NORTH" in list(event.code):  # blue X, left button
+                if event.code == "BTN_NORTH":  # blue X, left button
                     self.left_button.update(event.state)
-                if "BTN_EAST" in list(event.code):  # red B, right button
+                if event.code == "BTN_EAST":  # red B, right button
                     self.right_button.update(event.state)
 
                 if event.code == "BTN_TL":
@@ -721,35 +1048,23 @@ def get_joint_effort(status, joint_type, joint_name=None):
 
 
 def main():
-    import curses
-
     gamepad_controller = GamePadController(print_events=False)
     gamepad_controller.startup()
 
-    def live_view(stdscr, controller):
-        curses.curs_set(0)  # hide cursor
-        prev_state = None
-        controller.set_zero_state()  # allows for some zero state messages to return from get_state()
-        while True:
-            curr_state = controller.get_state()
-            state = curr_state or prev_state
-            stdscr.erase()
-            stdscr.addstr(
-                0,
-                0,
-                f"GAMEPAD CONTROLLER STATE {'- ACTIVE' if curr_state else '- INACTIVE'}",
-                curses.A_BOLD,
-            )
-            for i, (k, v) in enumerate(state.items(), start=2):
-                stdscr.addstr(i, 2, f"{k:30}: {v}")
-            stdscr.refresh()
-            time.sleep(0.05)
-            prev_state = state
-
+    # A plain redraw rather than curses, which does not exist on Windows.
+    prev_state = None
     try:
         while not gamepad_controller.is_gamepad_active:
             time.sleep(0.05)
-        curses.wrapper(live_view, gamepad_controller)
+        gamepad_controller.set_zero_state()  # so get_state() returns some zero states
+        while True:
+            curr_state = gamepad_controller.get_state()
+            state = curr_state or prev_state or {}
+            lines = [f"GAMEPAD CONTROLLER STATE {'- ACTIVE' if curr_state else '- INACTIVE'}", ""]
+            lines += [f"  {k:30}: {v}" for k, v in state.items()]
+            print("\033[H\033[J" + "\n".join(lines), end="\r\n", flush=True)
+            time.sleep(0.05)
+            prev_state = state
     except (KeyboardInterrupt, SystemExit):
         print("Closing gamepad controller...")
         gamepad_controller.stop()

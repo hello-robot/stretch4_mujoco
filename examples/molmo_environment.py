@@ -27,6 +27,7 @@ Usage:
 """
 
 import re
+import time
 from pathlib import Path
 
 import click
@@ -424,7 +425,16 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
 @click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
 @click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
-@click.option("--lidar", is_flag=True, help="Show the lidar point cloud in Rerun")
+@click.option(
+    "--imagery/--no_imagery",
+    default=True,
+    help="Show all the cameras' imagery. On by default; pass --no_imagery to skip rendering them.",
+)
+@click.option(
+    "--lidar/--no_lidar",
+    default=True,
+    help="Show the lidar point cloud in Rerun. On by default; pass --no_lidar to skip it.",
+)
 @click.option(
     "--opencv",
     is_flag=True,
@@ -451,6 +461,7 @@ def main(
     headless: bool,
     keyboard: bool,
     gamepad: bool,
+    imagery: bool,
     lidar: bool,
     opencv: bool,
     show_metrics: bool,
@@ -473,7 +484,7 @@ def main(
 
     rerun_logger = RerunLogger()
 
-    cameras_to_use = Stretch4MujocoSimulator.get_rgb_cameras()
+    cameras_to_use = Stretch4MujocoSimulator.get_rgb_cameras() if imagery else []
 
     sim = Stretch4MujocoSimulator(
         model=model,
@@ -482,7 +493,7 @@ def main(
     )
     sim.start(headless=headless)
 
-    if lidar or not opencv:
+    if lidar or ((imagery or show_metrics) and not opencv):
         # With --opencv the frames go to OpenCV windows, so Rerun shouldn't lay
         # out camera panels that will never receive an image.
         rerun_logger.init_rerun(
@@ -504,17 +515,28 @@ def main(
 
     try:
         while sim.is_running():
-            if opencv:
-                show_camera_feeds_sync(sim, show_metrics)
-            else:
-                camera_data = sim.pull_camera_data()
-                if show_metrics:
-                    status = sim.pull_status()
-                    rerun_logger.update_metrics(
-                        {"physics_fps": status.fps, "camera_fps": camera_data.fps},
-                        message=status.sim_to_real_time_ratio_msg,
-                    )
-                rerun_logger.update_camera_images(camera_data)
+            if not imagery:
+                # `pull_camera_data()` is what paces this loop, so without it the
+                # loop has to pace itself.
+                time.sleep(0.05)
+
+            camera_data = None
+            if imagery:
+                if opencv:
+                    show_camera_feeds_sync(sim, show_metrics)
+                else:
+                    camera_data = sim.pull_camera_data()
+                    rerun_logger.update_camera_images(camera_data)
+
+            if show_metrics and not (imagery and opencv):
+                status = sim.pull_status()
+                metrics = {"physics_fps": status.fps}
+                if camera_data is not None:
+                    metrics["camera_fps"] = camera_data.fps
+                rerun_logger.update_metrics(
+                    metrics, message=status.sim_to_real_time_ratio_msg
+                )
+
             if lidar:
                 rerun_logger.update_pointcloud_viz(sim.pull_lidar_points(), "world/lidar_points")
     except KeyboardInterrupt:
