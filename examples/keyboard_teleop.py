@@ -15,12 +15,16 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 @click.command()
 @click.option("--scene-xml-path", type=str, default=None, help="Path to the scene xml file")
 @click.option("--select_env", is_flag=True, help="Use robocasa environment")
-@click.option("--imagery", is_flag=True, help="Show all the cameras' imagery")
 @click.option(
-    "--lidar",
-    is_flag=True,
+    "--imagery/--no_imagery",
+    default=True,
+    help="Show all the cameras' imagery. On by default; pass --no_imagery to skip rendering them.",
+)
+@click.option(
+    "--lidar/--no_lidar",
+    default=True,
     help="Show the lidar scan: a 3D point cloud in Rerun for Stretch4MujocoSimulator, "
-    "or a 2D scan in Matplotlib for Stretch3.",
+    "or a 2D scan in Matplotlib for Stretch3. On by default; pass --no_lidar to skip it.",
 )
 @click.option(
     "--opencv",

@@ -32,8 +32,6 @@ Lastly, run the simulation:
 uv run launch_sim.py
 ```
 
-> Note: If you see a build error mentioning `evdev` on linux, please run `sudo apt install python3-dev`.
-
 To exit, press `Ctrl+C` in the terminal.
 
 > On MacOS, if `mjpython` fails to locate `libpython3.10.dylib` and `libz.1.dylib`, run these commands:
@@ -73,7 +71,7 @@ uv run examples/keyboard_teleop.py
 
 [Gamepad teleop](./examples/gamepad_teleop.py)
 
-Control Stretch in simulation using any xbox type gamepad (uses xinput)
+Control Stretch in simulation using any xbox type gamepad (read through pygame/SDL2, so it works on Linux, macOS and Windows)
 
 ```
 uv run examples/gamepad_teleop.py

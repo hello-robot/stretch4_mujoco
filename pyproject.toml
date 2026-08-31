@@ -19,7 +19,7 @@ dependencies = [
     "urdf2mjcf>=0.2.39",
     "pin>=4.1.0",
     "coal>=3.0.3",
-    "evdev>=1.9.3",
+    "pygame>=2.5.0",
     "hello-robot-stretch4-flying-gripper>=2026.7.2",
 ]
 authors = [
