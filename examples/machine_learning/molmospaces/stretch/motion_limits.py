@@ -16,11 +16,15 @@ which are mirrored from stretch_body's `robot_params_SE4.py`. Because
 rather than once per policy step, the shaping happens at 500Hz and a single
 policy action is spread over the ~33 control steps inside its 66ms tick.
 
-The shaper is `SetpointRateLimiter` rather than the `TrapezoidalProfile` the
-standalone simulator uses, and the difference matters: a controller here reissues
-an absolute target every control step, so a profile that plans to a stop at its
-current goal brakes into each of those samples instead of travelling through
-them. See `SetpointRateLimiter`'s docstring for what that does to the gripper.
+The shaper is `TrapezoidalSetpointLimiter`, the same trapezoid the standalone
+simulator uses, applied per move group. It decelerates into its goal rather than
+stopping dead on arrival, which is not optional on this robot: the wrist
+actuators carry no velocity feedback, so a setpoint that halts abruptly leaves
+the joint to swing 57 degrees past it and ring. See that class's docstring for
+the measurements.
+
+The one joint this does not suit is the gripper, for a reason particular to how
+finger commands are built rather than to the shaper -- see MOVE_GROUP_ACTUATORS.
 
 Policies see this as latency, not as a wall: they are closed loop against the
 observed joint state, so a waypoint simply takes more steps to converge, and
@@ -34,7 +38,7 @@ import numpy as np
 from molmo_spaces.controllers.abstract import AbstractPositionController
 from molmo_spaces.robots.robot_views.abstract import MoveGroup
 from stretch4_mujoco import config
-from stretch4_mujoco.trapezoidal_profile import SetpointRateLimiter
+from stretch4_mujoco.trapezoidal_profile import TrapezoidalSetpointLimiter
 
 # The MJCF actuator behind each element of a move group's command vector, in the
 # order `Stretch4RobotView` builds the group. The base is handled separately: its
@@ -146,7 +150,7 @@ class RateLimitedPositionController(AbstractPositionController):
         self._controller = controller
         super().__init__(controller.robot_move_group)
         self._ctrl_dt = ctrl_dt
-        self._limiter = SetpointRateLimiter(max_vel, max_accel, angular)
+        self._limiter = TrapezoidalSetpointLimiter(max_vel, max_accel, angular)
         self._was_stationary = True
         self.reset()
 
@@ -210,9 +214,6 @@ def rate_limited(
     profile: str = config.DEFAULT_MOTION_PROFILE,
 ) -> AbstractPositionController:
     """`controller`, wrapped if `move_group_id` has recorded limits."""
-    import os
-    if os.environ.get("STRETCH_DISABLE_RATE_LIMITS") == "1":
-        return controller
     limits = move_group_limits(move_group_id, profile)
     if limits is None:
         return controller

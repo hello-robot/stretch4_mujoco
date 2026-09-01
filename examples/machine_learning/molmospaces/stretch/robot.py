@@ -19,13 +19,15 @@ robots (`robots/mobile_franka.py`, and RBY1 under `use_holo_base`), the robot is
 hung off three *virtual* holonomic joints -- two slides and a hinge -- driven by
 position actuators.
 
-The real wheels stay in the model, visually and inertially, but never touch
-anything: Stretch's wheel geoms use `contype=6 conaffinity=4`, which does not
-match the `contype=1 conaffinity=1` of a MolmoSpaces floor, so they only ever
-collided through the explicit `<pair>` elements in `models/stretch_4/contact.xml`
-that `_prepare_robot_spec()` removes. With the pairs gone the wheels are inert
-and the base slides on its holonomic joints; the lowest remaining collision geom
-(`base_link_collision`) clears the floor by ~8cm.
+The real wheels stay in the model, visually and inertially, but are made not to
+touch anything: `_prepare_robot_spec()` clears their `contype`/`conaffinity`
+outright. Removing the explicit `<pair>` elements in
+`models/stretch_4/contact.xml` is not enough on its own -- a procthor-objaverse
+floor geom is `contype=8 conaffinity=15` against the wheels' `contype=6`, and
+`6 & 15` is non-zero, so the two collide through the default mechanism as well.
+With the wheels inert the base slides on its holonomic joints and the lowest
+remaining collision geom, `base_link_collision`, clears the floor by ~2.8cm --
+the same clearance it has on the standalone robot once that has settled.
 """
 
 import logging
@@ -222,10 +224,12 @@ class Stretch4Robot(Robot):
            the freejoint gone the robot is held wherever it is put, so that
            offset stops being a spawn margin and becomes permanent daylight --
            see `_drop_freejoint_spawn_height`.
-        3. The omniwheel `<pair>` elements. They name a geom called "floor" that
-           a MolmoSpaces house need not contain, which is a hard compile error,
-           and with the holonomic base there is nothing for them to do -- see the
-           module docstring.
+        3. The omniwheel contacts, both the explicit `<pair>` elements and the
+           geoms' own `contype`/`conaffinity`. The pairs name a geom called
+           "floor" that a MolmoSpaces house need not contain, which is a hard
+           compile error; the contype/conaffinity has to go too, or the wheels
+           collide with house floors through the default mechanism -- see
+           `_disable_omniwheel_contacts`.
         4. The keyframes. Their `ctrl` vectors are sized for the standalone
            model's 10 actuators; this scene will have more (three base actuators,
            plus whatever articulated furniture the house brings). MuJoCo warns
@@ -244,6 +248,8 @@ class Stretch4Robot(Robot):
         for pair in list(robot_spec.pairs):
             robot_spec.delete(pair)
 
+        cls._disable_omniwheel_contacts(robot_spec)
+
         # Keyframes stay "pending" -- invisible to `spec.keys` and undeletable --
         # until a compile resolves them, so the throwaway compile below is what
         # makes the deletion possible. It has to come after the pairs are gone,
@@ -260,6 +266,38 @@ class Stretch4Robot(Robot):
         # MuJoCo then refuses to read. Renaming is cosmetic -- elements hold a
         # pointer to their default, not its name.
         robot_spec.default.name = "stretch_main"
+
+    @staticmethod
+    def _disable_omniwheel_contacts(robot_spec: MjSpec) -> None:
+        """Stop the wheels colliding with anything. The holonomic base carries the robot.
+
+        The wheels are along for the ride here: the base is driven by three
+        virtual joints, and a wheel that can push against the world only fights
+        them. Deleting the `<pair>` elements does not achieve that on its own,
+        because `contype`/`conaffinity` still admit the default pairing -- the
+        omniwheel capsules are `contype=6 conaffinity=4` and a
+        procthor-objaverse floor is `contype=8 conaffinity=15`, and MuJoCo pairs
+        two geoms when either `contype & conaffinity` is non-zero, which `6 & 15`
+        is.
+
+        That went unnoticed while the robot hung 5.65cm in the air (see
+        `_drop_freejoint_spawn_height`) because the wheels never reached the
+        floor. Sitting the robot down put them in contact on every step, and
+        `MolmoSpaces`'s placement check reads those contacts as the robot being
+        stuck in the scenery: it excuses floor contact by looking for "floor" in
+        the *root body* name, and a house floor's root body is "world". Every
+        candidate base pose was rejected, and episodes died with
+        "[PLACE_ROBOT_NEAR] Failed after 10 attempts".
+        """
+        for geom_name in OMNIWHEEL_GEOMS:
+            geom = robot_spec.geom(geom_name)
+            if geom is None:
+                raise ValueError(
+                    f"Omniwheel geom '{geom_name}' not found in the Stretch MJCF; "
+                    "models/stretch_4/mjcf_generator.py is expected to emit it."
+                )
+            geom.contype = 0
+            geom.conaffinity = 0
 
     @staticmethod
     def _drop_freejoint_spawn_height(compiled: mujoco.MjModel, root: mujoco.MjsBody) -> None:

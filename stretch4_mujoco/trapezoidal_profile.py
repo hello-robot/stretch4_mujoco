@@ -138,99 +138,88 @@ class TrapezoidalProfile:
         self.target_pos = pos
 
 
-class SetpointRateLimiter:
-    """Caps how fast, and how hard, a *stream* of position setpoints may move.
+class TrapezoidalSetpointLimiter:
+    """Shapes a *stream* of position setpoints so they respect vel/accel limits.
 
-    For callers that re-issue an absolute target every step -- MolmoSpaces'
-    controllers, which recompute one per control interval -- rather than the
-    discrete goals `TrapezoidalProfile` is built for. The two cannot be swapped:
-    a trapezoid plans to a full stop at whatever goal it currently has, so when
-    the goal is a sample a few millimetres ahead it brakes into that sample, and
-    a policy that derives its next target from the *measured* joint position (as
-    the simple_ik expert's grasp controller does, at `measured + 0.03 rad` a
-    step) never gets moving at all -- measured position and setpoint chase each
-    other and the fingers crawl shut over hundreds of steps instead of the
-    hardware's 1.2s.
+    A vector wrapper over `TrapezoidalProfile` in position mode, for callers that
+    reissue an absolute target every control step -- MolmoSpaces' controllers --
+    rather than handing over one discrete goal at a time.
 
-    So this bounds the two things that were actually wrong -- top speed and how
-    hard the setpoint may be made to speed up -- and leaves slowing down free:
+    It decelerates into the goal, and that matters more than it sounds. The
+    obvious cheaper shaper -- cap the speed, cap how fast it may speed up, let it
+    stop dead on arrival -- is wrong here, because Stretch's wrist actuators are
+    `gainprm=[20, 0, 0] biasprm=[0, -20, 0]`: kp only, *no velocity feedback*. The
+    only thing damping the joint is `damping="2"` on the joint itself, so a
+    setpoint that stops dead leaves the wrist to carry its own momentum through
+    the target. Measured on the compiled model, driving wrist yaw 1.5 rad:
 
-        |v| <= max_vel,  d|v|/dt <= max_accel while speeding up
+        step ctrl (unshaped)   peak 11.9 rad/s, no overshoot,      settles 0.50s
+        stop-dead rate limit   peak  3.9 rad/s, 0.99 rad (57deg!), settles 2.99s
+        this, decelerating     peak  2.8 rad/s, no overshoot,      settles 1.13s
 
-    Deceleration is unbounded, which shows up only at the end of a long move,
-    where the setpoint lands on its goal rather than easing into it. The joint
-    itself still decelerates under its own gains and `forcerange`, and the
-    distance involved is one control interval's travel -- against the full-range
-    step input this replaces, which is what made the joints too fast to begin
-    with.
+    The middle row is a joint visibly swinging past where it was sent and ringing
+    back -- slower than before by the numbers, and much worse to watch.
 
     Args:
         max_vel: per-joint velocity limit.
-        max_accel: per-joint limit on how fast the setpoint may speed up.
+        max_accel: per-joint acceleration limit.
         angular: per-joint flag marking a continuous revolute DOF. Targets for
             those are unwrapped onto the revolution the setpoint is currently on
             before the error is taken, so a target the far side of +-pi is chased
-            the short way round.
+            the short way round. Only ever the base yaw here -- the wrist joints
+            are range-limited hinges whose travel exceeds pi, so wrapping them
+            would fold a legitimate target back on itself.
     """
 
     def __init__(self, max_vel, max_accel, angular=None) -> None:
-        self._max_vel = np.atleast_1d(np.asarray(max_vel, dtype=float))
-        self._max_accel = np.atleast_1d(np.asarray(max_accel, dtype=float))
-        if self._max_vel.shape != self._max_accel.shape:
+        max_vel = np.atleast_1d(np.asarray(max_vel, dtype=float))
+        max_accel = np.atleast_1d(np.asarray(max_accel, dtype=float))
+        if max_vel.shape != max_accel.shape:
             raise ValueError(
-                f"max_vel {self._max_vel.shape} and max_accel "
-                f"{self._max_accel.shape} must match."
+                f"max_vel {max_vel.shape} and max_accel {max_accel.shape} must match."
             )
 
+        self._profiles = [
+            TrapezoidalProfile(max_vel=v, max_accel=a)
+            for v, a in zip(max_vel, max_accel, strict=True)
+        ]
         if angular is None:
-            self._angular = np.zeros(self._max_vel.shape, dtype=bool)
+            self._angular = np.zeros(max_vel.shape, dtype=bool)
         else:
             self._angular = np.atleast_1d(np.asarray(angular, dtype=bool))
-            if self._angular.shape != self._max_vel.shape:
+            if self._angular.shape != max_vel.shape:
                 raise ValueError(
-                    f"angular {self._angular.shape} must match "
-                    f"max_vel {self._max_vel.shape}."
+                    f"angular {self._angular.shape} must match max_vel {max_vel.shape}."
                 )
 
-        self._position = np.zeros(self._max_vel.shape)
-        self._velocity = np.zeros(self._max_vel.shape)
-
     def __len__(self) -> int:
-        return len(self._position)
+        return len(self._profiles)
 
     @property
     def position(self) -> np.ndarray:
         """The setpoint as it currently stands."""
-        return self._position.copy()
+        return np.array([p.current_pos for p in self._profiles])
 
     def reset(self, position) -> None:
         """Jump the setpoint to `position` and stop, with no ramp."""
-        self._position = np.atleast_1d(np.asarray(position, dtype=float)).copy()
-        self._velocity = np.zeros_like(self._position)
+        for profile, value in zip(
+            self._profiles, np.atleast_1d(np.asarray(position, dtype=float)), strict=True
+        ):
+            profile.set_position(float(value))
+            profile.current_vel = 0.0
 
     def step(self, target, dt: float) -> np.ndarray:
         """Advance the setpoint one control interval towards `target`."""
         target = np.atleast_1d(np.asarray(target, dtype=float))
-
-        error = target - self._position
-        error = np.where(self._angular, _wrap_to_pi_array(error), error)
-
-        # The velocity that would land on the target this step, capped.
-        desired = np.clip(error / dt, -self._max_vel, self._max_vel)
-
-        # Slowing down is free; speeding up, and reversing through zero, are not.
-        slowing = (desired * self._velocity > 0) & (np.abs(desired) <= np.abs(self._velocity))
-        ramped = self._velocity + np.clip(
-            desired - self._velocity, -self._max_accel * dt, self._max_accel * dt
-        )
-        self._velocity = np.where(slowing, desired, ramped)
-
-        # `desired` already cannot carry us past the target, and the ramp only
-        # ever gives a velocity between the old one and `desired`, so this
-        # advances at most to the target.
-        self._position = self._position + self._velocity * dt
-        return self._position.copy()
+        shaped = np.empty(len(self._profiles))
+        for i, profile in enumerate(self._profiles):
+            goal = float(target[i])
+            if self._angular[i]:
+                goal = profile.current_pos + _wrap_to_pi(goal - profile.current_pos)
+            profile.set_target_position(goal)
+            shaped[i] = profile.update(dt)
+        return shaped
 
 
-def _wrap_to_pi_array(angle: np.ndarray) -> np.ndarray:
+def _wrap_to_pi(angle: float) -> float:
     return (angle + math.pi) % (2 * math.pi) - math.pi
