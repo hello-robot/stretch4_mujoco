@@ -238,7 +238,7 @@ FISHEYE_CAMERA_NAMES = frozenset({"head_camera_left", "head_camera_right"})
 The Stretch cameras whose frames are already barrel-distorted when recorded.
 
 `stretch/config.py` gives these two a ~123 degree field of view and installs
-`install_fisheye_distortion_hook()`, which runs
+`install_stretch_camera_hooks()`, which runs
 `StretchCameras.cam_nav_rgb_se4_{left,right}.post_processing_callback` -- the
 `_distort` function -- on every rendered frame before the MP4 is written. So the
 wide-angle geometry is baked into the dataset, not something a trainer has to

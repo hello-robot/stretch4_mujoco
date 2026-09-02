@@ -183,15 +183,35 @@ class StretchCameras(Enum):
                         return utils.apply_fisheye_distortion(
                             render, fx, fy, cx, cy, distortion_params, fov_deg=fov_deg
                         )
-                    scale = h / float(sensor_h)
-                    cx_scaled = w / 2.0
-                    cy_scaled = h / 2.0
+                    scale_x = w / float(sensor_w)
+                    scale_y = h / float(sensor_h)
+                    if abs(scale_x - scale_y) < 1e-3 * scale_y:
+                        # The frame is a straight scaling of the sensor, so the
+                        # calibration scales with it. Carrying the real optical
+                        # centre across matters: it sits ~20px off centre
+                        # horizontally on these lenses, and re-centring it warps
+                        # a downscaled frame differently from the
+                        # full-resolution one the simulator distorts.
+                        return utils.apply_fisheye_distortion(
+                            render,
+                            fx * scale_x,
+                            fy * scale_y,
+                            cx * scale_x,
+                            cy * scale_y,
+                            distortion_params,
+                            fov_deg=fov_deg,
+                        )
+                    # A frame that is not this camera's shape has no meaningful
+                    # principal point, so fall back to a centred approximation
+                    # rather than projecting the calibration somewhere it does
+                    # not belong. Nothing in the simulation or datagen paths
+                    # takes this branch; a hand-fed test image does.
                     return utils.apply_fisheye_distortion(
                         render,
-                        fx * scale,
-                        fy * scale,
-                        cx_scaled,
-                        cy_scaled,
+                        fx * scale_y,
+                        fy * scale_y,
+                        w / 2.0,
+                        h / 2.0,
                         distortion_params,
                         fov_deg=fov_deg,
                     )

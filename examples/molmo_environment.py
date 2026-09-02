@@ -496,12 +496,20 @@ def record_frame(recorder, sim: Stretch4MujocoSimulator, camera_data) -> None:
         pose7_from_matrix,
         qpos_from_status,
     )
+    from examples.machine_learning.molmospaces.hdf5_layout import match_trained_frame
 
     if camera_data is None:
         return
-    frames = camera_data.get_all()
+    # RGB, because `LiveDatasetRecorder` converts to BGR itself on the way into
+    # the video writer -- taking `get_all()`'s default here would swap the
+    # channels twice and store red and blue the wrong way round relative to a
+    # generated dataset. The resize matches the frame sizes datagen writes.
+    frames = camera_data.get_all(auto_correct_rgb=False)
     cameras = camera_frames_for(recorder.camera_names)
-    images = {name: frames.get(camera) for name, camera in cameras.items()}
+    images = {
+        name: match_trained_frame(camera, frames.get(camera))
+        for name, camera in cameras.items()
+    }
 
     status = sim.pull_status()
     base_pose = np.eye(4)

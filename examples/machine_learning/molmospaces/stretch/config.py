@@ -15,6 +15,9 @@ config points `robot_dir`/`robot_xml_path` at whatever
 
 import atexit
 import fcntl
+import functools
+import logging
+import math
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -25,12 +28,18 @@ from typing import Any
 import numpy as np
 from mujoco import MjData
 
+from examples.machine_learning.molmospaces.hdf5_layout import (
+    MACROBLOCK,
+    camera_output_size,
+    camera_render_size,
+)
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot
 from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
 from molmo_spaces.configs.camera_configs import CameraSystemConfig, MjcfCameraConfig
 from molmo_spaces.configs.robot_configs import BaseRobotConfig
 from molmo_spaces.robots.abstract import Robot
 from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
+from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
 # Names of the Stretch MJCF cameras this integration exposes to policies.
 HEAD_CAMERA = "head_camera"
@@ -54,11 +63,132 @@ HEAD_CAMERA_LEFT_MJCF_NAME = "camera_left_link"
 HEAD_CAMERA_RIGHT_MJCF_NAME = "camera_right_link"
 CHASE_CAMERA_MJCF_NAME = "chase_camera"
 
+MJCF_NAME_FOR_CAMERA: dict[str, str] = {
+    HEAD_CAMERA: HEAD_CAMERA_MJCF_NAME,
+    HEAD_CAMERA_LEFT: HEAD_CAMERA_LEFT_MJCF_NAME,
+    HEAD_CAMERA_RIGHT: HEAD_CAMERA_RIGHT_MJCF_NAME,
+    WRIST_CAMERA_LEFT: WRIST_LEFT_CAMERA_MJCF_NAME,
+    WRIST_CAMERA_RIGHT: WRIST_RIGHT_CAMERA_MJCF_NAME,
+    WRIST_CAMERA_STEREO: WRIST_STEREO_CAMERA_MJCF_NAME,
+}
 
-def install_fisheye_distortion_hook() -> None:
-    """Hook CPUMujocoEnv.render_rgb_frame and render_depth_frame to apply distortion and rotation to nav cameras."""
+
+def stretch_camera_for_mjcf_name(mjcf_name: str) -> StretchCameras:
+    """The `StretchCameras` member that renders a given MJCF camera.
+
+    Derived rather than hand-written, because the two stacks name the same
+    physical camera differently and getting the pairing wrong is invisible:
+    feeding a policy trained on `gripper_camera_left_rgb` the *right* gripper
+    camera produces plausible-looking images from 2cm away and a policy that
+    quietly does worse.
+
+    Several members can share an MJCF camera -- the head centre camera has a
+    full-resolution and a low-resolution member -- so prefer the one Stretch 4
+    exposes outwardly. `Stretch4MujocoSimulator` swaps in the low-resolution
+    variant internally and reports frames back under the outward name.
+    """
+    matches = [
+        camera
+        for camera in StretchCameras.all_stretch4()
+        if camera.camera_name_in_mjcf == mjcf_name
+    ]
+    if not matches:
+        raise ValueError(
+            f"No StretchCameras member renders MJCF camera {mjcf_name!r}; "
+            f"available: {sorted(c.camera_name_in_mjcf for c in StretchCameras.all_stretch4())}"
+        )
+    return matches[0]
+
+
+STRETCH_CAMERA_FOR_CAMERA: dict[str, StretchCameras] = {
+    name: stretch_camera_for_mjcf_name(mjcf_name)
+    for name, mjcf_name in MJCF_NAME_FOR_CAMERA.items()
+}
+"""MolmoSpaces camera name -> the `StretchCameras` member that describes it.
+
+`StretchCameras.initial_camera_settings` is the single source of truth for what
+each Stretch camera sees, and both stacks have to read it or they render
+different views of the same scene. `Stretch4MujocoSimulator` reads it directly
+(`MujocoServerCameraManagerSync.set_camera_params` writes `cam_fovy` and sizes
+the offscreen renderer from it); MolmoSpaces cannot, because it renders a *free*
+camera whose vertical FOV comes from `MjcfCameraConfig.fov` and whose horizontal
+FOV falls out of the render viewport's aspect ratio. So both numbers are carried
+across below.
+"""
+
+
+def _camera_fov(camera_name: str) -> float:
+    """The vertical FOV MuJoCo needs for a camera, in degrees.
+
+    Note that for the two head fisheyes this is `2*atan(width / (2*fx))`
+    (`stretch_cameras.py`), which is the *horizontal* FOV of the 1920-wide
+    sensor under a name that says vertical. That is a quirk of the calibration
+    being folded into a single MuJoCo number, and it is deliberately reproduced
+    rather than corrected here: the simulator feeds the same value to `cam_fovy`,
+    and the two stacks agreeing is the point.
+    """
+    settings = STRETCH_CAMERA_FOR_CAMERA[camera_name].initial_camera_settings
+    return float(settings.field_of_view_vertical_in_degrees)
+
+
+CAMERA_RENDER_SIZE: dict[str, tuple[int, int]] = {
+    name: camera_render_size(camera) for name, camera in STRETCH_CAMERA_FOR_CAMERA.items()
+}
+"""Camera name -> (width, height) to render at, before rotation. See `hdf5_layout`."""
+
+CAMERA_OUTPUT_SIZE: dict[str, tuple[int, int]] = {
+    name: camera_output_size(camera) for name, camera in STRETCH_CAMERA_FOR_CAMERA.items()
+}
+"""Camera name -> (width, height) of the frame that leaves the pipeline."""
+
+RENDER_BUFFER_RESOLUTION: tuple[int, int] = (
+    max(size[0] for size in CAMERA_RENDER_SIZE.values()),
+    max(size[1] for size in CAMERA_RENDER_SIZE.values()),
+)
+"""The offscreen buffer every camera renders into, as (width, height).
+
+MolmoSpaces builds one renderer per environment from
+`camera_config.img_resolution` and renders every camera through it, so this is
+not an image size but an upper bound: it has to enclose every entry of
+`CAMERA_RENDER_SIZE`, and each frame is then rendered into the sub-rectangle of
+that buffer that matches its own camera's aspect ratio.
+"""
+
+
+def install_stretch_camera_hooks() -> None:
+    """Make MolmoSpaces render Stretch's cameras the way the simulator does.
+
+    MolmoSpaces renders every camera through one renderer at one resolution,
+    with a free camera whose vertical FOV is `MjcfCameraConfig.fov`. Left alone
+    that produces a different view from `Stretch4MujocoSimulator`, which renders
+    through the MJCF camera at `initial_camera_settings.width x height` with
+    `cam_fovy` set from the same settings. The FOV half of the gap is closed by
+    `Stretch4CameraSystem` passing real FOVs; this closes the rest:
+
+    * each frame is rendered into the sub-rectangle of the shared buffer that
+      has its camera's aspect ratio, so the horizontal FOV matches too;
+    * the headlight follows the camera, which MolmoSpaces' aim-the-camera-after-
+      updating-the-scene order leaves behind -- see
+      `_render_with_camera_headlight`, and note that this one is not a Stretch
+      concern at all, it is every MolmoSpaces frame of every robot;
+    * the head cameras get the fisheye warp and the quarter turn the simulator
+      applies in `_render_camera` and `StatusStretchCameras.get_camera_data`;
+    * the wrist depth camera gets the same `depth_limits["gripper"]` clip;
+    * the recorded intrinsics describe the frame that comes out, rather than a
+      45-degree pinhole at the shared buffer's resolution.
+
+    With all of them in place a MolmoSpaces frame is pixel-identical to the
+    simulator's, which is what `test_datagen_render_matches_the_simulators_camera`
+    asserts.
+
+    Patching rather than subclassing because the render path is reached from
+    `CameraSensor.get_observation`, which MolmoSpaces' `get_core_sensors` builds
+    itself -- there is no seam in the config to pass a different env class
+    through.
+    """
     try:
         from molmo_spaces.env.env import CPUMujocoEnv
+        from molmo_spaces.env.sensors_cameras import CameraParameterSensor
     except ImportError:
         return
 
@@ -67,56 +197,164 @@ def install_fisheye_distortion_hook() -> None:
 
     _orig_render_rgb_frame = CPUMujocoEnv.render_rgb_frame
     _orig_render_depth_frame = CPUMujocoEnv.render_depth_frame
+    _orig_camera_parameters = CameraParameterSensor.get_observation
+    _orig_initialize_with_model = CPUMujocoEnv._initialize_with_model
 
-    def _postprocess_camera_frame(camera_name: str, frame: np.ndarray, is_depth: bool = False) -> np.ndarray:
+    def _stretch_initialize_with_model(self: Any, mj_model: Any, *args: Any, **kwargs: Any) -> Any:
+        """Guarantee the offscreen framebuffer can hold `RENDER_BUFFER_RESOLUTION`.
+
+        A scene's `<visual><global offwidth=.../>` is whatever its author wrote,
+        and MuJoCo refuses to build a renderer larger than it -- as a hard error
+        at environment construction, before any of the per-camera sizing below
+        gets a say. The default 640x480 happens to fit, but a scene that declares
+        something smaller would otherwise take the whole run down.
+        """
+        width, height = RENDER_BUFFER_RESOLUTION
+        mj_model.vis.global_.offwidth = max(int(mj_model.vis.global_.offwidth), width)
+        mj_model.vis.global_.offheight = max(int(mj_model.vis.global_.offheight), height)
+        return _orig_initialize_with_model(self, mj_model, *args, **kwargs)
+
+    def _fit_to_buffer(size: tuple[int, int], renderer: Any) -> tuple[int, int]:
+        """`size`, shrunk to fit the renderer's buffer without changing aspect.
+
+        Only bites when an environment was built with a smaller
+        `img_resolution` than `RENDER_BUFFER_RESOLUTION` -- a benchmark episode
+        recorded before per-camera sizing, say. Dropping resolution keeps the
+        view; letting the rectangle overrun the offscreen buffer would not.
+        """
+        width, height = size
+        max_width = getattr(renderer, "width", None)
+        max_height = getattr(renderer, "height", None)
+        if not max_width or not max_height:
+            return size
+        if width <= max_width and height <= max_height:
+            return size
+        scale = min(max_width / width, max_height / height)
+        # Floored to macroblocks rather than rounded: rounding up is what would
+        # overrun the buffer this is here to stay inside.
+        return (
+            max(MACROBLOCK, int(width * scale) // MACROBLOCK * MACROBLOCK),
+            max(MACROBLOCK, int(height * scale) // MACROBLOCK * MACROBLOCK),
+        )
+
+    def _render_with_camera_headlight(renderer: Any, **kwargs: Any) -> Any:
+        """Put the headlight back on the camera, then render.
+
+        MolmoSpaces aims its free camera by calling `mjv_updateScene` with a
+        default `MjvCamera` and *then* overwriting `scene.camera[i].pos/forward/up`.
+        The geometry comes out right, but `mjv_updateScene` has already placed
+        the headlight -- `scene.lights[0]`, which MuJoCo pins to the camera for a
+        fixed camera -- at the default viewpoint it was handed, several metres
+        away from where the frame is actually taken. Every frame is then lit from
+        somewhere the Stretch camera is not, which is most of the difference
+        between a MolmoSpaces frame and a `Stretch4MujocoSimulator` one: 57% of
+        the pixels of a wrist view, on a scene whose geometry aligns to
+        sub-pixel.
+
+        The camera is set by the time `render()` is called, so this is where the
+        light can follow it.
+        """
+        scene = renderer.scene
+        if scene.nlight > 0 and scene.lights[0].headlight:
+            scene.lights[0].pos = scene.camera[0].pos
+            scene.lights[0].dir = scene.camera[0].forward
+        return type(renderer).render(renderer, **kwargs)
+
+    def _render_at_camera_aspect(env: Any, camera_name: str, render_fn: Callable) -> Any:
+        """Run `render_fn` with the shared renderer clamped to this camera's rect."""
+        renderer = getattr(env, "_renderer", None)
+        if renderer is None:
+            return render_fn(env, camera_name)
+
+        size = CAMERA_RENDER_SIZE.get(camera_name)
+        if size is None:
+            rect: dict[str, int] = {}  # an unknown camera keeps the whole buffer
+        else:
+            width, height = _fit_to_buffer(size, renderer)
+            rect = {"width": width, "height": height}
+        # An instance attribute shadows the bound method for the duration of the
+        # call, which is the only seam MolmoSpaces' `_render_frame` leaves: it
+        # calls `self._renderer.render()` with no arguments.
+        renderer.render = functools.partial(_render_with_camera_headlight, renderer, **rect)
+        try:
+            return render_fn(env, camera_name)
+        finally:
+            renderer.__dict__.pop("render", None)
+
+    def _postprocess_camera_frame(
+        camera_name: str, frame: np.ndarray, is_depth: bool = False
+    ) -> np.ndarray:
+        """Apply what the simulator applies after `renderer.render()`.
+
+        The simulator splits this across two places -- distortion and depth
+        clipping in `MujocoServerCameraManagerSync._render_camera`, the rotation
+        in `StatusStretchCameras.get_camera_data(auto_rotate=True)` -- but every
+        consumer sees both, so both belong here.
+        """
         if frame is None:
             return frame
+        camera = STRETCH_CAMERA_FOR_CAMERA.get(camera_name)
+        if camera is None:
+            return frame
         try:
-            from stretch4_mujoco.enums.stretch_cameras import StretchCameras
-
-            if camera_name in (HEAD_CAMERA_LEFT, HEAD_CAMERA_LEFT_MJCF_NAME, "cam_nav_rgb_se4_left"):
-                if not is_depth:
-                    cb = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
-                    if cb is not None:
-                        frame = cb(frame)
-                rot = StretchCameras.cam_nav_rgb_se4_left.initial_camera_settings.rotate_number_of_times
-                if rot != 0:
-                    frame = np.rot90(frame, rot)
-                return frame
-            elif camera_name in (HEAD_CAMERA_RIGHT, HEAD_CAMERA_RIGHT_MJCF_NAME, "cam_nav_rgb_se4_right"):
-                if not is_depth:
-                    cb = StretchCameras.cam_nav_rgb_se4_right.post_processing_callback
-                    if cb is not None:
-                        frame = cb(frame)
-                rot = StretchCameras.cam_nav_rgb_se4_right.initial_camera_settings.rotate_number_of_times
-                if rot != 0:
-                    frame = np.rot90(frame, rot)
-                return frame
-            elif camera_name in (HEAD_CAMERA, HEAD_CAMERA_MJCF_NAME, "cam_nav_rgb_se4_center", "cam_nav_rgb_se4_center_low_rez"):
-                rot = StretchCameras.cam_nav_rgb_se4_center.initial_camera_settings.rotate_number_of_times
-                if rot != 0:
-                    frame = np.rot90(frame, rot)
-                return frame
+            settings = camera.initial_camera_settings
+            post_processing = camera.post_processing_callback
+            if post_processing is not None and camera.is_depth == is_depth:
+                frame = post_processing(frame)
+            if settings.rotate_number_of_times != 0:
+                frame = np.rot90(frame, settings.rotate_number_of_times)
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"Error applying camera post-processing to {camera_name}: {e}")
+            logging.getLogger(__name__).warning(
+                f"Error applying camera post-processing to {camera_name}: {e}"
+            )
         return frame
 
-    def _distorted_render_rgb_frame(self: Any, camera_name: str) -> Any:
-        frame = _orig_render_rgb_frame(self, camera_name)
+    def _stretch_render_rgb_frame(self: Any, camera_name: str) -> Any:
+        frame = _render_at_camera_aspect(self, camera_name, _orig_render_rgb_frame)
         return _postprocess_camera_frame(camera_name, frame, is_depth=False)
 
-    def _distorted_render_depth_frame(self: Any, camera_name: str) -> Any:
-        frame = _orig_render_depth_frame(self, camera_name)
+    def _stretch_render_depth_frame(self: Any, camera_name: str) -> Any:
+        frame = _render_at_camera_aspect(self, camera_name, _orig_render_depth_frame)
         return _postprocess_camera_frame(camera_name, frame, is_depth=True)
 
-    CPUMujocoEnv.render_rgb_frame = _distorted_render_rgb_frame
-    CPUMujocoEnv.render_depth_frame = _distorted_render_depth_frame
+    def _stretch_camera_parameters(
+        self: Any, env: Any, task: Any, batch_index: int = 0, *args: Any, **kwargs: Any
+    ) -> dict:
+        data = _orig_camera_parameters(self, env, task, batch_index, *args, **kwargs)
+        camera = STRETCH_CAMERA_FOR_CAMERA.get(self.camera_name)
+        size = CAMERA_RENDER_SIZE.get(self.camera_name)
+        if camera is None or size is None or not isinstance(data, dict):
+            return data
+
+        # MolmoSpaces builds K from `self.img_resolution`, which is the shared
+        # buffer rather than this camera's rectangle, and does not know the
+        # frame is about to be rotated. Both are known here.
+        width, height = size
+        fov = env.camera_manager.registry[self.camera_name].fov
+        focal = (height / 2.0) / math.tan(math.radians(fov / 2.0))
+        cx, cy = width / 2.0, height / 2.0
+
+        quarter_turns = camera.initial_camera_settings.rotate_number_of_times % 4
+        if quarter_turns == 1:  # np.rot90(frame, 1): (r, c) -> (W-1-c, r)
+            cx, cy = cy, (width - 1) - cx
+        elif quarter_turns == 3:  # np.rot90(frame, -1): (r, c) -> (c, H-1-r)
+            cx, cy = (height - 1) - cy, cx
+
+        data["intrinsic_cv"] = [
+            [focal, 0.0, cx],
+            [0.0, focal, cy],
+            [0.0, 0.0, 1.0],
+        ]
+        return data
+
+    CPUMujocoEnv._initialize_with_model = _stretch_initialize_with_model
+    CPUMujocoEnv.render_rgb_frame = _stretch_render_rgb_frame
+    CPUMujocoEnv.render_depth_frame = _stretch_render_depth_frame
+    CameraParameterSensor.get_observation = _stretch_camera_parameters
     CPUMujocoEnv._stretch_camera_hooked = True
-    CPUMujocoEnv._stretch_fisheye_hooked = True
 
 
-install_fisheye_distortion_hook()
+install_stretch_camera_hooks()
 
 
 @lru_cache(maxsize=1)
@@ -157,33 +395,43 @@ class Stretch4CameraSystem(CameraSystemConfig):
     Using `MjcfCameraConfig` rather than `RobotMountedCameraConfig` means the
     camera extrinsics come from the robot model itself, so a simulated view lines
     up with what the corresponding camera sees on hardware.
+
+    The intrinsics have to be carried across by hand, because MolmoSpaces reads
+    only `fov` off these specs and MuJoCo's own default (45 degrees, which is what
+    a `<camera>` with no `fovy` attribute gets, and `mjcf_generator.py` writes
+    none) is not any Stretch camera. Every FOV below is
+    `StretchCameras.<member>.initial_camera_settings.field_of_view_vertical_in_degrees`
+    -- the same number `MujocoServerCameraManagerSync.set_camera_params` writes
+    into `cam_fovy` -- so that the datagen render, the Rerun feed and the
+    simulator all frame the scene identically. `install_stretch_camera_hooks`
+    does the other half, matching each camera's aspect ratio.
     """
 
-    img_resolution: tuple[int, int] = (640, 368)
+    img_resolution: tuple[int, int] = RENDER_BUFFER_RESOLUTION
     cameras: list[Any] = [
         MjcfCameraConfig(
             name=HEAD_CAMERA,
             mjcf_name=HEAD_CAMERA_MJCF_NAME,
             robot_namespace="robot_0/",
-            fov=None,
+            fov=_camera_fov(HEAD_CAMERA),
         ),
         MjcfCameraConfig(
             name=WRIST_CAMERA_LEFT,
             mjcf_name=WRIST_LEFT_CAMERA_MJCF_NAME,
             robot_namespace="robot_0/",
-            fov=None,
+            fov=_camera_fov(WRIST_CAMERA_LEFT),
         ),
         MjcfCameraConfig(
             name=WRIST_CAMERA_RIGHT,
             mjcf_name=WRIST_RIGHT_CAMERA_MJCF_NAME,
             robot_namespace="robot_0/",
-            fov=None,
+            fov=_camera_fov(WRIST_CAMERA_RIGHT),
         ),
         MjcfCameraConfig(
             name=WRIST_CAMERA_STEREO,
             mjcf_name=WRIST_STEREO_CAMERA_MJCF_NAME,
             robot_namespace="robot_0/",
-            fov=None,
+            fov=_camera_fov(WRIST_CAMERA_STEREO),
             record_rgb=False,
             record_depth=True,
         ),
@@ -191,13 +439,13 @@ class Stretch4CameraSystem(CameraSystemConfig):
             name=HEAD_CAMERA_LEFT,
             mjcf_name=HEAD_CAMERA_LEFT_MJCF_NAME,
             robot_namespace="robot_0/",
-            fov=123.39,
+            fov=_camera_fov(HEAD_CAMERA_LEFT),
         ),
         MjcfCameraConfig(
             name=HEAD_CAMERA_RIGHT,
             mjcf_name=HEAD_CAMERA_RIGHT_MJCF_NAME,
             robot_namespace="robot_0/",
-            fov=123.20,
+            fov=_camera_fov(HEAD_CAMERA_RIGHT),
         ),
     ]
 

@@ -2441,9 +2441,105 @@ def test_finetune_trains_several_tasks_as_one_mixture(tmp_path):
     assert "--dataset_sample_rates" not in single
 
 
-def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
-    """Stretch 4 camera system exposes the onboard cameras at 640x368 resolution."""
+def test_datagen_cameras_frame_the_scene_like_the_simulator():
+    """Each MolmoSpaces camera sees exactly what `Stretch4MujocoSimulator` sees.
+
+    The simulator renders through the MJCF camera with `cam_fovy` and the
+    viewport both taken from `StretchCameras.initial_camera_settings`
+    (`MujocoServerCameraManagerSync.set_camera_params`). MolmoSpaces renders a
+    *free* camera instead, whose vertical FOV is `MjcfCameraConfig.fov` and whose
+    horizontal FOV falls out of the render viewport's aspect ratio. So the two
+    stacks agree on the view only if both numbers are carried across -- and
+    getting it wrong is silent: a policy trains on a narrower or wider world than
+    the one it is later deployed into, and simply does worse.
+    """
     from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_OUTPUT_SIZE,
+        CAMERA_RENDER_SIZE,
+        STRETCH_CAMERA_FOR_CAMERA,
+        Stretch4CameraSystem,
+    )
+
+    for spec in Stretch4CameraSystem().cameras:
+        settings = STRETCH_CAMERA_FOR_CAMERA[spec.name].initial_camera_settings
+
+        assert spec.fov is not None, (
+            f"{spec.name} has no FOV, so MolmoSpaces falls back to the MJCF's -- and "
+            "mjcf_generator.py writes no fovy attribute, which means MuJoCo's 45 degree "
+            "default rather than any Stretch camera"
+        )
+        assert spec.fov == pytest.approx(settings.field_of_view_vertical_in_degrees)
+
+        width, height = CAMERA_RENDER_SIZE[spec.name]
+        # 0.5%: both dimensions have to be multiples of 16 for the video writers
+        # not to resize the frame, which is coarse enough that most cameras have
+        # no exactly-correct size. See `hdf5_layout.camera_render_size`.
+        assert width / height == pytest.approx(settings.width / settings.height, rel=5e-3), (
+            f"{spec.name} renders at {width}x{height}, a different aspect ratio from the "
+            f"hardware's {settings.width}x{settings.height}; with fovy fixed that changes "
+            "how much of the scene lands in frame horizontally"
+        )
+        assert width % 16 == 0 and height % 16 == 0, (
+            f"{spec.name} renders at {width}x{height}; imageio's ffmpeg writer resizes "
+            "anything that is not a multiple of 16, so the MP4 would stop being the frame "
+            "that was rendered"
+        )
+
+        expected = (height, width) if settings.rotate_number_of_times % 2 else (width, height)
+        assert CAMERA_OUTPUT_SIZE[spec.name] == expected
+
+
+def test_recorded_intrinsics_describe_the_recorded_frame():
+    """`intrinsic_cv` matches the frame that is actually saved, rotation included.
+
+    MolmoSpaces builds K from the shared buffer resolution and knows nothing
+    about the quarter turn the head cameras get, so unpatched it describes an
+    image no consumer ever sees.
+    """
+    from molmo_spaces.env.sensors_cameras import CameraParameterSensor
+
+    from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_OUTPUT_SIZE,
+        HEAD_CAMERA_LEFT,
+        STRETCH_CAMERA_FOR_CAMERA,
+        WRIST_CAMERA_LEFT,
+    )
+
+    class _Camera:
+        def __init__(self, fov):
+            self.fov = fov
+
+        def get_pose(self):
+            return np.eye(4)
+
+    class _Env:
+        def __init__(self, name, fov):
+            self.camera_manager = type("_M", (), {"registry": {name: _Camera(fov)}})()
+
+    for name in (WRIST_CAMERA_LEFT, HEAD_CAMERA_LEFT):
+        settings = STRETCH_CAMERA_FOR_CAMERA[name].initial_camera_settings
+        fov = settings.field_of_view_vertical_in_degrees
+        sensor = CameraParameterSensor(camera_name=name, img_resolution=(648, 422))
+        params = sensor.get_observation(_Env(name, fov), task=None)
+
+        k = np.array(params["intrinsic_cv"])
+        width, height = CAMERA_OUTPUT_SIZE[name]
+        # The principal point sits at the centre of the frame that gets written,
+        # which for a rotated camera is the portrait one.
+        assert k[0, 2] == pytest.approx(width / 2.0, abs=1.0)
+        assert k[1, 2] == pytest.approx(height / 2.0, abs=1.0)
+        # A 123 degree lens has a far shorter focal length than a 58 degree one;
+        # the pre-patch code reported the same 444px for every camera.
+        unrotated_height = min(CAMERA_OUTPUT_SIZE[name]) if settings.rotate_number_of_times % 2 else height
+        assert k[0, 0] == pytest.approx(
+            (unrotated_height / 2.0) / np.tan(np.radians(fov / 2.0))
+        )
+
+
+def test_stretch_camera_system_exposes_onboard_cameras(tmp_path):
+    """Stretch 4 camera system exposes the onboard cameras into a big enough buffer."""
+    from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_RENDER_SIZE,
         CHASE_CAMERA,
         HEAD_CAMERA,
         HEAD_CAMERA_LEFT,
@@ -2456,9 +2552,16 @@ def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
     from examples.machine_learning.molmospaces import hdf5_layout
     from examples.machine_learning.molmospaces.finetuning import finetune, lerobot_export
 
-    # 1. Stretch4CameraSystem includes the onboard cameras at (640, 368)
+    # 1. img_resolution is the shared offscreen buffer, not an image size: every
+    #    camera renders into its own sub-rectangle of it, so it has to enclose
+    #    all of them.
     cam_system = Stretch4CameraSystem()
-    assert cam_system.img_resolution == (640, 368)
+    buffer_width, buffer_height = cam_system.img_resolution
+    for name, (width, height) in CAMERA_RENDER_SIZE.items():
+        assert width <= buffer_width and height <= buffer_height, (
+            f"{name} renders {width}x{height}, which does not fit the "
+            f"{buffer_width}x{buffer_height} buffer MolmoSpaces allocates"
+        )
     cam_names = [c.name for c in cam_system.cameras]
     assert cam_names == [
         HEAD_CAMERA,
