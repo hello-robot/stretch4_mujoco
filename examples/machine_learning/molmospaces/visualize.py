@@ -36,6 +36,17 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# The observation keys we look for images under, and the camera views the blueprint
+# lays out for them. A camera missing from an observation simply logs nothing, and
+# its view stays empty rather than breaking the layout.
+CAMERA_NAMES = [
+    "wrist_camera_left",
+    "wrist_camera_right",
+    "head_camera_left",
+    "head_camera",
+    "head_camera_right",
+]
+
 
 class StretchRerunVisualizer:
     """Streams 3D robot meshes, object meshes, coordinate frames, target grasp, and waypoints to Rerun."""
@@ -75,9 +86,21 @@ class StretchRerunVisualizer:
                         active_tab=0,
                     ),
                     rrb.Vertical(
-                        rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
-                        rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
+                        rrb.Grid(
+                            contents=[
+                                rrb.Spatial2DView(origin=f"world/cameras/{cam_name}", name=cam_name)
+                                for cam_name in CAMERA_NAMES
+                            ]
+                        ),
+                        rrb.Horizontal(
+                            rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
+                            rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
+                        ),
+                        # 3D scene > cameras > text, so the scene reads at a glance and the
+                        # text panes stay a strip along the bottom of the right column.
+                        row_shares=[3, 1],
                     ),
+                    column_shares=[3, 2],
                 ),
                 collapse_panels=True,
             )
@@ -721,7 +744,7 @@ All waypoints finished execution. Holding final posture/grip.
             if observation is not None:
                 obs_dict = observation[0] if isinstance(observation, list) and observation else observation
                 if isinstance(obs_dict, dict):
-                    for cam_name in ["head_camera", "wrist_camera_left", "wrist_camera_right", "head_camera_left", "head_camera_right"]:
+                    for cam_name in CAMERA_NAMES:
                         if cam_name in obs_dict and obs_dict[cam_name] is not None:
                             img = obs_dict[cam_name]
                             if hasattr(img, "ndim") and img.ndim == 3:
