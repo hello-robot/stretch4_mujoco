@@ -1790,15 +1790,59 @@ def test_camera_feature_names_and_defaults_in_lerobot_export():
 
 
 def test_fisheye_active_fill_coverage_not_overly_vignetted():
-    """Verify fisheye distortion does not mask out most of the image with excessive black vignetting."""
+    """The distortion crops to the image circle instead of resizing the void.
+
+    A 123 degree fisheye warped out of a pinhole render leaves ~45% of the raw
+    frame with no source pixels behind it. That black is not a lens vignette,
+    and `INTER_AREA` averages it into every downstream resize, so the distortion
+    crops it away before handing the frame back.
+    """
+    from examples.machine_learning.molmospaces.stretch.config import CAMERA_RENDER_SIZE
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+    from stretch4_mujoco.utils import FISHEYE_MIN_VALID_FRACTION
+
+    sizes = [(224, 224), (640, 400)]
+    sizes += [CAMERA_RENDER_SIZE[name] for name in ("head_camera_left", "head_camera_right")]
+
+    for camera in (StretchCameras.cam_nav_rgb_se4_left, StretchCameras.cam_nav_rgb_se4_right):
+        distort = camera.post_processing_callback
+        assert distort is not None
+        for width, height in sizes:
+            out = distort(np.full((height, width, 3), 200, dtype=np.uint8))
+            assert out.shape == (height, width, 3), "the crop must not change the frame size"
+            non_black_ratio = np.count_nonzero(np.any(out > 0, axis=-1)) / float(width * height)
+            assert non_black_ratio >= FISHEYE_MIN_VALID_FRACTION, (
+                f"{camera.name} at {width}x{height} keeps only {non_black_ratio:.2f} of the "
+                "frame as real pixels; the crop should hold it to FISHEYE_MIN_VALID_FRACTION"
+            )
+            # Some black is expected and wanted: the curved corners are what a
+            # real lens vignettes. A frame with none of it has been cropped past
+            # the image circle and thrown away field of view for nothing.
+            assert non_black_ratio < 1.0
+
+
+def test_fisheye_crop_is_a_zoom_into_the_same_view_at_every_resolution():
+    """The crop is the same window of the scene whatever size the frame is.
+
+    Both stacks render these cameras at their own sizes -- the simulator at the
+    sensor's 1920x1200, the datagen path at a macroblock-sized 640x400 -- and a
+    crop that differed between them would mean a policy trained on one seeing a
+    different field of view at the other.
+    """
     from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
-    cb_left = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
-    img = np.ones((224, 224, 3), dtype=np.uint8) * 200
-    out = cb_left(img)
-    non_black_ratio = np.count_nonzero(np.any(out > 0, axis=-1)) / (224 * 224)
-    # The active image area should be >= 70% of the frame (corners only are curved out)
-    assert non_black_ratio >= 0.70, f"Fisheye active area ratio {non_black_ratio:.2f} is too low (excessive black borders)"
+    for camera in (StretchCameras.cam_nav_rgb_se4_left, StretchCameras.cam_nav_rgb_se4_right):
+        settings = camera.initial_camera_settings
+        native = camera.fisheye_crop_rect(settings.width, settings.height)
+        scaled = camera.fisheye_crop_rect(640, 400)
+        scale = 640.0 / settings.width
+
+        assert camera.fisheye_crop_zoom(settings.width, settings.height) > 1.0
+        for native_edge, scaled_edge in zip(native, scaled):
+            # Two pixels of slack: the crop is searched on each frame's own
+            # integer grid, and one step of the 640-wide one is three native
+            # pixels.
+            assert abs(native_edge * scale - scaled_edge) <= 2.0
 
 
 def test_finetune_camera_selection_parsing_and_commands(tmp_path):
@@ -2500,6 +2544,7 @@ def test_recorded_intrinsics_describe_the_recorded_frame():
 
     from examples.machine_learning.molmospaces.stretch.config import (
         CAMERA_OUTPUT_SIZE,
+        CAMERA_RENDER_SIZE,
         HEAD_CAMERA_LEFT,
         STRETCH_CAMERA_FOR_CAMERA,
         WRIST_CAMERA_LEFT,
@@ -2517,23 +2562,39 @@ def test_recorded_intrinsics_describe_the_recorded_frame():
             self.camera_manager = type("_M", (), {"registry": {name: _Camera(fov)}})()
 
     for name in (WRIST_CAMERA_LEFT, HEAD_CAMERA_LEFT):
-        settings = STRETCH_CAMERA_FOR_CAMERA[name].initial_camera_settings
+        camera = STRETCH_CAMERA_FOR_CAMERA[name]
+        settings = camera.initial_camera_settings
         fov = settings.field_of_view_vertical_in_degrees
         sensor = CameraParameterSensor(camera_name=name, img_resolution=(648, 422))
         params = sensor.get_observation(_Env(name, fov), task=None)
 
         k = np.array(params["intrinsic_cv"])
         width, height = CAMERA_OUTPUT_SIZE[name]
+        render_width, render_height = CAMERA_RENDER_SIZE[name]
+        # A 123 degree lens has a far shorter focal length than a 58 degree one;
+        # the pre-patch code reported the same 444px for every camera.
+        unrotated_height = min(CAMERA_OUTPUT_SIZE[name]) if settings.rotate_number_of_times % 2 else height
+        focal = (unrotated_height / 2.0) / np.tan(np.radians(fov / 2.0))
+
+        if camera.applies_fisheye_distortion:
+            # The distortion crops into the render before handing the frame
+            # back at its original size, so the saved frame is zoomed in on a
+            # window of it and K has to say so.
+            zoom = camera.fisheye_crop_zoom(render_width, render_height)
+            assert zoom > 1.0
+            assert k[0, 0] == pytest.approx(focal * zoom, rel=1e-3)
+            # The crop tracks the image circle rather than the frame centre, so
+            # the principal point moves off centre -- but only by a few percent
+            # of the frame, not into another part of it.
+            assert abs(k[0, 2] - width / 2.0) < 0.1 * width
+            assert abs(k[1, 2] - height / 2.0) < 0.1 * height
+            continue
+
         # The principal point sits at the centre of the frame that gets written,
         # which for a rotated camera is the portrait one.
         assert k[0, 2] == pytest.approx(width / 2.0, abs=1.0)
         assert k[1, 2] == pytest.approx(height / 2.0, abs=1.0)
-        # A 123 degree lens has a far shorter focal length than a 58 degree one;
-        # the pre-patch code reported the same 444px for every camera.
-        unrotated_height = min(CAMERA_OUTPUT_SIZE[name]) if settings.rotate_number_of_times % 2 else height
-        assert k[0, 0] == pytest.approx(
-            (unrotated_height / 2.0) / np.tan(np.radians(fov / 2.0))
-        )
+        assert k[0, 0] == pytest.approx(focal)
 
 
 def test_stretch_camera_system_exposes_onboard_cameras(tmp_path):

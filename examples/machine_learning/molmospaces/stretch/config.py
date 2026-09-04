@@ -334,6 +334,16 @@ def install_stretch_camera_hooks() -> None:
         focal = (height / 2.0) / math.tan(math.radians(fov / 2.0))
         cx, cy = width / 2.0, height / 2.0
 
+        if camera.applies_fisheye_distortion:
+            # The fisheye distortion crops away the surround the pinhole render
+            # cannot fill and rescales what is left back to `size`, so the frame
+            # this K describes is zoomed in on a window of the raw render.
+            crop_x, crop_y, crop_width, crop_height = camera.fisheye_crop_rect(width, height)
+            zoom = width / float(crop_width)
+            focal *= zoom
+            cx = (cx - crop_x) * width / float(crop_width)
+            cy = (cy - crop_y) * height / float(crop_height)
+
         quarter_turns = camera.initial_camera_settings.rotate_number_of_times % 4
         if quarter_turns == 1:  # np.rot90(frame, 1): (r, c) -> (W-1-c, r)
             cx, cy = cy, (width - 1) - cx
