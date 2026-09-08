@@ -329,6 +329,19 @@ MOLMOBOT_OPTIONAL_FLAGS: list[tuple[str, list[str]]] = [
         ],
     ),
     (
+        "--save_final_optim=False",
+        [
+            "Leave the optimizer state out of the final checkpoint. It is on",
+            "by default here because train_molmobot.py turns it off, and a run",
+            "that reaches max_duration then leaves no resumable checkpoint at",
+            "all -- the intermediate saves that carry optimizer state are",
+            "rotated away by save_num_checkpoints_to_keep. Turn it off to save",
+            "the bytes (~1.7GiB of 8-bit moments at TRAINABLE=vision, ~6.8GiB",
+            "with OPTIMIZER=adamw) if the checkpoint will only ever be served",
+            "or evaluated, never continued.",
+        ],
+    ),
+    (
         "--ft_llm=True --ft_vit=True --ft_connector=True",
         [
             "Unfreeze the language model, vision tower and connector. Off by",
@@ -704,10 +717,11 @@ def trainer_command(
     because MolmoBot otherwise validates on the `val/` of the *first* data path
     alone -- so a two-task run would report pick's loss while training on both.
 
-    Three of MolmoBot's arguments are not argparse options at all. It builds a
+    Four of MolmoBot's arguments are not argparse options at all. It builds a
     `TrainConfig` and then merges the leftover `--name=value` arguments into it
-    as an OmegaConf dotlist, so `save_folder`, `max_duration` and `wandb` are
-    fields of that config rather than flags with help text:
+    as an OmegaConf dotlist, so `save_folder`, `max_duration`, `wandb` and
+    `save_final_optim` are fields of that config rather than flags with help
+    text:
 
     - `save_folder` is `omegaconf.MISSING` and is the only mandatory field, so
       leaving it off fails at `OmegaConf.to_object` -- after the checkpoint has
@@ -718,6 +732,9 @@ def trainer_command(
       logging off instead, and the generated script says how to turn it back on.
     - `max_duration` is hardcoded to 200000 in the constructed config, so this is
       where `--steps` actually lands.
+    - `save_final_optim` defaults to True in `TrainConfig` but is set False in
+      the config `train_molmobot.py` builds, which is why this passes it
+      explicitly. See the comment at the flag itself.
     """
     summary = datasets[0]
     refs = dataset_refs if dataset_refs is not None else [str(d.root) for d in datasets]
@@ -774,6 +791,24 @@ def trainer_command(
             f"--exp_name={experiment_name(datasets)}",
             f"--save_folder={save_folder}",
             f"--max_duration={steps}",
+            # `TrainConfig.save_final_optim` defaults to True, but
+            # train_molmobot.py sets it False in the config it builds, and
+            # `Trainer.save_checkpoint` reads it as
+            # `optim=(not done_training or cfg.save_final_optim)`. So the save
+            # at `max_duration` -- the one save that survives
+            # `save_num_checkpoints_to_keep=1` -- writes a `model_and_optim/`
+            # holding only model keys, and a run that reaches the end of its
+            # schedule leaves nothing that can be resumed: the intermediate
+            # saves that do carry optimizer state are rotated away behind it.
+            # Continuing then means `initial_model_checkpoint`, which resets
+            # the moments and the step counter by force
+            # (`run_trainer.py` hardcodes `reset_train, reset_opt = True, True`).
+            #
+            # Ahead of `extra_args` because `merge_with_dotlist` applies in
+            # order and the last value wins, so the commented-out
+            # `--save_final_optim=False` in the generated script can still
+            # turn it back off.
+            "--save_final_optim=True",
             *(extra_args or ["--wandb=null"]),
         ]
     if trainer == "openpi":
@@ -1129,11 +1164,20 @@ def _molmobot_script(
         "#",
         "#    Everything tunable comes from the block at the top of this file.",
         "#",
-        "#    --save_folder and --max_duration are not argparse options:",
-        "#    train_molmobot.py builds a TrainConfig and merges leftover --name=value",
-        "#    arguments into it as an OmegaConf dotlist. save_folder is that config's",
-        "#    only mandatory field, so leaving it off fails at OmegaConf.to_object --",
-        "#    after the checkpoint has loaded and the statistics have been computed.",
+        "#    --save_folder, --max_duration and --save_final_optim are not argparse",
+        "#    options: train_molmobot.py builds a TrainConfig and merges leftover",
+        "#    --name=value arguments into it as an OmegaConf dotlist. save_folder is",
+        "#    that config's only mandatory field, so leaving it off fails at",
+        "#    OmegaConf.to_object -- after the checkpoint has loaded and the",
+        "#    statistics have been computed.",
+        "#",
+        "#    --save_final_optim=True is here because train_molmobot.py sets that",
+        "#    field False, against TrainConfig's own default. The save at",
+        "#    max_duration is the one save that survives",
+        "#    save_num_checkpoints_to_keep, so with it off a finished run leaves",
+        "#    only weights: the earlier saves that carry optimizer state are already",
+        "#    rotated away, and continuing means resetting the moments and the step",
+        "#    counter. Uncomment --save_final_optim=False below to go back to that.",
         "#",
         "#    --stats_path is kept inside SAVE_FOLDER rather than at its relative",
         "#    default, which would write it into the shared MolmoBot checkout and",
@@ -1551,6 +1595,29 @@ def _tuning_block(
         '    --optimizer.llm_learning_rate="$LLM_LR"',
         ")",
         "",
+        "# RESUME_FROM continues a previous run *with* its optimizer state, which",
+        "# CHECKPOINT cannot do: a checkpoint passed there arrives as",
+        "# initial_model_checkpoint, and run_trainer.py hardcodes",
+        "# `reset_train, reset_opt = True, True` for that path -- the Adam moments and",
+        "# the step counter are discarded whatever the config says. load_path is the",
+        "# branch that honours reset_optimizer_state and reset_trainer_state, both",
+        "# false by default, so the moments, the step counter and the dataloader",
+        "# position all carry over.",
+        "#",
+        "# The step counter carrying over is why MAX_STEPS is a *cumulative* total",
+        "# here: the trainer raises if the restored step is already past it, so",
+        "# continuing a run that stopped at step N by another N steps wants",
+        "# MAX_STEPS=2N. The learning rate resumes at that point on the longer cosine",
+        "# rather than restarting at the peak.",
+        "#",
+        "# Needs a save folder of its own, and an empty one: the resume check looks",
+        "# for step<N>/ and takes precedence over this, and a save folder that",
+        "# already holds a config.yaml is refused outright.",
+        'RESUME_FROM="${RESUME_FROM:-}"',
+        'if [ -n "$RESUME_FROM" ]; then',
+        '    EXTRA_ARGS+=(--load_path="$RESUME_FROM")',
+        "fi",
+        "",
         'if [ -n "$WARP_CAMERAS" ]; then',
         "    # Unquoted on purpose: WARP_CAMERAS is a space-separated list and",
         "    # --cameras_to_warp takes nargs=*.",
@@ -1675,6 +1742,11 @@ def _checkpoint_step(base_checkpoint: str, output_dir: Path) -> list[str]:
         "#    learning-rate jump a resume into a longer horizon produces. Give it a save",
         "#    folder of its own, or allow_resume will find the old run's step<N>/ and",
         "#    resume from that instead.",
+        "#",
+        "#    Use RESUME_FROM instead of CHECKPOINT to keep the optimizer state and the",
+        "#    step counter -- see the comment on that variable. The log says which one",
+        "#    happened: `Resuming from checkpoint <path>` means the moments were",
+        "#    loaded, `Loading model from <path>` means they were reset.",
         "# --------------------------------------------------------------------------",
         f"CHECKPOINT_DEFAULT={shlex.quote(str(local))}",
         'CHECKPOINT="${CHECKPOINT:-$CHECKPOINT_DEFAULT}"',
