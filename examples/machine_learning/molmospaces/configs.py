@@ -298,6 +298,7 @@ class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):
 DEFAULT_BASELINE_CONFIGS: dict[str, str] = {
     "pick": "StretchSimpleIKEvalConfig",
     "potato": "StretchSimpleIKEvalConfig",
+    "pick_local": "StretchSimpleIKEvalConfig",
     "pnp": "StretchSimpleIKEvalConfig",
     "pnp_next_to": "StretchSimpleIKEvalConfig",
     "pnp_color": "StretchSimpleIKEvalConfig",

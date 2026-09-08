@@ -68,6 +68,7 @@ from examples.machine_learning.molmospaces.configs import (
     MOLMOBOT_ACTION_TYPE_ENV_VAR,
     VIEWER_ENV_VAR,
     qualified_config_name,
+    viewer_requested,
 )
 from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     MolmoBotSetupError,
@@ -75,7 +76,10 @@ from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     inference_requirements_message,
     missing_inference_requirements,
 )
-from examples.machine_learning.molmospaces.visualize import install_eval_visualize_hook
+from examples.machine_learning.molmospaces.visualize import (
+    install_eval_visualize_hook,
+    name_viewer_window_after,
+)
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +155,12 @@ def run_benchmark(
         success_rate=0.0,
         output_dir="",
     )
+
+    if viewer_requested():
+        # Titles the viewer window after the task family rather than the house the
+        # episode happens to be in. Per benchmark rather than once per run, so a
+        # sweep retitles as it moves on. See `name_viewer_window_after`.
+        name_viewer_window_after(benchmark.task_cls.rsplit(".", 1)[-1].removesuffix("Task"))
 
     try:
         benchmark_dir = resolve_benchmark_dir(benchmark_key, alternate=alternate)
