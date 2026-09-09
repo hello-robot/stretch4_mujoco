@@ -56,6 +56,7 @@ python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
     --output-dir data/stretch_pick --no-export
 
 # 3. prepare the data, fetch MolmoBot, write run_molmobot.sh
+# Note on cameras: first n/2 are exo, last n/2 are ego, paired with stride n/2 as (images[i], images[i + n/2]). Source: third_party/MolmoBot/MolmoBot/olmo/preprocessing/multicrop_preprocessor.py:298-306. Must be an even number of cameras.
 python -m examples.machine_learning.molmospaces.finetuning.finetune \
     --rollouts data/stretch_pick/rollouts/pick --trainer molmobot \
     --cameras "head_right,wrist_right"
