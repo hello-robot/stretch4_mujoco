@@ -13,7 +13,12 @@ or `run_benchmarks.py --visualize`:
   panning and zooming all still do what you expect once you take the camera over.
 * `StretchRerunVisualizer` streams what the policy is working from -- the target
   grasp, the waypoint plan and its progress, the frames the IK solves in, and
-  whatever camera images the observation carries.
+  the camera images it is looking at. Its "Robot Closeup" tab opens on the robot
+  in its room, from the same place the MuJoCo viewer's camera sits
+  (`robot_view_framing` picks that spot for both), and shows the scene's visual
+  meshes only -- a benchmark house carries about six collision meshes for every
+  one you can see, and `_is_collision_geom` is what tells them apart. The camera
+  views are the cameras the policy reads, or whatever `--visualize-camera` names.
 
 Datagen drives both directly, from its own `ParallelRolloutRunner` subclass.
 Evaluation cannot: `run_evaluation()` constructs and runs `JsonEvalRunner` itself
@@ -31,33 +36,136 @@ import functools
 import logging
 import math
 import re
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
 import mujoco
 import numpy as np
 
-from examples.machine_learning.molmospaces.stretch.config import Stretch4RobotConfig
+from examples.machine_learning.molmospaces.stretch.config import (
+    HEAD_CAMERA,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA_RIGHT,
+    WRIST_CAMERA_LEFT,
+    WRIST_CAMERA_RIGHT,
+    Stretch4RobotConfig,
+)
 from examples.machine_learning.molmospaces.stretch.robot import STRETCH_ROOT_BODY
 
 log = logging.getLogger(__name__)
 
-# The observation keys we look for images under, and the camera views the blueprint
-# lays out for them. A camera missing from an observation simply logs nothing, and
-# its view stays empty rather than breaking the layout.
 CAMERA_NAMES = [
-    "wrist_camera_left",
-    "wrist_camera_right",
-    "head_camera_left",
-    "head_camera",
-    "head_camera_right",
+    WRIST_CAMERA_LEFT,
+    WRIST_CAMERA_RIGHT,
+    HEAD_CAMERA_LEFT,
+    HEAD_CAMERA,
+    HEAD_CAMERA_RIGHT,
 ]
+"""
+Every camera an episode renders an RGB image for, and so every camera that can
+be streamed.
+
+These are the observation keys the images arrive under: `get_core_sensors`
+registers one `CameraSensor` per `Stretch4CameraSystem` camera with
+`uuid=camera_name`. Only the RGB ones are here -- `wrist_camera_stereo` is
+configured `record_rgb=False`.
+
+This is the fallback, not the default: a visualizer normally streams the subset
+a policy actually looks at. See `StretchRerunVisualizer._resolve_camera_names`.
+"""
+
+RERUN_MEMORY_LIMIT = "8GB"
+"""
+How much the spawned Rerun viewer may hold before it drops the oldest data.
+
+Worth being generous with, because what gets dropped first is the camera feeds,
+and the symptom is confusing: the 3D scene plays back over the whole run (its
+meshes are logged `static=True`, which is exempt from the viewer's memory
+budget) while the 2D views go blank for every episode but the last few. A
+640x368 RGB frame is 700KB, so at ~190 logged steps per episode two cameras
+cost roughly 250MB an episode -- an eight-episode run fits inside this with
+room to spare, where the five cameras a policy is *not* looking at would not.
+"""
+
+
+def _lower_name(value: Any) -> str:
+    """A MuJoCo name, lowercased -- or "" for anything that is not a name."""
+    return value.lower() if isinstance(value, str) else ""
+
+
+def _is_collision_geom(model: Any, geom_id: int) -> bool:
+    """Whether a geom is there to collide rather than to be seen.
+
+    Two signals, because neither alone covers the models one episode loads:
+
+    * **Contact bits.** A housegen scene declares everything it draws
+      `contype="0" conaffinity="0"` (its `__VISUAL_MJT__` default class) and
+      everything structural or dynamic with contact bits set. That is the test
+      that tells a house's 340 visual meshes from its ~2100 collision meshes,
+      and it is the only one that can: a wall's visual geom and its collision
+      geom reference the *same* mesh, `wall_4_0`, so the mesh name says nothing.
+    * **The name.** Stretch's own MJCF needs the other test. Some of its
+      collision geoms are deliberately contactless -- `grasp_center_collision_link`
+      and its neighbours, see `models/stretch_4/mjcf_generator.py` -- but every
+      one of them is named `*_collision_link`.
+    """
+    if "collision" in _lower_name(_geom_label(model, geom_id)):
+        return True
+    if "collision" in _lower_name(_mesh_label(model, geom_id)):
+        return True
+    try:
+        return bool(int(model.geom_contype[geom_id]) or int(model.geom_conaffinity[geom_id]))
+    except (TypeError, ValueError, IndexError, KeyError):
+        # A model that will not say is drawn rather than dropped.
+        return False
+
+
+def _geom_label(model: Any, geom_id: int) -> Any:
+    try:
+        return model.geom(geom_id).name
+    except Exception:  # noqa: BLE001 - an unnamed geom is not an error
+        return None
+
+
+def _mesh_label(model: Any, geom_id: int) -> Any:
+    try:
+        mesh_id = int(model.geom_dataid[geom_id])
+        return model.mesh(mesh_id).name if mesh_id >= 0 else None
+    except Exception:  # noqa: BLE001 - a primitive has no mesh
+        return None
+
+
+def _renderable_geoms(model: Any, geom_ids: Iterable[int]) -> list[int]:
+    """Which of `geom_ids` to draw: a body's visual geoms, or all of them if it has none.
+
+    Judged per body rather than per model, because "collision only" is a
+    property of a body. Every body a benchmark house draws has at least one
+    visual geom, so its collision hulls all drop out here -- but the world
+    body's `floor` plane is collision geometry with no visual counterpart, and
+    dropping that would take the ground out from under the robot.
+    """
+    by_body: dict[int, list[int]] = {}
+    for geom_id in geom_ids:
+        by_body.setdefault(int(model.geom_bodyid[geom_id]), []).append(geom_id)
+
+    renderable: list[int] = []
+    for geoms in by_body.values():
+        visual = [g for g in geoms if not _is_collision_geom(model, g)]
+        renderable.extend(visual or geoms)
+    return sorted(renderable)
 
 
 class StretchRerunVisualizer:
     """Streams 3D robot meshes, object meshes, coordinate frames, target grasp, and waypoints to Rerun."""
 
-    def __init__(self, spawn: bool = True, port: int = 9876, app_id: str = "Stretch4 Datagen"):
+    def __init__(
+        self,
+        spawn: bool = True,
+        port: int = 9876,
+        app_id: str = "Stretch4 Datagen",
+        camera_names: Sequence[str] | None = None,
+    ):
         self._spawn = spawn
         self._port = port
         self._app_id = app_id
@@ -65,57 +173,30 @@ class StretchRerunVisualizer:
         self._logged_meshes: set[str] = set()
         self._last_logged_waypoint_idx = -1
         self._logged_grasp_lost = False
+        # The caller's choice of cameras, and the choice in force for the
+        # episode running now -- which is the policy's own set when the caller
+        # named none. See `_resolve_camera_names`.
+        self._requested_cameras = list(camera_names) if camera_names else None
+        self._camera_names: list[str] = list(camera_names) if camera_names else list(CAMERA_NAMES)
+        self._announced_cameras: list[str] | None = None
 
     def start_episode(self, episode_seed: int, task: Any, policy: Any = None) -> None:
         """Starts a new Rerun recording for each episode."""
         try:
             import uuid
             import rerun as rr
-            import rerun.blueprint as rrb
 
             rec_id = f"episode_{episode_seed}_{uuid.uuid4().hex[:8]}"
             app_id = self._app_id
 
-            blueprint = rrb.Blueprint(
-                rrb.Horizontal(
-                    rrb.Tabs(
-                        rrb.Spatial3DView(
-                            origin="world",
-                            contents=["+ $origin/**", "- $origin/scene_objects/**"],
-                            name="3D Scene",
-                        ),
-                        rrb.Spatial3DView(
-                            origin="world",
-                            contents=["+ $origin/**"],
-                            name="3D Scene (Complete)",
-                        ),
-                        active_tab=0,
-                    ),
-                    rrb.Vertical(
-                        rrb.Grid(
-                            contents=[
-                                rrb.Spatial2DView(origin=f"world/cameras/{cam_name}", name=cam_name)
-                                for cam_name in CAMERA_NAMES
-                            ]
-                        ),
-                        rrb.Horizontal(
-                            rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
-                            rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
-                        ),
-                        # 3D scene > cameras > text, so the scene reads at a glance and the
-                        # text panes stay a strip along the bottom of the right column.
-                        row_shares=[3, 1],
-                    ),
-                    column_shares=[3, 2],
-                ),
-                collapse_panels=True,
-            )
+            self._camera_names = self._resolve_camera_names(policy)
+            blueprint = self._build_blueprint()
 
             if not self._initialized:
                 rr.init(app_id, recording_id=rec_id, spawn=False, default_blueprint=blueprint)
                 if self._spawn:
                     try:
-                        rr.spawn(port=self._port, memory_limit="4GB")
+                        rr.spawn(port=self._port, memory_limit=RERUN_MEMORY_LIMIT)
                     except Exception as e:
                         log.debug(f"rr.spawn note: {e}")
                 self._initialized = True
@@ -148,6 +229,159 @@ class StretchRerunVisualizer:
                 self.setup_meshes(task.env.current_model, pickup_obj_name)
         except Exception as e:
             log.warning(f"Failed to start Rerun episode recording: {e}")
+
+    def focus_on_robot(self, task: Any) -> None:
+        """Re-send the blueprint with the closeup tab's eye aimed at the robot.
+
+        Called from the rollout's `reset`, because that is the first moment the
+        robot is standing where the episode wants it: `start_episode` runs
+        before it, so the blueprint sent there can only carry Rerun's own
+        default eye, which frames the whole house.
+
+        The eye comes from `robot_view_framing`, the same occlusion-checked
+        framing the MuJoCo viewer's free camera gets, so the two views of the
+        episode look at the robot from the same place.
+        """
+        if not self._initialized:
+            return
+        framing = robot_view_framing(task)
+        if framing is None:
+            return
+        try:
+            import rerun as rr
+
+            rr.send_blueprint(self._build_blueprint(framing))
+        except Exception as e:  # noqa: BLE001 - a stale camera is not worth an exception
+            log.debug(f"Could not aim the Rerun 3D eye at the robot: {e}")
+
+    def _resolve_camera_names(self, policy: Any) -> list[str]:
+        """The cameras to stream this episode: the caller's choice, else the policy's.
+
+        A fine-tuned checkpoint records the cameras it was trained on, and
+        `StretchMolmoBotPolicy` serves exactly those rather than its config's
+        (see `policies/molmobot_checkpoint.py`), so the policy already knows the
+        answer -- and it is the interesting one, since a camera the policy never
+        looks at tells you nothing about why it did what it did. Streaming the
+        others is also what pushes the images the policy *does* see out of the
+        viewer's memory budget; see `RERUN_MEMORY_LIMIT`.
+
+        `CAMERA_NAMES` is the last resort, for a policy that names no cameras
+        at all -- the waypoint experts, which read poses rather than pixels.
+        """
+        if self._requested_cameras:
+            return list(self._requested_cameras)
+
+        for holder in (
+            policy,
+            # MolmoBot's own `SynthVLAPolicy`, which `StretchMolmoBotPolicy` wraps.
+            getattr(policy, "_inner", None),
+            self._unwrap_policy(policy),
+            getattr(getattr(policy, "config", None), "policy_config", None),
+        ):
+            names = getattr(holder, "camera_names", None)
+            # Checked rather than trusted: `camera_names` is read off objects
+            # this module does not own, and a test double answers every
+            # attribute with something truthy that is not a list of strings.
+            if not isinstance(names, (list, tuple)) or not names:
+                continue
+            if all(isinstance(name, str) for name in names):
+                resolved = list(names)
+                break
+        else:
+            resolved = list(CAMERA_NAMES)
+
+        if resolved != self._announced_cameras:
+            self._announced_cameras = list(resolved)
+            log.info(f"[visualize] streaming cameras {resolved}")
+        return resolved
+
+    def _build_blueprint(self, framing: tuple[np.ndarray, float, float] | None = None) -> Any:
+        """The viewer layout, for the cameras and robot framing now in force.
+
+        Rebuilt rather than mutated because a Rerun blueprint is sent whole, and
+        it is sent twice per episode: once from `start_episode` and once from
+        `focus_on_robot`, when the robot's reset pose is known.
+        """
+        import rerun.blueprint as rrb
+
+        right_column = [
+            rrb.Grid(
+                contents=[
+                    rrb.Spatial2DView(origin=f"world/cameras/{cam_name}", name=cam_name)
+                    for cam_name in self._camera_names
+                ]
+            ),
+            rrb.Horizontal(
+                rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
+                rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
+            ),
+        ]
+        # 3D scene > cameras > text, so the scene reads at a glance and the text
+        # panes stay a strip along the bottom of the right column. With no
+        # cameras to show, the text gets the column to itself.
+        row_shares = [3, 1] if self._camera_names else None
+        if not self._camera_names:
+            right_column = right_column[1:]
+
+        return rrb.Blueprint(
+            rrb.Horizontal(
+                rrb.Tabs(
+                    rrb.Spatial3DView(
+                        origin="world",
+                        # The whole scene, house included, minus the camera
+                        # images -- they are 2D, so a 3D view can only list
+                        # them. `setup_meshes` logs a body's collision geometry
+                        # only where it has no visual geometry, so "everything"
+                        # here is already the collision-free scene: the ~2100
+                        # collision meshes of a benchmark house are not logged
+                        # at all, rather than hidden by this filter.
+                        contents=["+ $origin/**", "- $origin/cameras/**"],
+                        name="Robot Closeup",
+                        eye_controls=self._closeup_eye(framing),
+                    ),
+                    rrb.Spatial3DView(
+                        origin="world",
+                        contents=["+ $origin/**", "- $origin/scene_objects/**"],
+                        name="Robot and Object",
+                    ),
+                    rrb.Spatial3DView(
+                        origin="world",
+                        contents=["+ $origin/**"],
+                        name="3D Scene (Complete)",
+                    ),
+                    active_tab=0,
+                ),
+                rrb.Vertical(*right_column, row_shares=row_shares),
+                column_shares=[3, 2],
+            ),
+            collapse_panels=True,
+        )
+
+    @staticmethod
+    def _closeup_eye(framing: tuple[np.ndarray, float, float] | None) -> Any:
+        """The closeup tab's 3D eye, put where the viewer's free camera goes.
+
+        None until the robot's pose is known, which leaves Rerun's own eye in
+        place -- and None as well on a `rerun-sdk` without `EyeControls3D`,
+        which is a blueprint archetype Rerun still marks unstable, so the tab
+        is worth having without it rather than not at all.
+        """
+        if framing is None:
+            return None
+        lookat, distance, azimuth = framing
+        try:
+            import rerun.blueprint as rrb
+
+            position = lookat + _eye_direction(azimuth, FREE_CAMERA_ELEVATION) * distance
+            return rrb.EyeControls3D(
+                kind="Orbital",
+                position=[float(v) for v in position],
+                look_target=[float(v) for v in lookat],
+                eye_up=[0.0, 0.0, 1.0],
+            )
+        except Exception as e:  # noqa: BLE001 - see the docstring
+            log.debug(f"Rerun blueprint eye unavailable, keeping the default: {e}")
+            return None
 
     @staticmethod
     def _unwrap_policy(policy: Any) -> Any:
@@ -302,55 +536,46 @@ class StretchRerunVisualizer:
             )
 
         # 1. Stretch 4 robot meshes (from stretch4_urdf)
-        robot_visual_links = set()
-        for g in range(model.ngeom):
-            b_id = model.geom_bodyid[g]
-            b_name = model.body(b_id).name
-            g_mesh = model.geom_dataid[g]
-            if "robot_0" in b_name and g_mesh >= 0:
-                mesh_name = model.mesh(g_mesh).name
-                if "collision" not in mesh_name:
-                    robot_visual_links.add(b_name)
+        robot_geoms = _renderable_geoms(
+            model,
+            (
+                g
+                for g in range(model.ngeom)
+                if "robot_0" in model.body(model.geom_bodyid[g]).name
+                and model.geom_dataid[g] >= 0
+            ),
+        )
 
-        for g in range(model.ngeom):
+        for g in robot_geoms:
             b_id = model.geom_bodyid[g]
             b_name = model.body(b_id).name
             g_mesh = model.geom_dataid[g]
 
             geom_key = f"robot/{b_name}/{g}"
-            if "robot_0" in b_name and g_mesh >= 0:
-                mesh_name = model.mesh(g_mesh).name
-                if "collision" in mesh_name and b_name in robot_visual_links:
-                    continue
+            if geom_key not in self._logged_meshes:
+                vertadr = int(model.mesh_vertadr[g_mesh])
+                vertnum = int(model.mesh_vertnum[g_mesh])
+                faceadr = int(model.mesh_faceadr[g_mesh])
+                facenum = int(model.mesh_facenum[g_mesh])
+                verts = model.mesh_vert[vertadr : vertadr + vertnum].astype(np.float32)
+                faces = model.mesh_face[faceadr : faceadr + facenum].astype(np.uint32)
 
-                if geom_key not in self._logged_meshes:
-                    vertadr = int(model.mesh_vertadr[g_mesh])
-                    vertnum = int(model.mesh_vertnum[g_mesh])
-                    faceadr = int(model.mesh_faceadr[g_mesh])
-                    facenum = int(model.mesh_facenum[g_mesh])
-                    verts = model.mesh_vert[vertadr : vertadr + vertnum].astype(np.float32)
-                    faces = model.mesh_face[faceadr : faceadr + facenum].astype(np.uint32)
+                rot = R.from_quat(model.geom_quat[g], scalar_first=True)
+                verts_local = rot.apply(verts) + model.geom_pos[g]
 
-                    rot = R.from_quat(model.geom_quat[g], scalar_first=True)
-                    verts_local = rot.apply(verts) + model.geom_pos[g]
-
-                    mesh_3d = _build_mesh3d(g, verts_local, faces, is_robot=True)
-                    b_key = b_name.replace("/", "_")
-                    rr.log(
-                        f"world/robot/{b_key}/geom_{g}",
-                        mesh_3d,
-                        static=True,
-                    )
-                    self._logged_meshes.add(geom_key)
+                mesh_3d = _build_mesh3d(g, verts_local, faces, is_robot=True)
+                b_key = b_name.replace("/", "_")
+                rr.log(
+                    f"world/robot/{b_key}/geom_{g}",
+                    mesh_3d,
+                    static=True,
+                )
+                self._logged_meshes.add(geom_key)
 
         # 2. Manipulated object meshes & primitives from MolmoSpaces scene assets
         obj_body_ids = self._get_object_body_ids(model, pickup_obj_name)
-        obj_geoms = [g for g in range(model.ngeom) if model.geom_bodyid[g] in obj_body_ids]
-        has_visual_mesh = any(
-            model.geom_dataid[g] >= 0
-            and "collision" not in model.mesh(model.geom_dataid[g]).name
-            for g in obj_geoms
-            if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH
+        obj_geoms = _renderable_geoms(
+            model, (g for g in range(model.ngeom) if model.geom_bodyid[g] in obj_body_ids)
         )
 
         for g in obj_geoms:
@@ -358,10 +583,6 @@ class StretchRerunVisualizer:
             b_name = model.body(b_id).name
             g_type = model.geom_type[g]
             g_mesh = model.geom_dataid[g]
-            mesh_name = model.mesh(g_mesh).name if g_mesh >= 0 else ""
-
-            if has_visual_mesh and ("collision" in mesh_name or g_mesh < 0):
-                continue
 
             obj_geom_key = f"object/{b_name}/{g}"
             if obj_geom_key not in self._logged_meshes:
@@ -437,30 +658,21 @@ class StretchRerunVisualizer:
                 self._logged_meshes.add(obj_geom_key)
 
         # 3. Other scene objects / environment (furniture, fixtures, walls, floor, tables)
-        scene_geoms = [
-            g
-            for g in range(model.ngeom)
-            if model.geom_bodyid[g] not in obj_body_ids
-            and "robot_0" not in model.body(model.geom_bodyid[g]).name
-        ]
-        scene_visual_bodies = set()
-        for g in scene_geoms:
-            b_id = model.geom_bodyid[g]
-            g_mesh = model.geom_dataid[g] if hasattr(model, "geom_dataid") else -1
-            if g_mesh >= 0:
-                mesh_name = model.mesh(g_mesh).name
-                if "collision" not in mesh_name:
-                    scene_visual_bodies.add(b_id)
+        scene_geoms = _renderable_geoms(
+            model,
+            (
+                g
+                for g in range(model.ngeom)
+                if model.geom_bodyid[g] not in obj_body_ids
+                and "robot_0" not in model.body(model.geom_bodyid[g]).name
+            ),
+        )
 
         for g in scene_geoms:
             b_id = model.geom_bodyid[g]
             b_name = model.body(b_id).name
             g_type = model.geom_type[g]
             g_mesh = model.geom_dataid[g] if hasattr(model, "geom_dataid") else -1
-            mesh_name = model.mesh(g_mesh).name if g_mesh >= 0 else ""
-
-            if b_id in scene_visual_bodies and ("collision" in mesh_name or g_mesh < 0):
-                continue
 
             scene_geom_key = f"scene_objects/{b_name}/{g}"
             if scene_geom_key not in self._logged_meshes:
@@ -747,20 +959,25 @@ All waypoints finished execution. Holding final posture/grip.
                         rr.log("logs/waypoints", rr.TextLog(f"⚠️ [Step {step_idx}] Grasp lost during lift!", level=rr.TextLogLevel.WARN))
 
             # 6. Optional Camera feeds
+            #
+            # Only the cameras the blueprint lays out -- normally the ones the
+            # policy is looking at. An episode renders every camera in
+            # `Stretch4CameraSystem` whether or not anything reads it, and
+            # logging the unread ones costs the viewer's whole memory budget in
+            # images nobody can see. See `RERUN_MEMORY_LIMIT`.
             if observation is not None:
                 obs_dict = observation[0] if isinstance(observation, list) and observation else observation
                 if isinstance(obs_dict, dict):
-                    for cam_name in CAMERA_NAMES:
-                        if cam_name in obs_dict and obs_dict[cam_name] is not None:
-                            img = obs_dict[cam_name]
-                            if hasattr(img, "ndim") and img.ndim == 3:
-                                rr.log(f"world/cameras/{cam_name}", rr.Image(img))
-                    for depth_key in [k for k in obs_dict.keys() if k.endswith("_depth")]:
-                        depth_img = obs_dict[depth_key]
+                    for cam_name in self._camera_names:
+                        img = obs_dict.get(cam_name)
+                        if img is not None and hasattr(img, "ndim") and img.ndim == 3:
+                            rr.log(f"world/cameras/{cam_name}", rr.Image(img))
+
+                        depth_img = obs_dict.get(f"{cam_name}_depth")
                         if depth_img is not None and hasattr(depth_img, "ndim") and depth_img.ndim in (2, 3):
                             if depth_img.ndim == 3 and depth_img.shape[-1] == 1:
                                 depth_img = depth_img.squeeze(-1)
-                            rr.log(f"world/cameras/{depth_key}", rr.DepthImage(depth_img))
+                            rr.log(f"world/cameras/{cam_name}_depth", rr.DepthImage(depth_img))
         except Exception as e:
             log.debug(f"Error logging to Rerun: {e}")
 
@@ -906,6 +1123,44 @@ def _view_is_clear(task: Any, lookat: np.ndarray, eye_direction: np.ndarray, dis
     return hit < 0.0 or hit > span
 
 
+def robot_view_framing(task: Any) -> tuple[np.ndarray, float, float] | None:
+    """Where to put a camera for a clear, close view of the robot.
+
+    Returns `(lookat, distance, azimuth)` -- MuJoCo free-camera terms, because
+    that is what the passive viewer takes -- or None if the robot's pose cannot
+    be read at all. Every candidate view is tested against the scene's own
+    geometry, so what comes back is a sightline that is actually clear; see the
+    constants above for where the candidates come from.
+
+    Shared with the Rerun blueprint's 3D eye
+    (`StretchRerunVisualizer._closeup_eye`), so the two views of an episode look
+    at the robot from the same place rather than each having their own idea of
+    where it is.
+    """
+    pose = _base_pose_of(task)
+    if pose is None:
+        return None
+    robot_position, base_yaw = pose
+
+    lookat = np.array(
+        [robot_position[0], robot_position[1], robot_position[2] + FREE_CAMERA_LOOKAT_HEIGHT]
+    )
+
+    # Preferred distance first, so a clear view is also a well-framed one.
+    for distance in FREE_CAMERA_DISTANCES:
+        for bearing in FREE_CAMERA_BEARINGS:
+            azimuth = _camera_azimuth(bearing, base_yaw)
+            direction = _eye_direction(azimuth, FREE_CAMERA_ELEVATION)
+            if _view_is_clear(task, lookat, direction, distance):
+                return lookat, distance, azimuth
+
+    # Blocked from every side -- the robot is boxed in. Sit as close as
+    # possible on the chase camera's bearing: inside the wall beats 70m
+    # outside it, and the near clipping plane hides what the eye is buried in.
+    log.info("[visualize] every candidate view of the robot is occluded; using the closest")
+    return lookat, FREE_CAMERA_DISTANCES[0], _camera_azimuth(FREE_CAMERA_BEARINGS[0], base_yaw)
+
+
 def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
     """Put MuJoCo's passive viewer on a free camera, aimed at the robot.
 
@@ -925,41 +1180,15 @@ def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
     if viewer is None:
         return
     try:
-        pose = _base_pose_of(task)
-        if pose is None:
+        framing = robot_view_framing(task)
+        if framing is None:
             log.warning(
                 "Could not read the robot's base pose, so the viewer keeps the chase "
                 "camera. Press Esc for the free camera."
             )
             return
-        robot_position, base_yaw = pose
+        lookat, distance, azimuth = framing
 
-        lookat = np.array(
-            [robot_position[0], robot_position[1], robot_position[2] + FREE_CAMERA_LOOKAT_HEIGHT]
-        )
-
-        # Preferred distance first, so a clear view is also a well-framed one.
-        framing = None
-        for distance in FREE_CAMERA_DISTANCES:
-            for bearing in FREE_CAMERA_BEARINGS:
-                azimuth = _camera_azimuth(bearing, base_yaw)
-                direction = _eye_direction(azimuth, FREE_CAMERA_ELEVATION)
-                if _view_is_clear(task, lookat, direction, distance):
-                    framing = (distance, azimuth)
-                    break
-            if framing is not None:
-                break
-
-        if framing is None:
-            # Blocked from every side -- the robot is boxed in. Sit as close as
-            # possible on the chase camera's bearing: inside the wall beats 70m
-            # outside it, and the near clipping plane hides what the eye is buried in.
-            framing = (FREE_CAMERA_DISTANCES[0], _camera_azimuth(FREE_CAMERA_BEARINGS[0], base_yaw))
-            log.info(
-                "[visualize] every candidate view of the robot is occluded; using the closest"
-            )
-
-        distance, azimuth = framing
         # The viewer renders from its own thread, so the camera is written under
         # the handle's lock -- otherwise a frame can be drawn from a half-updated
         # one. A viewer stub without `lock()` just gets the plain writes.
@@ -1002,6 +1231,7 @@ def _visualize_rollout(
         result = original_reset(*args, **kwargs)
         observation = result[0] if isinstance(result, tuple) else result
         snap_free_camera_to_robot(viewer, task)
+        visualizer.focus_on_robot(task)
         visualizer.log_step(0, task, observation, policy=policy)
         return result
 
@@ -1105,8 +1335,15 @@ def _hide_viewer_panels() -> None:
     mujoco.viewer.launch_passive = launch_passive
 
 
-def install_eval_visualize_hook(spawn: bool = True, port: int = 9876) -> None:
+def install_eval_visualize_hook(
+    spawn: bool = True, port: int = 9876, camera_names: Sequence[str] | None = None
+) -> None:
     """Give evaluation rollouts the same two views datagen's `--visualize` gets.
+
+    `camera_names` is `--visualize-camera`: the cameras to stream and lay out.
+    Left None, each episode streams the cameras its policy reads, which for a
+    fine-tuned checkpoint is the set it was trained on -- see
+    `StretchRerunVisualizer._resolve_camera_names`.
 
     Idempotent: eval configs are re-imported when MolmoSpaces resolves a
     "module:Class" string, and the workers import them again, so this gets called
@@ -1123,7 +1360,9 @@ def install_eval_visualize_hook(spawn: bool = True, port: int = 9876) -> None:
     # One visualizer for the whole process: `start_episode` opens a fresh Rerun
     # recording per episode, but spawning the viewer and connecting to it happen
     # once, on the first episode.
-    visualizer = StretchRerunVisualizer(spawn=spawn, port=port, app_id="Stretch4 Benchmark Eval")
+    visualizer = StretchRerunVisualizer(
+        spawn=spawn, port=port, app_id="Stretch4 Benchmark Eval", camera_names=camera_names
+    )
 
     @functools.wraps(original_run_single_rollout)
     def run_single_rollout(episode_seed: int, task: Any, policy: Any, **kwargs: Any) -> bool:

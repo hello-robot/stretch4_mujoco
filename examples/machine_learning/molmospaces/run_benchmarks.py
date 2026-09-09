@@ -77,6 +77,7 @@ from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     missing_inference_requirements,
 )
 from examples.machine_learning.molmospaces.visualize import (
+    CAMERA_NAMES,
     install_eval_visualize_hook,
     name_viewer_window_after,
 )
@@ -290,6 +291,15 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "waypoint plan, IK frames, camera feeds). Forces --num-workers 1.",
 )
 @click.option(
+    "--visualize-camera",
+    "visualize_cameras",
+    multiple=True,
+    type=click.Choice(CAMERA_NAMES),
+    help="Camera to stream to Rerun under --visualize. Repeatable. Defaults to the "
+    "cameras the policy reads, which for --policy molmobot is the set its "
+    "checkpoint was fine-tuned on.",
+)
+@click.option(
     "--report/--no-report",
     "want_report",
     default=False,
@@ -308,6 +318,7 @@ def main(
     alternate: str | None,
     output_dir: Path | None,
     visualize: bool,
+    visualize_cameras: tuple[str, ...],
     want_report: bool,
     list_only: bool,
 ) -> None:
@@ -354,6 +365,8 @@ def main(
         )
     if policy != "molmobot" and molmobot_action_type:
         raise click.UsageError("--molmobot-action-type only applies to --policy molmobot.")
+    if visualize_cameras and not visualize:
+        raise click.UsageError("--visualize-camera only applies with --visualize.")
     if molmobot_action_type:
         os.environ[MOLMOBOT_ACTION_TYPE_ENV_VAR] = molmobot_action_type
 
@@ -386,7 +399,7 @@ def main(
         # progress, the IK frames, camera feeds. Installed here rather than in
         # `configs.py` because a single worker runs the rollouts in this very
         # process.
-        install_eval_visualize_hook()
+        install_eval_visualize_hook(camera_names=visualize_cameras or None)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(output_dir) if output_dir else Path("eval_output") / "stretch4" / timestamp

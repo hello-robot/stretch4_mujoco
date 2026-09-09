@@ -1705,6 +1705,72 @@ def test_stretch_rerun_visualizer_extracts_pickup_object_and_logs(monkeypatch):
     assert rec_names == ["Episode 101", "Episode 102"]
 
 
+def test_renderable_geoms_keeps_visual_geometry_and_drops_collision_hulls():
+    """A housegen body draws its visual geoms only; a collision-only body still draws."""
+    import mujoco
+
+    from examples.machine_learning.molmospaces.visualize import (
+        _is_collision_geom,
+        _renderable_geoms,
+    )
+
+    # `wall` is shaped like a housegen wall: a contactless visual geom and a
+    # collision geom that reference the *same* mesh, so only the contact bits
+    # tell them apart. `mast` is shaped like Stretch's own MJCF, where the
+    # collision geom is named for what it is. `floor` has no visual counterpart.
+    model = mujoco.MjModel.from_xml_string(
+        """
+        <mujoco>
+          <worldbody>
+            <geom name="floor" type="plane" size="10 10 0.01"/>
+            <body name="wall">
+              <geom name="wall_visual_0" type="box" size="1 0.1 1" contype="0" conaffinity="0"/>
+              <geom name="wall_collision_0" type="box" size="1 0.1 1" contype="8" conaffinity="15"/>
+            </body>
+            <body name="mast">
+              <geom name="mast_link_visual" type="box" size="0.1 0.1 1" contype="0" conaffinity="0"/>
+              <geom name="mast_collision_link" type="box" size="0.1 0.1 1"
+                    contype="0" conaffinity="0"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+    )
+
+    kept = {model.geom(g).name for g in _renderable_geoms(model, range(model.ngeom))}
+    assert kept == {"floor", "wall_visual_0", "mast_link_visual"}
+
+    assert _is_collision_geom(model, model.geom("wall_collision_0").id)
+    assert _is_collision_geom(model, model.geom("mast_collision_link").id)
+    assert not _is_collision_geom(model, model.geom("wall_visual_0").id)
+
+
+def test_visualizer_streams_the_cameras_the_policy_reads():
+    """Camera selection: `--visualize-camera` wins, else the policy's own set."""
+    from types import SimpleNamespace
+
+    from examples.machine_learning.molmospaces.visualize import (
+        CAMERA_NAMES,
+        StretchRerunVisualizer,
+    )
+
+    trained_on = ["head_camera_right", "wrist_camera_right"]
+    # What `StretchMolmoBotPolicy` looks like: the checkpoint's cameras live on
+    # the MolmoBot policy it wraps.
+    policy = SimpleNamespace(_inner=SimpleNamespace(camera_names=list(trained_on)))
+
+    assert StretchRerunVisualizer(spawn=False)._resolve_camera_names(policy) == trained_on
+
+    chosen = ["head_camera"]
+    visualizer = StretchRerunVisualizer(spawn=False, camera_names=chosen)
+    assert visualizer._resolve_camera_names(policy) == chosen
+
+    # A waypoint expert names no cameras, so every camera is laid out.
+    assert StretchRerunVisualizer(spawn=False)._resolve_camera_names(
+        SimpleNamespace()
+    ) == CAMERA_NAMES
+
+
 def test_fisheye_distortion_scaling_arbitrary_resolutions():
     """Verify fisheye distortion applies correctly across different resolutions without clipping."""
     from stretch4_mujoco.enums.stretch_cameras import StretchCameras
