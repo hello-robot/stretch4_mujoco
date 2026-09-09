@@ -1790,15 +1790,59 @@ def test_camera_feature_names_and_defaults_in_lerobot_export():
 
 
 def test_fisheye_active_fill_coverage_not_overly_vignetted():
-    """Verify fisheye distortion does not mask out most of the image with excessive black vignetting."""
+    """The distortion crops to the image circle instead of resizing the void.
+
+    A 123 degree fisheye warped out of a pinhole render leaves ~45% of the raw
+    frame with no source pixels behind it. That black is not a lens vignette,
+    and `INTER_AREA` averages it into every downstream resize, so the distortion
+    crops it away before handing the frame back.
+    """
+    from examples.machine_learning.molmospaces.stretch.config import CAMERA_RENDER_SIZE
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+    from stretch4_mujoco.utils import FISHEYE_MIN_VALID_FRACTION
+
+    sizes = [(224, 224), (640, 400)]
+    sizes += [CAMERA_RENDER_SIZE[name] for name in ("head_camera_left", "head_camera_right")]
+
+    for camera in (StretchCameras.cam_nav_rgb_se4_left, StretchCameras.cam_nav_rgb_se4_right):
+        distort = camera.post_processing_callback
+        assert distort is not None
+        for width, height in sizes:
+            out = distort(np.full((height, width, 3), 200, dtype=np.uint8))
+            assert out.shape == (height, width, 3), "the crop must not change the frame size"
+            non_black_ratio = np.count_nonzero(np.any(out > 0, axis=-1)) / float(width * height)
+            assert non_black_ratio >= FISHEYE_MIN_VALID_FRACTION, (
+                f"{camera.name} at {width}x{height} keeps only {non_black_ratio:.2f} of the "
+                "frame as real pixels; the crop should hold it to FISHEYE_MIN_VALID_FRACTION"
+            )
+            # Some black is expected and wanted: the curved corners are what a
+            # real lens vignettes. A frame with none of it has been cropped past
+            # the image circle and thrown away field of view for nothing.
+            assert non_black_ratio < 1.0
+
+
+def test_fisheye_crop_is_a_zoom_into_the_same_view_at_every_resolution():
+    """The crop is the same window of the scene whatever size the frame is.
+
+    Both stacks render these cameras at their own sizes -- the simulator at the
+    sensor's 1920x1200, the datagen path at a macroblock-sized 640x400 -- and a
+    crop that differed between them would mean a policy trained on one seeing a
+    different field of view at the other.
+    """
     from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
-    cb_left = StretchCameras.cam_nav_rgb_se4_left.post_processing_callback
-    img = np.ones((224, 224, 3), dtype=np.uint8) * 200
-    out = cb_left(img)
-    non_black_ratio = np.count_nonzero(np.any(out > 0, axis=-1)) / (224 * 224)
-    # The active image area should be >= 70% of the frame (corners only are curved out)
-    assert non_black_ratio >= 0.70, f"Fisheye active area ratio {non_black_ratio:.2f} is too low (excessive black borders)"
+    for camera in (StretchCameras.cam_nav_rgb_se4_left, StretchCameras.cam_nav_rgb_se4_right):
+        settings = camera.initial_camera_settings
+        native = camera.fisheye_crop_rect(settings.width, settings.height)
+        scaled = camera.fisheye_crop_rect(640, 400)
+        scale = 640.0 / settings.width
+
+        assert camera.fisheye_crop_zoom(settings.width, settings.height) > 1.0
+        for native_edge, scaled_edge in zip(native, scaled):
+            # Two pixels of slack: the crop is searched on each frame's own
+            # integer grid, and one step of the 640-wide one is three native
+            # pixels.
+            assert abs(native_edge * scale - scaled_edge) <= 2.0
 
 
 def test_finetune_camera_selection_parsing_and_commands(tmp_path):
@@ -2441,9 +2485,122 @@ def test_finetune_trains_several_tasks_as_one_mixture(tmp_path):
     assert "--dataset_sample_rates" not in single
 
 
-def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
-    """Stretch 4 camera system exposes the onboard cameras at 640x368 resolution."""
+def test_datagen_cameras_frame_the_scene_like_the_simulator():
+    """Each MolmoSpaces camera sees exactly what `Stretch4MujocoSimulator` sees.
+
+    The simulator renders through the MJCF camera with `cam_fovy` and the
+    viewport both taken from `StretchCameras.initial_camera_settings`
+    (`MujocoServerCameraManagerSync.set_camera_params`). MolmoSpaces renders a
+    *free* camera instead, whose vertical FOV is `MjcfCameraConfig.fov` and whose
+    horizontal FOV falls out of the render viewport's aspect ratio. So the two
+    stacks agree on the view only if both numbers are carried across -- and
+    getting it wrong is silent: a policy trains on a narrower or wider world than
+    the one it is later deployed into, and simply does worse.
+    """
     from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_OUTPUT_SIZE,
+        CAMERA_RENDER_SIZE,
+        STRETCH_CAMERA_FOR_CAMERA,
+        Stretch4CameraSystem,
+    )
+
+    for spec in Stretch4CameraSystem().cameras:
+        settings = STRETCH_CAMERA_FOR_CAMERA[spec.name].initial_camera_settings
+
+        assert spec.fov is not None, (
+            f"{spec.name} has no FOV, so MolmoSpaces falls back to the MJCF's -- and "
+            "mjcf_generator.py writes no fovy attribute, which means MuJoCo's 45 degree "
+            "default rather than any Stretch camera"
+        )
+        assert spec.fov == pytest.approx(settings.field_of_view_vertical_in_degrees)
+
+        width, height = CAMERA_RENDER_SIZE[spec.name]
+        # 0.5%: both dimensions have to be multiples of 16 for the video writers
+        # not to resize the frame, which is coarse enough that most cameras have
+        # no exactly-correct size. See `hdf5_layout.camera_render_size`.
+        assert width / height == pytest.approx(settings.width / settings.height, rel=5e-3), (
+            f"{spec.name} renders at {width}x{height}, a different aspect ratio from the "
+            f"hardware's {settings.width}x{settings.height}; with fovy fixed that changes "
+            "how much of the scene lands in frame horizontally"
+        )
+        assert width % 16 == 0 and height % 16 == 0, (
+            f"{spec.name} renders at {width}x{height}; imageio's ffmpeg writer resizes "
+            "anything that is not a multiple of 16, so the MP4 would stop being the frame "
+            "that was rendered"
+        )
+
+        expected = (height, width) if settings.rotate_number_of_times % 2 else (width, height)
+        assert CAMERA_OUTPUT_SIZE[spec.name] == expected
+
+
+def test_recorded_intrinsics_describe_the_recorded_frame():
+    """`intrinsic_cv` matches the frame that is actually saved, rotation included.
+
+    MolmoSpaces builds K from the shared buffer resolution and knows nothing
+    about the quarter turn the head cameras get, so unpatched it describes an
+    image no consumer ever sees.
+    """
+    from molmo_spaces.env.sensors_cameras import CameraParameterSensor
+
+    from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_OUTPUT_SIZE,
+        CAMERA_RENDER_SIZE,
+        HEAD_CAMERA_LEFT,
+        STRETCH_CAMERA_FOR_CAMERA,
+        WRIST_CAMERA_LEFT,
+    )
+
+    class _Camera:
+        def __init__(self, fov):
+            self.fov = fov
+
+        def get_pose(self):
+            return np.eye(4)
+
+    class _Env:
+        def __init__(self, name, fov):
+            self.camera_manager = type("_M", (), {"registry": {name: _Camera(fov)}})()
+
+    for name in (WRIST_CAMERA_LEFT, HEAD_CAMERA_LEFT):
+        camera = STRETCH_CAMERA_FOR_CAMERA[name]
+        settings = camera.initial_camera_settings
+        fov = settings.field_of_view_vertical_in_degrees
+        sensor = CameraParameterSensor(camera_name=name, img_resolution=(648, 422))
+        params = sensor.get_observation(_Env(name, fov), task=None)
+
+        k = np.array(params["intrinsic_cv"])
+        width, height = CAMERA_OUTPUT_SIZE[name]
+        render_width, render_height = CAMERA_RENDER_SIZE[name]
+        # A 123 degree lens has a far shorter focal length than a 58 degree one;
+        # the pre-patch code reported the same 444px for every camera.
+        unrotated_height = min(CAMERA_OUTPUT_SIZE[name]) if settings.rotate_number_of_times % 2 else height
+        focal = (unrotated_height / 2.0) / np.tan(np.radians(fov / 2.0))
+
+        if camera.applies_fisheye_distortion:
+            # The distortion crops into the render before handing the frame
+            # back at its original size, so the saved frame is zoomed in on a
+            # window of it and K has to say so.
+            zoom = camera.fisheye_crop_zoom(render_width, render_height)
+            assert zoom > 1.0
+            assert k[0, 0] == pytest.approx(focal * zoom, rel=1e-3)
+            # The crop tracks the image circle rather than the frame centre, so
+            # the principal point moves off centre -- but only by a few percent
+            # of the frame, not into another part of it.
+            assert abs(k[0, 2] - width / 2.0) < 0.1 * width
+            assert abs(k[1, 2] - height / 2.0) < 0.1 * height
+            continue
+
+        # The principal point sits at the centre of the frame that gets written,
+        # which for a rotated camera is the portrait one.
+        assert k[0, 2] == pytest.approx(width / 2.0, abs=1.0)
+        assert k[1, 2] == pytest.approx(height / 2.0, abs=1.0)
+        assert k[0, 0] == pytest.approx(focal)
+
+
+def test_stretch_camera_system_exposes_onboard_cameras(tmp_path):
+    """Stretch 4 camera system exposes the onboard cameras into a big enough buffer."""
+    from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_RENDER_SIZE,
         CHASE_CAMERA,
         HEAD_CAMERA,
         HEAD_CAMERA_LEFT,
@@ -2456,9 +2613,16 @@ def test_stretch_camera_system_exposes_onboard_cameras_at_640x368(tmp_path):
     from examples.machine_learning.molmospaces import hdf5_layout
     from examples.machine_learning.molmospaces.finetuning import finetune, lerobot_export
 
-    # 1. Stretch4CameraSystem includes the onboard cameras at (640, 368)
+    # 1. img_resolution is the shared offscreen buffer, not an image size: every
+    #    camera renders into its own sub-rectangle of it, so it has to enclose
+    #    all of them.
     cam_system = Stretch4CameraSystem()
-    assert cam_system.img_resolution == (640, 368)
+    buffer_width, buffer_height = cam_system.img_resolution
+    for name, (width, height) in CAMERA_RENDER_SIZE.items():
+        assert width <= buffer_width and height <= buffer_height, (
+            f"{name} renders {width}x{height}, which does not fit the "
+            f"{buffer_width}x{buffer_height} buffer MolmoSpaces allocates"
+        )
     cam_names = [c.name for c in cam_system.cameras]
     assert cam_names == [
         HEAD_CAMERA,

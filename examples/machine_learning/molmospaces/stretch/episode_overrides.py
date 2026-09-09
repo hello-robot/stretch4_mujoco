@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from examples.machine_learning.molmospaces.stretch.config import (
+    RENDER_BUFFER_RESOLUTION,
     Stretch4CameraSystem,
     Stretch4RobotConfig,
 )
@@ -206,7 +207,20 @@ def stretch_episode_override(
     # up until something rebinds the attribute -- at which point the cameras
     # actually created and the camera sensors created to read them stop agreeing.
     # (`cap_robot_eval_override` mutates in place for the same reason.)
-    stretch_cameras = Stretch4CameraSystem(img_resolution=tuple(episode_spec.img_resolution))
+    #
+    # `img_resolution` is the shared offscreen buffer rather than an image size:
+    # what each camera renders at is fixed by `CAMERA_RENDER_SIZE`, so an episode
+    # recorded before per-camera sizing carries a buffer too small to hold them.
+    # Taking the enclosing size of the two means a replay renders at exactly the
+    # sizes datagen did, which is the only way an eval score is comparable with
+    # what the policy trained on.
+    recorded_resolution = tuple(episode_spec.img_resolution)
+    stretch_cameras = Stretch4CameraSystem(
+        img_resolution=(
+            max(recorded_resolution[0], RENDER_BUFFER_RESOLUTION[0]),
+            max(recorded_resolution[1], RENDER_BUFFER_RESOLUTION[1]),
+        )
+    )
     exp_config.camera_config.cameras = list(stretch_cameras.cameras)
     exp_config.camera_config.img_resolution = stretch_cameras.img_resolution
 

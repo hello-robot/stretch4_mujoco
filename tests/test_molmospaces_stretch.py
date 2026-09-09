@@ -405,7 +405,7 @@ def test_the_override_rewrites_the_robot_and_leaves_the_task_alone():
         WRIST_CAMERA_RIGHT,
         WRIST_CAMERA_STEREO,
     )
-    # Stretch's own cameras, at the episode's resolution.
+    # Stretch's own cameras.
     assert [camera.name for camera in exp_config.camera_config.cameras] == [
         HEAD_CAMERA,
         WRIST_CAMERA_LEFT,
@@ -414,7 +414,17 @@ def test_the_override_rewrites_the_robot_and_leaves_the_task_alone():
         HEAD_CAMERA_LEFT,
         HEAD_CAMERA_RIGHT,
     ]
-    assert tuple(exp_config.camera_config.img_resolution) == (624, 352)
+    # `img_resolution` is the shared offscreen buffer, not an image size, and
+    # what each camera renders at is fixed by `CAMERA_RENDER_SIZE`. The episode's
+    # own 624x352 is too small to hold them, so the buffer grows to enclose both
+    # -- otherwise the replay would render smaller frames than the policy trained
+    # on and the eval score would not be comparable.
+    from examples.machine_learning.molmospaces.stretch.config import RENDER_BUFFER_RESOLUTION
+
+    assert tuple(exp_config.camera_config.img_resolution) == (
+        max(624, RENDER_BUFFER_RESOLUTION[0]),
+        max(352, RENDER_BUFFER_RESOLUTION[1]),
+    )
     # The spawn moved into the reach band, and nothing else about the task did.
     base_xy = np.array(spec.task["robot_base_pose"][:2])
     target_xy = np.array(spec.task["pickup_obj_start_pose"][:2])
@@ -1024,6 +1034,142 @@ def test_lift_waypoint_is_the_one_that_verifies_the_grasp():
     # Everything else must default to not participating.
     plain = Waypoint(position=np.zeros(3), wrist_pitch=0.0, gripper_open=True, label="reach")
     assert not plain.establishes_grasp and not plain.verify_grasp
+
+
+def test_datagen_render_matches_the_simulators_camera(robot_config):
+    """A MolmoSpaces frame is the frame `Stretch4MujocoSimulator` would render.
+
+    Not "close to" -- identical. The simulator renders through the MJCF camera
+    with `cam_fovy` from `StretchCameras.initial_camera_settings`; MolmoSpaces
+    renders a free camera aimed at the same pose. Three things have to line up
+    for those to be the same picture, and each was wrong before
+    `install_stretch_camera_hooks`:
+
+    * the vertical FOV (`MjcfCameraConfig.fov`, previously MuJoCo's 45 degree
+      default for four of the six cameras),
+    * the viewport's aspect ratio, which is where the horizontal FOV comes from,
+    * the headlight, which `mjv_updateScene` pins to whatever camera it was
+      handed -- and MolmoSpaces hands it a default one, then moves the *camera*
+      afterwards, leaving every frame lit from metres away from where it was
+      taken.
+
+    This drives the patched `CPUMujocoEnv.render_rgb_frame` itself, through a
+    stub env, so it fails if the patch stops being installed as well as if the
+    geometry drifts.
+    """
+    import mujoco
+    from molmo_spaces.env.env import CPUMujocoEnv
+    from molmo_spaces.renderer.opengl_rendering import MjOpenGLRenderer
+
+    from examples.machine_learning.molmospaces.stretch.config import (
+        CAMERA_RENDER_SIZE,
+        HEAD_CAMERA,
+        HEAD_CAMERA_LEFT,
+        MJCF_NAME_FOR_CAMERA,
+        RENDER_BUFFER_RESOLUTION,
+        STRETCH_CAMERA_FOR_CAMERA,
+        WRIST_CAMERA_LEFT,
+    )
+
+    spec = MjSpec()
+    spec.worldbody.add_light(pos=[0, 0, 3], dir=[0, 0, -1])
+    spec.worldbody.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_PLANE, size=[6, 6, 0.1], rgba=[0.4, 0.5, 0.4, 1]
+    )
+    # Something with structure in front of every camera, close and far.
+    for x, y, colour in [(1.4, 0.0, (1, 0, 0)), (0.9, 0.5, (0, 0, 1)), (0.4, 0.0, (1, 1, 0))]:
+        body = spec.worldbody.add_body(pos=[x, y, 0.5])
+        body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.06, 0.06, 0.5], rgba=[*colour, 1])
+    robot_config.robot_cls.add_robot_to_scene(
+        robot_config,
+        spec,
+        prefix=robot_config.robot_namespace,
+        pos=[0.0, 0.0, 0.0],
+        quat=[1.0, 0.0, 0.0, 0.0],
+        strip_meshes=False,
+    )
+    model = spec.compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+
+    class _StubManager:
+        def __init__(self, registry):
+            self.registry = registry
+
+    class _StubCamera:
+        """What `CameraManager`'s registry hands `render_rgb_frame`."""
+
+        def __init__(self, camera_id, fov):
+            rotation = data.cam_xmat[camera_id].reshape(3, 3)
+            self.pos = data.cam_xpos[camera_id].copy()
+            self.forward = -rotation[:, 2]  # MuJoCo cameras look down -Z...
+            self.up = rotation[:, 1]  # ...with +Y up
+            self.fov = fov
+
+    buffer_width, buffer_height = RENDER_BUFFER_RESOLUTION
+    # What `install_stretch_camera_hooks` guarantees on a real environment by
+    # patching `_initialize_with_model`; done by hand because this builds the
+    # renderer itself rather than going through `CPUMujocoEnv.__init__`.
+    model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), buffer_width)
+    model.vis.global_.offheight = max(int(model.vis.global_.offheight), buffer_height)
+    renderer = MjOpenGLRenderer(model=model, width=buffer_width, height=buffer_height)
+    try:
+        for name in (HEAD_CAMERA, HEAD_CAMERA_LEFT, WRIST_CAMERA_LEFT):
+            camera = STRETCH_CAMERA_FOR_CAMERA[name]
+            settings = camera.initial_camera_settings
+            mjcf_name = robot_config.robot_namespace + MJCF_NAME_FOR_CAMERA[name]
+            camera_id = model.camera(mjcf_name).id
+            width, height = CAMERA_RENDER_SIZE[name]
+
+            # What the simulator produces: the MJCF camera at its own fovy, then
+            # `_render_camera`'s post-processing and the driver's rotation.
+            model.cam_fovy[camera_id] = settings.field_of_view_vertical_in_degrees
+            reference_renderer = mujoco.Renderer(model, width=width, height=height)
+            try:
+                reference_renderer.update_scene(data, camera=mjcf_name)
+                reference = reference_renderer.render()
+            finally:
+                reference_renderer.close()
+            post_processing = camera.post_processing_callback
+            if post_processing is not None and not camera.is_depth:
+                reference = post_processing(reference)
+            if settings.rotate_number_of_times:
+                reference = np.rot90(reference, settings.rotate_number_of_times)
+
+            # What the datagen pipeline produces, through the patched method.
+            # `_render_frame` is borrowed unpatched, exactly as the patched
+            # `render_rgb_frame` calls it on a real environment.
+            env = type(
+                "_StubEnv",
+                (),
+                {
+                    "mj_model": model,
+                    "current_data": data,
+                    "_renderer": renderer,
+                    "_render_frame": CPUMujocoEnv._render_frame,
+                    "camera_manager": _StubManager(
+                        {name: _StubCamera(camera_id, settings.field_of_view_vertical_in_degrees)}
+                    ),
+                },
+            )()
+            rendered = CPUMujocoEnv.render_rgb_frame(env, name)
+
+            assert rendered.shape == reference.shape, (
+                f"{name} renders {rendered.shape}, the simulator {reference.shape}"
+            )
+            difference = np.abs(rendered.astype(int) - reference.astype(int))
+            # One level, on a handful of pixels: the datagen frame is rasterised
+            # into a sub-rectangle of a larger framebuffer than the reference,
+            # and the fisheye remap turns that into the odd off-by-one. A real
+            # difference of view is not subtle -- misplacing the headlight alone
+            # moved 57% of a wrist frame, by a mean of 30 levels.
+            assert difference.max() <= 1, (
+                f"{name} differs from the simulator's view of the same scene: "
+                f"mean |difference| {difference.mean():.2f} over "
+                f"{(difference.max(axis=2) > 1).mean() * 100:.1f}% of pixels"
+            )
+    finally:
+        renderer.close()
 
 
 def test_head_camera_renders_upright(robot_config):

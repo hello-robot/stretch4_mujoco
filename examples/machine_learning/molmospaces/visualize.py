@@ -29,12 +29,29 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import math
+import re
+from pathlib import Path
 from typing import Any
 
 import mujoco
 import numpy as np
 
+from examples.machine_learning.molmospaces.stretch.config import Stretch4RobotConfig
+from examples.machine_learning.molmospaces.stretch.robot import STRETCH_ROOT_BODY
+
 log = logging.getLogger(__name__)
+
+# The observation keys we look for images under, and the camera views the blueprint
+# lays out for them. A camera missing from an observation simply logs nothing, and
+# its view stays empty rather than breaking the layout.
+CAMERA_NAMES = [
+    "wrist_camera_left",
+    "wrist_camera_right",
+    "head_camera_left",
+    "head_camera",
+    "head_camera_right",
+]
 
 
 class StretchRerunVisualizer:
@@ -75,9 +92,21 @@ class StretchRerunVisualizer:
                         active_tab=0,
                     ),
                     rrb.Vertical(
-                        rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
-                        rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
+                        rrb.Grid(
+                            contents=[
+                                rrb.Spatial2DView(origin=f"world/cameras/{cam_name}", name=cam_name)
+                                for cam_name in CAMERA_NAMES
+                            ]
+                        ),
+                        rrb.Horizontal(
+                            rrb.TextDocumentView(origin="planner/waypoint", name="Current Waypoint"),
+                            rrb.TextLogView(origin="logs/waypoints", name="Waypoint Log"),
+                        ),
+                        # 3D scene > cameras > text, so the scene reads at a glance and the
+                        # text panes stay a strip along the bottom of the right column.
+                        row_shares=[3, 1],
                     ),
+                    column_shares=[3, 2],
                 ),
                 collapse_panels=True,
             )
@@ -721,7 +750,7 @@ All waypoints finished execution. Holding final posture/grip.
             if observation is not None:
                 obs_dict = observation[0] if isinstance(observation, list) and observation else observation
                 if isinstance(obs_dict, dict):
-                    for cam_name in ["head_camera", "wrist_camera_left", "wrist_camera_right", "head_camera_left", "head_camera_right"]:
+                    for cam_name in CAMERA_NAMES:
                         if cam_name in obs_dict and obs_dict[cam_name] is not None:
                             img = obs_dict[cam_name]
                             if hasattr(img, "ndim") and img.ndim == 3:
@@ -736,6 +765,147 @@ All waypoints finished execution. Holding final posture/grip.
             log.debug(f"Error logging to Rerun: {e}")
 
 
+# Framing for the viewer's free camera, all measured against benchmark episodes
+# rather than guessed -- see `StretchRobot._add_chase_camera`, which found that
+# anything 1.5m or more behind the robot was inside a wall in every episode
+# tried, and that everything within about a metre had a clear view in five of
+# six. So the offsets here start close and behind-right, which is where the
+# chase camera sits, and only back off if that view is blocked.
+FREE_CAMERA_LOOKAT_HEIGHT = 0.85
+"""
+Metres above the base body to aim at.
+
+Halfway up the robot, so the base and the head are both in frame: `head_link`
+sits 1.64m above the floor with the lift down, and `robot_0/base` is on it.
+"""
+
+FREE_CAMERA_ELEVATION = -20.0
+
+FREE_CAMERA_DISTANCES = (2.2, 1.8, 1.4)
+"""
+Camera distances to try, in order of preference.
+
+At the model's 45 degree fovy the visible half-height at the lookat plane is
+`distance * tan(fovy/2) / cos(elevation)`, so 2.2m puts the top of the frame at
+z=1.82 -- the head, at 1.64, with room above it. The fallbacks step *inwards*
+rather than out: per `_add_chase_camera`'s measurements the wall risk grows with
+distance, so when the robot is boxed in the way out is to close in and lose the
+head, not to back off into the wall.
+"""
+
+FREE_CAMERA_BEARINGS = (-155.0, -115.0, 155.0, 115.0, -65.0, 65.0, 180.0, 0.0)
+"""
+Directions to place the camera, in degrees to the left of the base's forward axis.
+
+-155 is the chase camera's own bearing (`pos = [-1.0, -0.45, 1.9]`, so behind and
+to the robot's right); the rest sweep outwards from it, keeping a view over the
+robot's shoulder wherever one is available.
+"""
+
+FREE_CAMERA_CLEARANCE = 0.45
+"""
+Where the occlusion ray starts, in metres from the lookat point.
+
+The ray is cast outwards from the robot rather than inwards from the camera, so
+it has to clear Stretch's own mast and base first or the robot would occlude
+every candidate view of itself.
+"""
+
+
+def _base_pose_of(task: Any) -> tuple[np.ndarray, float] | None:
+    """The robot's world position and yaw at reset, or None if it cannot be read.
+
+    Tries the live MuJoCo state first, since that is the pose the episode is
+    actually standing in, and falls back to the pose the episode spec asked for.
+    """
+    env = getattr(task, "env", None)
+    if env is not None:
+        try:
+            model, data = env.current_model, env.current_data
+        except Exception:  # noqa: BLE001 - an env mid-reset simply has no state yet
+            model = data = None
+        if model is not None and data is not None:
+            # `robot_0/base` is the holonomic base body `StretchRobot` adds to the
+            # worldbody; `robot_0/stretch4` is the robot root parented under it.
+            prefix = getattr(getattr(task, "robot", None), "namespace", None) or (
+                Stretch4RobotConfig.model_fields["robot_namespace"].default
+            )
+            for name in (f"{prefix}base", f"{prefix}{STRETCH_ROOT_BODY}"):
+                try:
+                    body = model.body(name)
+                except KeyError:
+                    continue
+                position = np.array(data.xpos[body.id], dtype=float)
+                # Column 0 of the body frame is its forward axis, in world coordinates.
+                forward = np.array(data.xmat[body.id], dtype=float).reshape(3, 3)[:, 0]
+                return position, float(np.arctan2(forward[1], forward[0]))
+
+    # The base pose the episode was authored with, as a 4x4 or a 7-vector.
+    pose = getattr(getattr(task, "config", None), "task_config", None)
+    pose = getattr(pose, "robot_base_pose", None)
+    if pose is not None:
+        pose = np.asarray(pose, dtype=float)
+        if pose.shape == (4, 4):
+            return pose[:3, 3], float(np.arctan2(pose[1, 0], pose[0, 0]))
+        if pose.shape[-1] >= 3:
+            return pose[:3], 0.0
+    return None
+
+
+def _camera_azimuth(bearing_deg: float, base_yaw: float) -> float:
+    """MuJoCo azimuth that puts the camera `bearing_deg` off the base's forward axis.
+
+    MuJoCo's azimuth names the direction the camera *looks along*, and its eye sits
+    on the opposite side of the lookat point, so the bearing has to be flipped.
+    """
+    angle = base_yaw + math.radians(bearing_deg)
+    return math.degrees(math.atan2(-math.sin(angle), -math.cos(angle)))
+
+
+def _eye_direction(azimuth_deg: float, elevation_deg: float) -> np.ndarray:
+    """Unit vector from the lookat point towards the camera's eye.
+
+    Verified against `mjv_updateScene`: for a free camera the eye sits at
+    `lookat + distance * this`, so a negative elevation puts it overhead.
+    """
+    azimuth, elevation = math.radians(azimuth_deg), math.radians(elevation_deg)
+    return np.array(
+        [
+            -math.cos(elevation) * math.cos(azimuth),
+            -math.cos(elevation) * math.sin(azimuth),
+            -math.sin(elevation),
+        ]
+    )
+
+
+def _view_is_clear(task: Any, lookat: np.ndarray, eye_direction: np.ndarray, distance: float) -> bool:
+    """Whether anything stands between the camera's eye and the robot.
+
+    Casts one ray outwards from the robot along the sightline. Static geometry is
+    included, because a wall is exactly what this is looking for.
+    """
+    span = distance - FREE_CAMERA_CLEARANCE
+    if span <= 0.0:
+        return True
+    try:
+        model, data = task.env.current_model, task.env.current_data
+        geom_id = np.zeros(1, dtype=np.int32)
+        hit = mujoco.mj_ray(
+            model,
+            data,
+            lookat + eye_direction * FREE_CAMERA_CLEARANCE,
+            eye_direction,
+            None,
+            1,
+            -1,
+            geom_id,
+        )
+    except Exception as error:  # noqa: BLE001 - an untestable view is not a fatal one
+        log.debug(f"Occlusion ray failed, accepting the view as-is: {error}")
+        return True
+    return hit < 0.0 or hit > span
+
+
 def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
     """Put MuJoCo's passive viewer on a free camera, aimed at the robot.
 
@@ -745,37 +915,68 @@ def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
     not swing around as the base turns. Press `[` / `]` in the viewer to cycle to
     the model's own cameras (Stretch mounts a chase camera and its head camera),
     or Esc to come back here.
+
+    The camera is only taken over once the robot's pose is in hand. MuJoCo's
+    default free camera frames the whole model, and a benchmark house is loaded in
+    its sealed "ceiling" variant, so that default is a building shot from ~70m
+    out -- switching to it and then failing to aim is strictly worse than leaving
+    the fixed chase camera `setup_viewer` configured.
     """
     if viewer is None:
         return
     try:
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        viewer.cam.fixedcamid = -1
+        pose = _base_pose_of(task)
+        if pose is None:
+            log.warning(
+                "Could not read the robot's base pose, so the viewer keeps the chase "
+                "camera. Press Esc for the free camera."
+            )
+            return
+        robot_position, base_yaw = pose
 
-        robot_pos = None
-        if hasattr(task, "env") and hasattr(task.env, "current_model") and hasattr(task.env, "mj_datas"):
-            m = task.env.current_model
-            d = task.env.mj_datas[task.env.current_batch_index]
-            for candidate in ["robot_0/base_link", "robot_0/base", "base_link", "robot_0/lift_link"]:
-                try:
-                    bid = m.body(candidate).id
-                    robot_pos = d.xpos[bid]
+        lookat = np.array(
+            [robot_position[0], robot_position[1], robot_position[2] + FREE_CAMERA_LOOKAT_HEIGHT]
+        )
+
+        # Preferred distance first, so a clear view is also a well-framed one.
+        framing = None
+        for distance in FREE_CAMERA_DISTANCES:
+            for bearing in FREE_CAMERA_BEARINGS:
+                azimuth = _camera_azimuth(bearing, base_yaw)
+                direction = _eye_direction(azimuth, FREE_CAMERA_ELEVATION)
+                if _view_is_clear(task, lookat, direction, distance):
+                    framing = (distance, azimuth)
                     break
-                except Exception:
-                    pass
+            if framing is not None:
+                break
 
-        if robot_pos is None and hasattr(task, "robot") and task.robot:
-            base_pose = getattr(task.robot, "base_pose", None)
-            if base_pose is not None:
-                robot_pos = base_pose[:3]
+        if framing is None:
+            # Blocked from every side -- the robot is boxed in. Sit as close as
+            # possible on the chase camera's bearing: inside the wall beats 70m
+            # outside it, and the near clipping plane hides what the eye is buried in.
+            framing = (FREE_CAMERA_DISTANCES[0], _camera_azimuth(FREE_CAMERA_BEARINGS[0], base_yaw))
+            log.info(
+                "[visualize] every candidate view of the robot is occluded; using the closest"
+            )
 
-        if robot_pos is not None:
-            viewer.cam.lookat[0] = float(robot_pos[0])
-            viewer.cam.lookat[1] = float(robot_pos[1])
-            viewer.cam.lookat[2] = float(robot_pos[2]) + 0.6
-            viewer.cam.distance = 2.5
-            viewer.cam.elevation = -20.0
-            viewer.cam.azimuth = 135.0
+        distance, azimuth = framing
+        # The viewer renders from its own thread, so the camera is written under
+        # the handle's lock -- otherwise a frame can be drawn from a half-updated
+        # one. A viewer stub without `lock()` just gets the plain writes.
+        lock = getattr(viewer, "lock", None)
+        with lock() if callable(lock) else contextlib.nullcontext():
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            viewer.cam.fixedcamid = -1
+            viewer.cam.lookat[0] = float(lookat[0])
+            viewer.cam.lookat[1] = float(lookat[1])
+            viewer.cam.lookat[2] = float(lookat[2])
+            viewer.cam.distance = distance
+            viewer.cam.elevation = FREE_CAMERA_ELEVATION
+            viewer.cam.azimuth = azimuth
+        log.info(
+            f"[visualize] free camera on the robot at {np.round(lookat, 2).tolist()}, "
+            f"{distance}m out, azimuth {azimuth:.0f}"
+        )
     except Exception as e:
         log.warning(f"Failed to snap free camera to robot: {e}")
 
@@ -823,6 +1024,87 @@ def _visualize_rollout(
             task.__dict__.pop(name, None)
 
 
+_HOUSE_SCENE_STEM = re.compile(r"^(?:train|val|test)_\d+(?:_ceiling)?$")
+"""
+Filenames housegen gives a house scene, as `<split>_<index>[_ceiling]`.
+
+Documented at `molmo_spaces_constants.py:392` and parsed the same way there. This
+is what tells a house apart from the receptacles, pickup objects and robot that
+`MjSpec.from_file` also loads.
+"""
+
+
+def name_viewer_window_after(task_name: str) -> None:
+    """Make the viewer's title bar name the task instead of the house.
+
+    MuJoCo titles its window `"MuJoCo : " + <model name>`; the string is composed
+    in C++ inside `_simulate`, so the prefix cannot be dropped from here. The name
+    after it comes from the house scene, which `housegen/exporter.py` stamps with
+    `f"{split}_{house_index}"` -- so the title reads "MuJoCo : val_0" and changes
+    with every episode.
+
+    A compiled model cannot be renamed (`MjModel.names` is `bytes` in Python, and
+    the viewer has to be handed the very model the simulation steps), so the rename
+    happens on the spec, before `task_sampler.setup_robot_scene` compiles it.
+
+    Narrowed to house scenes by filename on purpose: the same `MjSpec.from_file`
+    loads receptacles, pickup objects and the robot, and those specs get attached
+    into the scene, where their names are not ours to rename.
+    """
+    if getattr(mujoco.MjSpec.from_file, "_stretch_scene_name", None) is not None:
+        # Already installed -- just retarget it, so a sweep over several
+        # benchmarks titles each one rather than keeping the first.
+        mujoco.MjSpec.from_file._stretch_scene_name = task_name
+        return
+
+    original_from_file = mujoco.MjSpec.from_file
+
+    @functools.wraps(original_from_file)
+    def from_file(filename: Any, *args: Any, **kwargs: Any) -> Any:
+        spec = original_from_file(filename, *args, **kwargs)
+        name = from_file._stretch_scene_name
+        if name and _HOUSE_SCENE_STEM.match(Path(str(filename)).stem):
+            with contextlib.suppress(Exception):
+                # Cosmetic: a spec that will not take a name is not worth an
+                # exception on the scene-loading path.
+                spec.modelname = name
+        return spec
+
+    from_file._stretch_scene_name = task_name
+    mujoco.MjSpec.from_file = staticmethod(from_file)
+    log.info(f"[visualize] viewer window title: MuJoCo : {task_name}")
+
+
+def _hide_viewer_panels() -> None:
+    """Open MuJoCo's passive viewer with both side panels collapsed.
+
+    `launch_passive` takes `show_left_ui` / `show_right_ui`, but the call that
+    creates the viewer is MolmoSpaces' `setup_viewer`, which does not pass either
+    -- so wrapping the function is the way in. `setup_viewer` looks the name up on
+    the module at call time, so replacing the attribute is enough, and it re-opens
+    the viewer once per episode, so this has to hold for the whole process rather
+    than just the first window.
+
+    Tab and Shift+Tab still bring the panels back once the window is open.
+    """
+    import mujoco.viewer
+
+    if getattr(mujoco.viewer.launch_passive, "_stretch_hidden_panels", False):
+        return
+
+    original_launch_passive = mujoco.viewer.launch_passive
+
+    @functools.wraps(original_launch_passive)
+    def launch_passive(*args: Any, **kwargs: Any) -> Any:
+        # setdefault, not an override: an explicit caller still wins.
+        kwargs.setdefault("show_left_ui", False)
+        kwargs.setdefault("show_right_ui", False)
+        return original_launch_passive(*args, **kwargs)
+
+    launch_passive._stretch_hidden_panels = True
+    mujoco.viewer.launch_passive = launch_passive
+
+
 def install_eval_visualize_hook(spawn: bool = True, port: int = 9876) -> None:
     """Give evaluation rollouts the same two views datagen's `--visualize` gets.
 
@@ -831,6 +1113,8 @@ def install_eval_visualize_hook(spawn: bool = True, port: int = 9876) -> None:
     more than once per process.
     """
     from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
+
+    _hide_viewer_panels()
 
     if getattr(JsonEvalRunner.run_single_rollout, "_stretch_visualize_hook", False):
         return

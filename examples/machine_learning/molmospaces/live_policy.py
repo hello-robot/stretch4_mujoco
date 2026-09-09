@@ -42,19 +42,16 @@ from pathlib import Path
 import click
 import numpy as np
 
+from examples.machine_learning.molmospaces.hdf5_layout import match_trained_frame
 from examples.machine_learning.molmospaces.policies.checkpoint import TrainedPolicy
 from examples.machine_learning.molmospaces.policies.networks import STATE_GROUPS
 from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA,
     HEAD_CAMERA_LEFT,
-    HEAD_CAMERA_LEFT_MJCF_NAME,
-    HEAD_CAMERA_MJCF_NAME,
     HEAD_CAMERA_RIGHT,
-    HEAD_CAMERA_RIGHT_MJCF_NAME,
+    STRETCH_CAMERA_FOR_CAMERA,
     WRIST_CAMERA_LEFT,
     WRIST_CAMERA_RIGHT,
-    WRIST_LEFT_CAMERA_MJCF_NAME,
-    WRIST_RIGHT_CAMERA_MJCF_NAME,
 )
 from examples.molmo_environment import STRETCH_ROOT_BODY
 from stretch4_mujoco.enums.actuators import Actuators
@@ -64,41 +61,21 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 log = logging.getLogger(__name__)
 
 
-def _camera_for_mjcf_name(mjcf_name: str) -> StretchCameras:
-    """The `StretchCameras` member that renders a given MJCF camera.
-
-    Derived rather than hand-written, because the two stacks name the same
-    physical camera differently and getting the pairing wrong is invisible:
-    feeding a policy trained on `gripper_camera_left_rgb` the *right* gripper
-    camera produces plausible-looking images from 2cm away and a policy that
-    quietly does worse.
-
-    Several members can share an MJCF camera -- the head centre camera has a
-    full-resolution and a low-resolution member -- so prefer the one Stretch 4
-    exposes outwardly. `Stretch4MujocoSimulator` swaps in the low-resolution
-    variant internally and reports frames back under the outward name.
-    """
-    matches = [
-        camera
-        for camera in StretchCameras.all_stretch4()
-        if camera.camera_name_in_mjcf == mjcf_name
-    ]
-    if not matches:
-        raise ValueError(
-            f"No StretchCameras member renders MJCF camera {mjcf_name!r}; "
-            f"available: {sorted(c.camera_name_in_mjcf for c in StretchCameras.all_stretch4())}"
-        )
-    return matches[0]
-
-
 # The policy's camera names, mapped to the simulator cameras that render the very
-# same MJCF cameras `Stretch4CameraSystem` used during training.
+# same MJCF cameras `Stretch4CameraSystem` used during training. The pairing is
+# derived from the MJCF camera names in `stretch/config.py` rather than written
+# out here, because getting it wrong is invisible: feeding a policy trained on
+# `gripper_camera_left_rgb` the *right* gripper camera produces plausible-looking
+# images from 2cm away and a policy that quietly does worse.
 CAMERA_FOR_TRAINED_NAME: dict[str, StretchCameras] = {
-    HEAD_CAMERA: _camera_for_mjcf_name(HEAD_CAMERA_MJCF_NAME),
-    WRIST_CAMERA_LEFT: _camera_for_mjcf_name(WRIST_LEFT_CAMERA_MJCF_NAME),
-    WRIST_CAMERA_RIGHT: _camera_for_mjcf_name(WRIST_RIGHT_CAMERA_MJCF_NAME),
-    HEAD_CAMERA_LEFT: _camera_for_mjcf_name(HEAD_CAMERA_LEFT_MJCF_NAME),
-    HEAD_CAMERA_RIGHT: _camera_for_mjcf_name(HEAD_CAMERA_RIGHT_MJCF_NAME),
+    name: STRETCH_CAMERA_FOR_CAMERA[name]
+    for name in (
+        HEAD_CAMERA,
+        WRIST_CAMERA_LEFT,
+        WRIST_CAMERA_RIGHT,
+        HEAD_CAMERA_LEFT,
+        HEAD_CAMERA_RIGHT,
+    )
 }
 
 # Move groups the policy commands as absolute joint positions, and the simulator
@@ -267,13 +244,18 @@ class PolicyRunner:
 
     def _step(self) -> None:
         status = self.sim.pull_status()
-        frames = self.sim.pull_camera_data().get_all()
+        # `auto_correct_rgb` swaps to BGR for OpenCV windows, which is not what a
+        # policy was trained on -- the datagen pipeline writes its MP4s through
+        # imageio, in RGB. `match_trained_frame` closes the other half of the gap:
+        # the simulator renders each camera at its full hardware resolution, and
+        # the dataset holds the same view at `camera_output_size`.
+        frames = self.sim.pull_camera_data().get_all(auto_correct_rgb=False)
         images = {}
         for trained_name, camera in CAMERA_FOR_TRAINED_NAME.items():
             pixels = frames.get(camera)
             if pixels is None:
                 return  # cameras not warmed up yet; try again next step
-            images[trained_name] = pixels
+            images[trained_name] = match_trained_frame(camera, pixels)
 
         state = read_state(status)
         base_xytheta = np.array([status.base.x, status.base.y, status.base.theta])

@@ -40,12 +40,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
+from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +66,127 @@ class DuplicateSplitError(RuntimeError):
     to say something better than a traceback: `finetune.py` turns it into a
     `ClickException`, and a test can assert on it without matching on message text.
     """
+
+CAMERA_PIXEL_BUDGET = 640 * 368
+"""Roughly how many pixels one rendered camera frame in this format costs.
+
+Every camera is rendered at *its own aspect ratio* scaled to this budget rather
+than at one shared resolution. The aspect ratio is what decides how much of the
+scene lands in frame, so it has to match the hardware camera or the simulator
+and the dataset show different views; the pixel count does not, and is free to
+be whatever training wants. This is the count the pipeline used before per-camera
+sizing; the sizes actually chosen land within 13% of it, so the cost per frame is
+essentially unchanged.
+
+This lives here, next to the rest of the format, because it is a property of the
+dataset rather than of either stack that reads it: `stretch/config.py` renders to
+it, `live_recorder.py` records to it, and `live_policy.py` serves to it, and the
+three are only comparable while they agree.
+"""
+
+
+MACROBLOCK = 16
+"""Both frame dimensions are kept a multiple of this.
+
+Not a preference: imageio's ffmpeg writer silently *resizes* any frame whose
+dimensions are not a multiple of 16 (`macro_block_size`), so a 560x422 render
+landed in the MP4 as 560x432 and stopped being the frame that was rendered, that
+Rerun showed, and that the recorded intrinsics describe. cv2's writer does not
+resize, so live recordings would not match generated ones either. Sizing to
+macroblocks in the first place makes every writer agree without any of them
+having to be configured.
+"""
+
+
+def round_to_macroblock(value: float) -> int:
+    """Round to the nearest positive multiple of `MACROBLOCK`."""
+    return max(MACROBLOCK, int(round(value / MACROBLOCK)) * MACROBLOCK)
+
+
+MAX_BUDGET_ERROR = 0.15
+"""How far a render may sit from `CAMERA_PIXEL_BUDGET`, as a fraction.
+
+Sizing in macroblocks is coarse, so a camera rarely has a size that is both
+exactly its aspect ratio and exactly the budget -- 16:9 in multiples of 16 is
+only exact at 512x288, which is 63% of the pixels. Aspect ratio is the one
+that has to be right, since it is what decides how much of the scene is in
+frame, so the search minimises aspect error and lets the pixel count wander
+within this band rather than the other way round.
+"""
+
+
+@lru_cache(maxsize=32)
+def camera_render_size(camera: "StretchCameras") -> tuple[int, int]:
+    """(width, height) to render `camera` at: its own aspect, near the budget.
+
+        cam_nav_rgb_se4_center      592x448   (4034x3040 native, 81.8 deg)
+        cam_nav_rgb_se4_left        640x400   (1920x1200 native, 123.4 deg)
+        cam_nav_rgb_se4_right       640x400   (1920x1200 native, 123.2 deg)
+        cam_gripper_se4_*           656x368   (480x270 native, 58 deg)
+
+    The worst aspect error left is 0.42%, about a quarter of a degree of
+    horizontal field of view -- against the 31% the head centre camera carried
+    when every camera shared one 640x368 viewport.
+    """
+    settings = camera.initial_camera_settings
+    aspect = settings.width / float(settings.height)
+    ideal_height = math.sqrt(CAMERA_PIXEL_BUDGET / aspect)
+
+    candidates = []
+    for offset in range(-6, 7):
+        height = round_to_macroblock(ideal_height) + offset * MACROBLOCK
+        if height < MACROBLOCK:
+            continue
+        width = round_to_macroblock(height * aspect)
+        aspect_error = abs(width / height - aspect) / aspect
+        budget_error = abs(width * height - CAMERA_PIXEL_BUDGET) / CAMERA_PIXEL_BUDGET
+        candidates.append((aspect_error, budget_error, width, height))
+
+    affordable = [c for c in candidates if c[1] <= MAX_BUDGET_ERROR]
+    _, _, width, height = min(affordable or candidates, key=lambda c: (c[0], c[1]))
+    return (width, height)
+
+
+@lru_cache(maxsize=32)
+def camera_output_size(camera: "StretchCameras") -> tuple[int, int]:
+    """(width, height) of the frame that actually reaches a video or a policy.
+
+    The head cameras are mounted rotated on the hardware and their frames come
+    out of a quarter turn (`rotate_number_of_times`), which swaps width and
+    height -- 448x592 rather than 592x448. That rotation is applied by both
+    stacks, so it is part of what "the same view" means here.
+    """
+    width, height = camera_render_size(camera)
+    if camera.initial_camera_settings.rotate_number_of_times % 2:
+        return (height, width)
+    return (width, height)
+
+
+def match_trained_frame(camera: "StretchCameras", frame: np.ndarray) -> np.ndarray:
+    """Resize a live simulator frame to the size this format stores.
+
+    `Stretch4MujocoSimulator` renders at the camera's full
+    `initial_camera_settings` resolution, which is what the hardware streams;
+    the dataset holds the same view at `camera_output_size`. Handing a policy the
+    full-resolution frame is not a mismatch a vision encoder quietly absorbs: it
+    rescales to its own input size, so the aspect survives but every intermediate
+    crop and patch grid differs from what training saw.
+    """
+    import cv2
+
+    if frame is None:
+        return frame
+    size = camera_output_size(camera)
+    if (frame.shape[1], frame.shape[0]) == size:
+        return frame
+    # Area averaging on the way down -- the live frames are larger than the
+    # stored size for every Stretch camera, and INTER_AREA is what keeps the
+    # fisheye's fine structure from aliasing into the downscale.
+    interpolation = cv2.INTER_AREA if frame.shape[1] > size[0] else cv2.INTER_LINEAR
+    # Contiguous because the caller's frame is usually a `np.rot90` view, whose
+    # negative strides OpenCV refuses.
+    return cv2.resize(np.ascontiguousarray(frame), size, interpolation=interpolation)
+
 
 VIDEO_PATH_FIELD_BYTES = 100
 """

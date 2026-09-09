@@ -351,7 +351,20 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     tree = ET.ElementTree(new_root)
     tree.write(out_mjcf_path, encoding="unicode", xml_declaration=True)
 
-    # Inject ctrlrange into actuator_sensor.xml based on the extracted joint ranges
+    # Inject ctrlrange into actuator_sensor.xml based on the extracted joint ranges.
+    #
+    # Position limits are the only part of the joints' dynamic envelope that MJCF
+    # can hold. There is deliberately no velocity or acceleration limit written
+    # here because MuJoCo has nowhere to put one: a <joint> takes `range` and
+    # `actuatorfrcrange` but nothing bounding qvel, and an <actuator> takes
+    # `ctrlrange` and `forcerange` but nothing bounding how fast it may chase its
+    # setpoint. `damping`/`armature`/`forcerange` only shape the response, they do
+    # not cap it.
+    #
+    # So the per-joint velocity and acceleration limits from stretch_body's
+    # robot_params_SE4.py live in `stretch4_mujoco/config.py` instead.
+    # Anything that writes `mjdata.ctrl` without going through one of those gets
+    # a step input, and the joint will move as fast as the physics allows.
     try:
         import os
 

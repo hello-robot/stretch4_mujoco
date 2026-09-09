@@ -19,13 +19,15 @@ robots (`robots/mobile_franka.py`, and RBY1 under `use_holo_base`), the robot is
 hung off three *virtual* holonomic joints -- two slides and a hinge -- driven by
 position actuators.
 
-The real wheels stay in the model, visually and inertially, but never touch
-anything: Stretch's wheel geoms use `contype=6 conaffinity=4`, which does not
-match the `contype=1 conaffinity=1` of a MolmoSpaces floor, so they only ever
-collided through the explicit `<pair>` elements in `models/stretch_4/contact.xml`
-that `_prepare_robot_spec()` removes. With the pairs gone the wheels are inert
-and the base slides on its holonomic joints; the lowest remaining collision geom
-(`base_link_collision`) clears the floor by ~8cm.
+The real wheels stay in the model, visually and inertially, but are made not to
+touch anything: `_prepare_robot_spec()` clears their `contype`/`conaffinity`
+outright. Removing the explicit `<pair>` elements in
+`models/stretch_4/contact.xml` is not enough on its own -- a procthor-objaverse
+floor geom is `contype=8 conaffinity=15` against the wheels' `contype=6`, and
+`6 & 15` is non-zero, so the two collide through the default mechanism as well.
+With the wheels inert the base slides on its holonomic joints and the lowest
+remaining collision geom, `base_link_collision`, clears the floor by ~2.8cm --
+the same clearance it has on the standalone robot once that has settled.
 """
 
 import logging
@@ -36,6 +38,7 @@ import numpy as np
 from mujoco import MjData, MjSpec
 from scipy.spatial.transform import Rotation as R
 
+from examples.machine_learning.molmospaces.stretch.motion_limits import rate_limited
 from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
 from molmo_spaces.controllers.abstract import Controller
 from molmo_spaces.controllers.joint_pos import JointPosController
@@ -57,6 +60,11 @@ log = logging.getLogger(__name__)
 # freejoint, which `_prepare_robot_spec()` strips before the body is grafted onto
 # the holonomic base.
 STRETCH_ROOT_BODY = "stretch4"
+
+# The omniwheel collision capsules `mjcf_generator` substitutes for the URDF's
+# rigid wheel meshes. These are what the robot rests on, so they are the
+# reference for where the floor is; see `_drop_freejoint_spawn_height`.
+OMNIWHEEL_GEOMS = ("left_wheel_link", "back_wheel_link", "right_wheel_link")
 
 # MJCF camera -> the hardware camera it stands for. Only cameras that appear here
 # get their mounting rotation corrected; everything else is left as the URDF
@@ -112,9 +120,24 @@ class Stretch4Robot(Robot):
             "holo_joint_rel_planar_position": JointRelPosController,
         }[robot_config.command_mode["base"]]
 
+        # Every controller's output is shaped to Stretch's real joint velocity and
+        # acceleration limits on the way to `ctrl`; see `motion_limits.py` for why
+        # that cannot be left to MuJoCo or baked into the MJCF. `compute_control()`
+        # runs once per control step, so this is the interval the ramp advances by.
+        ctrl_dt = exp_config.ctrl_dt_ms / 1000.0
+
         self._controllers: dict[str, Controller] = {
-            "base": base_controller_cls(self._robot_view.get_move_group("base")),
-            "gripper": JointPosController(self._robot_view.get_move_group("gripper")),
+            "base": rate_limited(
+                base_controller_cls(self._robot_view.get_move_group("base")), "base", ctrl_dt
+            ),
+            # Left unshaped on purpose -- see MOVE_GROUP_ACTUATORS. Routed
+            # through `rate_limited` anyway so that adding gripper limits is a
+            # one-line change there rather than here.
+            "gripper": rate_limited(
+                JointPosController(self._robot_view.get_move_group("gripper")),
+                "gripper",
+                ctrl_dt,
+            ),
         }
         for group in _RELATIVE_CAPABLE_GROUPS:
             controller_cls = (
@@ -122,7 +145,9 @@ class Stretch4Robot(Robot):
                 if robot_config.command_mode.get(group) == "joint_rel_position"
                 else JointPosController
             )
-            self._controllers[group] = controller_cls(self._robot_view.get_move_group(group))
+            self._controllers[group] = rate_limited(
+                controller_cls(self._robot_view.get_move_group(group)), group, ctrl_dt
+            )
 
     @property
     def namespace(self) -> str:
@@ -187,17 +212,25 @@ class Stretch4Robot(Robot):
     def _prepare_robot_spec(cls, robot_spec: MjSpec) -> None:
         """Make the standalone Stretch MJCF safe to graft into a foreign scene.
 
-        Three things in the generated model only make sense for the standalone
+        Four things in the generated model only make sense for the standalone
         `scene_stretch4.xml`:
 
         1. The freejoint on the root body. The root is about to become a child of
            the holonomic base body, and a free-jointed body cannot hang off one
            whose pose is already determined by other joints.
-        2. The omniwheel `<pair>` elements. They name a geom called "floor" that
-           a MolmoSpaces house need not contain, which is a hard compile error,
-           and with the holonomic base there is nothing for them to do -- see the
-           module docstring.
-        3. The keyframes. Their `ctrl` vectors are sized for the standalone
+        2. The root body's spawn height. `mjcf_generator` lifts it by
+           `ConversionMetadata.height_offset` so a *freejointed* robot does not
+           start with its wheels through the floor; gravity then settles it. With
+           the freejoint gone the robot is held wherever it is put, so that
+           offset stops being a spawn margin and becomes permanent daylight --
+           see `_drop_freejoint_spawn_height`.
+        3. The omniwheel contacts, both the explicit `<pair>` elements and the
+           geoms' own `contype`/`conaffinity`. The pairs name a geom called
+           "floor" that a MolmoSpaces house need not contain, which is a hard
+           compile error; the contype/conaffinity has to go too, or the wheels
+           collide with house floors through the default mechanism -- see
+           `_disable_omniwheel_contacts`.
+        4. The keyframes. Their `ctrl` vectors are sized for the standalone
            model's 10 actuators; this scene will have more (three base actuators,
            plus whatever articulated furniture the house brings). MuJoCo warns
            about exactly this on attach ("child model has pending keyframes").
@@ -215,13 +248,17 @@ class Stretch4Robot(Robot):
         for pair in list(robot_spec.pairs):
             robot_spec.delete(pair)
 
+        cls._disable_omniwheel_contacts(robot_spec)
+
         # Keyframes stay "pending" -- invisible to `spec.keys` and undeletable --
         # until a compile resolves them, so the throwaway compile below is what
         # makes the deletion possible. It has to come after the pairs are gone,
         # since those name a "floor" geom the robot model does not define.
-        robot_spec.compile()
+        compiled = robot_spec.compile()
         for key in list(robot_spec.keys):
             robot_spec.delete(key)
+
+        cls._drop_freejoint_spawn_height(compiled, root)
 
         # Both the robot spec and any MolmoSpaces house call their root default
         # class "main". Compiling a merged spec with two of them is fine, but
@@ -229,6 +266,84 @@ class Stretch4Robot(Robot):
         # MuJoCo then refuses to read. Renaming is cosmetic -- elements hold a
         # pointer to their default, not its name.
         robot_spec.default.name = "stretch_main"
+
+    @staticmethod
+    def _disable_omniwheel_contacts(robot_spec: MjSpec) -> None:
+        """Stop the wheels colliding with anything. The holonomic base carries the robot.
+
+        The wheels are along for the ride here: the base is driven by three
+        virtual joints, and a wheel that can push against the world only fights
+        them. Deleting the `<pair>` elements does not achieve that on its own,
+        because `contype`/`conaffinity` still admit the default pairing -- the
+        omniwheel capsules are `contype=6 conaffinity=4` and a
+        procthor-objaverse floor is `contype=8 conaffinity=15`, and MuJoCo pairs
+        two geoms when either `contype & conaffinity` is non-zero, which `6 & 15`
+        is.
+
+        That went unnoticed while the robot hung 5.65cm in the air (see
+        `_drop_freejoint_spawn_height`) because the wheels never reached the
+        floor. Sitting the robot down put them in contact on every step, and
+        `MolmoSpaces`'s placement check reads those contacts as the robot being
+        stuck in the scenery: it excuses floor contact by looking for "floor" in
+        the *root body* name, and a house floor's root body is "world". Every
+        candidate base pose was rejected, and episodes died with
+        "[PLACE_ROBOT_NEAR] Failed after 10 attempts".
+        """
+        for geom_name in OMNIWHEEL_GEOMS:
+            geom = robot_spec.geom(geom_name)
+            if geom is None:
+                raise ValueError(
+                    f"Omniwheel geom '{geom_name}' not found in the Stretch MJCF; "
+                    "models/stretch_4/mjcf_generator.py is expected to emit it."
+                )
+            geom.contype = 0
+            geom.conaffinity = 0
+
+    @staticmethod
+    def _drop_freejoint_spawn_height(compiled: mujoco.MjModel, root: mujoco.MjsBody) -> None:
+        """Sit the robot on the floor instead of the height its freejoint spawned at.
+
+        `mjcf_generator` builds the MJCF with
+        `ConversionMetadata(height_offset=0.056)`, which lifts the root body so
+        that a robot dropped into `scene_stretch4.xml` does not start with its
+        wheels below the floor plane. There it is a spawn margin and nothing
+        more: the root carries a freejoint, so the first few hundred steps settle
+        the robot onto its wheels and the offset is gone. Measured, a settled
+        standalone robot has its omniwheel capsules bottoming out at z = +0.001.
+
+        Here the freejoint has just been deleted and the body is about to be
+        welded to the holonomic base, whose joints move it in x, y and yaw only.
+        Nothing settles it, so the spawn margin becomes a permanent 5.65cm of
+        daylight under the wheels -- visible in a rendered frame, and 5.65cm of
+        error in every tool pose the robot reaches for.
+
+        The correction is measured off the model rather than read back from
+        `height_offset`, so it stays right if the URDF's wheel placement or that
+        constant changes. The reference is the omniwheel collision capsules,
+        because those are what the robot rests on; they are capsules whatever
+        `strip_meshes` did, so the kinematics-only model gets the same answer as
+        the physics one.
+        """
+        data = mujoco.MjData(compiled)
+        mujoco.mj_forward(compiled, data)
+
+        bottoms = []
+        for wheel in OMNIWHEEL_GEOMS:
+            geom_id = mujoco.mj_name2id(compiled, mujoco.mjtObj.mjOBJ_GEOM, wheel)
+            if geom_id == -1:
+                raise ValueError(
+                    f"Omniwheel geom '{wheel}' not found in the Stretch MJCF; "
+                    "models/stretch_4/mjcf_generator.py is expected to emit it."
+                )
+            radius, half_length = compiled.geom_size[geom_id][:2]
+            # The capsule runs along its own z, which is the axle -- roughly
+            # horizontal, but project it rather than assume so.
+            axis_z = data.geom_xmat[geom_id].reshape(3, 3)[2, 2]
+            bottoms.append(
+                data.geom_xpos[geom_id][2] - abs(half_length * axis_z) - radius
+            )
+
+        root.pos[2] -= min(bottoms)
 
     @classmethod
     def _orient_cameras_to_hardware_convention(cls, robot_spec: MjSpec) -> None:

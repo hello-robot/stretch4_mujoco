@@ -242,8 +242,9 @@ def flush_episode_to_disk(
     """Encode one finished episode's videos and drop its camera frames immediately.
 
     This is the whole memory story of a datagen run. An episode's observation
-    history is ~4.3 MiB per step -- five 640x368 RGB streams plus a float32 depth
-    stream -- so a 300-step episode is ~1.3 GiB and a 500-step one ~2.1 GiB, and
+    history is ~4.2 MiB per step -- five RGB streams of roughly 640x368 each
+    (`CAMERA_RENDER_SIZE` sizes them per camera) plus a float32 depth stream --
+    so a 300-step episode is ~1.3 GiB and a 500-step one ~2.1 GiB, and
     *none* of it lands in the HDF5: the frames go out as side-car MP4s.
 
     The pipeline's own `save_house_trajectories` does this encoding once per
