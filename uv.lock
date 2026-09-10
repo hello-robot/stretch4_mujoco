@@ -4687,6 +4687,7 @@ jupyter = [
 ]
 molmo = [
     { name = "molmo-spaces", extra = ["mujoco"] },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -4712,6 +4713,7 @@ requires-dist = [
     { name = "pynput", specifier = ">=1.8.1" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "rerun-sdk", specifier = ">=0.23.1" },
+    { name = "tqdm", marker = "extra == 'molmo'", specifier = ">=4.66" },
     { name = "urdf2mjcf", specifier = ">=0.2.39" },
     { name = "yourdfpy" },
 ]
