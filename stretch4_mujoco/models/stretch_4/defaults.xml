@@ -25,7 +25,7 @@
       </default>
       <default class="telescope">
         <joint damping="50" stiffness="0.02" armature="0.01" frictionloss="1.5" />
-        <general gainprm="500" biasprm="0 -1000 -100" forcerange="-150 150" />
+        <general gainprm="500" biasprm="0 -1000 -100" forcerange="-175 175" />
       </default>
       <default class="head">
         <joint axis="0 0 1" damping="1" />
@@ -41,6 +41,7 @@
       </default>
 
       <default class="wrist">
+        <general forcerange="-400 400" />
         <joint axis="0 0 1" damping="1" />
         <position kp="10" />
         <default class="wrist_yaw">
