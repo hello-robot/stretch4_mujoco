@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+data/
 
 # Virtual environments
 .venv
@@ -23,3 +24,10 @@ MUJOCO_LOG.TXT
 # Temp runtime XML
 stretch_temp_abs.xml
 .DS_Store
+
+# Default output directory for examples/machine_learning/molmospaces/run_benchmarks.py
+eval_output/
+
+# MolmoBot: a plain clone (robocasa/robosuite beside it are submodules), put
+# there by finetuning/finetune.py so it can generate a runnable training script.
+third_party/MolmoBot/
