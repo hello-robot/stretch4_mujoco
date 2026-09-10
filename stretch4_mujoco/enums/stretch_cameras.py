@@ -156,6 +156,71 @@ class StretchCameras(Enum):
         raise NotImplementedError(f"Camera {self} is_depth is not implemented")
 
     @property
+    def applies_fisheye_distortion(self) -> bool:
+        """Whether `post_processing_callback` warps this camera's frames.
+
+        Only the two head cameras do. The centre camera carries distortion
+        parameters as well, but its frames are left as MuJoCo rendered them.
+        """
+        return self in [
+            StretchCameras.cam_nav_rgb_se4_left,
+            StretchCameras.cam_nav_rgb_se4_right,
+        ] and self.initial_camera_settings.distortion_params is not None
+
+    def fisheye_params_for_frame(
+        self, width: int, height: int
+    ) -> tuple[float, float, float, float, tuple, float]:
+        """`(fx, fy, cx, cy, distortion_params, fov_deg)` for a frame this size.
+
+        The calibration is for the sensor's own resolution, so a frame rendered
+        at any other size needs it projected across. Carrying the real optical
+        centre matters: it sits ~20px off centre horizontally on these lenses,
+        and re-centring it warps a downscaled frame differently from the
+        full-resolution one.
+        """
+        settings = self.initial_camera_settings
+        if settings.distortion_params is None:
+            raise NotImplementedError(f"Camera {self} has no distortion parameters")
+
+        fx, fy = settings.focal
+        cx, cy = settings.optical_center
+        fov_deg = float(settings.field_of_view_vertical_in_degrees)
+        scale_x = width / float(settings.width)
+        scale_y = height / float(settings.height)
+
+        if abs(scale_x - scale_y) >= 1e-3 * scale_y:
+            # A frame that is not this camera's shape has no meaningful
+            # principal point, so fall back to a centred approximation rather
+            # than projecting the calibration somewhere it does not belong.
+            # Nothing in the simulation or datagen paths takes this branch; a
+            # hand-fed test image does.
+            return (fx * scale_y, fy * scale_y, width / 2.0, height / 2.0,
+                    settings.distortion_params, fov_deg)
+
+        return (fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y,
+                settings.distortion_params, fov_deg)
+
+    def fisheye_crop_zoom(self, width: int, height: int) -> float:
+        """How far `post_processing_callback` zooms into a frame this size.
+
+        The distortion crops away the surround the pinhole render cannot fill
+        and hands back a frame of the original size, which multiplies the
+        frame's focal length by this and pulls its principal point in with it
+        (`fisheye_crop_rect`). A consumer that reports intrinsics for a
+        distorted frame has to account for it; one that only looks at pixels
+        does not.
+        """
+        _, _, crop_width, _ = self.fisheye_crop_rect(width, height)
+        return width / float(crop_width)
+
+    def fisheye_crop_rect(self, width: int, height: int) -> tuple[int, int, int, int]:
+        """`(x, y, width, height)` of the window the distortion crops to."""
+        fx, fy, cx, cy, distortion_params, fov_deg = self.fisheye_params_for_frame(width, height)
+        return utils.get_fisheye_crop_rect(
+            fx, fy, cx, cy, tuple(distortion_params), width, height, fov_deg
+        )
+
+    @property
     def post_processing_callback(self) -> Callable[[np.ndarray], np.ndarray] | None:
 
         if self == StretchCameras.cam_gripper_depth or self == StretchCameras.cam_gripper_se4_stereo_depth:
@@ -164,18 +229,16 @@ class StretchCameras(Enum):
         if self == StretchCameras.cam_d435i_depth:
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["d435i"])
 
-        if self in [
-            StretchCameras.cam_nav_rgb_se4_left,
-            StretchCameras.cam_nav_rgb_se4_right,
-        ]:
-            settings = self.initial_camera_settings
-            if settings.distortion_params is not None:
-                fx, fy = settings.focal
-                cx, cy = settings.optical_center
-                distortion_params = settings.distortion_params
-                return lambda render: utils.apply_fisheye_distortion(
-                    render, fx, fy, cx, cy, distortion_params
+        if self.applies_fisheye_distortion:
+
+            def _distort(render: np.ndarray) -> np.ndarray:
+                h, w = render.shape[:2]
+                fx, fy, cx, cy, distortion_params, fov_deg = self.fisheye_params_for_frame(w, h)
+                return utils.apply_fisheye_distortion(
+                    render, fx, fy, cx, cy, distortion_params, fov_deg=fov_deg
                 )
+
+            return _distort
 
         if not self.is_depth:
             return None
