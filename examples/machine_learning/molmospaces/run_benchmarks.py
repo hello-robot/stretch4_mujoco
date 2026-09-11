@@ -20,6 +20,11 @@ Run Stretch 4 on the MolmoSpaces benchmark evaluations.
     python -m examples.machine_learning.molmospaces.run_benchmarks \
         --benchmark potato --episodes 20
 
+    # one MP4 per episode -- the scene beside the policy's cameras, captioned
+    # with the outcome -- written to <output>/videos. No viewer needed.
+    python -m examples.machine_learning.molmospaces.run_benchmarks \
+        --benchmark potato --export-to-mp4
+
     # just list what is registered and whether it is installed
     python -m examples.machine_learning.molmospaces.run_benchmarks --list
 
@@ -66,6 +71,7 @@ from examples.machine_learning.molmospaces.benchmarks import (
 from examples.machine_learning.molmospaces.configs import (
     DEFAULT_BASELINE_CONFIGS,
     MOLMOBOT_ACTION_TYPE_ENV_VAR,
+    VIDEO_EXPORT_ENV_VAR,
     VIEWER_ENV_VAR,
     qualified_config_name,
     viewer_requested,
@@ -78,6 +84,7 @@ from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
 )
 from examples.machine_learning.molmospaces.visualize import (
     CAMERA_NAMES,
+    install_eval_video_hook,
     install_eval_visualize_hook,
     name_viewer_window_after,
 )
@@ -300,6 +307,23 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "checkpoint was fine-tuned on.",
 )
 @click.option(
+    "--export-to-mp4",
+    "export_to_mp4",
+    is_flag=True,
+    help="Write every episode to its own MP4 as it runs: the third-person view of "
+    "the robot beside the cameras the policy reads, laid out like the Rerun view "
+    "and captioned with the outcome. Written to <output>/videos. Needs no viewer, "
+    "so it works headless and with several workers.",
+)
+@click.option(
+    "--export-camera",
+    "export_cameras",
+    multiple=True,
+    type=click.Choice(CAMERA_NAMES),
+    help="Camera to record under --export-to-mp4. Repeatable. Defaults to the "
+    "cameras the policy reads, the same set --visualize streams.",
+)
+@click.option(
     "--report/--no-report",
     "want_report",
     default=False,
@@ -319,6 +343,8 @@ def main(
     output_dir: Path | None,
     visualize: bool,
     visualize_cameras: tuple[str, ...],
+    export_to_mp4: bool,
+    export_cameras: tuple[str, ...],
     want_report: bool,
     list_only: bool,
 ) -> None:
@@ -367,6 +393,8 @@ def main(
         raise click.UsageError("--molmobot-action-type only applies to --policy molmobot.")
     if visualize_cameras and not visualize:
         raise click.UsageError("--visualize-camera only applies with --visualize.")
+    if export_cameras and not export_to_mp4:
+        raise click.UsageError("--export-camera only applies with --export-to-mp4.")
     if molmobot_action_type:
         os.environ[MOLMOBOT_ACTION_TYPE_ENV_VAR] = molmobot_action_type
 
@@ -400,6 +428,14 @@ def main(
         # `configs.py` because a single worker runs the rollouts in this very
         # process.
         install_eval_visualize_hook(camera_names=visualize_cameras or None)
+
+    if export_to_mp4:
+        # The environment variable is for the workers, which re-import
+        # `configs.py` rather than inheriting this process's hooks; the direct
+        # call is for this process, which imported it before the flag was
+        # parsed. See `configs.VIDEO_EXPORT_ENV_VAR`.
+        os.environ[VIDEO_EXPORT_ENV_VAR] = ",".join(export_cameras) or "1"
+        install_eval_video_hook(camera_names=export_cameras or None)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = Path(output_dir) if output_dir else Path("eval_output") / "stretch4" / timestamp

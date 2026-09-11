@@ -75,8 +75,50 @@ needs setting for a checkpoint trained the other way.
 """
 
 
+VIDEO_EXPORT_ENV_VAR = "STRETCH_MOLMOSPACES_EXPORT_MP4"
+"""
+Set to "1" -- or to a comma-separated camera list -- to write every evaluation
+episode to its own MP4.
+
+Same injection route as the viewer, and the same reason -- but unlike the
+viewer, this one is worth having with several workers, and a rollout hook
+installed in the parent process does not survive the trip: workers are started
+under `forkserver` (or `spawn`), so they inherit the environment and re-import
+this module rather than inheriting a monkeypatched `JsonEvalRunner`. Reading the
+request here, at import time, is what makes `--export-to-mp4 --num-workers 8`
+record all eight workers' episodes. `run_benchmarks.py --export-to-mp4` sets it
+and installs the hook in its own process too, since this module was already
+imported by the time the flag was parsed.
+"""
+
+
 def viewer_requested() -> bool:
     return os.environ.get(VIEWER_ENV_VAR, "") not in ("", "0", "false", "False")
+
+
+def video_export_requested() -> bool:
+    return os.environ.get(VIDEO_EXPORT_ENV_VAR, "") not in ("", "0", "false", "False")
+
+
+def video_export_cameras() -> list[str] | None:
+    """The cameras `--export-camera` named, or None for whichever ones the policy reads."""
+    value = os.environ.get(VIDEO_EXPORT_ENV_VAR, "")
+    names = [name for name in value.split(",") if name and name not in ("1", "true", "True")]
+    return names or None
+
+
+def install_video_export_hook_if_requested() -> None:
+    """Record every episode of this process's rollouts, if `--export-to-mp4` asked.
+
+    Idempotent, like the other import-time installers here: this module is
+    imported once per worker and again when an eval config is resolved from its
+    "module:Class" string.
+    """
+    if not video_export_requested():
+        return
+    from examples.machine_learning.molmospaces.visualize import install_eval_video_hook
+
+    install_eval_video_hook(camera_names=video_export_cameras())
 
 
 def register_stretch_episode_override() -> None:
@@ -92,6 +134,7 @@ def register_stretch_episode_override() -> None:
 
 
 register_stretch_episode_override()
+install_video_export_hook_if_requested()
 
 # A benchmark whose target object is *added* to the scene (the locally built
 # `potato` one) needs the same asset-mass correction data generation applies, or

@@ -276,7 +276,7 @@ def _render_review_video(
                 ok, frame = capture.read()
                 if not ok:
                     break
-                panels.append(_label_panel(frame, name))
+                panels.append(label_panel(frame, name))
             if len(panels) != len(captures):
                 break
 
@@ -309,7 +309,12 @@ def _render_review_video(
     return path if writer is not None else None
 
 
-def _label_panel(frame: np.ndarray, name: str) -> np.ndarray:
+def label_panel(frame: np.ndarray, name: str) -> np.ndarray:
+    """Write a camera's name into the top-left of its panel.
+
+    Shared with `visualize.EpisodeVideoRecorder`, which labels the same panels
+    while the episode is still running.
+    """
     import cv2
 
     frame = frame.copy()
@@ -320,21 +325,24 @@ def _label_panel(frame: np.ndarray, name: str) -> np.ndarray:
     return frame
 
 
-def _add_caption(frame: np.ndarray, step: int, num_steps: int, report: EpisodeReport) -> np.ndarray:
-    """A banner under the frame: outcome, progress and the instruction."""
+def caption_banner(
+    width: int, headline: str, instruction: str = "", success: bool | None = None
+) -> np.ndarray:
+    """The strip that goes under a review frame: outcome colour, headline, instruction.
+
+    `success=None` is "not known yet", which is the case for every frame of an
+    episode still being recorded -- it takes the failure colour, since an
+    unfinished episode has not succeeded. Also shared with
+    `visualize.EpisodeVideoRecorder`.
+    """
     import cv2
 
-    width = frame.shape[1]
     banner = np.zeros((CAPTION_HEIGHT_PX, width, 3), dtype=np.uint8)
-    banner[:] = CAPTION_COLOUR_SUCCESS if report.success else CAPTION_COLOUR_FAILURE
-
-    outcome = "SUCCESS" if report.success else "FAILURE"
-    headline = f"{report.house} ep{report.episode:04d}  {outcome}  step {step + 1}/{num_steps}"
+    banner[:] = CAPTION_COLOUR_SUCCESS if success else CAPTION_COLOUR_FAILURE
     cv2.putText(
         banner, headline, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA
     )
-    if report.instruction:
-        instruction = report.instruction
+    if instruction:
         # Truncate rather than wrap: the banner is one line by construction, and
         # a wrapped caption would change the frame height mid-video.
         max_characters = max(10, int(width / 9))
@@ -350,6 +358,14 @@ def _add_caption(frame: np.ndarray, step: int, num_steps: int, report: EpisodeRe
             1,
             cv2.LINE_AA,
         )
+    return banner
+
+
+def _add_caption(frame: np.ndarray, step: int, num_steps: int, report: EpisodeReport) -> np.ndarray:
+    """A banner under the frame: outcome, progress and the instruction."""
+    outcome = "SUCCESS" if report.success else "FAILURE"
+    headline = f"{report.house} ep{report.episode:04d}  {outcome}  step {step + 1}/{num_steps}"
+    banner = caption_banner(frame.shape[1], headline, report.instruction, report.success)
     return np.vstack([frame, banner])
 
 

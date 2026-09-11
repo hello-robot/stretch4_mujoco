@@ -41,7 +41,7 @@ training/               behaviour-clone from scratch -- see training/README.md
   dataset.py            the shard format, and the torch-side reader
   train_bc.py           fit the network, write a checkpoint
 report.py               a finished run -> captioned video, telemetry, summary
-visualize.py            what --visualize shows, shared by datagen and eval
+visualize.py            what --visualize shows and --export-to-mp4 records
 telemetry.py            live Rerun streaming and recording
 live_policy.py          run a checkpoint in the interactive sim
 ```
@@ -433,6 +433,28 @@ That last clause is the one that matters when a benchmark scores badly: it
 separates a policy that is bad from a policy that is early. See
 `finetuning/README.md`.
 
+**The checkpoint is loaded once, not once per episode.** MolmoSpaces builds a
+policy for every episode — `pipeline.setup_policy` calls the policy factory
+unless `run_evaluation` was handed a `preloaded_policy`, which nothing here does
+— and the previous episode's policy is still referenced by the rollout loop while
+the next one's constructor runs. Taken literally that means a 20GB read off disk
+per episode and, for the length of it, two copies of the weights on the GPU:
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 48.00 MiB.
+GPU 0 has a total capacity of 23.52 GiB of which 102.12 MiB is free.
+```
+
+which is what a 9.4 GiB checkpoint does to a 24GB card an hour or two into a
+run, once a Rerun viewer has grown into the couple of gigabytes left over. So
+`policies/molmobot_policy.py` keeps the loaded model in `_LOADED_MODELS`, keyed
+by checkpoint and `states_mode`, and gives the adapter the `close()` that
+`cleanup_episode_resources` looks for and `BasePolicy` does not define — the
+episode's policy is released at the end of its episode, the weights stay. One
+copy per process, one load, and the second episode starts in two seconds instead
+of twenty. `reuse_loaded_model=False` on the policy config puts the per-episode
+load back.
+
 **Relative actions become absolute targets here.** A `joint_pos_rel` checkpoint
 emits deltas, and every Stretch move group is commanded absolutely — the gripper
 has to be, since a relative finger command cannot hold a grasp. The inversion is
@@ -497,7 +519,7 @@ it, write the trainer config, print or run the command.
 
 ## Watching a policy, and keeping proof
 
-Three different questions, three answers.
+Four different questions, four answers.
 
 **Watch an evaluation as it happens.** `--visualize` launches MuJoCo's passive
 viewer for each episode:
@@ -539,6 +561,32 @@ rollout runner; evaluation cannot, since `run_evaluation()` instantiates
 `JsonEvalRunner` itself, so `install_eval_visualize_hook()` wraps that runner's
 `run_single_rollout` and works from the task's `reset`/`step_chunk` rather than
 from a second copy of the rollout loop.
+
+**Watch it later, or on a machine with no viewer.** `--export-to-mp4` writes one
+MP4 per episode as it runs — the same two views, in the blueprint's layout:
+
+```bash
+python -m examples.machine_learning.molmospaces.run_benchmarks \
+    --benchmark potato --policy molmobot --checkpoint <ckpt> --export-to-mp4
+```
+
+The third-person view of the robot on the left, from the framing the viewer's free
+camera gets, and the cameras the policy reads gridded down the right — for a
+fine-tuned checkpoint, the cameras it was trained on, which is the pair worth
+seeing. Every frame is captioned with the house, the episode, the step and the
+instruction, the last second holds the outcome, and the filename ends in
+`_success` or `_failure`. They land in `videos/` inside the run's own output
+directory. `--export-camera` names a different set.
+
+It renders offscreen, so it needs no viewer, no window and no `--visualize`, and
+it does not force single-worker: unlike the Rerun hook, the request travels to
+the workers as `STRETCH_MOLMOSPACES_EXPORT_MP4`, which `configs.py` reads when a
+worker re-imports it. The cost is one 960x540 render per policy step, which is
+worth knowing before pointing it at a 2000-episode benchmark.
+
+This is not what the pipeline already saves. That is one MP4 per *camera*, and
+only for the episodes whose trajectories it keeps — an episode that errored out
+leaves no footage at all, which is exactly the episode you wanted to watch.
 
 **Export proof of a run.** `report.py` turns MolmoSpaces' raw output — JSON blobs
 in HDF5 and unlabelled per-camera MP4s — into artifacts someone else can look at

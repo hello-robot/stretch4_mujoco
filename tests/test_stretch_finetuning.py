@@ -576,6 +576,103 @@ def test_molmobot_policy_factory_patch_is_scoped_and_idempotent(tmp_path):
 
 
 # =============================================================================
+# Loading the checkpoint once instead of once per episode
+# =============================================================================
+
+
+class _CountingSynthVLAPolicy:
+    """Stands in for MolmoBot's policy: counts how often the weights are read."""
+
+    loads = 0
+
+    def __init__(self, checkpoint_path, states_mode="cross_attn"):
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(
+            policy_config=SimpleNamespace(
+                checkpoint_path=checkpoint_path, states_mode=states_mode
+            )
+        )
+        self._prepared = False
+        self.prepare_model()
+
+    def prepare_model(self):
+        if self._prepared:
+            return
+        self._prepared = True
+        # On the class, not on `type(self)`: the subclass under test is what
+        # `type(self)` is, and the count has to survive it.
+        _CountingSynthVLAPolicy.loads += 1
+        # The object the real one puts here weighs 9GB of VRAM.
+        self.agent = f"weights of {self.config.policy_config.checkpoint_path}"
+
+
+def _reusing(monkeypatch):
+    """`_CountingSynthVLAPolicy` with the model reuse `_build_inner_policy` applies."""
+    from examples.machine_learning.molmospaces.policies import molmobot_policy
+
+    monkeypatch.setattr(molmobot_policy, "_LOADED_MODELS", {})
+    monkeypatch.setattr(molmobot_policy, "_MODEL_REUSING_CLASSES", {})
+    _CountingSynthVLAPolicy.loads = 0
+    return molmobot_policy, molmobot_policy._model_reusing_policy_cls(_CountingSynthVLAPolicy)
+
+
+def test_a_checkpoint_is_loaded_once_per_process_not_once_per_episode(monkeypatch):
+    """The per-episode load is what put two copies of the weights on the GPU.
+
+    MolmoSpaces builds a policy per episode, and the previous episode's is still
+    referenced while the next one's constructor runs -- so the second load has to
+    fit beside the first. It does not, in 24GB, beside a Rerun viewer.
+    """
+    molmobot_policy, reusing = _reusing(monkeypatch)
+
+    episodes = [reusing("/checkpoints/step20000") for _ in range(4)]
+
+    assert _CountingSynthVLAPolicy.loads == 1
+    assert {id(episode.agent) for episode in episodes} == {id(episodes[0].agent)}
+    # And the subclass is made once, not once per episode.
+    assert molmobot_policy._model_reusing_policy_cls(_CountingSynthVLAPolicy) is reusing
+
+
+def test_a_different_checkpoint_replaces_the_loaded_one(monkeypatch):
+    """A miss means a different model, so the one held is dead weight -- and 9GB of it."""
+    molmobot_policy, reusing = _reusing(monkeypatch)
+
+    reusing("/checkpoints/step20000")
+    reusing("/checkpoints/step20000", states_mode="concat")
+    assert _CountingSynthVLAPolicy.loads == 2
+    # Only the newest survives: a different states_mode is a differently built
+    # model, not a differently configured policy.
+    assert list(molmobot_policy._LOADED_MODELS) == [("/checkpoints/step20000", "concat")]
+
+
+def test_closing_a_policy_releases_the_episode_but_keeps_the_weights(monkeypatch):
+    """`cleanup_episode_resources` calls `close()` if it exists -- `BasePolicy` has none."""
+    from examples.machine_learning.molmospaces.policies import molmobot_policy
+    from examples.machine_learning.molmospaces.policies.molmobot_policy import (
+        StretchMolmoBotPolicy,
+    )
+
+    loaded = {("/checkpoints/step20000", "cross_attn"): "the weights"}
+    monkeypatch.setattr(molmobot_policy, "_LOADED_MODELS", loaded)
+
+    policy = _adapter()
+    policy._inner = object()
+    policy._clipper = object()
+    policy._previous_qpos = {"lift": np.zeros(1)}
+
+    assert callable(getattr(StretchMolmoBotPolicy, "close", None))
+    policy.close()
+    assert policy._inner is None
+    assert policy._clipper is None
+    assert policy._previous_qpos is None
+    # What the next episode would otherwise spend a 20GB read rebuilding.
+    assert molmobot_policy._LOADED_MODELS == loaded
+    # Idempotent: an episode that raised mid-rollout can be closed twice.
+    policy.close()
+
+
+# =============================================================================
 # What a checkpoint says about how it was trained
 # =============================================================================
 
@@ -1769,6 +1866,217 @@ def test_visualizer_streams_the_cameras_the_policy_reads():
     assert StretchRerunVisualizer(spawn=False)._resolve_camera_names(
         SimpleNamespace()
     ) == CAMERA_NAMES
+
+
+# =============================================================================
+# Exporting an episode to MP4
+# =============================================================================
+
+_VIDEO_TEST_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 3"/>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="robot_0/base" pos="0 0 0.2">
+      <freejoint/>
+      <geom type="box" size="0.2 0.2 0.2"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _video_task(tmp_path, cameras=("head_camera", "wrist_camera_left")):
+    """A task and policy shaped the way `EpisodeVideoRecorder` reads them."""
+    from types import SimpleNamespace
+
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(_VIDEO_TEST_XML)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+
+    task = SimpleNamespace(
+        env=SimpleNamespace(
+            current_model=model, current_data=data, mj_datas=[data], current_batch_index=0
+        ),
+        config=SimpleNamespace(
+            output_dir=tmp_path,
+            task_horizon=40,
+            fps=15.15,
+            task_sampler_config=SimpleNamespace(house_inds=[34]),
+        ),
+        get_task_description=lambda: "pick up the potato",
+    )
+    policy = SimpleNamespace(_inner=SimpleNamespace(camera_names=list(cameras)))
+    return task, policy, data, model
+
+
+def test_an_exported_episode_is_one_playable_mp4_named_after_its_outcome(tmp_path):
+    """`--export-to-mp4` has to leave a file that plays, for every episode."""
+    import cv2
+    import mujoco
+
+    from examples.machine_learning.molmospaces.visualize import EpisodeVideoRecorder
+
+    task, policy, data, model = _video_task(tmp_path)
+    observation = {
+        "head_camera": np.full((368, 640, 3), 40, dtype=np.uint8),
+        "wrist_camera_left": np.full((240, 320, 3), 80, dtype=np.uint8),
+    }
+
+    recorder = EpisodeVideoRecorder()
+    recorder.start_episode(4242, task, policy=policy)
+    recorder.on_reset(task)
+    recorder.log_step(0, task, [observation], policy=policy)
+    for step in range(1, 6):
+        data.qpos[0] = step * 0.05
+        mujoco.mj_forward(model, data)
+        recorder.log_step(step, task, [observation], policy=policy)
+    path = recorder.finish_episode(success=True)
+
+    assert path is not None
+    assert path.parent == tmp_path / "videos"
+    assert path.name == "house_34_episode_0000_seed4242_success.mp4"
+
+    capture = cv2.VideoCapture(str(path))
+    try:
+        frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        ok, first = capture.read()
+    finally:
+        capture.release()
+    # The six logged steps plus the held outcome frames.
+    assert ok and frames > 6
+    # Recorded at the rate the robot was driven, so it plays back in real time.
+    assert fps == pytest.approx(15.15, abs=0.2)
+
+    # The scene panel is on the left and the cameras are to its right, so the
+    # frame is wider than the scene alone and taller by the caption banner.
+    scene_width = min(960, int(model.vis.global_.offwidth))
+    scene_height = min(540, int(model.vis.global_.offheight))
+    assert first.shape[1] > scene_width
+    assert first.shape[0] == scene_height + 64
+
+    # A second episode writes its own file, with the outcome it had.
+    recorder.start_episode(4343, task, policy=policy)
+    recorder.on_reset(task)
+    recorder.log_step(0, task, [observation], policy=policy)
+    second = recorder.finish_episode(success=False)
+    assert second is not None
+    assert second.name == "house_34_episode_0001_seed4343_failure.mp4"
+    recorder.close()
+
+
+def test_a_camera_missing_from_one_observation_keeps_its_cell(tmp_path):
+    """The size an MP4 is opened with is the only size it can be written with."""
+    from examples.machine_learning.molmospaces.visualize import EpisodeVideoRecorder
+
+    task, policy, _data, _model = _video_task(tmp_path)
+    recorder = EpisodeVideoRecorder()
+    recorder.start_episode(1, task, policy=policy)
+    recorder.on_reset(task)
+
+    full = {
+        "head_camera": np.full((368, 640, 3), 40, dtype=np.uint8),
+        "wrist_camera_left": np.full((240, 320, 3), 80, dtype=np.uint8),
+    }
+    recorder.log_step(0, task, [full], policy=policy)
+    first = recorder._last_body.shape
+    # The wrist camera drops out of this observation entirely.
+    recorder.log_step(1, task, [{"head_camera": full["head_camera"]}], policy=policy)
+    assert recorder._last_body.shape == first
+    # And so does every camera.
+    recorder.log_step(2, task, [{}], policy=policy)
+    assert recorder._last_body.shape == first
+    recorder.close()
+
+
+def test_the_camera_column_fills_its_cells_but_stays_the_narrower_half(tmp_path):
+    """A 640x368 camera in a 2:5 column would letterbox to a third of its cell."""
+    from examples.machine_learning.molmospaces.visualize import (
+        CAMERA_COLUMN_SHARE,
+        EpisodeVideoRecorder,
+    )
+
+    scene = np.zeros((480, 640, 3), dtype=np.uint8)
+    head = np.zeros((368, 640, 3), dtype=np.uint8)
+    floor = round(640 * CAMERA_COLUMN_SHARE / (1 - CAMERA_COLUMN_SHARE))
+
+    four = [(f"camera_{i}", head) for i in range(4)]
+    width = EpisodeVideoRecorder._measure_grid_width(four, scene)
+    assert floor <= width <= scene.shape[1]
+
+    # One narrow camera needs less than the floor, and does not get less.
+    narrow = [("wrist", np.zeros((240, 240, 3), dtype=np.uint8))]
+    assert EpisodeVideoRecorder._measure_grid_width(narrow, scene) == floor
+
+
+def test_an_episode_without_a_renderer_still_records_its_cameras(tmp_path, monkeypatch):
+    """No GL is a reason to lose the third-person view, not the whole recording."""
+    import mujoco
+
+    from examples.machine_learning.molmospaces.visualize import EpisodeVideoRecorder
+
+    def no_renderer(*args, **kwargs):
+        raise RuntimeError("could not create an OpenGL context")
+
+    monkeypatch.setattr(mujoco, "Renderer", no_renderer)
+
+    task, policy, _data, _model = _video_task(tmp_path)
+    recorder = EpisodeVideoRecorder()
+    recorder.start_episode(7, task, policy=policy)
+    recorder.on_reset(task)
+    recorder.log_step(
+        0, task, [{"head_camera": np.full((368, 640, 3), 40, dtype=np.uint8)}], policy=policy
+    )
+    path = recorder.finish_episode(success=False)
+
+    assert path is not None and path.exists()
+    assert recorder._renderer is None
+
+
+def test_an_episode_that_raises_still_leaves_a_playable_video(tmp_path, monkeypatch):
+    """The episode worth watching is the one that errored -- and it saves nothing else.
+
+    A rollout that raises never reaches its own end, so the recorder is closed
+    from the hook's `finally`; a writer left open is an unplayable file.
+    """
+    from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
+
+    from examples.machine_learning.molmospaces import visualize as visualize_module
+
+    def exploding_rollout(episode_seed, task, policy, **kwargs):
+        task.reset()
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(visualize_module, "_EVAL_OBSERVERS", [])
+    monkeypatch.setattr(
+        JsonEvalRunner, "run_single_rollout", staticmethod(exploding_rollout)
+    )
+
+    task, policy, _data, _model = _video_task(tmp_path)
+    observation = {
+        "head_camera": np.full((368, 640, 3), 40, dtype=np.uint8),
+        "wrist_camera_left": np.full((240, 320, 3), 80, dtype=np.uint8),
+    }
+    task.reset = lambda: (observation, {})
+    task.step_chunk = lambda chunk, **kwargs: (observation, 0.0, False, False, [{}])
+
+    recorder = visualize_module.install_eval_video_hook()
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        JsonEvalRunner.run_single_rollout(episode_seed=9, task=task, policy=policy)
+
+    written = sorted((tmp_path / "videos").glob("*.mp4"))
+    assert len(written) == 1
+    # Neither a success nor a failure: the episode never returned a verdict.
+    assert written[0].name.endswith("_incomplete.mp4")
+    assert written[0].stat().st_size > 0
+    assert recorder._writer is None
+
+    # The shadowing attributes are gone, so no closure over the task -- and so
+    # over its whole MuJoCo model -- outlives the episode.
+    assert "reset" not in task.__dict__ and "step_chunk" not in task.__dict__
 
 
 def test_fisheye_distortion_scaling_arbitrary_resolutions():
