@@ -16,12 +16,10 @@ produces the training data:
         --output-dir data/stretch_potato_eval
 
     # freeze them into <assets>/benchmarks/stretch-local/potato/benchmark.json
-    python -m examples.machine_learning.molmospaces.build_benchmark \\
-        --rollouts data/stretch_potato_eval/rollouts/potato --benchmark potato
+    python -m examples.machine_learning.molmospaces.build_benchmark --rollouts data/stretch_potato_eval/rollouts/potato --benchmark potato
 
     # and score a policy on it exactly like a released benchmark
-    python -m examples.machine_learning.molmospaces.run_benchmarks \\
-        --benchmark potato --policy molmobot --checkpoint <ckpt>
+    python -m examples.machine_learning.molmospaces.run_benchmarks --benchmark potato --policy molmobot --checkpoint <ckpt>
 
 ## Why this is possible at all
 

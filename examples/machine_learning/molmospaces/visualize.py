@@ -27,6 +27,11 @@ and takes no `runner_class`, so there is nothing to subclass into the loop.
 -- the same seam `added_pickup_repair` patches on the eval path -- and works from
 the task's own `reset`/`step_chunk` rather than from a copy of the rollout loop, so
 it inherits upstream changes to that loop instead of drifting from them.
+
+`EpisodeVideoRecorder` is a third view of the same episode, on the same seam
+(`install_eval_video_hook()`, which is `run_benchmarks.py --export-to-mp4`): the
+two live views written to one MP4 per episode, in the blueprint's own layout, for
+watching a run that has already finished or on a machine that never had a viewer.
 """
 
 from __future__ import annotations
@@ -254,42 +259,18 @@ class StretchRerunVisualizer:
         except Exception as e:  # noqa: BLE001 - a stale camera is not worth an exception
             log.debug(f"Could not aim the Rerun 3D eye at the robot: {e}")
 
+    # -- the rollout hook's observer protocol; see `_observed_rollout` ---------
+
+    def on_reset(self, task: Any) -> None:
+        """Aim the 3D eye, now that the robot stands where the episode wants it."""
+        self.focus_on_robot(task)
+
+    def finish_episode(self, success: bool | None = None) -> None:
+        """Nothing to close -- the next `start_episode` opens the next recording."""
+
     def _resolve_camera_names(self, policy: Any) -> list[str]:
-        """The cameras to stream this episode: the caller's choice, else the policy's.
-
-        A fine-tuned checkpoint records the cameras it was trained on, and
-        `StretchMolmoBotPolicy` serves exactly those rather than its config's
-        (see `policies/molmobot_checkpoint.py`), so the policy already knows the
-        answer -- and it is the interesting one, since a camera the policy never
-        looks at tells you nothing about why it did what it did. Streaming the
-        others is also what pushes the images the policy *does* see out of the
-        viewer's memory budget; see `RERUN_MEMORY_LIMIT`.
-
-        `CAMERA_NAMES` is the last resort, for a policy that names no cameras
-        at all -- the waypoint experts, which read poses rather than pixels.
-        """
-        if self._requested_cameras:
-            return list(self._requested_cameras)
-
-        for holder in (
-            policy,
-            # MolmoBot's own `SynthVLAPolicy`, which `StretchMolmoBotPolicy` wraps.
-            getattr(policy, "_inner", None),
-            self._unwrap_policy(policy),
-            getattr(getattr(policy, "config", None), "policy_config", None),
-        ):
-            names = getattr(holder, "camera_names", None)
-            # Checked rather than trusted: `camera_names` is read off objects
-            # this module does not own, and a test double answers every
-            # attribute with something truthy that is not a list of strings.
-            if not isinstance(names, (list, tuple)) or not names:
-                continue
-            if all(isinstance(name, str) for name in names):
-                resolved = list(names)
-                break
-        else:
-            resolved = list(CAMERA_NAMES)
-
+        """`policy_camera_names`, announced when the answer changes."""
+        resolved = policy_camera_names(policy, self._requested_cameras)
         if resolved != self._announced_cameras:
             self._announced_cameras = list(resolved)
             log.info(f"[visualize] streaming cameras {resolved}")
@@ -982,6 +963,41 @@ All waypoints finished execution. Holding final posture/grip.
             log.debug(f"Error logging to Rerun: {e}")
 
 
+def policy_camera_names(policy: Any, requested: Sequence[str] | None = None) -> list[str]:
+    """The cameras to show for an episode: the caller's choice, else the policy's.
+
+    A fine-tuned checkpoint records the cameras it was trained on, and
+    `StretchMolmoBotPolicy` serves exactly those rather than its config's (see
+    `policies/molmobot_checkpoint.py`), so the policy already knows the answer --
+    and it is the interesting one, since a camera the policy never looks at tells
+    you nothing about why it did what it did. For the Rerun stream, showing the
+    others is also what pushes the images the policy *does* see out of the
+    viewer's memory budget; see `RERUN_MEMORY_LIMIT`.
+
+    `CAMERA_NAMES` is the last resort, for a policy that names no cameras at all
+    -- the waypoint experts, which read poses rather than pixels.
+    """
+    if requested:
+        return list(requested)
+
+    for holder in (
+        policy,
+        # MolmoBot's own `SynthVLAPolicy`, which `StretchMolmoBotPolicy` wraps.
+        getattr(policy, "_inner", None),
+        StretchRerunVisualizer._unwrap_policy(policy),
+        getattr(getattr(policy, "config", None), "policy_config", None),
+    ):
+        names = getattr(holder, "camera_names", None)
+        # Checked rather than trusted: `camera_names` is read off objects this
+        # module does not own, and a test double answers every attribute with
+        # something truthy that is not a list of strings.
+        if not isinstance(names, (list, tuple)) or not names:
+            continue
+        if all(isinstance(name, str) for name in names):
+            return list(names)
+    return list(CAMERA_NAMES)
+
+
 # Framing for the viewer's free camera, all measured against benchmark episodes
 # rather than guessed -- see `StretchRobot._add_chase_camera`, which found that
 # anything 1.5m or more behind the robot was inside a wall in every episode
@@ -1210,11 +1226,470 @@ def snap_free_camera_to_robot(viewer: Any, task: Any) -> None:
         log.warning(f"Failed to snap free camera to robot: {e}")
 
 
+SCENE_PANEL_SIZE = (960, 540)
+"""
+Requested size of the third-person panel, in pixels, before clamping.
+
+Clamped down to the model's offscreen framebuffer, because that is what
+`mujoco.Renderer` draws into and it raises rather than resizing. MolmoSpaces'
+`base_scene.xml` declares `<global offwidth="1280" offheight="720"/>`, so a
+benchmark house has room for this; a model that declares less -- MuJoCo's own
+default is 640x480 -- gets a smaller panel rather than no video.
+"""
+
+CAMERA_PANEL_COLUMNS = 2
+"""Columns in the camera grid, matching what Rerun's `Grid` does with four cameras."""
+
+CAMERA_COLUMN_SHARE = 2 / 5
+"""
+Narrowest the camera grid may be, as a fraction of the frame.
+
+`_build_blueprint`'s `column_shares=[3, 2]`, so a recorded episode is laid out
+like the one you watch live. It is a floor rather than the width because a
+Stretch camera is 640x368 and a cell of that column is taller than it is wide:
+holding the blueprint's ratio exactly would letterbox the camera feeds down to
+a third of the space they were given. `_measure_grid_width` widens the column,
+up to the scene panel's own width, until the cells fit the cameras.
+"""
+
+OUTCOME_HOLD_SECONDS = 1.5
+"""How long to hold the last frame, recaptioned with the episode's outcome."""
+
+VIDEO_FPS_FALLBACK = 15.0
+"""
+Frame rate for a task that will not say what its policy rate is.
+
+Every eval config here sets `policy_dt_ms = 66.0`, so the real answer is 15.15
+and this is only reached by a test double.
+"""
+
+
+class EpisodeVideoRecorder:
+    """Writes one captioned MP4 per episode: the scene beside the policy's cameras.
+
+    The same two views `--visualize` shows, in one file that can be watched
+    without a Rerun viewer or a GPU on the far end: the third-person view of the
+    robot on the left, from the framing `robot_view_framing` picks for the
+    MuJoCo viewer's free camera, and the cameras the policy actually reads
+    gridded down the right at the blueprint's own 3:2 split.
+
+    Driven by the same `reset`/`step_chunk` hook the Rerun visualizer is (see
+    `_observed_rollout`), so it records one frame per policy step -- 15Hz, real
+    time -- and needs no viewer, no window and no `--visualize`.
+
+    What the evaluation pipeline writes on its own is not this: it saves one MP4
+    per *camera* per episode, and only for the episodes whose trajectories it
+    keeps, so an episode that errored out or was filtered leaves no footage at
+    all. `report.py` tiles those camera files afterwards; this is the live
+    equivalent, plus the view no camera has.
+    """
+
+    def __init__(
+        self,
+        output_dir: Path | None = None,
+        camera_names: Sequence[str] | None = None,
+        scene_panel_size: tuple[int, int] = SCENE_PANEL_SIZE,
+        fps: float | None = None,
+    ) -> None:
+        """
+        Args:
+            output_dir: where the MP4s go. Defaults to `videos/` inside the
+                evaluation's own output directory, which is only known once an
+                episode's task is in hand.
+            camera_names: cameras to record. Defaults to the ones the policy
+                reads; see `policy_camera_names`.
+            scene_panel_size: requested `(width, height)` of the scene panel.
+            fps: frame rate to declare. Defaults to the episode's policy rate,
+                so the video plays at the speed the robot moved.
+        """
+        self._output_dir = Path(output_dir) if output_dir is not None else None
+        self._requested_cameras = list(camera_names) if camera_names else None
+        self._scene_panel_size = scene_panel_size
+        self._fps = fps
+
+        self._camera_names: list[str] = []
+        self._announced_cameras: list[str] | None = None
+        self._episodes_per_house: dict[str, int] = {}
+
+        # Per-episode state, all reset by `start_episode`.
+        self._writer: Any = None
+        self._renderer: Any = None
+        self._camera: Any = None
+        self._scene_panel: np.ndarray | None = None
+        self._grid_width: int | None = None
+        self._last_body: np.ndarray | None = None
+        self._path: Path | None = None
+        self._headline_prefix = ""
+        self._instruction = ""
+        self._horizon: int | None = None
+        self._episode_fps = VIDEO_FPS_FALLBACK
+        self._steps = 0
+        self._written = 0
+        self._warned_about_drops = False
+
+    # =========================================================================
+    # The observer protocol
+    # =========================================================================
+
+    def start_episode(self, episode_seed: int, task: Any, policy: Any = None) -> None:
+        """Open a file for this episode and build its renderer."""
+        # Defensive: an episode that raised mid-rollout never got its
+        # `finish_episode`, and its writer still holds a half-written file.
+        self.finish_episode(success=None)
+
+        self._camera_names = policy_camera_names(policy, self._requested_cameras)
+        if self._camera_names != self._announced_cameras:
+            self._announced_cameras = list(self._camera_names)
+            log.info(f"[video] recording cameras {self._camera_names}")
+
+        house = self._house_label(task)
+        index = self._episodes_per_house.get(house, 0)
+        self._episodes_per_house[house] = index + 1
+        self._instruction = self._task_description(task)
+        self._horizon = getattr(getattr(task, "config", None), "task_horizon", None)
+        self._episode_fps = self._fps or float(
+            getattr(getattr(task, "config", None), "fps", VIDEO_FPS_FALLBACK)
+        )
+        self._headline_prefix = f"{house} ep{index:04d}"
+        self._steps = 0
+        self._written = 0
+        self._warned_about_drops = False
+        self._scene_panel = None
+        self._grid_width = None
+        self._last_body = None
+
+        directory = self._resolve_output_dir(task)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            log.warning(f"[video] cannot write to {directory}, not recording: {error}")
+            self._path = None
+            return
+        self._path = directory / f"{house}_episode_{index:04d}_seed{episode_seed}.mp4"
+        self._renderer = self._build_renderer(task)
+        self._camera = None
+
+    def on_reset(self, task: Any) -> None:
+        """Aim the scene camera, now that the robot stands where the episode wants it."""
+        self._camera = self._build_camera(task)
+
+    def log_step(
+        self, step_idx: int, task: Any, observation: Any = None, policy: Any = None
+    ) -> None:
+        """Compose and write one frame."""
+        if self._path is None:
+            return
+        try:
+            self._steps = int(step_idx)
+            body = self._compose(self._scene_frame(task), self._camera_frames(observation))
+            if body is None:
+                return
+            self._last_body = body
+            self._write(np.vstack([body, self._banner(body.shape[1], success=None)]))
+        except Exception as error:  # noqa: BLE001 - a dropped frame must not sink the episode
+            # Once at warning, then quietly: a frame that cannot be composed is
+            # usually every frame, and that is worth saying -- once.
+            if self._warned_about_drops:
+                log.debug(f"[video] dropped a frame at step {step_idx}: {error}")
+            else:
+                self._warned_about_drops = True
+                log.warning(f"[video] dropped a frame at step {step_idx}: {error}")
+
+    def finish_episode(self, success: bool | None = None) -> Path | None:
+        """Close the file, hold the outcome on screen, and name it after the result."""
+        if self._writer is None:
+            self._release()
+            return None
+
+        try:
+            if self._last_body is not None:
+                banner = self._banner(self._last_body.shape[1], success=success)
+                frame = np.vstack([self._last_body, banner])
+                for _ in range(max(1, int(self._episode_fps * OUTCOME_HOLD_SECONDS))):
+                    self._write(frame)
+        except Exception as error:  # noqa: BLE001 - the video is already written
+            log.debug(f"[video] could not hold the outcome frame: {error}")
+
+        path, written = self._path, self._written
+        self._release()
+        if path is None:
+            return None
+
+        outcome = "success" if success else ("failure" if success is not None else "incomplete")
+        final = path.with_name(f"{path.stem}_{outcome}{path.suffix}")
+        try:
+            path.replace(final)
+        except OSError as error:  # noqa: BLE001 - the footage matters, the name does not
+            log.debug(f"[video] could not rename {path}: {error}")
+            final = path
+        log.info(f"[video] {written} frames -> {final}")
+        return final
+
+    def close(self) -> None:
+        """Release the writer and the renderer, whatever state they are in."""
+        self.finish_episode(success=None)
+
+    # =========================================================================
+    # Frames
+    # =========================================================================
+
+    def _scene_frame(self, task: Any) -> np.ndarray | None:
+        """The third-person panel, or None if this episode has no renderer.
+
+        The camera tracks the robot's position but keeps the azimuth and
+        distance chosen at reset: an occlusion-checked framing is only right for
+        the pose it was measured at, and re-choosing one mid-episode would cut
+        the camera to the other side of the room whenever the robot passed a
+        doorway.
+        """
+        if self._renderer is None:
+            return None
+        if self._camera is None:
+            self._camera = self._build_camera(task)
+        try:
+            pose = _base_pose_of(task)
+            if pose is not None and self._camera is not None:
+                position = pose[0]
+                self._camera.lookat[0] = float(position[0])
+                self._camera.lookat[1] = float(position[1])
+                self._camera.lookat[2] = float(position[2]) + FREE_CAMERA_LOOKAT_HEIGHT
+            self._renderer.update_scene(self._episode_data(task), camera=self._camera)
+            # MuJoCo renders RGB; OpenCV writes BGR.
+            frame = np.ascontiguousarray(self._renderer.render()[..., ::-1])
+        except Exception as error:  # noqa: BLE001 - the camera panels are still worth writing
+            log.debug(f"[video] scene render failed: {error}")
+            return self._blank(self._scene_panel) if self._scene_panel is not None else None
+
+        self._scene_panel = frame
+        return frame
+
+    def _camera_frames(self, observation: Any) -> list[tuple[str, np.ndarray | None]]:
+        """This step's image for each recorded camera, None where it is missing.
+
+        A missing camera keeps its cell rather than collapsing the grid: the
+        frame size an MP4 is opened with is the only one it can be written with.
+        """
+        batched = isinstance(observation, (list, tuple)) and observation
+        obs = observation[0] if batched else observation
+        images: list[tuple[str, np.ndarray | None]] = []
+        for name in self._camera_names:
+            image = obs.get(name) if isinstance(obs, dict) else None
+            if isinstance(image, np.ndarray) and image.ndim == 3 and image.shape[2] >= 3:
+                # RGB to BGR, and contiguous: MuJoCo's frames arrive as a
+                # negative-stride view, which OpenCV will not take.
+                images.append((name, np.ascontiguousarray(image[..., 2::-1])))
+            else:
+                images.append((name, None))
+        return images
+
+    def _compose(
+        self, scene: np.ndarray | None, cameras: list[tuple[str, np.ndarray | None]]
+    ) -> np.ndarray | None:
+        """Scene panel beside the camera grid, at the blueprint's 3:2 split."""
+        import cv2
+
+        if scene is None and not cameras:
+            return None
+        if scene is None:
+            # No third-person view to be had; the cameras get the whole frame.
+            width, height = self._scene_panel_size
+            return self._camera_grid(cameras, width, height)
+        if not cameras:
+            return scene
+
+        if self._grid_width is None:
+            self._grid_width = self._measure_grid_width(cameras, scene)
+        grid = self._camera_grid(cameras, self._grid_width, scene.shape[0])
+        return cv2.hconcat([scene, grid])
+
+    @staticmethod
+    def _measure_grid_width(
+        cameras: list[tuple[str, np.ndarray | None]], scene: np.ndarray
+    ) -> int:
+        """How wide the camera column has to be for its cells to fit the cameras.
+
+        Between `CAMERA_COLUMN_SHARE` of the frame and the scene panel's own
+        width, so the layout stays recognisably the blueprint's, and never wider
+        than the cameras have pixels for -- a column sized to fill its cells
+        with an upscaled 240x240 wrist camera would be all blur.
+
+        Measured once per episode and then held: the width an MP4 is opened with
+        is the only width it can be written with, so a camera missing from one
+        observation must not resize the frame.
+        """
+        columns = min(CAMERA_PANEL_COLUMNS, len(cameras))
+        rows = math.ceil(len(cameras) / columns)
+        cell_height = scene.shape[0] / rows
+        widths = [
+            min(image.shape[1], cell_height * image.shape[1] / image.shape[0])
+            for _, image in cameras
+            if image is not None
+        ] or [cell_height * 16 / 9]
+        floor = round(scene.shape[1] * CAMERA_COLUMN_SHARE / (1 - CAMERA_COLUMN_SHARE))
+        return max(2, floor, min(round(columns * max(widths)), scene.shape[1]))
+
+    def _camera_grid(
+        self, cameras: list[tuple[str, np.ndarray | None]], width: int, height: int
+    ) -> np.ndarray:
+        """The camera panels, labelled and letterboxed into a `width` x `height` grid."""
+        import cv2
+
+        from examples.machine_learning.molmospaces.report import label_panel
+
+        grid = np.zeros((height, width, 3), dtype=np.uint8)
+        if not cameras:
+            return grid
+
+        columns = min(CAMERA_PANEL_COLUMNS, len(cameras))
+        rows = math.ceil(len(cameras) / columns)
+        cell_width, cell_height = width // columns, height // rows
+
+        for index, (name, image) in enumerate(cameras):
+            if image is None:
+                continue
+            scale = min(cell_width / image.shape[1], cell_height / image.shape[0])
+            resized = cv2.resize(
+                image,
+                (max(1, int(image.shape[1] * scale)), max(1, int(image.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            resized = label_panel(resized, name)
+            row, column = divmod(index, columns)
+            top = row * cell_height + (cell_height - resized.shape[0]) // 2
+            left = column * cell_width + (cell_width - resized.shape[1]) // 2
+            grid[top : top + resized.shape[0], left : left + resized.shape[1]] = resized
+        return grid
+
+    def _banner(self, width: int, success: bool | None) -> np.ndarray:
+        from examples.machine_learning.molmospaces.report import caption_banner
+
+        progress = f"step {self._steps}" + (f"/{self._horizon}" if self._horizon else "")
+        outcome = "SUCCESS" if success else ("FAILURE" if success is not None else "running")
+        return caption_banner(
+            width, f"{self._headline_prefix}  {outcome}  {progress}", self._instruction, success
+        )
+
+    def _write(self, frame: np.ndarray) -> None:
+        """Write one frame, opening the file on the first one."""
+        import cv2
+
+        if self._writer is None:
+            if self._path is None:
+                return
+            height, width = frame.shape[:2]
+            self._writer = cv2.VideoWriter(
+                str(self._path), cv2.VideoWriter_fourcc(*"mp4v"), self._episode_fps, (width, height)
+            )
+            if not self._writer.isOpened():
+                log.warning(f"[video] OpenCV would not open {self._path}; not recording")
+                self._writer, self._path = None, None
+                return
+            log.info(f"[video] recording {width}x{height} at {self._episode_fps:.1f}fps")
+        self._writer.write(frame)
+        self._written += 1
+
+    @staticmethod
+    def _blank(like: np.ndarray) -> np.ndarray:
+        return np.zeros_like(like)
+
+    # =========================================================================
+    # Per-episode setup
+    # =========================================================================
+
+    def _build_renderer(self, task: Any) -> Any:
+        """An offscreen renderer for this episode's model, or None if it cannot be made."""
+        try:
+            model = task.env.current_model
+            width = min(self._scene_panel_size[0], int(model.vis.global_.offwidth))
+            height = min(self._scene_panel_size[1], int(model.vis.global_.offheight))
+            if (width, height) != tuple(self._scene_panel_size):
+                log.debug(
+                    f"[video] scene panel clamped to the model's offscreen buffer: "
+                    f"{width}x{height}"
+                )
+            return mujoco.Renderer(model, height=height, width=width)
+        except Exception as error:  # noqa: BLE001 - the camera panels do not need a renderer
+            log.warning(
+                f"[video] no third-person view this episode ({error}); "
+                "recording the camera feeds only"
+            )
+            return None
+
+    def _build_camera(self, task: Any) -> Any:
+        """A free camera on the robot, framed the way the passive viewer's is."""
+        camera = mujoco.MjvCamera()
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        camera.fixedcamid = -1
+        camera.elevation = FREE_CAMERA_ELEVATION
+        framing = robot_view_framing(task)
+        if framing is None:
+            log.debug("[video] could not read the robot's pose; keeping MuJoCo's default framing")
+            return camera
+        lookat, distance, azimuth = framing
+        camera.lookat[:] = [float(value) for value in lookat]
+        camera.distance = float(distance)
+        camera.azimuth = float(azimuth)
+        return camera
+
+    def _resolve_output_dir(self, task: Any) -> Path:
+        """`videos/` inside whatever directory this evaluation is writing to."""
+        if self._output_dir is not None:
+            return self._output_dir
+        configured = getattr(getattr(task, "config", None), "output_dir", None)
+        return (Path(configured) if configured else Path("eval_output")) / "videos"
+
+    @staticmethod
+    def _house_label(task: Any) -> str:
+        """`house_34`, from the house index the episode's config was narrowed to.
+
+        `JsonEvalTaskSampler` writes the episode's `house_index` into
+        `task_sampler_config.house_inds`, which is also where the pipeline's own
+        `house_*` output directories come from -- so a video and the HDF5 beside
+        it agree on which house they are.
+        """
+        sampler_config = getattr(getattr(task, "config", None), "task_sampler_config", None)
+        house_inds = getattr(sampler_config, "house_inds", None)
+        if isinstance(house_inds, (list, tuple)) and len(house_inds) == 1:
+            return f"house_{house_inds[0]}"
+        return "house_unknown"
+
+    @staticmethod
+    def _task_description(task: Any) -> str:
+        try:
+            description = task.get_task_description()
+        except Exception:  # noqa: BLE001 - a caption is not worth an exception
+            return ""
+        return description if isinstance(description, str) else ""
+
+    @staticmethod
+    def _episode_data(task: Any) -> Any:
+        data = getattr(task.env, "current_data", None)
+        if data is not None:
+            return data
+        return task.env.mj_datas[task.env.current_batch_index]
+
+    def _release(self) -> None:
+        """Close the writer and the renderer, and forget this episode."""
+        if self._writer is not None:
+            with contextlib.suppress(Exception):
+                self._writer.release()
+        if self._renderer is not None:
+            # A renderer holds a GL context and an `MjrContext`, one per
+            # episode -- 130 of them by the end of a benchmark if none is closed.
+            with contextlib.suppress(Exception):
+                self._renderer.close()
+        self._writer = None
+        self._renderer = None
+        self._camera = None
+        self._path = None
+        self._last_body = None
+        self._scene_panel = None
+        self._grid_width = None
+
+
 @contextlib.contextmanager
-def _visualize_rollout(
-    visualizer: StretchRerunVisualizer, task: Any, policy: Any, viewer: Any = None
-):
-    """Drive both views from `task.reset` and `task.step_chunk`, for one rollout.
+def _observed_rollout(observers: Sequence[Any], task: Any, policy: Any, viewer: Any = None):
+    """Drive every view from `task.reset` and `task.step_chunk`, for one rollout.
 
     Shadowing the two methods on the task instance, rather than reimplementing
     `run_single_rollout`, is what keeps this hook thin: the step count, the chunk
@@ -1222,6 +1697,10 @@ def _visualize_rollout(
     stays the one actually running the episode. `reset` is also the earliest point
     at which the robot is standing where the episode wants it, so it is where the
     viewer camera gets aimed.
+
+    An observer is anything with `on_reset(task)` and
+    `log_step(step, task, observation, policy)` -- the Rerun stream and the MP4
+    recorder, which can both be running.
     """
     original_reset = task.reset
     original_step_chunk = task.step_chunk
@@ -1231,15 +1710,17 @@ def _visualize_rollout(
         result = original_reset(*args, **kwargs)
         observation = result[0] if isinstance(result, tuple) else result
         snap_free_camera_to_robot(viewer, task)
-        visualizer.focus_on_robot(task)
-        visualizer.log_step(0, task, observation, policy=policy)
+        for observer in observers:
+            observer.on_reset(task)
+            observer.log_step(0, task, observation, policy=policy)
         return result
 
     def step_chunk(action_chunk: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal steps
         result = original_step_chunk(action_chunk, *args, **kwargs)
         steps += len(action_chunk)
-        visualizer.log_step(steps, task, result[0], policy=policy)
+        for observer in observers:
+            observer.log_step(steps, task, result[0], policy=policy)
         return result
 
     task.reset = reset
@@ -1335,43 +1816,100 @@ def _hide_viewer_panels() -> None:
     mujoco.viewer.launch_passive = launch_passive
 
 
+_EVAL_OBSERVERS: list[Any] = []
+"""
+The views watching this process's evaluation rollouts.
+
+A list rather than one visualizer because `--visualize` and `--export-to-mp4`
+are independent flags that both need the same seam, and
+`JsonEvalRunner.run_single_rollout` can only be wrapped once -- the second
+`install_*` call would otherwise find the guard set and install nothing.
+"""
+
+
 def install_eval_visualize_hook(
     spawn: bool = True, port: int = 9876, camera_names: Sequence[str] | None = None
-) -> None:
+) -> StretchRerunVisualizer:
     """Give evaluation rollouts the same two views datagen's `--visualize` gets.
 
     `camera_names` is `--visualize-camera`: the cameras to stream and lay out.
     Left None, each episode streams the cameras its policy reads, which for a
     fine-tuned checkpoint is the set it was trained on -- see
-    `StretchRerunVisualizer._resolve_camera_names`.
+    `policy_camera_names`.
 
     Idempotent: eval configs are re-imported when MolmoSpaces resolves a
     "module:Class" string, and the workers import them again, so this gets called
     more than once per process.
     """
-    from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
-
     _hide_viewer_panels()
 
-    if getattr(JsonEvalRunner.run_single_rollout, "_stretch_visualize_hook", False):
-        return
+    existing = next((o for o in _EVAL_OBSERVERS if isinstance(o, StretchRerunVisualizer)), None)
+    if existing is not None:
+        return existing
 
-    original_run_single_rollout = JsonEvalRunner.run_single_rollout
     # One visualizer for the whole process: `start_episode` opens a fresh Rerun
     # recording per episode, but spawning the viewer and connecting to it happen
     # once, on the first episode.
     visualizer = StretchRerunVisualizer(
         spawn=spawn, port=port, app_id="Stretch4 Benchmark Eval", camera_names=camera_names
     )
+    _install_eval_rollout_hook(visualizer)
+    log.info(f"[visualize] evaluation rollouts stream to Rerun on port {port}")
+    return visualizer
+
+
+def install_eval_video_hook(
+    output_dir: Path | None = None,
+    camera_names: Sequence[str] | None = None,
+    fps: float | None = None,
+) -> EpisodeVideoRecorder:
+    """Write every evaluation episode to its own MP4. See `EpisodeVideoRecorder`.
+
+    Independent of `--visualize`: it renders offscreen, so it neither needs a
+    viewer nor minds one. Idempotent for the same reason
+    `install_eval_visualize_hook` is.
+    """
+    existing = next((o for o in _EVAL_OBSERVERS if isinstance(o, EpisodeVideoRecorder)), None)
+    if existing is not None:
+        return existing
+
+    recorder = EpisodeVideoRecorder(output_dir=output_dir, camera_names=camera_names, fps=fps)
+    _install_eval_rollout_hook(recorder)
+    log.info(
+        "[video] evaluation episodes will be written to "
+        f"{output_dir if output_dir is not None else '<eval output dir>/videos'}"
+    )
+    return recorder
+
+
+def _install_eval_rollout_hook(observer: Any) -> None:
+    """Add `observer` to `_EVAL_OBSERVERS`, wrapping the rollout the first time."""
+    from molmo_spaces.evaluation.json_eval_runner import JsonEvalRunner
+
+    _EVAL_OBSERVERS.append(observer)
+    if getattr(JsonEvalRunner.run_single_rollout, "_stretch_visualize_hook", False):
+        return
+
+    original_run_single_rollout = JsonEvalRunner.run_single_rollout
 
     @functools.wraps(original_run_single_rollout)
     def run_single_rollout(episode_seed: int, task: Any, policy: Any, **kwargs: Any) -> bool:
-        visualizer.start_episode(episode_seed, task, policy=policy)
-        with _visualize_rollout(visualizer, task, policy, viewer=kwargs.get("viewer")):
-            return original_run_single_rollout(
-                episode_seed=episode_seed, task=task, policy=policy, **kwargs
-            )
+        observers = list(_EVAL_OBSERVERS)
+        for watcher in observers:
+            watcher.start_episode(episode_seed, task, policy=policy)
+        success = None
+        try:
+            with _observed_rollout(observers, task, policy, viewer=kwargs.get("viewer")):
+                success = original_run_single_rollout(
+                    episode_seed=episode_seed, task=task, policy=policy, **kwargs
+                )
+                return success
+        finally:
+            # In a `finally` so an episode that raises still closes its file: an
+            # unfinished MP4 is unplayable, and a rollout error is exactly the
+            # episode worth watching.
+            for watcher in observers:
+                watcher.finish_episode(success)
 
     run_single_rollout._stretch_visualize_hook = True
     JsonEvalRunner.run_single_rollout = staticmethod(run_single_rollout)
-    log.info(f"[visualize] evaluation rollouts stream to Rerun on port {port}")

@@ -42,10 +42,17 @@ rather than left to the caller, because each fails quietly:
   scaling, which is to say in the middle of a rollout rather than at startup.
   Resized to the arm's real width from `max_relative_arm_delta`.
 - **the action frame.** See `_to_absolute_targets`.
+
+One thing it does *not* delegate is when the weights are read. MolmoSpaces builds
+a fresh policy for every episode -- `pipeline.setup_policy` calls the policy
+factory unless `run_evaluation` was handed a `preloaded_policy`, which nothing
+here does -- so a checkpoint that takes 20GB on disk and 9GB of VRAM would be
+loaded, and held twice, once per episode. See `_LOADED_MODELS` and `close`.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -114,6 +121,101 @@ ImportError that looks like "MolmoBot is not installed" when it is.
 `ensure_importable` puts the first spelling within reach without anyone exporting
 anything; the other two remain for a copy installed some other way.
 """
+
+_LOADED_MODELS: dict[tuple[str, str | None], Any] = {}
+"""
+The checkpoint this process has loaded, by `(checkpoint_path, states_mode)`.
+
+MolmoSpaces builds a policy per *episode* (`pipeline.setup_policy`), and the one
+it built for the previous episode is still referenced by the rollout loop's own
+local while the next one's constructor runs -- so without this, every episode
+reads ~20GB of `.distcp` shards off disk and, for the length of that read, two
+copies of the weights sit on the GPU at once. Two copies do not fit in 24GB
+beside a Rerun viewer, which is the `torch.OutOfMemoryError` a `--visualize` run
+dies of somewhere in its second hour, having got through thirty houses first.
+
+Holding the loaded model here instead makes it exactly one copy per process,
+loaded once. Keyed by what would make a *different* model rather than by
+checkpoint alone: `states_mode` is pushed into `model_config` before the weights
+are built (`inference_wrapper._load_checkpoint`), so two policies that disagree
+about it need two models. Only the newest key is kept -- see
+`_model_reusing_policy_cls` -- because a single evaluation runs a single
+checkpoint, and keeping the one it has stopped using would waste the VRAM this
+exists to save.
+"""
+
+_MODEL_REUSING_CLASSES: dict[type, type] = {}
+"""`_model_reusing_policy_cls`'s subclass per base class, so it makes each once."""
+
+
+def _loaded_model_key(policy_config: Any) -> tuple[str, str | None]:
+    """What makes two `SynthVLAPolicy` models the same model. See `_LOADED_MODELS`."""
+    return (str(policy_config.checkpoint_path), getattr(policy_config, "states_mode", None))
+
+
+def _cuda_allocated_gib() -> float | None:
+    """How much VRAM this process has allocated, or None without a GPU.
+
+    Logged after a load because the alternative diagnostic is an
+    `OutOfMemoryError` several hours into a run.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.memory_allocated() / 1024**3
+    except Exception:  # noqa: BLE001 - a number for a log line is not worth an exception
+        return None
+
+
+def _model_reusing_policy_cls(base: type) -> type:
+    """`base`, but loading its weights through `_LOADED_MODELS`.
+
+    A subclass rather than a wrapper because the load happens *inside*
+    `SynthVLAPolicy.__init__`, which calls its own `prepare_model()` -- there is
+    no moment between construction and loading at which an already-loaded model
+    could be handed over from outside.
+
+    Everything else about the policy is still built per episode, from that
+    episode's config: the buffered action horizon, the camera list, the state
+    mode. It is only the weights, the preprocessor and the normalizers -- all of
+    which `SynthManipMolmoInferenceWrapper` owns and none of which vary by
+    episode -- that are shared.
+    """
+    reusing = _MODEL_REUSING_CLASSES.get(base)
+    if reusing is not None:
+        return reusing
+
+    class ModelReusingSynthVLAPolicy(base):  # type: ignore[misc, valid-type]
+        """MolmoBot's policy, with the loaded checkpoint kept between episodes."""
+
+        def prepare_model(self) -> None:
+            key = _loaded_model_key(self.config.policy_config)
+            loaded = _LOADED_MODELS.get(key)
+            if loaded is not None:
+                self.agent = loaded
+                self._prepared = True
+                log.debug(f"[molmobot] reusing the checkpoint already loaded from {key[0]}")
+                return
+
+            # Dropped before the load, not after: a key that misses is a
+            # different checkpoint, so the one held here is dead weight, and
+            # freeing it first is the difference between one model on the GPU
+            # and two.
+            _LOADED_MODELS.clear()
+            gc.collect()
+            super().prepare_model()
+            _LOADED_MODELS[key] = self.agent
+            allocated = _cuda_allocated_gib()
+            log.info(
+                f"[molmobot] loaded {key[0]}"
+                + (f" ({allocated:.1f} GiB of VRAM allocated)" if allocated is not None else "")
+                + "; kept for the rest of this process"
+            )
+
+    _MODEL_REUSING_CLASSES[base] = ModelReusingSynthVLAPolicy
+    return ModelReusingSynthVLAPolicy
 
 
 class StretchMolmoBotPolicyConfig(BasePolicyConfig):
@@ -185,6 +287,17 @@ class StretchMolmoBotPolicyConfig(BasePolicyConfig):
     already on disk -- see `policies/molmobot_checkpoint.py`. Set False to run a
     checkpoint strictly as this config describes it, which is worth having for
     the case where the recorded arguments are the thing under suspicion.
+    """
+
+    reuse_loaded_model: bool = True
+    """
+    Load the checkpoint once per process rather than once per episode.
+
+    On by default because the per-episode load is not a trade-off -- it costs a
+    20GB read and a second copy of the weights on the GPU to arrive at the same
+    model. See `_LOADED_MODELS`. Set False to have each episode load its own,
+    which is worth having if a checkpoint is ever suspected of being mutated by
+    the rollout it is driving.
     """
 
     max_relative_arm_delta: float = 0.2
@@ -317,8 +430,11 @@ class StretchMolmoBotPolicy(BasePolicy):
         # robot, cameras and task settings are the very same objects this
         # evaluation is running with.
         inner_exp_config = self.config.model_copy(update={"policy_config": inner_config})
+        policy_cls = module.SynthVLAPolicy
+        if policy_config.reuse_loaded_model:
+            policy_cls = _model_reusing_policy_cls(policy_cls)
         try:
-            return module.SynthVLAPolicy(inner_exp_config, self.task)
+            return policy_cls(inner_exp_config, self.task)
         except ModuleNotFoundError as error:
             # The model is built and the checkpoint loaded inside this
             # constructor, which is where MolmoBot's own runtime dependencies
@@ -442,6 +558,38 @@ class StretchMolmoBotPolicy(BasePolicy):
         # And the frame the first delta of the next episode is measured from is
         # that episode's first observation, not the last one of this episode.
         self._previous_qpos = None
+
+    def close(self) -> None:
+        """Let go of everything this episode's policy is holding.
+
+        `pipeline.cleanup_episode_resources` calls this after every episode --
+        but only if it exists, and `BasePolicy` does not define it, so without
+        this method the episode's policy stayed reachable until the rollout loop
+        happened to overwrite its own local, which is *after* the next episode's
+        model has been built. That is the second copy of the weights.
+
+        The loaded checkpoint itself survives, in `_LOADED_MODELS`, and is the
+        one thing here that should: it is what the next episode would otherwise
+        spend a 20GB read rebuilding. What goes is the per-episode policy around
+        it, and with it the observation history it accumulated -- MolmoBot's
+        policy appends every observation it is shown, camera images included,
+        which is a few hundred MB of host memory by the end of an episode.
+
+        Idempotent, and safe to call on a policy that never finished building.
+        """
+        self._inner = None
+        self._clipper = None
+        self._previous_qpos = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                # What `cleanup_episode_resources` does anyway, done here too so
+                # that a caller who only closes the policy gets the VRAM back.
+                torch.cuda.empty_cache()
+        except Exception as error:  # noqa: BLE001 - freeing memory must not raise
+            log.debug(f"[molmobot] could not empty the CUDA cache: {error}")
 
     def get_action(self, observation) -> dict[str, Any]:
         observation = self._prepare_observation(observation)
