@@ -520,7 +520,7 @@ class StretchRolloutRunner(ParallelRolloutRunner):
         if rerun_viz is not None:
             # After reset, so the closeup tab's 3D eye is aimed at the robot
             # where this episode stands it. Same call the evaluation path makes;
-            # see `visualize._visualize_rollout`.
+            # see `visualize._observed_rollout`.
             rerun_viz.focus_on_robot(task)
             rerun_viz.log_step(0, task, observation, policy=policy)
 
