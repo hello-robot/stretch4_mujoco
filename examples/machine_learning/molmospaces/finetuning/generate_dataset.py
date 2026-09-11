@@ -33,6 +33,11 @@ One command for the whole data half of the pipeline:
     python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
         --rollouts data/stretch_pick/rollouts --output-dir data/stretch_pick
 
+    # 100 episodes from a single house, e.g. to stress-test one scene
+    python -m examples.machine_learning.molmospaces.finetuning.generate_dataset \
+        --task pick --houses 1 --samples-per-house 100 \
+        --output-dir data/stretch_pick_1house
+
 Two stages, either of which can be run alone (`--no-export`, `--rollouts`):
 
 1. **Generate.** MolmoSpaces' `ParallelRolloutRunner` over one of the Stretch
@@ -1159,6 +1164,7 @@ def generate_rollouts(
     scene_dataset: str | None = None,
     data_split: str | None = None,
     houses: int | None = None,
+    samples_per_house: int | None = None,
     seed: int | None = None,
     keep_failures: bool = False,
     visualize: bool = False,
@@ -1173,6 +1179,7 @@ def generate_rollouts(
         output_dir: where the rollouts go. The pipeline appends its own
             `<ConfigName>/<timestamp>/` beneath this.
         episodes: total episodes to attempt. Spread over `houses` houses.
+            Ignored if `samples_per_house` is given.
         num_workers: parallel rollout worker processes.
         scene_dataset: override the config's scene dataset, e.g. `procthor-10k`.
         data_split: `train`, `val` or `test`. Left at the config's default
@@ -1181,6 +1188,10 @@ def generate_rollouts(
         houses: how many houses to draw from. Defaults to enough that each house
             contributes a handful of episodes rather than hundreds, which is
             what keeps the scene distribution wide.
+        samples_per_house: exact episode count to request per house, bypassing
+            `_spread_episodes`'s usual cap of 10. Use this to pull many episodes
+            out of a small number of houses (e.g. one house, 100 episodes) --
+            the opposite of the wide-distribution default.
         seed: task-sampling seed.
         keep_failures: keep failed trajectories in the rollout dataset.
         visualize: watch the rollouts in MuJoCo's passive viewer. Requires
@@ -1209,7 +1220,9 @@ def generate_rollouts(
     config.use_passive_viewer = visualize
     config.filter_for_successful_trajectories = not keep_failures
 
-    if episodes is not None:
+    if samples_per_house is not None:
+        _set_samples_per_house(config, samples_per_house, houses)
+    elif episodes is not None:
         _spread_episodes(config, episodes, houses)
 
     config.output_dir = Path(output_dir) / task
@@ -1267,6 +1280,24 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
     sampler_config.max_tasks = episodes
 
 
+def _set_samples_per_house(config, samples_per_house: int, houses: int | None) -> None:
+    """Request an exact episode count per house, uncapped.
+
+    `_spread_episodes` caps at 10 episodes/house to keep the scene distribution
+    wide; this is the escape hatch for the opposite goal -- e.g. 100 episodes
+    out of a single house to debug or stress-test one scene.
+    """
+    sampler_config = config.task_sampler_config
+    house_count = houses if houses is not None else 1
+
+    available = list(sampler_config.house_inds or [])
+    if len(available) < house_count:
+        available = list(range(house_count))
+    sampler_config.house_inds = available[:house_count]
+    sampler_config.samples_per_house = samples_per_house
+    sampler_config.max_tasks = house_count * samples_per_house
+
+
 @click.command()
 @click.option(
     "--task",
@@ -1316,6 +1347,14 @@ def _spread_episodes(config, episodes: int, houses: int | None) -> None:
     help="Scene split. Leave unset to use the config's default (train).",
 )
 @click.option("--houses", type=int, default=None, help="How many houses to draw episodes from.")
+@click.option(
+    "--samples-per-house",
+    type=int,
+    default=None,
+    help="Exact episode count to request per house, bypassing the usual 10/house "
+    "cap that keeps --episodes/--houses runs spread across many houses. Use this "
+    "to pull many episodes out of few houses, e.g. --houses 1 --samples-per-house 100.",
+)
 @click.option("--seed", type=int, default=None, help="Task-sampling seed.")
 @click.option(
     "--keep-failures/--successful-only",
@@ -1364,6 +1403,7 @@ def main(
     scene_dataset: str | None,
     data_split: str | None,
     houses: int | None,
+    samples_per_house: int | None,
     seed: int | None,
     keep_failures: bool,
     visualize: bool,
@@ -1415,6 +1455,7 @@ def main(
                 scene_dataset=scene_dataset,
                 data_split=data_split,
                 houses=houses,
+                samples_per_house=samples_per_house,
                 seed=seed,
                 keep_failures=keep_failures,
                 visualize=visualize,
