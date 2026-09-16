@@ -23,10 +23,15 @@ import os
 
 from examples.machine_learning.molmospaces.added_pickup_repair import install_eval_repair
 from examples.machine_learning.molmospaces.policies.bc_policy import StretchBCPolicyConfig
+from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (
+    StretchMolmoBotDroidPolicyConfig,
+)
 from examples.machine_learning.molmospaces.policies.molmobot_policy import (
     StretchMolmoBotPolicyConfig,
 )
-from examples.machine_learning.molmospaces.policies.simple_ik_policy import StretchSimpleIKPolicyConfig
+from examples.machine_learning.molmospaces.policies.simple_ik_policy import (
+    StretchSimpleIKPolicyConfig,
+)
 from examples.machine_learning.molmospaces.stretch.config import (
     HEAD_CAMERA,
     WRIST_CAMERA_RIGHT,
@@ -295,10 +300,10 @@ class StretchMolmoBotEvalConfig(Stretch4BenchmarkEvalConfig):
     `policies/molmobot_policy.py` supplies Stretch's spec and delegates to
     MolmoBot's `SynthVLAPolicy`.
 
-    The *released* `allenai/MolmoBot-DROID` is a different case and is not
-    runnable here: it was trained on the `franka_joint` action spec, so it emits
-    seven Franka arm joints, which nothing in this repo translates. Fine-tune on
-    Stretch data instead -- see `finetuning/README.md`.
+    The *released* `allenai/MolmoBot-DROID` is a different case: it was trained
+    on the `franka_joint` action spec, so it emits seven Franka arm joints rather
+    than Stretch's ten numbers. `StretchMolmoBotDroidEvalConfig` runs that one,
+    by retargeting every action and observation through a virtual Franka.
     """
 
     policy_config: StretchMolmoBotPolicyConfig = StretchMolmoBotPolicyConfig()
@@ -316,6 +321,40 @@ class StretchMolmoBotEvalConfig(Stretch4BenchmarkEvalConfig):
             # been trained with; `_resolve_action_type` needs to know which of
             # the two it is looking at.
             self.policy_config.action_type_explicit = True
+
+
+class StretchMolmoBotDroidEvalConfig(Stretch4BenchmarkEvalConfig):
+    """The released `allenai/MolmoBot-DROID` checkpoint, retargeted onto Stretch.
+
+    A zero-shot cross-embodiment baseline. The checkpoint was trained on DROID,
+    so it emits seven Franka arm joints and a Robotiq 0-255 gripper command and
+    reads seven Franka joint angles back; `policies/molmobot_droid_policy.py`
+    translates all of it through a virtual Franka standing on a pedestal at
+    Stretch's own feet, and re-solves each tool pose on Stretch's base, lift,
+    telescoping arm and wrist.
+
+    Read the scores as a floor. Retargeting fixes the action interface and
+    nothing else -- the policy is looking at a Stretch arm through a Stretch
+    camera, having been trained on neither. `StretchMolmoBotEvalConfig` is the
+    fine-tuned comparison, and `get_info()` on this policy reports how far the
+    commanded tool poses fell outside what Stretch could reach, which is what
+    separates a retargeting failure from a policy one.
+
+    `--checkpoint` is optional here: with none given the released checkpoint is
+    fetched from the Hub.
+    """
+
+    policy_config: StretchMolmoBotDroidPolicyConfig = StretchMolmoBotDroidPolicyConfig()
+
+    @property
+    def tag(self) -> str:
+        return "stretch4_molmobot_droid"
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        action_type = os.environ.get(MOLMOBOT_ACTION_TYPE_ENV_VAR)
+        if action_type:
+            self.policy_config.action_type = action_type
 
 
 class StretchDummyEvalConfig(Stretch4BenchmarkEvalConfig):

@@ -16,6 +16,11 @@ Run Stretch 4 on the MolmoSpaces benchmark evaluations.
     python -m examples.machine_learning.molmospaces.run_benchmarks \
         --policy molmobot --checkpoint /path/to/checkpoint --benchmark pick
 
+    # the released MolmoBot-DROID checkpoint, retargeted onto Stretch's joints
+    # from the Franka's. Needs no --checkpoint: it fetches the released one.
+    python -m examples.machine_learning.molmospaces.run_benchmarks \
+        --policy molmobot_droid --benchmark pick --episodes 20
+
     # a locally built benchmark: not in the default sweep, so name it
     python -m examples.machine_learning.molmospaces.run_benchmarks \
         --benchmark potato --episodes 20
@@ -98,6 +103,7 @@ POLICY_CHOICES = (
     "simple_ik_top_down",
     "bc",
     "molmobot",
+    "molmobot_droid",
     "dummy",
 )
 
@@ -130,6 +136,7 @@ def eval_config_for(policy: str, benchmark_key: str) -> str:
         "simple_ik_top_down": "StretchSimpleIKTopDownEvalConfig",
         "bc": "StretchBCEvalConfig",
         "molmobot": "StretchMolmoBotEvalConfig",
+        "molmobot_droid": "StretchMolmoBotDroidEvalConfig",
         "dummy": "StretchDummyEvalConfig",
     }[policy]
 
@@ -253,7 +260,8 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     type=str,
     default=None,
     help="Checkpoint for --policy bc or --policy molmobot. Overrides the path on "
-    "the policy config.",
+    "the policy config. Optional for --policy molmobot_droid, which otherwise "
+    "fetches the released checkpoint from the Hub.",
 )
 @click.option(
     "--episodes",
@@ -266,8 +274,9 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "--molmobot-action-type",
     type=click.Choice(["joint_pos_rel", "joint_pos"]),
     default=None,
-    help="Action type a --policy molmobot checkpoint was trained with. Defaults to "
-    "joint_pos_rel, MolmoBot's own default.",
+    help="Action type a --policy molmobot or --policy molmobot_droid checkpoint is "
+    "driven with. Defaults to joint_pos_rel for a fine-tuned checkpoint, MolmoBot's "
+    "own default, and to joint_pos for the released DROID one.",
 )
 @click.option("--num-workers", type=int, default=1, help="Parallel rollout worker processes.")
 @click.option(
@@ -389,8 +398,11 @@ def main(
             "`python -m examples.machine_learning.molmospaces.finetuning.finetune "
             "--rollouts <run> --trainer molmobot`."
         )
-    if policy != "molmobot" and molmobot_action_type:
-        raise click.UsageError("--molmobot-action-type only applies to --policy molmobot.")
+    if policy not in ("molmobot", "molmobot_droid") and molmobot_action_type:
+        raise click.UsageError(
+            "--molmobot-action-type only applies to --policy molmobot and --policy "
+            "molmobot_droid."
+        )
     if visualize_cameras and not visualize:
         raise click.UsageError("--visualize-camera only applies with --visualize.")
     if export_cameras and not export_to_mp4:
@@ -398,7 +410,7 @@ def main(
     if molmobot_action_type:
         os.environ[MOLMOBOT_ACTION_TYPE_ENV_VAR] = molmobot_action_type
 
-    if policy == "molmobot":
+    if policy in ("molmobot", "molmobot_droid"):
         # MolmoBot is a clone, not a dependency, so nothing puts its `olmo`
         # package on the import path. Done before the first rollout rather than
         # inside the policy so a missing checkout is a message here, at the
