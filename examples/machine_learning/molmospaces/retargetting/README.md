@@ -24,29 +24,56 @@ examples/machine_learning/molmospaces/retargetting/
 ## Running it
 
 ```bash
-# the seven setups at their defaults -- 28 rollouts, and the place to start
+# the default: sweep every parameter that applies to each setup, in stages.
+# 184 trials, 736 rollouts, roughly 9 hours. Prints the plan before it starts.
 python -m examples.machine_learning.molmospaces.retargetting.params_search
 
-# one setup, a grid over camera pitch and field of view
-python -m examples.machine_learning.molmospaces.retargetting.params_search \
-    --setup stretch_stretchcam \
+# the quick comparison table instead: each setup once, at its own defaults.
+# 7 trials, ~20 minutes.
+python -m ...params_search --search none
+
+# one setup, a grid over dimensions you name
+python -m ...params_search --setup stretch_stretchcam \
     --search grid --dim pitch_deg=15:50:4 --dim fovy=50:100:3
 
-# the Franka setups mount high on a pedestal, so they need this to see the
-# counter at all -- see "the mount is fixed" below
-python -m examples.machine_learning.molmospaces.retargetting.params_search \
-    --setup franka_stretchcam \
-    --search grid --dim pitch_deg=10:45:5 --dim fovy=70:130:4
-
-# the gripper parameters on the fisheye setup, by CMA-ES
-python -m examples.machine_learning.molmospaces.retargetting.params_search \
-    --setup stretch_fisheye --search cmaes \
+# the gripper parameters by CMA-ES
+python -m ...params_search --setup stretch_fisheye --search cmaes \
     --dim grasp_offset_m=-0.05:0.15 --dim wrist_tilt_deg=-20:60 \
     --population 6 --generations 5
 
 python -m ...params_search --list-setups   # what the seven are
-python -m ...params_search --list-dims     # what can be searched
+python -m ...params_search --list-dims     # what can be searched, and what the sweep tries
+python -m ...retargetting.diagnose         # measure the retargeting, no policy needed
 ```
+
+Output lands under `--output-dir` (default `eval_output/retarget_params/`): an
+MP4 per rollout, `episodes.csv`, `trials.csv`, `trials.jsonl`, and `report.md`
+ranking the trials. **Everything is rewritten after every trial**, so a long
+sweep can be stopped at any point and what it has is already on disk.
+
+### What the default sweep does
+
+Per setup, a full grid per stage, carrying the winning parameters into the next
+stage:
+
+| stage | dimensions | points | applies to |
+|---|---|---:|---|
+| camera | `pitch_deg` (4) × `fovy` (4) | 16 | every setup |
+| gripper | `grasp_offset_m` (4) × `z_offset_fraction` (2) × `wrist_tilt_deg` (3) | 24 | Stretch setups |
+
+Staged rather than one grid over all five, because the full cross product is 384
+points per Stretch setup — days of rollouts, most of them re-measuring a camera
+a previous point already showed was bad. Parameters that *interact* are kept in
+the same stage: `grasp_offset_m` and `z_offset_fraction` are inseparable (see
+the debugging section below), and swept one at a time neither would have looked
+like the answer. What staging cannot see is an interaction *across* stages — a
+camera that is only good with a particular gripper correction. `--search grid`
+over a hand-picked pair is how you check one if you suspect it.
+
+Dimensions declare which robot they apply to, so the gripper stage is skipped on
+Franka setups (there is nothing to retarget on the robot the policy was trained
+on), and `--dim grasp_offset_m` on a Franka setup is refused rather than running
+16 identical trials.
 
 ## The mount is fixed; the optics are not
 
@@ -60,17 +87,19 @@ reaches from. Holding that point still is the premise of the transplant: what
 the study varies is the optics around it, so `DIMENSIONS` contains `pitch_deg`
 and `fovy` and no translation at all.
 
-There is one consequence worth knowing before reading any Franka row. A
-benchmark Franka stands on a 0.75 m pedestal, so the transplanted mount ends up
-2.29 m above the floor — about 0.75 m higher above the room than the same mount
-is on Stretch. Rendered on this kitchen at the pinhole defaults (pitch 43,
-fovy 71) the target object is not in a single frame of the episode. The counter
-is *below* the default cone rather than out of reach, so tilting further down
-and widening `fovy` recover it — which is exactly what those two dimensions are
-for. Mind the sign: `pitch_deg` is measured **up from straight down** (0 = floor,
-90 = horizon), so further down is a *smaller* number.
-Read `--search none` for setups 2, 4 and 6 as a floor, and compare the best
-(pitch, fovy) found for each instead.
+Both robots' cameras end up at **the same height in the room** — 1.5432 m above
+the floor — which is what makes 2 → 3, 4 → 5 and 6 → 7 comparisons of the robot
+rather than of two different viewpoints. That takes different numbers on each,
+because their bases are at different heights: Stretch's `base_link` is on the
+floor, while a benchmark Franka's `fr3_link0` is 0.75 m up on a pedestal and
+`fr3_link1` another 0.333 m above that. So the Franka offset is
+1.5432 − 0.75 − 0.333 = **0.460 m** above `fr3_link1`, not the 1.210 m that
+would be right if `fr3_link0` stood on the floor. `setups.FRANKA_STRETCHCAM_HEIGHT`
+derives it rather than stating it, so the two cannot drift apart.
+
+Mind the sign when searching the tilt: `pitch_deg` is measured **up from
+straight down** (0 = floor, 90 = horizon), so pointing further down is a
+*smaller* number.
 
 ## What can be searched
 
@@ -82,17 +111,94 @@ Read `--search none` for setups 2, 4 and 6 as a floor, and compare the best
 | `wrist_tilt_deg` | Stretch | extra pitch between the Franka tool frame and Stretch's |
 | `z_offset_fraction` | Stretch | how much of the measured lift shortfall to add to targets |
 
-The three Stretch-only dimensions are ignored, not rejected, on a Franka setup,
-so one parameter vector describes a trial on either robot.
+`--list-dims` prints each one's range and the values the sweep tries. The three
+Stretch-only dimensions are carried on a Franka setup's parameters but never
+read there, so one parameter vector still describes a trial on either robot —
+`--dim` refuses to *search* them on a Franka setup, since every trial would be
+identical.
 
 Output lands under `--output-dir` (default `eval_output/retarget_params/`): an
 MP4 per rollout, `episodes.csv`, `trials.csv`, `trials.jsonl`, and `report.md`
 ranking the trials.
 
 One trial is four rollouts of ~300 steps with a VLA in the loop — minutes, not
-seconds. Budget accordingly: `--search none` over all seven setups is the
-baseline table, a grid is for one setup and one or two dimensions, and CMA-ES is
-for the continuous parameters once you know which setup is worth tuning.
+seconds. That is what makes the default sweep a 9-hour job; `--search none` is
+the 20-minute version.
+
+## Debugging the retargeting: what was wrong, and the fix
+
+The first full run put `franka_stretchcam` at 0.965 (3/4 picked) and
+`stretch_stretchcam` at 0.776 (1/4) — the *same camera* on the two robots, so
+the gap was the retargeting. `diagnose.py` found two geometric faults, both
+readable off a standing robot with no policy running.
+
+**1. The grasp centre is past the fingertips.** The retargeting drives Stretch's
+`grasp_center_link` to the pose the policy asked for its Robotiq's `grasp_site`
+— but those are different points on their grippers. Measured in the base frame:
+`grasp_center_link` at x = 0.4667, furthest fingertip geom at x = 0.4516, finger
+pads at x = 0.3611. So an object placed "at the grasp centre" is 1.5 cm *beyond*
+the fingertips and 10.6 cm beyond the pads. The fingers close behind it and nudge
+it. `grasp_offset_m` pushes the commanded centre further along the approach,
+which pulls the object deeper into the gripper.
+
+**2. Every grasp is commanded 5.1 cm high.** `measure_tool_height_offset()`
+returns +0.103 m here and `z_offset_fraction = 0.5` adds half of it to every
+target. Three of the four objects are shorter than that:
+
+| object | height above counter | at +5.1 cm |
+|---|---:|---|
+| bowl | 4.8 cm | rim still catches |
+| potato | 4.0 cm | closes above it |
+| salt_shaker | 5.5 cm | grazes the top |
+| knife | 2.6 cm | never approaches |
+
+### The search
+
+`grasp_offset_m` × `z_offset_fraction`, four objects per point:
+
+| `grasp_offset_m` | `z_frac=0.0` | `z_frac=0.5` |
+|---:|---:|---:|
+| 0.00 | 0.776 (1/4) | 0.776 (1/4) |
+| 0.03 | 0.792 (1/4) | — |
+| 0.06 | 0.945 (3/4) | 0.554 (0/4) |
+| **0.09** | **0.980 (3/4)** | 0.818 (1/4) |
+| 0.12 | 0.895 (2/4) | 0.871 (1/4) |
+| 0.15 | 0.972 (2/4) | 0.915 (3/4) |
+
+The two parameters interact, which is why neither alone had looked like the
+answer: at `grasp_offset_m = 0` the height made no difference, because the depth
+error was already losing every grasp. Once the depth is right the height becomes
+the limiting error — mean score over the four offsets is 0.948 at `z_frac=0`
+against 0.789 at 0.5.
+
+At the best point Stretch picks up **the same three objects the Franka picks**,
+and fails on the same one:
+
+| object | before (0.0 / 0.5) | after (0.09 / 0.0) | Franka, same camera |
+|---|---|---|---|
+| bowl | picked | picked | picked |
+| potato | 0.5 cm lift | 1.1 cm lift, still failed | failed |
+| salt_shaker | 0.4 cm lift | picked | picked |
+| knife | never approached (18.7 cm) | picked (2.9 cm, 2.0 cm lift) | picked |
+
+`0.776 (1/4)` → `0.980 (3/4)`, against the Franka's `0.965 (3/4)`. These are now
+the defaults for the Stretch setups (`STRETCH_GRASP_OFFSET_M`,
+`STRETCH_Z_OFFSET_FRACTION`).
+
+### How much to trust this
+
+Not very much, on its own. Each cell is one rollout per object, and the noise is
+a whole object wide: `grasp_offset_m = 0.06 / z_frac = 0` scored 0.860 (2/4) in
+one run and 0.945 (3/4) in another, at identical parameters. What survives that
+noise is the *shape* — everything at or above 0.06 beats everything at or below
+0.03, and `z_frac=0` beats 0.5 at every offset but the last. The peak's exact
+location does not; 0.09 is the best single point and agrees with the geometry
+(it puts the object at the finger pads), which is why it is the default, but
+0.06–0.15 is one plateau as far as this evidence goes.
+
+Confirm on a real benchmark before relying on it:
+
+    run_benchmarks.py --policy molmobot_droid --benchmark pick --episodes 50
 
 ## The fisheye, and matching the simulator
 

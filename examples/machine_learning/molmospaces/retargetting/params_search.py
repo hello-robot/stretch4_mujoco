@@ -45,6 +45,7 @@ rank settings against each other cheaply, and then to confirm the winner with
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import json
 import logging
 import os
@@ -111,6 +112,27 @@ class Dimension:
     write: Callable[[RetargetParams, float], RetargetParams]
     description: str
 
+    sweep: tuple[float, ...]
+    """
+    The values `--search sweep` tries for this dimension.
+
+    Chosen to span what is physically sensible rather than to bracket the
+    current default, so the sweep can find that the shipped value was wrong --
+    which, for `grasp_offset_m`, it was. Wider than a search would pick on its
+    own, because the point of the default run is coverage.
+    """
+
+    robots: tuple[str, ...] = ("franka", "stretch")
+    """
+    Which setups this dimension does anything to.
+
+    The gripper parameters only exist on the Stretch path -- there is nothing to
+    retarget on the Franka the policy was trained on -- so sweeping them on a
+    Franka setup would run identical trials and report them as if they differed.
+    `--dim` warns rather than silently doing that, and `--search sweep` skips
+    them.
+    """
+
 
 def _with_exo(params: RetargetParams, **changes: Any) -> RetargetParams:
     return dataclasses.replace(params, exo=dataclasses.replace(params.exo, **changes))
@@ -127,6 +149,7 @@ DIMENSIONS: dict[str, Dimension] = {
             description="Camera tilt, measured up from straight down: 0 looks at "
             "the floor and 90 at the horizon, so SMALLER points further DOWN. "
             "The default 43 is 47 degrees below horizontal.",
+            sweep=(23.0, 33.0, 43.0, 53.0),
         ),
         Dimension(
             name="fovy",
@@ -134,6 +157,7 @@ DIMENSIONS: dict[str, Dimension] = {
             read=lambda p: p.exo.fovy,
             write=lambda p, v: _with_exo(p, fovy=float(v)),
             description="Vertical field of view. 71 is DROID's, 123 is Stretch's fisheye.",
+            sweep=(55.0, 71.0, 95.0, 123.0),
         ),
         Dimension(
             name="grasp_offset_m",
@@ -142,6 +166,8 @@ DIMENSIONS: dict[str, Dimension] = {
             write=lambda p, v: dataclasses.replace(p, grasp_offset_m=float(v)),
             description="How far to push the commanded grasp centre along Stretch's "
             "approach axis, to account for its much longer gripper. Stretch setups only.",
+            sweep=(0.0, 0.06, 0.09, 0.12),
+            robots=("stretch",),
         ),
         Dimension(
             name="wrist_tilt_deg",
@@ -150,6 +176,8 @@ DIMENSIONS: dict[str, Dimension] = {
             write=lambda p, v: dataclasses.replace(p, wrist_tilt_deg=float(v)),
             description="Extra pitch between the Franka's tool frame and Stretch's. "
             "Stretch setups only.",
+            sweep=(-45.0, 0.0, 45.0),
+            robots=("stretch",),
         ),
         Dimension(
             name="z_offset_fraction",
@@ -158,9 +186,39 @@ DIMENSIONS: dict[str, Dimension] = {
             write=lambda p, v: dataclasses.replace(p, z_offset_fraction=float(v)),
             description="How much of the measured lift shortfall to add to every "
             "target. Stretch setups only.",
+            sweep=(0.0, 0.5),
+            robots=("stretch",),
         ),
     )
 }
+
+
+SWEEP_STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("camera", ("pitch_deg", "fovy")),
+    ("gripper", ("grasp_offset_m", "z_offset_fraction", "wrist_tilt_deg")),
+)
+"""
+What `--search sweep` does, in order: a full grid per stage, carrying the winner.
+
+Staged rather than one grid over all five dimensions, because the full cross
+product is 384 points per Stretch setup -- days of rollouts, most of them spent
+re-measuring a camera that a previous point already showed was bad. Staging it
+costs 40 points per Stretch setup instead, and each stage answers one question:
+where should the camera look, and then, from that view, how should the gripper
+be corrected.
+
+The stages are grouped so that parameters which *interact* stay in the same
+grid. That grouping is not cosmetic. `grasp_offset_m` and `z_offset_fraction`
+turned out to be inseparable -- at `grasp_offset_m = 0` the height offset made
+no measurable difference, because the depth error was already losing every
+grasp, and only once the depth was right did the height become the limiting
+error. Swept one at a time, neither would have looked like the answer.
+
+What staging still cannot see is an interaction *across* stages -- a camera that
+is only good with a particular gripper correction. That is the price of not
+running the full grid; `--search grid` over a hand-picked pair is how you check
+one if you suspect it.
+"""
 
 
 @dataclass(frozen=True)
@@ -172,7 +230,20 @@ class Axis:
     high: float
     steps: int | None
 
+    values: tuple[float, ...] | None = None
+    """
+    Explicit values, when the caller has them.
+
+    `--dim name=lo:hi:steps` leaves this unset and gets an even spacing. The
+    sweep sets it, because its values are chosen rather than spaced -- a
+    `grasp_offset_m` sweep of (0, 0.06, 0.09, 0.12) is four points that mean
+    something, and `linspace` over the same range would quietly replace them
+    with (0, 0.04, 0.08, 0.12).
+    """
+
     def grid_values(self) -> list[float]:
+        if self.values is not None:
+            return [float(v) for v in self.values]
         return [float(v) for v in np.linspace(self.low, self.high, self.steps or 3)]
 
 
@@ -225,6 +296,15 @@ class TrialRunner:
             params_description=params.describe(),
             params_json=params_to_json(setup_key, params),
         )
+
+        # Rebuilt if it has gone missing, rather than assumed. A search is an
+        # hour of GPU time and the benchmark is a directory in the run's own
+        # output tree -- one that has, in practice, been moved out from under a
+        # running search. Regenerating it costs a house compile and is
+        # deterministic, so the alternative (every remaining trial failing with
+        # FileNotFoundError, and the run reporting nine errors) is strictly
+        # worse. `build` is a no-op when the file is where it was left.
+        mini_benchmark.build(self.benchmark_dir)
 
         # Before the config class is resolved: `run_evaluation` builds the
         # experiment config from the "module:Class" string, and that
@@ -446,10 +526,13 @@ class SimpleCMAES:
 )
 @click.option(
     "--search",
-    type=click.Choice(["none", "grid", "cmaes"]),
-    default="none",
-    help="'none' runs each setup once at its own defaults. 'grid' and 'cmaes' need "
-    "at least one --dim, and are worth pointing at one setup at a time.",
+    type=click.Choice(["sweep", "none", "grid", "cmaes"]),
+    default="sweep",
+    help="'sweep' (the default) grids every parameter that applies to each setup, "
+    "in stages, carrying the winner forward -- hours of rollouts, and the thing to "
+    "run when you want coverage. 'none' runs each setup once at its own defaults, "
+    "which is the quick comparison table. 'grid' and 'cmaes' search the dimensions "
+    "named by --dim, and are worth pointing at one setup at a time.",
 )
 @click.option(
     "--dim",
@@ -518,23 +601,46 @@ def main(
         return
     if list_dims:
         for name, dimension in DIMENSIONS.items():
-            click.echo(f"{name:20s} {dimension.bounds[0]:>8.3f} .. {dimension.bounds[1]:<8.3f}")
+            scope = "both robots" if len(dimension.robots) > 1 else f"{dimension.robots[0]} only"
+            click.echo(
+                f"{name:20s} {dimension.bounds[0]:>8.3f} .. {dimension.bounds[1]:<8.3f} {scope}"
+            )
             click.echo(f"{'':20s} {dimension.description}")
+            values = ", ".join(f"{value:g}" for value in dimension.sweep)
+            click.echo(f"{'':20s} --search sweep tries: {values}")
         return
 
     keys = list(setup_keys) or list(SETUP_KEYS)
     crop = _parse_crop(exo_crop)
     axes = [parse_axis(spec) for spec in dim_specs]
-    if search != "none" and not axes:
+    if search in ("grid", "cmaes") and not axes:
         raise click.UsageError(f"--search {search} needs at least one --dim. See --list-dims.")
-    if search == "none" and axes:
-        raise click.UsageError("--dim only applies with --search grid or --search cmaes.")
-    if search != "none" and len(keys) > 1:
+    if search in ("none", "sweep") and axes:
+        raise click.UsageError(
+            f"--dim does not apply to --search {search}. Use --search grid or --search cmaes "
+            "to search dimensions you name, or let --search sweep use its own."
+        )
+    if search in ("grid", "cmaes") and len(keys) > 1:
         click.secho(
             f"Searching {len(axes)} dimensions across {len(keys)} setups. Each trial is "
             f"{len(mini_benchmark.TARGETS)} rollouts; consider one --setup at a time.",
             fg="yellow",
         )
+
+    # A dimension the setup's robot ignores would run identical trials and report
+    # them as if they differed, which is worse than refusing.
+    for axis in axes:
+        inapplicable = [k for k in keys if SETUPS[k].robot not in axis.dimension.robots]
+        if inapplicable:
+            raise click.UsageError(
+                f"--dim {axis.dimension.name} only does anything on "
+                f"{'/'.join(axis.dimension.robots)} setups, and {', '.join(inapplicable)} "
+                f"{'is' if len(inapplicable) == 1 else 'are'} not. Every trial would be "
+                "identical."
+            )
+
+    if search == "sweep":
+        _announce_sweep(keys)
 
     # MolmoBot is a clone rather than a dependency, so nothing puts its `olmo`
     # package on the import path. Done here so a missing checkout is a message
@@ -558,6 +664,13 @@ def main(
     from examples.machine_learning.molmospaces.visualize import install_eval_video_hook
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    archived = preserve_previous_run(output_dir)
+    if archived is not None:
+        click.secho(
+            f"{output_dir} already held a run's results; moved them to {archived} rather "
+            "than overwriting them.",
+            fg="yellow",
+        )
     benchmark_dir = mini_benchmark.build(output_dir / "benchmark", force=rebuild_benchmark)
 
     # Both hooks wrap the same rollout, once, for the whole search: the recorder
@@ -574,29 +687,144 @@ def main(
     )
 
     trials: list[TrialResult] = []
+
+    def record(trial: TrialResult) -> TrialResult:
+        """Keep a trial, and refresh the report with everything run so far.
+
+        Rewritten after *every* trial rather than at the end, or even per setup:
+        a grid over two dimensions is an hour or more, and being interrupted in
+        the middle of one should still leave the rows it managed -- and let you
+        watch the search decide while it runs. The files are small and rewritten
+        whole, so there is no partial-file state to get wrong.
+        """
+        trials.append(trial)
+        _write_outputs(trials, output_dir)
+        return trial
+
     for setup_key in keys:
         base = SETUPS[setup_key].params
         if crop is not None:
             base = dataclasses.replace(base, exo=dataclasses.replace(base.exo, crop_to=crop))
-        if search == "none":
-            trials.append(runner.run(setup_key, base, "default"))
+        if search == "sweep":
+            _run_sweep(runner, setup_key, base, record)
+        elif search == "none":
+            record(runner.run(setup_key, base, "default"))
         elif search == "grid":
             for index, point in enumerate(grid_points(axes)):
-                trials.append(
-                    runner.run(setup_key, apply_point(base, axes, point), _label(axes, point, index))
-                )
+                record(runner.run(setup_key, apply_point(base, axes, point), _label(axes, point, index)))
         else:
-            trials.extend(_run_cmaes(runner, setup_key, base, axes, population, generations, seed))
-
-        # Written after every setup rather than at the end: a search is long
-        # enough that being interrupted halfway through should still leave the
-        # rows it has.
-        _write_outputs(trials, output_dir)
+            _run_cmaes(runner, setup_key, base, axes, population, generations, seed, record)
 
     targets = mini_benchmark.TARGET_KEYS
     click.echo("\n" + format_trial_table(trials, targets) + "\n")
     report = _write_outputs(trials, output_dir)
     click.secho(f"Wrote {report}", fg="green")
+
+
+def sweep_axes(stage: str, robot: str) -> list[Axis]:
+    """The axes a stage sweeps for a given robot, at their declared sweep values.
+
+    Empty when no dimension in the stage applies -- the gripper stage on a
+    Franka setup -- which the caller takes as "skip".
+    """
+    names = dict(SWEEP_STAGES)[stage]
+    axes = []
+    for name in names:
+        dimension = DIMENSIONS[name]
+        if robot not in dimension.robots:
+            continue
+        values = dimension.sweep
+        axes.append(Axis(dimension, min(values), max(values), len(values), values))
+    return axes
+
+
+def sweep_plan(keys: list[str]) -> list[tuple[str, str, int]]:
+    """`(setup, stage, trial count)` for every stage the sweep will run."""
+    plan = []
+    for setup_key in keys:
+        robot = SETUPS[setup_key].robot
+        for stage, _ in SWEEP_STAGES:
+            axes = sweep_axes(stage, robot)
+            if axes:
+                plan.append((setup_key, stage, len(grid_points(axes))))
+    return plan
+
+
+def _run_sweep(
+    runner: TrialRunner,
+    setup_key: str,
+    base: RetargetParams,
+    record: Callable[[TrialResult], TrialResult],
+) -> None:
+    """Grid each stage in turn, carrying the best parameters forward.
+
+    The winner of a stage is the best *usable* trial -- a stage whose trials all
+    crashed carries its starting parameters forward rather than a meaningless
+    one, so a GPU that filled up mid-sweep costs that stage rather than every
+    stage after it.
+    """
+    robot = SETUPS[setup_key].robot
+    best = base
+    for stage, _ in SWEEP_STAGES:
+        axes = sweep_axes(stage, robot)
+        if not axes:
+            log.info(f"[sweep] {setup_key}: no {stage} dimensions apply, skipping")
+            continue
+        points = grid_points(axes)
+        log.info(
+            f"[sweep] {setup_key} stage '{stage}': {len(points)} points over "
+            f"{', '.join(axis.dimension.name for axis in axes)}"
+        )
+        results = [
+            record(runner.run(setup_key, apply_point(best, axes, point), f"{stage}_{_label(axes, point, index)}"))
+            for index, point in enumerate(points)
+        ]
+        usable = [trial for trial in results if trial.usable]
+        if not usable:
+            log.warning(
+                f"[sweep] {setup_key} stage '{stage}': nothing usable, carrying the "
+                "stage's starting parameters into the next one"
+            )
+            continue
+        winner = max(usable, key=lambda trial: trial.score)
+        best = apply_point(best, axes, points[results.index(winner)])
+        log.info(
+            f"[sweep] {setup_key} stage '{stage}' best {winner.score:.3f}: {best.describe()}"
+        )
+
+
+SECONDS_PER_ROLLOUT = 45
+"""
+Rough wall-clock per rollout, for the estimate printed before a sweep.
+
+Measured on this machine over a few hundred episodes: a 20-second episode at
+15Hz is ~300 policy steps, and one that grasps early stops sooner. Only ever
+used to print an order of magnitude, so it does not need to be right.
+"""
+
+
+def _announce_sweep(keys: list[str]) -> None:
+    """Print what the sweep will run before it starts, with a time estimate.
+
+    A default that takes hours should say so on the first line rather than in
+    the scrollback an hour later.
+    """
+    plan = sweep_plan(keys)
+    trials = sum(count for _, _, count in plan)
+    rollouts = trials * len(mini_benchmark.TARGETS)
+    click.secho(f"Sweeping {len(keys)} setup(s): {trials} trials, {rollouts} rollouts.", bold=True)
+    for setup_key, stage, count in plan:
+        axes = sweep_axes(stage, SETUPS[setup_key].robot)
+        names = ", ".join(
+            f"{axis.dimension.name}({len(axis.grid_values())})" for axis in axes
+        )
+        click.echo(f"  {setup_key:20s} {stage:8s} {count:3d} trials   {names}")
+    hours = rollouts * SECONDS_PER_ROLLOUT / 3600
+    click.secho(
+        f"Roughly {hours:.0f} hours. Results are written after every trial, so the run "
+        "can be stopped at any point and what it has is already in report.md.",
+        fg="yellow",
+    )
 
 
 def _parse_crop(text: str | None) -> tuple[int, int] | None:
@@ -624,6 +852,7 @@ def _run_cmaes(
     population: int,
     generations: int,
     seed: int,
+    record: Callable[[TrialResult], TrialResult],
 ) -> list[TrialResult]:
     """Run CMA-ES over `axes`, starting from the setup's own defaults."""
     x0 = np.array([axis.dimension.read(base) for axis in axes], dtype=float)
@@ -641,8 +870,8 @@ def _run_cmaes(
         points = optimiser.ask()
         scores = []
         for point in points:
-            trial = runner.run(
-                setup_key, apply_point(base, axes, point), _label(axes, point, evaluated)
+            trial = record(
+                runner.run(setup_key, apply_point(base, axes, point), _label(axes, point, evaluated))
             )
             trials.append(trial)
             # A trial that measured nothing is fed back as the generation's worst
@@ -667,6 +896,46 @@ def _run_cmaes(
             f"mean now {np.round(optimiser.mean, 4).tolist()}, sigma {optimiser.sigma:.4f}"
         )
     return trials
+
+
+AGGREGATE_FILES = (
+    "report.md",
+    "trials.csv",
+    "trials.jsonl",
+    "episodes.csv",
+    "analysis.md",
+    "analysis.csv",
+)
+"""The files a run rewrites wholesale, and so the files a second run would destroy."""
+
+
+def preserve_previous_run(output_dir: Path) -> Path | None:
+    """Move a previous run's aggregate files aside before this one starts writing.
+
+    `_write_outputs` rewrites each of `AGGREGATE_FILES` from scratch after every
+    trial, holding only *this* run's trials -- so a second run pointed at a
+    directory that already has them replaces a finished sweep with its own first
+    trial, and nine hours of results are gone by the time anyone looks. The
+    default `--output-dir` is a fixed path, so this is not an exotic mistake:
+    running the command twice is enough.
+
+    Returns the archive directory, or None if there was nothing to preserve. The
+    per-trial subdirectories under `trials/` are left alone -- `run_evaluation`
+    timestamps its own output inside them, so a repeated trial name adds a
+    directory rather than overwriting one.
+    """
+    existing = [output_dir / name for name in AGGREGATE_FILES if (output_dir / name).is_file()]
+    if not existing:
+        return None
+
+    stamp = datetime.datetime.fromtimestamp(
+        max(path.stat().st_mtime for path in existing)
+    ).strftime("%Y%m%d_%H%M%S")
+    archive = output_dir / "previous" / stamp
+    archive.mkdir(parents=True, exist_ok=True)
+    for path in existing:
+        path.rename(archive / path.name)
+    return archive
 
 
 def _write_outputs(trials: list[TrialResult], output_dir: Path) -> Path:

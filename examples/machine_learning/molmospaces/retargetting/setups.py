@@ -125,6 +125,39 @@ aspect disagrees -- which quietly warps the frame differently from the hardware.
 DROID_FRAME_SIZE = (640, 360)
 """What the checkpoint was trained on. `--exo-crop` brings a fisheye frame to it."""
 
+STRETCH_GRASP_OFFSET_M = 0.09
+STRETCH_Z_OFFSET_FRACTION = 0.0
+"""
+The tool correction the Stretch setups retarget with, measured by search.
+
+The shipped values were `grasp_offset_m = 0.0` (no correction at all) and
+`z_offset_fraction = 0.5`, and together they cost most of what the retargeting
+could do. Both faults are geometric and both are visible on a standing robot
+with no policy running -- see `diagnose.py`, which prints them:
+
+* **The grasp centre.** The retargeting drives `grasp_center_link` to the pose
+  the policy asked for its Robotiq's `grasp_site`, but on Stretch that point
+  sits 1.5cm *past* the fingertips and 10.6cm past the finger pads. An object
+  placed there is outside the gripper, so the fingers close behind it and it is
+  nudged rather than grasped. 0.09 puts it between the pads, which is where the
+  Robotiq's own grasp site is on the robot the policy was trained on.
+* **The height.** `z_offset_fraction` of the measured lift shortfall is added to
+  every target -- 5.1cm in this kitchen, which is more than three of the four
+  benchmark objects are tall. It exists to stop the gripper dragging through a
+  countertop where the lift has run out of travel; with the grasp depth
+  corrected it costs more than it buys here.
+
+Measured over the four objects, `z_offset_fraction=0` versus `0.5` at four grasp
+offsets: mean score 0.948 against 0.789. The two interact -- at
+`grasp_offset_m=0` the height made no difference at all, because the depth error
+was already losing every grasp.
+
+These are tuned on one kitchen from one robot pose. Confirm on a real benchmark
+before treating them as the retargeting's defaults everywhere:
+
+    run_benchmarks.py --policy molmobot_droid --benchmark pick
+"""
+
 HEAD_CAMERA_ROLL_DEG = -90.0
 """
 How far Stretch's head cameras are rolled about their view axis: a quarter turn.
@@ -241,33 +274,35 @@ home pose the two give pixel-identical frames, and they diverge only once the
 arm turns.
 """
 
-FRANKA_STRETCHCAM_HEIGHT = 1.21024331
+FRANKA_LINK1_HEIGHT = 0.333
+"""`fr3_link1`'s origin above `fr3_link0`, measured off the compiled model."""
+
+FRANKA_STRETCHCAM_HEIGHT = (
+    STRETCH_STRETCHCAM_HEIGHT + 0.0845 - FRANKA_LINK0_HEIGHT - FRANKA_LINK1_HEIGHT
+)
 """
-Where Stretch's head camera goes on a Franka: 1.210 above `fr3_link1`.
+Where Stretch's head camera goes on a Franka: 0.460 above `fr3_link1`.
 
-Stretch's 1.5432 above `base_link`, less `fr3_link1`'s own 0.333 above
-`fr3_link0` -- so the camera sits where Stretch's right head camera would mount
-if you took the Franka's own base as the robot's base. That is the transplant
-this study is about, and it is *fixed*: no setup and no search moves it, which
-is why `params_search.DIMENSIONS` has no translation in it.
+Derived, not written down, and the derivation is the point: the camera must end
+up at **the same height in the room** on both robots. That is what makes setups
+2 and 3 (or 4 and 5) a comparison of the *robot* rather than of two different
+viewpoints -- the whole premise of transplanting Stretch's camera onto a Franka
+is that the camera does not move, only the arm under it does.
 
-It is worth knowing what that costs, because it decides how setups 2, 4 and 6
-have to be run. `fr3_link0` is not on the floor -- a benchmark Franka stands on
-a 0.75m pedestal (`FRANKA_LINK0_HEIGHT`) -- so this puts the camera 2.29m up,
-about 0.75m higher above the room than the same mount is on Stretch. Rendered on
-this kitchen at the pinhole defaults (pitch 43, fovy 71) the target object is
-not in a single frame of the episode.
+Stretch's head camera is 1.5432 m above the floor, and its base sits on the
+floor. A benchmark Franka does not: `fr3_link0` is 0.75 m up on a pedestal
+(`FRANKA_LINK0_HEIGHT`) and `fr3_link1` another 0.333 m above that, so matching
+the height in the room means 1.5432 - 0.75 - 0.333 = 0.460 m above `fr3_link1`.
 
-That is the framing the pitch and the field of view exist to recover: from 2.29m
-the counter is *below* the default cone rather than outside the mount's reach,
-so the camera has to be tilted further down and widened. Note which way that is:
-`pitch_deg` is measured up from straight down, so further down means a *smaller*
-number, not a larger one. It does mean a `--search none` row for these three
-setups is a floor and not a result -- the comparison worth reading is the best
-(pitch, fovy) found for each, e.g.
+The number that looks like Stretch's -- 1.21024, which is 1.5432 less
+`fr3_link1`'s own 0.333 -- is the offset that would be right if `fr3_link0`
+stood on the floor. It does not, so that value puts the camera 2.29 m up,
+0.75 m higher above the room than the same mount is on Stretch, and it is a
+different viewpoint rather than the same one. Rendered on this kitchen at the
+pinhole defaults the target object is not in a single frame of the episode.
 
-    --setup franka_stretchcam --search grid \\
-        --dim pitch_deg=10:45:5 --dim fovy=70:130:4
+Fixed, either way: no setup and no search moves it, which is why
+`params_search.DIMENSIONS` contains no translation.
 """
 
 SETUPS: dict[str, Setup] = {
@@ -315,6 +350,8 @@ SETUPS: dict[str, Setup] = {
             robot="stretch",
             description="Stretch + the same upright pinhole",
             params=RetargetParams(
+                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
+                z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
@@ -344,6 +381,8 @@ SETUPS: dict[str, Setup] = {
             robot="stretch",
             description="Stretch + its real 123-degree fisheye",
             params=RetargetParams(
+                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
+                z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
@@ -376,6 +415,8 @@ SETUPS: dict[str, Setup] = {
             robot="stretch",
             description="Stretch + that fisheye, rectified",
             params=RetargetParams(
+                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
+                z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
