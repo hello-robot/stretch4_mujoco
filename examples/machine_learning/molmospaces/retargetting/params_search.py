@@ -204,13 +204,14 @@ DIMENSIONS: dict[str, Dimension] = {
             robots=("stretch",),
         ),
         Dimension(
-            name="z_offset_fraction",
-            bounds=(0.0, 1.0),
-            read=lambda p: p.z_offset_fraction,
-            write=lambda p, v: dataclasses.replace(p, z_offset_fraction=float(v)),
-            description="How much of the measured lift shortfall to add to every "
-            "target. Stretch setups only.",
-            sweep=(0.0, 0.5),
+            name="target_z_offset_m",
+            bounds=(0.0, 0.15),
+            read=lambda p: p.target_z_offset_m,
+            write=lambda p, v: dataclasses.replace(p, target_z_offset_m=float(v)),
+            description="Metres to raise every commanded target by, for clearance over "
+            "the counter. Absolute, not a fraction of a measurement -- see "
+            "StretchMolmoBotDroidPolicyConfig.target_z_offset. Stretch setups only.",
+            sweep=(0.0, 0.05),
             robots=("stretch",),
         ),
     )
@@ -219,7 +220,7 @@ DIMENSIONS: dict[str, Dimension] = {
 
 SWEEP_STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("camera", ("pitch_deg", "virtual_pitch_deg", "fovy")),
-    ("gripper", ("grasp_offset_m", "z_offset_fraction", "wrist_tilt_deg")),
+    ("gripper", ("grasp_offset_m", "target_z_offset_m", "wrist_tilt_deg")),
 )
 """
 What `--search sweep` does, in order: a full grid per stage, carrying the winner.
@@ -232,7 +233,7 @@ where should the camera look, and then, from that view, how should the gripper
 be corrected.
 
 The stages are grouped so that parameters which *interact* stay in the same
-grid. That grouping is not cosmetic. `grasp_offset_m` and `z_offset_fraction`
+grid. That grouping is not cosmetic. `grasp_offset_m` and `target_z_offset_m`
 turned out to be inseparable -- at `grasp_offset_m = 0` the height offset made
 no measurable difference, because the depth error was already losing every
 grasp, and only once the depth was right did the height become the limiting
@@ -633,6 +634,34 @@ class SimpleCMAES:
     "camera actually produces; this trades field of view for the landscape shape "
     "the checkpoint was trained on.",
 )
+@click.option(
+    "--replay-as-stretch4",
+    "--replay_as_stretch4",
+    "replay_as_stretch4",
+    is_flag=True,
+    help="Skip the evaluation and instead replay the Franka trajectories already recorded "
+    "under --output-dir through the retargeting, as Stretch 4. No policy runs, so it is "
+    "seconds rather than minutes -- the fast loop for changing a retargeting parameter and "
+    "seeing what it does to actions that are known to work. See retargetting/replay.py.",
+)
+@click.option(
+    "--replay-z-offset",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="target_z_offset to replay with, in metres. The default is 0, which is also what a rollout now applies unless told otherwise.",
+)
+@click.option(
+    "--replay-limit",
+    type=int,
+    default=None,
+    help="Replay at most this many episodes. Handy on a full run, which has dozens.",
+)
+@click.option(
+    "--replay-no-video",
+    is_flag=True,
+    help="Measure without rendering, which is much faster when you only want the numbers.",
+)
 @click.option("--list-dims", is_flag=True, help="List the searchable dimensions and exit.")
 @click.option("--list-setups", is_flag=True, help="List the seven setups and exit.")
 def main(
@@ -650,6 +679,10 @@ def main(
     rebuild_benchmark: bool,
     exo_crop: str | None,
     list_dims: bool,
+    replay_as_stretch4: bool,
+    replay_z_offset: float,
+    replay_limit: int | None,
+    replay_no_video: bool,
     list_setups: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -669,6 +702,22 @@ def main(
             click.echo(f"{'':20s} {dimension.description}")
             values = ", ".join(f"{value:g}" for value in dimension.sweep)
             click.echo(f"{'':20s} --search sweep tries: {values}")
+        return
+
+    if replay_as_stretch4:
+        # Before anything expensive: a replay needs no checkpoint, no GPU and no
+        # MolmoBot checkout, so it must not be gated behind their setup checks.
+        from examples.machine_learning.molmospaces.retargetting import replay as replay_mod
+
+        destination = replay_mod.replay_output_dir(output_dir)
+        results = replay_mod.replay_run(
+            output_dir,
+            destination,
+            render=not replay_no_video,
+            limit=replay_limit,
+            target_z_offset=replay_z_offset,
+        )
+        replay_mod.report(results, destination, rendered=not replay_no_video)
         return
 
     keys = list(setup_keys) or list(SETUP_KEYS)

@@ -129,7 +129,7 @@ def load(run_dir: Path) -> pd.DataFrame:
                 "fovy": exo["fovy"],
                 "grasp_offset_m": params["grasp_offset_m"],
                 "wrist_tilt_deg": params["wrist_tilt_deg"],
-                "z_offset_fraction": params["z_offset_fraction"],
+                "target_z_offset_m": params["target_z_offset_m"],
                 "error": str(row["error"]) if isinstance(row["error"], str) else "",
                 "episodes": int(len(window)),
                 "scenes": int(window.scene.nunique()) if "scene" in window else 1,
@@ -197,7 +197,7 @@ def analyse(df: pd.DataFrame) -> str:
                     "pitch_deg",
                     "fovy",
                     "grasp_offset_m",
-                    "z_offset_fraction",
+                    "target_z_offset_m",
                     "wrist_tilt_deg",
                 ]
             ]
@@ -265,7 +265,7 @@ def analyse(df: pd.DataFrame) -> str:
             _pivot_markdown(
                 gripper.pivot_table(
                     index="grasp_offset_m",
-                    columns="z_offset_fraction",
+                    columns="target_z_offset_m",
                     values="picked",
                     aggfunc="mean",
                 ),

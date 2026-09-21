@@ -262,27 +262,29 @@ class StretchMolmoBotDroidPolicyConfig(BasePolicyConfig):
     `franka_retarget.StretchArmIK`. Set False to score what the arm alone can do.
     """
 
-    target_z_offset: float | None = None
+    target_z_offset: float = 0.0
     """
-    Metres to raise every retargeted target by, or None to measure it per episode.
+    Metres to raise every retargeted target by. Zero, and deliberately so.
 
-    Stretch's tool centre comes out *lower* than the Franka's wherever the lift
-    runs out of travel, and a gripper 10cm deeper than the one the policy was
-    trained with drags through the countertop. None measures the shortfall on
-    this robot in this scene at episode start and applies `z_offset_fraction` of
-    it, which is what the notebook this was ported from settled on; a number
-    fixes it by hand, and 0.0 restores the un-offset behaviour. See
-    `FrankaOnStretchView` for what it does not fix.
-    """
+    Stretch's tool centre comes out lower than the Franka's wherever the lift
+    runs out of travel, and this exists to buy that clearance back. It used to
+    default to a *measured* correction -- `measure_tool_height_offset()` at
+    episode start, scaled by a fraction -- and that is now removed, because the
+    measurement is sound and the way it was used was not.
 
-    z_offset_fraction: float = 0.5
-    """
-    How much of the measured shortfall to apply when `target_z_offset` is None.
+    `measure_tool_height_offset()` solves for the Franka's **home** pose, which
+    is above Stretch's lift ceiling, and returns the residual there: about 103mm.
+    That number describes one pose the robot cannot reach at all. Applying a
+    fraction of it to *every* target raised grasps that needed no raising -- at a
+    counter-height grasp the lift solves around 0.95m with 0.25m of headroom and
+    a residual of zero -- while buying nothing at the pose it was measured at,
+    where the lift is already at its stop and the offset only grows the miss
+    (`FrankaOnStretchView._warn_if_lift_saturated` says so out loud now).
 
-    Half of it. The offset trades grasp depth against clearance and the full
-    shortfall is measured at the *home* pose, where the lift is already at its
-    stop -- so applying all of it buys clearance the robot cannot use there while
-    biasing every later target high. Half was what read best over a rollout.
+    So it is a hand-set number again, and 0 is the default. `setups.py` had
+    already searched its way to `0.0` for the study's Stretch setups, which is
+    the same conclusion from the other direction. Raise it if a specific task
+    wants clearance, and see `FrankaOnStretchView` for what it does not fix.
     """
 
     snap_to_franka_home: bool = True
@@ -527,6 +529,14 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         info["retarget_position_error_max_m"] = float(position.max())
         info["retarget_orientation_error_mean_rad"] = float(orientation.mean())
         info["retarget_orientation_error_max_rad"] = float(orientation.max())
+        if self._proxy is not None:
+            # Steps the policy asked for somewhere the lift could not go. Distinct
+            # from the residual above, which averages every step's compromise:
+            # this counts only the ones where the arm was against a travel limit
+            # and still short, which is the difference between "the retargeting
+            # approximated" and "the robot cannot go there". See
+            # `FrankaOnStretchView._warn_if_lift_saturated`.
+            info["retarget_unreachable_steps"] = int(self._proxy.unreachable_steps)
         return info
 
     # =========================================================================
@@ -547,17 +557,15 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
             self.config.robot_config.robot_namespace,
             franka_mount_pose_from_base(base_xytheta),
             include_base=policy_config.include_base,
+            match_robotiq_aperture=policy_config.match_robotiq_aperture,
+            jaw_mode=policy_config.jaw_mode,
         )
 
         # Measured before the snap and from where the robot is standing, so it
         # measures this scene's shortfall rather than one left over from the
         # pose the snap puts the robot in.
-        if policy_config.target_z_offset is None:
-            proxy.target_z_offset = (
-                proxy.measure_tool_height_offset() * policy_config.z_offset_fraction
-            )
-        else:
-            proxy.target_z_offset = float(policy_config.target_z_offset)
+        # Taken as given, never measured. See `target_z_offset`.
+        proxy.target_z_offset = float(policy_config.target_z_offset)
 
         if policy_config.snap_to_franka_home:
             residual = proxy.snap_to_franka_joint_pos()
@@ -570,6 +578,7 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         log.info(
             f"[droid] virtual Franka at {np.round(proxy.franka_mount_pose[:3, 3], 3).tolist()}, "
             f"target z offset {proxy.target_z_offset:+.4f}m, "
+            f"jaw {proxy.jaw_mode}, opens to {proxy.finger_open:.4f} rad, "
             f"base {'in' if policy_config.include_base else 'out of'} the IK"
         )
         self._proxy = proxy
