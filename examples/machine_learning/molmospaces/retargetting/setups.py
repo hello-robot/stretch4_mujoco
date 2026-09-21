@@ -355,6 +355,33 @@ home pose the two give pixel-identical frames, and they diverge only once the
 arm turns.
 """
 
+DROID_SHOULDER_CAMERA_POS = (0.1, 0.57, 0.66)
+DROID_SHOULDER_CAMERA_ANGLES = (-139.8504, 52.7169, 7.6879)
+"""
+The DROID shoulder camera MolmoBot ships with: its offset from `fr3_link0`, and
+its intrinsic ZXZ angles.
+
+Pulled out of `franka_baseline` so `stretch_baseline` can mount the *same*
+camera without restating the numbers. The angles are the euler form of the
+quaternion `FrankaDroidCameraSystem` uses; see `franka_baseline`.
+"""
+
+STRETCH_BASELINE_HEIGHT = FRANKA_LINK0_HEIGHT + DROID_SHOULDER_CAMERA_POS[2]
+"""
+Where the DROID shoulder camera goes on Stretch: 1.41 m above `base_link`.
+
+Derived, and the derivation is the same one `FRANKA_STRETCHCAM_HEIGHT` runs in
+the other direction: the camera has to end up at **the same height in the room**
+on both robots, or the pair stops being a comparison of the robot and becomes a
+comparison of two viewpoints. On the Franka the camera sits 0.66 m above
+`fr3_link0`, which is itself 0.75 m up on a pedestal, so 1.41 m above the floor.
+Stretch's `base_link` is on the floor, so that is the number straight through.
+
+The xy offset and the orientation are carried across unchanged -- it is the same
+camera, looking the same way, at the same height. What differs is the robot under
+it, which is the whole point of the pair.
+"""
+
 FRANKA_LINK1_HEIGHT = 0.333
 """`fr3_link1`'s origin above `fr3_link0`, measured off the compiled model."""
 
@@ -397,21 +424,52 @@ SETUPS: dict[str, Setup] = {
             params=RetargetParams(
                 exo=ExoCameraParams(
                     mount_body="robot_0/fr3_link0",
-                    pos=(0.1, 0.57, 0.66),
+                    pos=DROID_SHOULDER_CAMERA_POS,
                     # The quaternion [-0.3633, -0.1241, 0.4263, 0.8191] that
                     # `FrankaDroidCameraSystem` mounts this camera with, as the
                     # euler triple every other setup here is written in.
                     # `FrankaDroidCameraSystem` mounts this one with the
                     # quaternion [-0.3633, -0.1241, 0.4263, 0.8191]; these are
                     # its intrinsic ZXZ angles, which reproduce it exactly.
-                    yaw_deg=-139.8504,
-                    pitch_deg=52.7169,
-                    roll_deg=7.6879,
+                    yaw_deg=DROID_SHOULDER_CAMERA_ANGLES[0],
+                    pitch_deg=DROID_SHOULDER_CAMERA_ANGLES[1],
+                    roll_deg=DROID_SHOULDER_CAMERA_ANGLES[2],
                     fovy=71.0,
                     render_size=DROID_FRAME_SIZE,
                     fisheye=FISHEYE_NONE,
                     quarter_turns=0,
                 )
+            ),
+        ),
+        Setup(
+            key="stretch_baseline",
+            robot="stretch",
+            camera_dims=(),
+            description="Stretch + the DROID shoulder camera, at the same height in the room",
+            params=RetargetParams(
+                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
+                target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
+                exo=ExoCameraParams(
+                    # The same camera as `franka_baseline`, at the same height
+                    # above the floor -- see `STRETCH_BASELINE_HEIGHT`. It hangs
+                    # off `base_link` rather than an arm link, so unlike the
+                    # Franka's it does not turn with the arm; that is the one
+                    # thing the transplant cannot preserve, because Stretch has
+                    # no link that moves the way `fr3_link0` does.
+                    mount_body="robot_0/base_link",
+                    pos=(
+                        DROID_SHOULDER_CAMERA_POS[0],
+                        DROID_SHOULDER_CAMERA_POS[1],
+                        STRETCH_BASELINE_HEIGHT,
+                    ),
+                    yaw_deg=DROID_SHOULDER_CAMERA_ANGLES[0],
+                    pitch_deg=DROID_SHOULDER_CAMERA_ANGLES[1],
+                    roll_deg=DROID_SHOULDER_CAMERA_ANGLES[2],
+                    fovy=71.0,
+                    render_size=DROID_FRAME_SIZE,
+                    fisheye=FISHEYE_NONE,
+                    quarter_turns=0,
+                ),
             ),
         ),
         Setup(
@@ -479,9 +537,17 @@ SETUPS: dict[str, Setup] = {
         Setup(
             key="franka_rectified",
             robot="franka",
-            camera_dims=("virtual_pitch_deg", "fovy"),
-            description="Franka + that fisheye, rectified and cropped to a synthesised pitch",
+            camera_dims=("pitch_deg", "fovy"),
+            description="Franka + that fisheye, rectified, whole frame",
             params=RetargetParams(
+                # Rectified and nothing else: no `crop_to`, so the whole
+                # rectified frame is delivered, and no `virtual_pitch_deg`, so
+                # the only tilt is the camera's own physical one. Both were here
+                # to trade field of view for the landscape shape the checkpoint
+                # was trained on and to synthesise a pitch by cropping
+                # off-centre; neither is part of "rectify the 123-degree fisheye",
+                # and leaving them in made this pair carry two changes rather
+                # than one.
                 exo=_stretch_head_camera_params(
                     FRANKA_EXO_MOUNT_BODY,
                     FRANKA_STRETCHCAM_HEIGHT,
@@ -490,19 +556,18 @@ SETUPS: dict[str, Setup] = {
                     roll_deg=HEAD_CAMERA_ROLL_DEG,
                     fisheye=FISHEYE_RECTIFIED,
                     quarter_turns=-1,
-                    crop_to=DROID_FRAME_SIZE,
-                    virtual_pitch_deg=HEAD_CAMERA_PITCH_DEG,
                 )
             ),
         ),
         Setup(
             key="stretch_rectified",
             robot="stretch",
-            camera_dims=("virtual_pitch_deg", "fovy"),
-            description="Stretch + that fisheye, rectified and cropped to a synthesised pitch",
+            camera_dims=("pitch_deg", "fovy"),
+            description="Stretch + that fisheye, rectified, whole frame",
             params=RetargetParams(
                 grasp_offset_m=STRETCH_GRASP_OFFSET_M,
                 target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
+                # Rectified and nothing else; see `franka_rectified`.
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
@@ -511,8 +576,6 @@ SETUPS: dict[str, Setup] = {
                     roll_deg=HEAD_CAMERA_ROLL_DEG,
                     fisheye=FISHEYE_RECTIFIED,
                     quarter_turns=-1,
-                    crop_to=DROID_FRAME_SIZE,
-                    virtual_pitch_deg=HEAD_CAMERA_PITCH_DEG,
                 )
             ),
         ),

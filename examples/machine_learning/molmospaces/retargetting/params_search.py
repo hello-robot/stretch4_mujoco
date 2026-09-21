@@ -716,6 +716,9 @@ def main(
             render=not replay_no_video,
             limit=replay_limit,
             target_z_offset=replay_z_offset,
+            # The run's own --scenes, so `scene_for_house` searches a list that
+            # contains the houses the trajectories were recorded in.
+            scene_count=scene_count,
         )
         replay_mod.report(results, destination, rendered=not replay_no_video)
         return

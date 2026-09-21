@@ -115,6 +115,7 @@ log = logging.getLogger(__name__)
 # =============================================================================
 
 MATCHED_PAIRS: dict[str, tuple[str, str]] = {
+    "baseline": ("franka_baseline", "stretch_baseline"),
     "stretchcam": ("franka_stretchcam", "stretch_stretchcam"),
     "fisheye": ("franka_fisheye", "stretch_fisheye"),
     "rectified": ("franka_rectified", "stretch_rectified"),
@@ -122,21 +123,41 @@ MATCHED_PAIRS: dict[str, tuple[str, str]] = {
 """
 The `(franka, stretch)` setups that differ only in the robot.
 
-Each pair carries the same `ExoCameraParams`, so a difference between its halves
-is the robot and the retargeting rather than the view. `franka_baseline` has no
-partner on purpose: it is the DROID shoulder camera, which no Stretch setup
-reproduces, and pairing it with one would put the lens back into a comparison
-this exists to take it out of.
+Every pair carries identical `ExoCameraParams`, so a difference between its
+halves is the robot and the retargeting rather than the view. That is the whole
+design: four cameras, each mounted at the same height in the room on both
+robots, and nothing else varying.
+
+    baseline    the DROID shoulder camera MolmoBot ships with, 71 degrees
+    stretchcam  an upright pinhole at Stretch's head-camera pose, 71 degrees
+    fisheye     Stretch's real 123-degree fisheye, distorted
+    rectified   that fisheye rectified, whole frame
+
+`baseline` used to have no Stretch half, on the grounds that nothing reproduced
+the DROID camera on Stretch. It does now: the camera is mounted on `base_link` at
+`STRETCH_BASELINE_HEIGHT`, which is the same 1.41 m above the floor it sits at on
+the Franka's pedestal. The one thing the transplant cannot preserve is that the
+Franka's hangs off `fr3_link0` and turns with the arm; Stretch has no link that
+moves that way, so its copy is fixed to the base.
+
+`rectified` carries no crop and no synthesised pitch. Both were there to trade
+field of view for the checkpoint's training shape, and both made the pair carry
+two changes instead of one.
 """
 
-DEFAULT_PAIR = "stretchcam"
-"""
-The pinhole pair, which is the one to look at first.
+ALL_PAIRS = "all"
+"""`--pair all`: run every pair in one go, which is eight setups and four videos."""
 
-It is the pair with the *fewest* differences left -- an upright pinhole at
-Stretch's head-camera height on both robots -- so whatever is visible here is
-the retargeting and the robot, with no lens to blame. The fisheye pairs add the
-lens back on both sides.
+DEFAULT_PAIR = ALL_PAIRS
+"""
+Every pair, because the four of them are the experiment rather than four
+alternatives.
+
+Read in order they walk from the camera the policy knows to the one it does not:
+`baseline` is the DROID camera on both robots, `stretchcam` moves to Stretch's
+head-camera pose, `fisheye` puts the real lens on, `rectified` takes the
+distortion back out. A difference that appears at one step and not the one before
+it is attributable to that step.
 """
 
 
@@ -394,12 +415,19 @@ class SplitPanelRecorder(EpisodeVideoRecorder):
             "key": self._key,
             "house": house,
             "index": index,
-            "seed": episode_seed,
+            "seed": int(episode_seed),
             "instruction": self._instruction,
             "steps": 0,
             "success": None,
         }
-        self.panel_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.panel_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            # Same rule as `_write_index`: this runs inside the rollout, so it
+            # must not be able to end one. Losing the panels is bad; losing the
+            # episode they were recording is worse.
+            log.warning(f"[side-by-side] cannot write to {self.panel_dir}: {error}")
+            self._key = None
 
     def log_step(self, step_idx: int, task: Any, observation: Any = None, policy: Any = None):
         """Write one frame to each of the two files."""
@@ -428,16 +456,42 @@ class SplitPanelRecorder(EpisodeVideoRecorder):
 
     def finish_episode(self, success: bool | None = None):
         if self._key is not None:
-            self.episodes[self._key]["success"] = success
-            (self.panel_dir / "episodes.json").write_text(
-                json.dumps(list(self.episodes.values()), indent=2)
-            )
+            # `bool(...)`, not the value as handed over. The pipeline reports
+            # success as a `numpy.bool`, which `json.dumps` refuses -- and the
+            # refusal is maddening to read, because NumPy 2 renamed `np.bool_` to
+            # `numpy.bool` whose `__class__.__name__` is `"bool"`, so the error
+            # says "Object of type bool is not JSON serializable" about a type
+            # that is not Python's bool. That exception used to escape this
+            # method and take the whole rollout with it.
+            self.episodes[self._key]["success"] = None if success is None else bool(success)
+            self._write_index()
         self._close_writers()
         self._key = None
         # The base class holds an outcome banner and renames its file; there is
         # no single file here, so its bookkeeping is reset rather than run.
         self._writer = None
         return super().finish_episode(success=success)
+
+    def _write_index(self) -> None:
+        """Write `episodes.json`, and never let a failure to do so end an episode.
+
+        This is an observer: the pipeline calls it from inside the rollout, so an
+        exception raised here surfaces as "rollout error" and loses the episode --
+        which is what a stray `numpy.bool` did before the coercion above. The
+        panels are already on disk by this point, so the worst a failure here
+        should cost is the index that pairs them, and `compose_pair` says so
+        clearly when it finds none.
+        """
+        try:
+            (self.panel_dir / "episodes.json").write_text(
+                json.dumps(list(self.episodes.values()), indent=2)
+            )
+        except (TypeError, ValueError, OSError) as error:
+            log.warning(
+                f"[side-by-side] could not write {self.panel_dir / 'episodes.json'}: {error}. "
+                f"The panels are written; the pairing index is not, so --compose-only will "
+                f"find nothing to tile for this run."
+            )
 
     def _camera_grid_panel(self, cameras):
         """The camera row, at the scene panel's width so the two tile cleanly."""
@@ -798,10 +852,11 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
 @click.command()
 @click.option(
     "--pair",
-    type=click.Choice(sorted(MATCHED_PAIRS)),
+    type=click.Choice([ALL_PAIRS, *MATCHED_PAIRS]),
     default=DEFAULT_PAIR,
     show_default=True,
-    help="Which matched (franka, stretch) pair to run. See MATCHED_PAIRS.",
+    help="Which matched (franka, stretch) pair to run, or 'all' for every one of them "
+    "-- eight setups, four split-screen videos per episode. See MATCHED_PAIRS.",
 )
 @click.option(
     "--param",
@@ -901,7 +956,7 @@ def main(
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    franka_key, stretch_key = MATCHED_PAIRS[pair]
+    pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = output_dir / "videos"
 
@@ -917,18 +972,26 @@ def main(
             render=not replay_no_video,
             limit=replay_limit,
             target_z_offset=replay_z_offset,
+            # The run's own --scenes, so `scene_for_house` searches a list that
+            # contains the houses the trajectories were recorded in.
+            scene_count=scene_count,
         )
         replay_mod.report(results, destination, rendered=not replay_no_video)
         return
 
     if compose_only:
-        franka = RunResult(franka_key, output_dir / "runs" / franka_key / "panels")
-        stretch = RunResult(stretch_key, output_dir / "runs" / stretch_key / "panels")
-        for result in (franka, stretch):
-            probe = result.panel_dir.parent / "probe"
-            if probe.is_dir():
-                result.episodes = collect_probe_records(probe)
-        written = compose_pair(franka, stretch, videos_dir)
+        written = []
+        for name in pair_names:
+            franka_key, stretch_key = MATCHED_PAIRS[name]
+            halves = [
+                RunResult(key, output_dir / "runs" / key / "panels")
+                for key in (franka_key, stretch_key)
+            ]
+            for result in halves:
+                probe = result.panel_dir.parent / "probe"
+                if probe.is_dir():
+                    result.episodes = collect_probe_records(probe)
+            written += compose_pair(*halves, videos_dir / name)
         _report(written, videos_dir)
         return
 
@@ -955,39 +1018,49 @@ def main(
         output_dir / "benchmark", force=rebuild_benchmark, scene_count=scene_count
     )
 
-    recorder = SplitPanelRecorder(output_dir / "runs" / franka_key / "panels")
+    # One recorder, re-pointed per run; `set_panel_dir` is what keeps each run's
+    # panels and episode numbering separate.
+    recorder = SplitPanelRecorder(output_dir / "runs")
     _install(recorder)
 
+    setups_to_run = [key for name in pair_names for key in MATCHED_PAIRS[name]]
+    episodes = scene_count * len(mini_benchmark.TARGETS)
     click.secho(
-        f"Running {franka_key} then {stretch_key} over {scene_count} scene(s) x "
-        f"{len(mini_benchmark.TARGETS)} objects, {workers} worker(s) each. "
-        "Sequentially, because two policies do not fit on one card.",
+        f"Running {len(setups_to_run)} setup(s) over {scene_count} scene(s) x "
+        f"{len(mini_benchmark.TARGETS)} objects = {episodes} episodes each, "
+        f"{workers} worker(s). Sequentially, because two policies do not fit on one card. "
+        f"Output: {len(pair_names)} split-screen video(s) per episode.",
         bold=True,
     )
+    for name in pair_names:
+        click.echo(f"  {name:11s} {' vs '.join(MATCHED_PAIRS[name])}")
 
-    results = []
-    for setup_key in (franka_key, stretch_key):
+    # Every setup first, then the tiling: a pair cannot be composed until both
+    # its halves have run, and running them pair by pair would reload the
+    # checkpoint for each half anyway.
+    runs: dict[str, RunResult] = {}
+    for setup_key in setups_to_run:
         base = SETUPS[setup_key].params
         params = _apply_params(base, param_specs)
-        results.append(
-            run_setup(
-                setup_key,
-                params,
-                benchmark_dir=benchmark_dir,
-                output_root=output_dir,
-                recorder=recorder,
-                checkpoint=checkpoint,
-                episode_steps=episode_steps,
-                num_workers=workers,
-            )
+        runs[setup_key] = run_setup(
+            setup_key,
+            params,
+            benchmark_dir=benchmark_dir,
+            output_root=output_dir,
+            recorder=recorder,
+            checkpoint=checkpoint,
+            episode_steps=episode_steps,
+            num_workers=workers,
         )
+        if runs[setup_key].error:
+            click.secho(f"{setup_key} failed: {runs[setup_key].error}", fg="red")
 
-    franka, stretch = results
-    for result in results:
-        if result.error:
-            click.secho(f"{result.setup} failed: {result.error}", fg="red")
-
-    written = compose_pair(franka, stretch, videos_dir)
+    written = []
+    for name in pair_names:
+        franka_key, stretch_key = MATCHED_PAIRS[name]
+        # A pair whose halves both failed has nothing to tile; one that lost a
+        # half still writes what it has, held against the surviving side.
+        written += compose_pair(runs[franka_key], runs[stretch_key], videos_dir / name)
     _report(written, videos_dir)
 
 
@@ -1007,14 +1080,15 @@ def _install(recorder: SplitPanelRecorder) -> None:
 def _report(written: list[Path], videos_dir: Path) -> None:
     if not written:
         click.secho(
-            "No videos were composed. If the runs completed, check that both "
-            f"{videos_dir.parent / 'runs'}/*/panels hold an episodes.json.",
+            "No videos were composed. If the runs completed, check that both halves of a "
+            f"pair left an episodes.json under {videos_dir.parent / 'runs'}/*/panels.",
             fg="red",
         )
         return
-    click.secho(f"Wrote {len(written)} side-by-side video(s) to {videos_dir}", fg="green")
+    click.secho(f"Wrote {len(written)} side-by-side video(s) under {videos_dir}", fg="green")
     for path in written:
-        click.echo(f"  {path.name}")
+        # `<pair>/<episode>.mp4`, so the pair is visible without the full path.
+        click.echo(f"  {path.parent.name}/{path.name}")
 
 
 if __name__ == "__main__":

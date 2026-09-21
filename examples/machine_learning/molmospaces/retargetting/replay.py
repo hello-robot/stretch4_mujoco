@@ -276,12 +276,41 @@ def load_episodes(path: Path) -> list[RecordedEpisode]:
 # =============================================================================
 
 
-def build_stretch_in_scene(scene_index: int, base_xytheta: np.ndarray):
+def scene_for_house(house_index: int, scene_count: int):
+    """The `mini_benchmark` scene whose house is `house_index`.
+
+    Matched on `Scene.house_index`, not on position in the list, and the
+    difference is not academic: the `house_<n>` directory a run writes is the
+    *released dataset's* house index, so a five-scene run over borrowed kitchens
+    leaves directories named `house_0`, `house_1011`, `house_1013`, `house_1014`,
+    `house_1033`. Treating those as list indices -- which the first version of
+    this did -- asks `build_scenes` for 1034 scenes and hangs.
+
+    `scene_count` is how wide to search, and wants to be the `--scenes` the run
+    used: `build_scenes` is deterministic, so the first `n` scenes of a replay are
+    the first `n` of the run.
+    """
+    scenes = mini_benchmark.build_scenes(max(1, scene_count))
+    for scene in scenes:
+        if scene.house_index == house_index:
+            return scene
+    log.warning(
+        f"[replay] no scene with house_index {house_index} among the first {scene_count}; "
+        f"falling back to {scenes[0].key}. If the run used more scenes than this, pass a "
+        f"larger --scenes so the right house is in the list."
+    )
+    return scenes[0]
+
+
+def build_stretch_in_scene(
+    house_index: int,
+    base_xytheta: np.ndarray,
+    scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT,
+):
     """Stretch, spawned in the recorded episode's house at the recorded base pose.
 
-    The scene comes from `mini_benchmark`'s own deterministic list, so house
-    `n` of a replay is house `n` of the run -- the same house the trajectory was
-    recorded in, without having to store it.
+    The house is looked up by index rather than by position; see
+    `scene_for_house`.
 
     The objects are *not* staged. A replay measures where the retargeting puts
     the gripper, which is a question about the robot and the room; the object
@@ -293,8 +322,7 @@ def build_stretch_in_scene(scene_index: int, base_xytheta: np.ndarray):
         install_scene_with_objects_and_grasps_from_path,
     )
 
-    scenes = mini_benchmark.build_scenes(max(1, scene_index + 1))
-    scene = scenes[scene_index] if scene_index < len(scenes) else scenes[0]
+    scene = scene_for_house(house_index, scene_count)
     scene_path = mini_benchmark.house_scene_path(scene)
     install_scene_with_objects_and_grasps_from_path(str(scene_path))
     spec = MjSpec.from_file(str(scene_path))
@@ -360,6 +388,7 @@ def replay_episode(
     target_z_offset: float = 0.0,
     match_robotiq_aperture: bool = True,
     include_base: bool = True,
+    scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT,
     frame_sink: Any = None,
 ) -> ReplayResult:
     """Drive Stretch through one recorded Franka trajectory and measure the result.
@@ -368,7 +397,9 @@ def replay_episode(
     every step -- which is how a caller renders a video without this function
     knowing anything about rendering.
     """
-    model, data, view, namespace = build_stretch_in_scene(episode.house, episode.base_xytheta)
+    model, data, view, namespace = build_stretch_in_scene(
+        episode.house, episode.base_xytheta, scene_count=scene_count
+    )
     proxy = fr.FrankaOnStretchView(
         view,
         namespace,
