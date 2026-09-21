@@ -11,6 +11,7 @@ Stretch anyway:
       -> VirtualFranka.fk           -> tool pose in the Franka's base frame
       -> franka_mount_pose          -> tool pose in the world
       -> FRANKA_TO_STRETCH_TOOL     -> Stretch's tool convention
+      -> JAW_FLIP (maybe)           -> the grasp-equivalent branch the wrist can hold
       -> StretchArmIK.solve         -> base / lift / arm extension / wrist targets
       -> Stretch's own move groups
 
@@ -67,6 +68,50 @@ from examples.machine_learning.molmospaces.stretch.robot_view import (
 # target would arrive rotated a quarter turn and the gripper would try to grasp
 # edge-on.
 FRANKA_TO_STRETCH_TOOL = R.from_euler("y", -90, degrees=True).as_matrix()
+
+# A half turn about Stretch's tool +x -- its approach axis. A parallel jaw grasps
+# identically either way round: the rotation maps one finger onto where the other
+# was and leaves the jaw line and the approach direction unchanged, so both poses
+# close on the same object the same way. Only the labels "left finger" and "right
+# finger" swap, and nothing downstream depends on which is which.
+#
+# It is worth a second solve because Stretch's wrist roll has an asymmetric range
+# (`wrist_roll_joint`, about [-4.28, +1.14] rad): a commanded twist can pin both
+# `wrist_yaw` and `wrist_roll` against their upper limits with the orientation
+# still a quarter turn out, while the same grasp expressed half a turn round sits
+# in open range. Measured, on the waypoints in
+# `retargetting/tests/test_retargeting.py`: one of fifteen stalls at 0.43 rad of
+# orientation error that no number of iterations recovers (80, 240, 800 and 3000
+# all settle at 0.433), and the flipped branch reaches it to 0.001 rad with no
+# change in position error. See `FrankaOnStretchView._solve_either_jaw`.
+JAW_FLIP = np.eye(4)
+JAW_FLIP[:3, :3] = R.from_euler("x", 180, degrees=True).as_matrix()
+
+JAW_FLIP_GAIN_RAD = 0.10
+"""
+How much orientation the other jaw branch has to win before the wrist rolls over
+to it.
+
+This is hysteresis, not a tolerance. Both branches are legitimate solutions, so
+without a deadband the choice would follow whichever residual happened to be
+smaller and the wrist would spin half a turn between steps that command almost
+the same pose -- real motion, at the moment a grasp is closing. Requiring a clear
+win against the branch already in use means the arm changes its mind only when
+there is something to gain: over the 180 commands of the test's continuous path,
+twice, both times mid-reorientation rather than mid-grasp.
+"""
+
+JAW_FLIP_POSITION_SLACK_M = 0.001
+"""
+How much position the other jaw branch may cost while still being preferred.
+
+Position outranks orientation everywhere else in this module
+(`_task_priority_step` solves for it outright and gives orientation the leftovers),
+so it would be incoherent for a jaw flip to buy an angle at the price of a
+millimetre of reach. The slack is there only so that two solves which reach the
+same point to within solver noise are judged on their orientation rather than on
+which one happened to round down.
+"""
 
 # Per-iteration caps on the pose error an IK step is allowed to chase, and on the
 # joint motion it is allowed to ask for. See `_clamped_pose_error`.
@@ -135,6 +180,39 @@ def franka_mount_pose_from_base(base_xytheta, pedestal_height: float = FRANKA_PE
         [FRANKA_MOUNT_OFFSET_XY[0], FRANKA_MOUNT_OFFSET_XY[1], pedestal_height], [1, 0, 0, 0]
     )
     return base @ offset
+
+
+def robotiq_ctrl_from_driver(driver_angle) -> float:
+    """A Robotiq driver-joint angle expressed as a 0-255 command.
+
+    The inverse of the arithmetic in `FrankaOnStretchView.retarget_robotiq_ctrl`,
+    and the way to ask "what command would leave the Franka's hand like this?" --
+    used to start Stretch's hand where a DROID episode starts the Franka's.
+    """
+    fraction = np.clip(
+        (float(np.asarray(driver_angle, dtype=float).reshape(-1)[0]) - ROBOTIQ_DRIVER_OPEN)
+        / (ROBOTIQ_DRIVER_CLOSED - ROBOTIQ_DRIVER_OPEN),
+        0.0,
+        1.0,
+    )
+    return float(ROBOTIQ_CTRL_RANGE[0] + fraction * (ROBOTIQ_CTRL_RANGE[1] - ROBOTIQ_CTRL_RANGE[0]))
+
+
+def robotiq_ctrl_from_stretch_fingers(finger_angles) -> float:
+    """Stretch's finger angles expressed as the Robotiq 0-255 that would produce them.
+
+    The other inverse of `retarget_robotiq_ctrl`: it answers "what has this hand
+    been told?" from where the fingers actually are, so the proxy can report a
+    gripper command it has established rather than one it assumed.
+    """
+    finger = float(np.mean(np.asarray(finger_angles, dtype=float)))
+    open_fraction = np.clip(
+        (finger - STRETCH_FINGER_CLOSED) / (STRETCH_FINGER_OPEN - STRETCH_FINGER_CLOSED), 0.0, 1.0
+    )
+    # 0 is open on the Robotiq and closed on Stretch, so an open hand is ctrl 0.
+    return float(
+        ROBOTIQ_CTRL_RANGE[1] + open_fraction * (ROBOTIQ_CTRL_RANGE[0] - ROBOTIQ_CTRL_RANGE[1])
+    )
 
 
 def _pose_error(current: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -280,6 +358,8 @@ class VirtualFranka:
         self._grasp_site_id = self.model.site("gripper/grasp_site").id
         self._base_body_id = self.model.body("fr3_link0").id
         self.init_qpos = np.asarray(config.init_qpos["arm"], dtype=float)
+        self.init_gripper_qpos = np.asarray(config.init_qpos["gripper"], dtype=float)
+        """The Robotiq driver angles a DROID episode starts from. See `robotiq_ctrl_from_driver`."""
 
     @property
     def joint_limits(self) -> np.ndarray:
@@ -581,7 +661,12 @@ class FrankaOnStretchView:
       not reached -- `last_residual` reports by how much, and
       `last_position_error` is the part of it you can see. The holonomic base
       joins the solve when `include_base` is set, which buys most of the reach
-      back; see `StretchArmIK`.
+      back; see `StretchArmIK`. What is left of the orientation shortfall is
+      partly bought back by holding the jaw half a turn over where that is the
+      branch the wrist can reach, which grasps the same object the same way;
+      see `JAW_FLIP` and `_solve_either_jaw`. `jaw_flipped` says which branch the
+      arm is currently in, and `franka_joint_pos` reports the arm state back in
+      the orientation the policy commanded either way.
     * The policy is looking through Stretch's camera at a Stretch arm, which is
       not what it was trained on. Retargeting fixes the action interface, not
       the visual domain gap.
@@ -630,6 +715,8 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = self.franka.init_qpos.copy()
         self.last_gripper_ctrl = np.array([ROBOTIQ_CTRL_RANGE[0]])
         self.last_residual = np.zeros(6)
+        self.jaw_flipped = False
+        """Whether the arm is currently holding the half-turned jaw. See `JAW_FLIP`."""
         self.set_franka_mount_pose(franka_mount_pose)
 
     # -- the bits of the RobotView interface a policy loop uses ---------------
@@ -658,7 +745,14 @@ class FrankaOnStretchView:
         self.arm_ik.releash()
         self._franka_seed = self.franka.init_qpos.copy()
         self.last_arm_ctrl = self.franka_joint_pos()
-        self.last_gripper_ctrl = np.array([ROBOTIQ_CTRL_RANGE[0]])
+        # Read off the fingers rather than assumed to be open. The arm half of
+        # this method has always reported where Stretch actually is; the gripper
+        # half used to hardcode `ROBOTIQ_CTRL_RANGE[0]`, which is a claim that the
+        # hand is open and is wrong on a robot whose `init_qpos` shuts it. That
+        # made `ctrl` and `joint_pos` disagree about the same gripper -- and with
+        # `snap_to_franka_home` off, nothing else would have corrected it.
+        fingers = self.stretch_view.get_move_group("gripper").joint_pos
+        self.last_gripper_ctrl = np.array([robotiq_ctrl_from_stretch_fingers(fingers)])
         self.last_residual = np.zeros(6)
 
     def snap_to_franka_joint_pos(self, joint_pos=None) -> np.ndarray:
@@ -681,11 +775,31 @@ class FrankaOnStretchView:
         joint_pos = np.asarray(joint_pos, dtype=float)
 
         target = self.franka_tool_pose_to_world(self.franka.fk(joint_pos))
-        solution, residual = self.arm_ik.solve(target)
+        # Through the same branch selection as a commanded step, so that the
+        # configuration the robot is written into and `jaw_flipped` cannot
+        # disagree -- the reported arm state is read back through that flag, and
+        # a snap that picked one branch while the flag said the other would
+        # report an arm half a turn from the one Stretch is holding.
+        self.jaw_flipped = False
+        solution, residual, self.jaw_flipped = self._solve_either_jaw(target)
         for group, value in self.arm_ik.split(solution).items():
             move_group = self.stretch_view.get_move_group(group)
             move_group.joint_pos = value
             move_group.ctrl = value
+
+        # The hand as well as the arm. Stretch's `init_qpos` starts its fingers
+        # shut and the DROID Franka's starts open, so without this the policy's
+        # first observation reports a closed gripper -- 0.824 against the 0.003 a
+        # Franka episode reports, the opposite end of the range it reads that
+        # channel in -- on a checkpoint whose training episodes all begin with an
+        # open hand. It is also the state `reset()` already claims in
+        # `last_gripper_ctrl`, so leaving the fingers shut made the proxy
+        # contradict itself about its own gripper.
+        gripper_ctrl = robotiq_ctrl_from_driver(self.franka.init_gripper_qpos)
+        gripper = self.stretch_view.get_move_group("gripper")
+        gripper.joint_pos = self.retarget_robotiq_ctrl(gripper_ctrl)
+        gripper.ctrl = gripper.joint_pos
+
         mujoco.mj_forward(self.stretch_view.mj_data.model, self.stretch_view.mj_data)
 
         self.last_arm_ctrl = joint_pos.copy()
@@ -694,6 +808,39 @@ class FrankaOnStretchView:
         return residual
 
     # -- the retargeting itself ----------------------------------------------
+
+    def _solve_either_jaw(self, target_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Solve for `target_pose`, allowing the gripper to be held half a turn over.
+
+        Returns the joint targets, the residual, and which branch they are. Both
+        branches grasp the commanded object identically (see `JAW_FLIP`), so this
+        is free reach rather than a compromise: the arm is allowed to pick the
+        one its wrist can actually hold.
+
+        The branch in use is tried first and kept unless the other one clearly
+        wins, which is what stops the wrist rolling over on solver noise; see
+        `JAW_FLIP_GAIN_RAD`. Two solves per call, so roughly twice the IK cost of
+        a single one -- a few hundred microseconds against a policy step that
+        runs a transformer.
+        """
+        current = target_pose @ JAW_FLIP if self.jaw_flipped else target_pose
+        current_solution, current_residual = self.arm_ik.solve(current)
+
+        other = target_pose if self.jaw_flipped else target_pose @ JAW_FLIP
+        other_solution, other_residual = self.arm_ik.solve(other)
+
+        def split(residual):
+            return float(np.linalg.norm(residual[:3])), float(np.linalg.norm(residual[3:]))
+
+        current_position, current_angle = split(current_residual)
+        other_position, other_angle = split(other_residual)
+        switch = (
+            other_position <= current_position + JAW_FLIP_POSITION_SLACK_M
+            and other_angle < current_angle - JAW_FLIP_GAIN_RAD
+        )
+        if switch:
+            return other_solution, other_residual, not self.jaw_flipped
+        return current_solution, current_residual, self.jaw_flipped
 
     def stretch_tool_pose_to_franka(self, tool_pose_world: np.ndarray) -> np.ndarray:
         """A Stretch tool pose in the world -> the Franka grasp site's pose in its base frame."""
@@ -738,7 +885,16 @@ class FrankaOnStretchView:
         Seeding from the previous answer instead lets a run of unreachable
         targets walk the reported arm somewhere the policy never sent it.
         """
-        target = self.stretch_tool_pose_to_franka(self.arm_ik.tool_pose())
+        tool_pose = self.arm_ik.tool_pose()
+        if self.jaw_flipped:
+            # Reported in the orientation the policy asked for, not the
+            # grasp-equivalent one the wrist adopted. The two describe the same
+            # grasp (see `JAW_FLIP`), but only one of them is in the frame the
+            # policy is closing its loop in: report the flipped pose and the
+            # checkpoint reads its own command as having been rolled half a turn
+            # and spends the next chunk undoing it.
+            tool_pose = tool_pose @ JAW_FLIP
+        target = self.stretch_tool_pose_to_franka(tool_pose)
         self._franka_seed = self.franka.ik(target, self.last_arm_ctrl)
         return self._franka_seed.copy()
 
@@ -754,7 +910,7 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = joint_pos.copy()
 
         target = self.franka_tool_pose_to_world(self.franka.fk(joint_pos))
-        solution, self.last_residual = self.arm_ik.solve(target)
+        solution, self.last_residual, self.jaw_flipped = self._solve_either_jaw(target)
         return self.arm_ik.split(solution)
 
     def retarget_robotiq_ctrl(self, value) -> np.ndarray:

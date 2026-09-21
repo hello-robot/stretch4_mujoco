@@ -34,6 +34,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import click
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -515,34 +516,385 @@ def write_trial_csv(trials: list[TrialResult], path: Path) -> None:
             )
 
 
+# =============================================================================
+# What actually differs between trials
+# =============================================================================
+
+PARAM_LABELS = {
+    "mount_body": "mount",
+    "pos": "pos",
+    "yaw_deg": "yaw",
+    "pitch_deg": "pitch",
+    "roll_deg": "roll",
+    "fovy": "fovy",
+    "render_size": "render",
+    "fisheye": "lens",
+    "quarter_turns": "turns",
+    "virtual_pitch_deg": "vpitch",
+    "crop_to": "crop",
+    "grasp_offset_m": "grasp_off",
+    "wrist_tilt_deg": "wrist_tilt",
+    "z_offset_fraction": "z_frac",
+}
+"""Column headings for the parameter fields, short enough to put in a table."""
+
+TOOL_FIELDS = ("grasp_offset_m", "wrist_tilt_deg", "z_offset_fraction")
+
+PARAM_EXPLANATIONS = {
+    "pitch_deg": (
+        "Where the camera points, in degrees **up from straight down** — 0 looks at the "
+        "floor, 90 at the horizon, so smaller numbers point further down. 43 is Stretch's "
+        "head camera as built. This moves the camera itself, so a winner here is a claim "
+        "about how the head *should* be mounted, not something that can be deployed on an "
+        "existing robot — that is what `vpitch` is for."
+    ),
+    "fovy": (
+        "Vertical field of view in degrees, as MuJoCo means it. Wider brings more of the "
+        "workspace into frame at lower angular resolution on the object; narrower is the "
+        "opposite trade. 71 is the DROID exo camera the checkpoint was trained on, 123 is "
+        "Stretch's own head camera."
+    ),
+    "virtual_pitch_deg": (
+        "Pitch **synthesised by sliding the crop window** up the rectified frame, with the "
+        "camera left bolted where it is. A 123-degree fisheye sees far more than a 640x360 "
+        "window needs, so a view that looks like it came from a differently-aimed camera can "
+        "be cut out of the frame the hardware already produces. This is the only camera knob "
+        "here that is deployable on the robot as built."
+    ),
+    "grasp_offset_m": (
+        "Metres the commanded grasp centre is pushed **along Stretch's approach axis**. The "
+        "policy drives `grasp_center_link` to the pose it asked for its Robotiq's grasp site, "
+        "and those are not the same point: measured on a standing robot, Stretch's grasp "
+        "centre sits about 1.5 cm past its own fingertips, so an uncorrected command leaves "
+        "the object at or beyond the tips. Positive pulls the object deeper between the "
+        "fingers. See `diagnose.py`."
+    ),
+    "wrist_tilt_deg": (
+        "Extra pitch, in degrees, between the Franka's tool frame and Stretch's — applied "
+        "about the tool y axis on top of the fixed -90 degree correction the retargeting "
+        "already carries. 0 is the retargeting's own behaviour; positive tips the gripper "
+        "further down than the policy asked for."
+    ),
+    "z_offset_fraction": (
+        "How much of the **measured lift shortfall** to add to every commanded target. "
+        "Stretch's lift runs out of travel where the Franka's does not, so the retargeting "
+        "raises targets to stop the gripper dragging through the counter. The shortfall is "
+        "measured per episode; this is the fraction of it applied. Raise it too far and the "
+        "gripper closes above the object rather than around it."
+    ),
+}
+"""One sentence on what each searched parameter actually does, for the report.
+
+The marginal tables say which value won. Without this they do not say what was
+won, and a mean-picked column is not self-explanatory to anyone who did not
+write the retargeting.
+"""
+
+
+def _hashable(value: Any) -> Any:
+    """Lists out of JSON turned into something that can go in a set."""
+    return tuple(value) if isinstance(value, list) else value
+
+
+def flat_params(trial: TrialResult) -> dict[str, Any]:
+    """A trial's parameters as one flat `field -> value` mapping.
+
+    The exo camera's fields and the tool correction's in a single namespace,
+    because for the purpose of "what is different about this row" the nesting is
+    noise -- nothing is named twice.
+    """
+    try:
+        blob = json.loads(trial.params_json) if trial.params_json else {}
+    except ValueError:
+        return {}
+    params = blob.get("params", blob)
+    flat = {key: _hashable(value) for key, value in dict(params.get("exo", {})).items()}
+    for key in TOOL_FIELDS:
+        if key in params:
+            flat[key] = params[key]
+    return flat
+
+
+def parameter_groups(
+    trials: list[TrialResult],
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    """Split the parameter fields three ways: searched, setup-defining, constant.
+
+    This is what makes the summary table readable. A trial's full description is
+    fourteen fields long and all but two or three of them are identical down the
+    whole table, so printing it per row buries the one number that changed --
+    which is how two rows that differ in `vpitch` come to look like the same run
+    repeated.
+
+    * **searched** -- fields that take more than one value *within* a single
+      setup. These are what the sweep moved, and they get a column each.
+    * **setup-defining** -- fields constant within every setup but different
+      between setups: the mount, the lens, the render size. The `setup` column
+      already names these, so they go in a legend rather than in every row.
+    * **constant** -- the same everywhere, stated once.
+
+    Splitting within-setup from between-setup matters because the second kind is
+    not a result. `stretch_fisheye` having a different `render_size` from
+    `stretch_stretchcam` is the definition of those setups, not a finding about
+    them.
+    """
+    usable = [trial for trial in trials if not trial.error]
+    per_trial = [(trial.setup, flat_params(trial)) for trial in usable]
+    fields = sorted({key for _, params in per_trial for key in params}, key=_field_order)
+
+    by_setup: dict[str, list[dict[str, Any]]] = {}
+    for setup, params in per_trial:
+        by_setup.setdefault(setup, []).append(params)
+
+    searched, setup_defining, constant = [], [], {}
+    for field_name in fields:
+        within = any(
+            len({params.get(field_name) for params in group}) > 1 for group in by_setup.values()
+        )
+        across = len({params.get(field_name) for _, params in per_trial}) > 1
+        if within:
+            searched.append(field_name)
+        elif across:
+            setup_defining.append(field_name)
+        elif per_trial:
+            constant[field_name] = per_trial[0][1].get(field_name)
+    return searched, setup_defining, constant
+
+
+def _field_order(field_name: str) -> tuple[int, str]:
+    """Camera fields before tool fields, each in the order they are applied."""
+    order = list(PARAM_LABELS)
+    return (order.index(field_name) if field_name in order else len(order), field_name)
+
+
+def format_value(value: Any) -> str:
+    """A parameter value, short: floats without trailing zeros, tuples as `a x b`."""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, tuple):
+        return "x".join(format_value(item) for item in value)
+    return str(value)
+
+
+def _target_cell(trial: TrialResult, target: str) -> str:
+    """How a trial did on one object, across every scene it was tried in.
+
+    A count rather than a verdict, because with more than one scene there is no
+    single verdict to give: the same object is attempted once per scene and the
+    interesting cases are the ones picked up in some scenes and not others.
+    (The previous version of this kept only the last scene's episode per object,
+    so a row could read "picked" on all four objects while its own total said
+    15/20.)
+    """
+    episodes = [episode for episode in trial.episodes if episode.target == target]
+    if not episodes:
+        return "—"
+    scored = [episode for episode in episodes if episode.completed]
+    if not scored:
+        return "crashed"
+    picked = sum(1 for episode in scored if episode.success)
+    if picked == len(scored):
+        return f"**{picked}/{len(scored)}**"
+    if picked:
+        return f"{picked}/{len(scored)}"
+    # Nothing picked: the partial score is the only signal left, so show it.
+    return f"0/{len(scored)} ({np.mean([e.score for e in scored]):.2f})"
+
+
 def format_trial_table(trials: list[TrialResult], targets: tuple[str, ...]) -> str:
-    """The table printed at the end of a run: a trial per row, an object per column."""
-    columns = "".join(f"{target[:9]:>10s}" for target in targets)
-    header = f"{'setup':20s} {'score':>6s} {'succ':>6s}{columns}   parameters"
+    """The table printed at the end of a run: a trial per row, an object per column.
+
+    Only the searched parameters are printed, for the reason `parameter_groups`
+    gives -- on a console the full description is wider than the terminal and
+    the part that differs is off the right-hand edge.
+    """
+    searched, _, _ = parameter_groups(trials)
+    param_header = "".join(f"{PARAM_LABELS.get(f, f)[:10]:>11s}" for f in searched)
+    columns = "".join(f"{target[:11]:>12s}" for target in targets)
+    header = f"{'setup':20s} {'score':>6s} {'succ':>6s}{param_header}{columns}"
     lines = [header, "-" * len(header)]
     for trial in trials:
         if trial.error:
             lines.append(f"{trial.setup:20s} {'ERROR':>6s}  {trial.error[:70]}")
             continue
-        by_target = {episode.target: episode for episode in trial.episodes}
-        cells = ""
-        for target in targets:
-            episode = by_target.get(target)
-            if episode is None:
-                cells += f"{'-':>10s}"
-            elif not episode.completed:
-                cells += f"{'crashed':>10s}"
-            elif episode.success:
-                cells += f"{'PICKED':>10s}"
-            else:
-                cells += f"{episode.score:>10.2f}"
+        params = flat_params(trial)
+        cells = "".join(f"{format_value(params.get(f))[:10]:>11s}" for f in searched)
+        cells += "".join(
+            f"{_target_cell(trial, t).replace('**', '')[:11]:>12s}" for t in targets
+        )
         scored = len(trial.scored_episodes)
         score = f"{trial.score:6.3f}" if trial.usable else f"{'n/a':>6s}"
         lines.append(
-            f"{trial.setup:20s} {score} "
-            f"{trial.successes:>3d}/{scored:<2d}{cells}   {trial.params_description}"
+            f"{trial.setup:20s} {score} {trial.successes:>3d}/{scored:<2d}{cells}"
         )
     return "\n".join(lines)
+
+
+def _rank(trials: list[TrialResult]) -> list[TrialResult]:
+    """Best first, by objects picked and then by score.
+
+    Picked first because that is what the benchmark asks. The score exists to
+    give a search a gradient between settings that all pick nothing, and it pays
+    up to 1.0 of partial credit for a near miss -- so ranking a finished sweep by
+    it alone puts a trial that nearly picked four things above one that picked
+    three.
+    """
+    return sorted(
+        (trial for trial in trials if trial.usable),
+        key=lambda trial: (trial.successes, trial.score),
+        reverse=True,
+    )
+
+
+def _summary_table(trials: list[TrialResult], targets: tuple[str, ...], searched: list[str]) -> list[str]:
+    """The ranked table: one row per trial, one column per searched parameter."""
+    param_columns = [PARAM_LABELS.get(field, field) for field in searched]
+    lines = [
+        "| rank | setup | score | picked | "
+        + " | ".join(param_columns + list(targets))
+        + " |",
+        "|---:|---|---:|---:|" + "---:|" * len(param_columns) + "---:|" * len(targets),
+    ]
+    for rank, trial in enumerate(_rank(trials), start=1):
+        params = flat_params(trial)
+        cells = [format_value(params.get(field)) for field in searched]
+        cells += [_target_cell(trial, target) for target in targets]
+        lines.append(
+            f"| {rank} | {trial.setup} | {trial.score:.3f} | "
+            f"{trial.successes}/{len(trial.scored_episodes)} | " + " | ".join(cells) + " |"
+        )
+    return lines
+
+
+def _video_link(trial: TrialResult, run_dir: Path) -> str:
+    """A markdown link to the directory holding this trial's MP4s.
+
+    The directory rather than the clips: one trial is 20 rollouts, and twenty
+    links in a table cell is not a table. Every episode of a trial records into
+    the same `videos/` directory, so the link is unambiguous.
+
+    Relative to the report, which sits in the run directory -- an absolute path
+    would only open on the machine the sweep ran on.
+    """
+    videos = [episode.video for episode in trial.episodes if episode.video]
+    if not videos:
+        return "—"
+    directory = Path(videos[0]).parent
+    try:
+        relative = directory.relative_to(run_dir)
+    except ValueError:
+        relative = directory
+    return f"[{len(videos)} clips]({relative.as_posix()}/)"
+
+
+def _stretch_section(
+    trials: list[TrialResult],
+    targets: tuple[str, ...],
+    searched: list[str],
+    run_dir: Path,
+) -> list[str]:
+    """The best configurations for Stretch 4, with the string to reproduce each.
+
+    Separated from the main ranking because the Franka rows are a control, not a
+    candidate: they measure what the checkpoint does on the robot it was trained
+    on, and no amount of searching them produces something to run on a Stretch.
+    Whoever is picking settings for the robot wants these rows and only these.
+    """
+    stretch = [trial for trial in trials if trial.setup.startswith("stretch") and trial.usable]
+    if not stretch:
+        return []
+
+    lines = [
+        "## Best configurations for Stretch 4",
+        "",
+        "The Franka rows above are the control -- what this checkpoint does on the robot it "
+        "was trained on. These are the ones that can actually be run on a Stretch.",
+        "",
+        "### Best per setup",
+        "",
+        "One row per camera configuration: the best trial found for it. `--retarget-params` "
+        "takes the description verbatim, so a row here can be replayed on a full benchmark "
+        "with `run_benchmarks.py --policy molmobot_droid_retarget --retarget-setup <setup>`.",
+        "",
+    ]
+
+    best_per_setup = []
+    for trial in _rank(stretch):
+        if trial.setup not in {t.setup for t in best_per_setup}:
+            best_per_setup.append(trial)
+
+    param_columns = [PARAM_LABELS.get(field, field) for field in searched]
+    lines += [
+        "| setup | picked | score | " + " | ".join(param_columns + list(targets)) + " |",
+        "|---|---:|---:|" + "---:|" * (len(param_columns) + len(targets)),
+    ]
+    for trial in best_per_setup:
+        params = flat_params(trial)
+        cells = [format_value(params.get(field)) for field in searched]
+        cells += [_target_cell(trial, target) for target in targets]
+        lines.append(
+            f"| {trial.setup} | {trial.successes}/{len(trial.scored_episodes)} | "
+            f"{trial.score:.3f} | " + " | ".join(cells) + " |"
+        )
+
+    lines += ["", "The same rows as parameter strings:", ""]
+    for trial in best_per_setup:
+        lines += [
+            f"**{trial.setup}** — {trial.successes}/{len(trial.scored_episodes)} picked",
+            "",
+            "```",
+            trial.params_description,
+            "```",
+            "",
+        ]
+
+    top = _rank(stretch)[:10]
+    lines += [
+        "### Top 10 Stretch trials overall",
+        "",
+        "| rank | setup | picked | score | " + " | ".join(param_columns) + " | videos |",
+        "|---:|---|---:|---:|" + "---:|" * len(param_columns) + "---|",
+    ]
+    for rank, trial in enumerate(top, start=1):
+        params = flat_params(trial)
+        lines.append(
+            f"| {rank} | {trial.setup} | {trial.successes}/{len(trial.scored_episodes)} | "
+            f"{trial.score:.3f} | "
+            + " | ".join(format_value(params.get(field)) for field in searched)
+            + f" | {_video_link(trial, run_dir)} |"
+        )
+
+    # What each searched parameter is worth on Stretch, marginalised over the rest.
+    lines += ["", "### What each parameter is worth on Stretch", "",
+              "Mean objects picked per trial, grouped by one parameter at a time. Every other "
+              "parameter varies underneath each row, so these are marginals, not a recipe -- "
+              "but a parameter whose rows are flat is one that did not matter.", ""]
+    for field_name in searched:
+        values: dict[Any, list[TrialResult]] = {}
+        for trial in stretch:
+            values.setdefault(flat_params(trial).get(field_name), []).append(trial)
+        if len(values) < 2:
+            continue
+        lines += [
+            f"**{PARAM_LABELS.get(field_name, field_name)}** (`{field_name}`)",
+            "",
+            PARAM_EXPLANATIONS.get(field_name, ""),
+            "",
+            "| value | trials | mean picked | mean score |",
+            "|---|---:|---:|---:|",
+        ]
+        for value, group in sorted(values.items(), key=lambda kv: str(kv[0])):
+            mean_picked = float(np.mean([t.successes for t in group]))
+            mean_score = float(np.mean([t.score for t in group]))
+            lines.append(
+                f"| {format_value(value)} | {len(group)} | {mean_picked:.2f} | {mean_score:.3f} |"
+            )
+        lines.append("")
+    return lines
 
 
 def write_report(trials: list[TrialResult], targets: tuple[str, ...], output_dir: Path) -> Path:
@@ -553,51 +905,79 @@ def write_report(trials: list[TrialResult], targets: tuple[str, ...], output_dir
     the latter.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    ranked = sorted(trials, key=lambda trial: trial.score, reverse=True)
+    searched, setup_defining, constant = parameter_groups(trials)
+    ranked = _rank(trials)
+    scenes = sorted({episode.scene for trial in trials for episode in trial.episodes})
+    per_trial = max((len(trial.episodes) for trial in trials), default=0)
 
     lines = [
         "# Retargeting parameter search",
         "",
-        "Each trial is one setup at one point in the parameter space, scored over "
-        f"{len(targets)} objects ({', '.join(targets)}) in one kitchen from one robot pose.",
+        f"{len(trials)} trials. Each is one setup at one point in the parameter space, "
+        f"scored over {len(targets)} objects ({', '.join(targets)}) in "
+        f"{len(scenes)} scene(s) — {per_trial} rollouts per trial.",
         "",
-        "`score` is the mean episode score: 1.0 for a grasp, and for a failure a "
-        "weighted sum of how far the gripper closed the gap to the object "
-        f"({APPROACH_WEIGHT}), whether it touched it ({CONTACT_WEIGHT}) and how far it "
-        f"lifted it ({LIFT_WEIGHT}). See `scoring.py`.",
+        "Ranked by **objects picked, then score**. `score` is the mean episode score: 1.0 "
+        "for a grasp, and for a failure a weighted sum of how far the gripper closed the gap "
+        f"to the object ({APPROACH_WEIGHT}), whether it touched it ({CONTACT_WEIGHT}) and how "
+        f"far it lifted it ({LIFT_WEIGHT}). See `scoring.py`. The score is the right thing for "
+        "a search to climb and the wrong thing to read a winner off, because a trial that "
+        "misses four times by a millimetre can outscore one that picks three things up.",
         "",
-        "| rank | setup | score | picked | " + " | ".join(targets) + " | parameters |",
-        "|---:|---|---:|---:|" + "---:|" * len(targets) + "---|",
+        "Object columns are **picked / attempted** across scenes, bold when every scene "
+        "succeeded; a `0/n (0.42)` cell gives the mean partial score instead.",
+        "",
     ]
-    crashed = sum(trial.incomplete for trial in trials)
-    for rank, trial in enumerate(ranked, start=1):
-        if trial.error:
-            lines.append(
-                f"| {rank} | {trial.setup} | - | - | "
-                + " | ".join("-" for _ in targets)
-                + f" | ERROR: {trial.error} |"
-            )
-            continue
-        by_target = {episode.target: episode for episode in trial.episodes}
-        cells = []
-        for target in targets:
-            episode = by_target.get(target)
-            if episode is None:
-                cells.append("-")
-            elif not episode.completed:
-                cells.append("crashed")
-            elif episode.success:
-                cells.append("**picked**")
-            else:
-                cells.append(f"{episode.score:.2f}")
-        score = f"{trial.score:.3f}" if trial.usable else "n/a"
-        lines.append(
-            f"| {rank} | {trial.setup} | {score} | "
-            f"{trial.successes}/{len(trial.scored_episodes)} | "
-            + " | ".join(cells)
-            + f" | `{trial.params_description}` |"
-        )
 
+    if searched:
+        lines += [
+            "## What varied",
+            "",
+            "Only the parameters the sweep actually moved get a column below. "
+            + ", ".join(f"`{PARAM_LABELS.get(f, f)}`" for f in searched)
+            + ".",
+            "",
+        ]
+    if setup_defining:
+        lines += [
+            "Constant within each setup but different between them — these are what the "
+            "`setup` column *means*, not results:",
+            "",
+            "| setup | " + " | ".join(PARAM_LABELS.get(f, f) for f in setup_defining) + " |",
+            "|---|" + "---|" * len(setup_defining),
+        ]
+        seen: dict[str, dict[str, Any]] = {}
+        for trial in trials:
+            if not trial.error:
+                seen.setdefault(trial.setup, flat_params(trial))
+        for setup, params in seen.items():
+            lines.append(
+                f"| {setup} | "
+                + " | ".join(format_value(params.get(f)) for f in setup_defining)
+                + " |"
+            )
+        lines.append("")
+    if constant:
+        lines += [
+            "Held constant across every trial: "
+            + ", ".join(
+                f"`{PARAM_LABELS.get(f, f)}={format_value(v)}`" for f, v in constant.items()
+            )
+            + ".",
+            "",
+        ]
+
+    lines += ["## All trials", ""]
+    lines += _summary_table(trials, targets, searched)
+
+    errored = [trial for trial in trials if trial.error or not trial.usable]
+    if errored:
+        lines += ["", "### Trials that measured nothing", "", "| setup | parameters | why |", "|---|---|---|"]
+        for trial in errored:
+            why = trial.error or "every episode crashed"
+            lines.append(f"| {trial.setup} | `{trial.params_description}` | {why} |")
+
+    crashed = sum(trial.incomplete for trial in trials)
     if crashed:
         lines += [
             "",
@@ -609,19 +989,25 @@ def write_report(trials: list[TrialResult], targets: tuple[str, ...], output_dir
             "whose episodes all crashed shows `n/a` and is not ranked.",
         ]
 
+    lines += [""]
+    lines += _stretch_section(trials, targets, searched, output_dir)
+
     lines += ["", "## Episodes", ""]
     for trial in ranked:
         if trial.error:
             continue
-        lines.append(f"### {trial.setup} — score {trial.score:.3f}")
+        lines.append(
+            f"### {trial.setup} — {trial.successes}/{len(trial.scored_episodes)} picked, "
+            f"score {trial.score:.3f}"
+        )
         lines.append("")
         lines.append(f"`{trial.params_description}`")
         lines.append("")
         lines.append(
-            "| object | outcome | approach | touched | best lift | retarget pos err | video |"
+            "| scene | object | outcome | approach | touched | best lift | retarget pos err | video |"
         )
-        lines.append("|---|---|---:|---:|---:|---:|---|")
-        for episode in trial.episodes:
+        lines.append("|---:|---|---|---:|---:|---:|---:|---|")
+        for episode in sorted(trial.episodes, key=lambda e: (e.scene, e.target)):
             outcome = (
                 "crashed" if not episode.completed else "picked up" if episode.success else "failed"
             )
@@ -632,7 +1018,7 @@ def write_report(trials: list[TrialResult], targets: tuple[str, ...], output_dir
             )
             video = f"[mp4]({episode.video})" if episode.video else ""
             lines.append(
-                f"| {episode.target} | {outcome} | {episode.approach:.2f} | "
+                f"| {episode.scene} | {episode.target} | {outcome} | {episode.approach:.2f} | "
                 f"{'yes' if episode.touched else 'no'} | {episode.best_lift_m * 100:.1f} cm | "
                 f"{residual} | {video} |"
             )
@@ -641,3 +1027,107 @@ def write_report(trials: list[TrialResult], targets: tuple[str, ...], output_dir
     path = output_dir / "report.md"
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+# =============================================================================
+# Rebuilding a finished run
+# =============================================================================
+
+
+def load_trials(run_dir: Path) -> list[TrialResult]:
+    """Reconstruct a finished sweep's trials from the files it wrote.
+
+    `write_report` runs at the end of a search, from objects that only exist in
+    that process -- so changing how the report is laid out would otherwise mean
+    re-running the rollouts to see the new layout, which for this sweep is nine
+    hours. `episodes.csv` and `trials.jsonl` between them hold everything the
+    report reads, so it can be rebuilt instead.
+
+    `trial` in the CSV is the index into `trials.jsonl`; both are written
+    together by `params_search._write_outputs` after every trial.
+    """
+    trials_path = run_dir / "trials.jsonl"
+    records = [json.loads(line) for line in trials_path.read_text().splitlines() if line.strip()]
+
+    episodes: dict[int, list[EpisodeScore]] = {}
+    descriptions: dict[int, str] = {}
+    with (run_dir / "episodes.csv").open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            index = int(row["trial"])
+            episodes.setdefault(index, []).append(_episode_from_row(row))
+            descriptions.setdefault(index, row.get("params", ""))
+
+    trials = []
+    for index, record in enumerate(records):
+        params = record.get("params", {})
+        trials.append(
+            TrialResult(
+                setup=record.get("setup", ""),
+                params_description=descriptions.get(index, ""),
+                params_json=json.dumps(params),
+                episodes=episodes.get(index, []),
+                error=record.get("error", ""),
+            )
+        )
+    return trials
+
+
+def _episode_from_row(row: dict[str, str]) -> EpisodeScore:
+    """One `episodes.csv` row back into an `EpisodeScore`.
+
+    Only the recorded fields are restored; `score`, `approach`, `contact` and
+    `lift` are properties and are recomputed from them, which is also a check
+    that the two agree.
+    """
+
+    def number(key: str, default: float = float("nan")) -> float:
+        try:
+            return float(row.get(key, ""))
+        except (TypeError, ValueError):
+            return default
+
+    def flag(key: str) -> bool:
+        return str(row.get(key, "")).strip().lower() in ("true", "1", "yes")
+
+    return EpisodeScore(
+        setup=row.get("setup", ""),
+        target=row.get("target", ""),
+        scene=int(number("scene", -1)) if row.get("scene") else -1,
+        instruction=row.get("instruction", ""),
+        success=flag("success"),
+        steps=int(number("steps", 0)),
+        completed=flag("completed"),
+        start_distance_m=number("start_distance_m"),
+        min_distance_m=number("min_distance_m"),
+        touched=flag("touched"),
+        best_lift_m=number("best_lift_m", 0.0),
+        retarget_position_error_mean_m=number("retarget_position_error_mean_m"),
+        retarget_orientation_error_mean_rad=number("retarget_orientation_error_mean_rad"),
+        video=row.get("video", ""),
+    )
+
+
+def rebuild_report(run_dir: Path, targets: tuple[str, ...]) -> Path:
+    """Re-render `report.md` for a finished run, without re-running anything."""
+    trials = load_trials(run_dir)
+    return write_report(trials, targets, run_dir)
+
+
+@click.command()
+@click.option(
+    "--run-dir",
+    type=click.Path(path_type=Path, exists=True),
+    default=Path("eval_output") / "retarget_params",
+    help="A directory `params_search` wrote: trials.jsonl and episodes.csv.",
+)
+def main(run_dir: Path) -> None:
+    """Re-render `report.md` for a finished run, without re-running the rollouts."""
+    from examples.machine_learning.molmospaces.retargetting import mini_benchmark
+
+    targets = tuple(target.key for target in mini_benchmark.TARGETS)
+    path = rebuild_report(run_dir, targets)
+    click.secho(f"Wrote {path}", fg="green")
+
+
+if __name__ == "__main__":
+    main()
