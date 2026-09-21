@@ -42,6 +42,7 @@ orientation rather than trade against it. See `_task_priority_step`.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -54,6 +55,8 @@ from examples.machine_learning.molmospaces.stretch.robot_view import (
     Stretch4RobotView,
     commandable_limits,
 )
+
+log = logging.getLogger(__name__)
 
 # The rotation from the Franka's `gripper/grasp_site` frame to Stretch's
 # `grasp_center_link` frame. Both models put their tool frame between the
@@ -87,6 +90,39 @@ FRANKA_TO_STRETCH_TOOL = R.from_euler("y", -90, degrees=True).as_matrix()
 JAW_FLIP = np.eye(4)
 JAW_FLIP[:3, :3] = R.from_euler("x", 180, degrees=True).as_matrix()
 
+JAW_MODES = ("auto", "flipped", "upright")
+"""
+How `FrankaOnStretchView` chooses which way round to hold the jaw.
+
+* `"auto"` -- the default. Try the branch already in use and switch only on a
+  clear orientation win. Two IK solves per step, and the only mode that gives up
+  nothing: measured across `tests/test_retargeting.py`'s waypoints it holds every
+  one to 0.0006 rad.
+* `"flipped"` -- always the half-turned branch. One solve per step, no branch
+  that can change mid-reach, and *better position everywhere* -- worst 0.39mm
+  against auto's 1.87mm across those waypoints, with 0.0000 rad of orientation at
+  fourteen of sixteen. The catch is the other two: at large tool yaws (`yaw_in`
+  at +45 degrees, `yaw_out` at -30) the flipped branch runs the wrist into a roll
+  limit and settles **0.43 rad** short.
+* `"upright"` -- never flip. The behaviour before jaw symmetry existed, kept so a
+  result can be compared against runs that predate it. Measures the same as
+  "auto" on those waypoints, because solved fresh from the snap the upright
+  branch suffices; the two diverge along a continuous path.
+
+The 0.43 rad is why "flipped" is not the default despite winning on position. It
+is not a symmetry to be forgiven: a jaw rotated that far about its approach axis
+closes along a different line, so it would take a knife across rather than along
+-- and `test_both_grippers_end_up_pointing_the_same_way`, which reads the finger
+bodies rather than any tool frame, fails at those two waypoints under "flipped".
+The tests are left tight on purpose, so selecting a worse mode makes the suite
+name the poses it costs.
+
+All three grasp the same object the same way where they agree; see `JAW_FLIP`.
+What differs is which poses Stretch's wrist can hold, and that is not a strict
+ordering -- a fixed branch that is right for most of the workspace is wrong at
+its edges.
+"""
+
 JAW_FLIP_GAIN_RAD = 0.10
 """
 How much orientation the other jaw branch has to win before the wrist rolls over
@@ -119,6 +155,24 @@ MAX_IK_LINEAR_STEP = 0.05  # metres
 MAX_IK_ANGULAR_STEP = 0.20  # radians
 MAX_IK_JOINT_STEP = 0.20  # radians (or metres, for the prismatic lift and arm)
 
+LIFT_SATURATION_MARGIN_M = 0.002
+"""
+How close the lift has to be to a travel limit to count as saturated, in metres.
+
+Small, because the IK clamps its solution to the commandable interval, so a
+saturated lift sits *exactly* on the limit rather than near it. The margin is
+only there to absorb the last step's floating point.
+"""
+
+UNREACHABLE_WARNING_M = 0.01
+"""
+How far short the tool has to fall before a saturated lift is worth warning about.
+
+A centimetre, which is the scale at which a grasp starts missing. Below that the
+residual is the IK's normal compromise between five DOFs and a six-dimensional
+pose error and says nothing about the lift.
+"""
+
 # Robotiq 2F-85 driver-joint angle at each end of the actuator's 0-255 range,
 # measured by stepping the Franka model to rest at each end. The policy is fed
 # `obs["qpos"]["gripper"][0]`, so these are the units its gripper state is in and
@@ -131,6 +185,59 @@ ROBOTIQ_CTRL_RANGE = (0.0, 255.0)
 # 0.5 rad fully open.
 STRETCH_FINGER_OPEN = 0.5
 STRETCH_FINGER_CLOSED = 0.0
+
+ROBOTIQ_MAX_APERTURE_M = 0.087
+"""
+How wide the Robotiq 2F-85 opens, in metres -- its 85mm spec, measured on the
+model as 0.0870 between the pads.
+
+Stretch's hand opens to 0.1885m at `STRETCH_FINGER_OPEN`, which is 2.17 times as
+wide. Left alone, that is a visible domain gap on the channel a grasping policy
+cares most about: told to open, Stretch spreads its fingers more than twice as
+far as any hand in the checkpoint's training data, and the wrist camera sees two
+fingers where the Robotiq's would be a narrow pair. Matching the aperture is what
+`match_robotiq_aperture` does, and it is on by default -- see
+`FrankaOnStretchView.finger_open`.
+
+The cost of matching, stated plainly: Stretch can no longer be commanded wider
+than 87mm, so an object it could previously swallow at 188mm is now out of reach
+of its jaw. That is the same limit the Franka condition has, which is the point,
+but it does mean the two conditions become comparable by making Stretch *worse*
+at wide objects rather than by making it better.
+"""
+
+
+def stretch_finger_for_aperture(move_group, model, data, aperture_m: float) -> float:
+    """The finger angle at which Stretch's jaw is `aperture_m` wide.
+
+    Measured on the model rather than assumed linear: the angle-to-aperture
+    relation is close to a straight 0.377 m/rad but not exactly, and this is
+    solved once per `FrankaOnStretchView` so there is no reason to approximate
+    it. A bisection, because the relation is monotone and the model is the only
+    thing that knows it -- and because a closed form would go stale the next time
+    the gripper's geometry changes.
+
+    Runs on whatever `data` it is handed, which the caller is expected to make
+    scratch data: it moves the fingers to measure them.
+    """
+    low, high = STRETCH_FINGER_CLOSED, STRETCH_FINGER_OPEN
+
+    def width(angle: float) -> float:
+        move_group.joint_pos = [angle, angle]
+        mujoco.mj_kinematics(model, data)
+        return float(move_group.inter_finger_dist)
+
+    if aperture_m >= width(high):
+        # Wider than the hand opens: give it everything it has, rather than
+        # silently returning a bisection's midpoint.
+        return float(high)
+    for _ in range(40):
+        middle = 0.5 * (low + high)
+        if width(middle) < aperture_m:
+            low = middle
+        else:
+            high = middle
+    return float(0.5 * (low + high))
 
 # The pedestal the DROID Franka is bolted to in MolmoSpaces' own scenes, and in
 # the notebook this module was ported from: `FrankaRobotConfig(base_size=[0.5,
@@ -198,16 +305,25 @@ def robotiq_ctrl_from_driver(driver_angle) -> float:
     return float(ROBOTIQ_CTRL_RANGE[0] + fraction * (ROBOTIQ_CTRL_RANGE[1] - ROBOTIQ_CTRL_RANGE[0]))
 
 
-def robotiq_ctrl_from_stretch_fingers(finger_angles) -> float:
+def robotiq_ctrl_from_stretch_fingers(
+    finger_angles, finger_open: float = STRETCH_FINGER_OPEN
+) -> float:
     """Stretch's finger angles expressed as the Robotiq 0-255 that would produce them.
 
     The other inverse of `retarget_robotiq_ctrl`: it answers "what has this hand
     been told?" from where the fingers actually are, so the proxy can report a
     gripper command it has established rather than one it assumed.
+
+    `finger_open` is the angle that counts as fully open, and must be the same one
+    the forward mapping used -- `FrankaOnStretchView.finger_open`, which is
+    narrowed to the Robotiq's aperture by default. Passing the module constant
+    while the forward direction used a narrowed angle would make the two stop
+    being inverses, which is exactly the kind of drift that shows up as a policy
+    reading its own gripper command back wrong.
     """
     finger = float(np.mean(np.asarray(finger_angles, dtype=float)))
     open_fraction = np.clip(
-        (finger - STRETCH_FINGER_CLOSED) / (STRETCH_FINGER_OPEN - STRETCH_FINGER_CLOSED), 0.0, 1.0
+        (finger - STRETCH_FINGER_CLOSED) / (finger_open - STRETCH_FINGER_CLOSED), 0.0, 1.0
     )
     # 0 is open on the Robotiq and closed on Stretch, so an open hand is ctrl 0.
     return float(
@@ -618,7 +734,10 @@ class _ProxyGripperGroup:
         (`gripper_representation_count = 1`), but reads it in these units.
         """
         finger = float(np.mean(self._view.stretch_view.get_move_group("gripper").joint_pos))
-        fraction = (finger - STRETCH_FINGER_CLOSED) / (STRETCH_FINGER_OPEN - STRETCH_FINGER_CLOSED)
+        fraction = (finger - STRETCH_FINGER_CLOSED) / (
+            self._view.finger_open - STRETCH_FINGER_CLOSED
+        )
+        fraction = float(np.clip(fraction, 0.0, 1.0))
         driver = ROBOTIQ_DRIVER_CLOSED + fraction * (ROBOTIQ_DRIVER_OPEN - ROBOTIQ_DRIVER_CLOSED)
         return np.array([driver, driver])
 
@@ -698,13 +817,33 @@ class FrankaOnStretchView:
         franka_mount_pose: np.ndarray,
         include_base: bool = True,
         target_z_offset: float = 0.0,
+        match_robotiq_aperture: bool = True,
+        jaw_mode: str = "auto",
     ) -> None:
+        if jaw_mode not in JAW_MODES:
+            raise ValueError(f"jaw_mode must be one of {JAW_MODES}, not {jaw_mode!r}")
+        self.jaw_mode = jaw_mode
         self.stretch_view = stretch_view
         self.namespace = namespace
         self.target_z_offset = float(target_z_offset)
 
         self.franka = VirtualFranka()
         self.arm_ik = StretchArmIK(stretch_view, namespace, include_base=include_base)
+
+        # What "fully open" means on Stretch, in finger-joint radians. Narrowed to
+        # the angle at which its jaw is as wide as the Robotiq's so that a gripper
+        # command means the same aperture on both robots; see
+        # `ROBOTIQ_MAX_APERTURE_M` for why, and for what it costs. Solved on the
+        # IK's scratch data, which is what keeps the measurement from moving the
+        # robot that is about to be commanded.
+        self.finger_open = STRETCH_FINGER_OPEN
+        if match_robotiq_aperture:
+            self.finger_open = stretch_finger_for_aperture(
+                self.arm_ik._scratch_view.get_move_group("gripper"),
+                self.arm_ik._scratch_data.model,
+                self.arm_ik._scratch_data,
+                ROBOTIQ_MAX_APERTURE_M,
+            )
 
         self._tool_correction = np.eye(4)
         self._tool_correction[:3, :3] = FRANKA_TO_STRETCH_TOOL
@@ -715,8 +854,10 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = self.franka.init_qpos.copy()
         self.last_gripper_ctrl = np.array([ROBOTIQ_CTRL_RANGE[0]])
         self.last_residual = np.zeros(6)
-        self.jaw_flipped = False
+        self.jaw_flipped = jaw_mode == "flipped"
         """Whether the arm is currently holding the half-turned jaw. See `JAW_FLIP`."""
+        self.unreachable_steps = 0
+        """Steps this episode whose target was out of reach with the lift saturated."""
         self.set_franka_mount_pose(franka_mount_pose)
 
     # -- the bits of the RobotView interface a policy loop uses ---------------
@@ -752,8 +893,11 @@ class FrankaOnStretchView:
         # made `ctrl` and `joint_pos` disagree about the same gripper -- and with
         # `snap_to_franka_home` off, nothing else would have corrected it.
         fingers = self.stretch_view.get_move_group("gripper").joint_pos
-        self.last_gripper_ctrl = np.array([robotiq_ctrl_from_stretch_fingers(fingers)])
+        self.last_gripper_ctrl = np.array(
+            [robotiq_ctrl_from_stretch_fingers(fingers, self.finger_open)]
+        )
         self.last_residual = np.zeros(6)
+        self.unreachable_steps = 0
 
     def snap_to_franka_joint_pos(self, joint_pos=None) -> np.ndarray:
         """Put Stretch in the configuration that best matches a Franka arm pose.
@@ -780,7 +924,7 @@ class FrankaOnStretchView:
         # disagree -- the reported arm state is read back through that flag, and
         # a snap that picked one branch while the flag said the other would
         # report an arm half a turn from the one Stretch is holding.
-        self.jaw_flipped = False
+        self.jaw_flipped = self.jaw_mode == "flipped"
         solution, residual, self.jaw_flipped = self._solve_either_jaw(target)
         for group, value in self.arm_ik.split(solution).items():
             move_group = self.stretch_view.get_move_group(group)
@@ -817,12 +961,20 @@ class FrankaOnStretchView:
         is free reach rather than a compromise: the arm is allowed to pick the
         one its wrist can actually hold.
 
-        The branch in use is tried first and kept unless the other one clearly
-        wins, which is what stops the wrist rolling over on solver noise; see
-        `JAW_FLIP_GAIN_RAD`. Two solves per call, so roughly twice the IK cost of
-        a single one -- a few hundred microseconds against a policy step that
-        runs a transformer.
+        Under `jaw_mode` "flipped" or "upright" the branch is fixed and this is a
+        single solve; only "auto" pays for two and chooses. See `JAW_MODES`.
+
+        In "auto", the branch in use is tried first and kept unless the other one
+        clearly wins, which is what stops the wrist rolling over on solver noise;
+        see `JAW_FLIP_GAIN_RAD`.
         """
+        if self.jaw_mode != "auto":
+            fixed = self.jaw_mode == "flipped"
+            solution, residual = self.arm_ik.solve(
+                target_pose @ JAW_FLIP if fixed else target_pose
+            )
+            return solution, residual, fixed
+
         current = target_pose @ JAW_FLIP if self.jaw_flipped else target_pose
         current_solution, current_residual = self.arm_ik.solve(current)
 
@@ -911,7 +1063,64 @@ class FrankaOnStretchView:
 
         target = self.franka_tool_pose_to_world(self.franka.fk(joint_pos))
         solution, self.last_residual, self.jaw_flipped = self._solve_either_jaw(target)
-        return self.arm_ik.split(solution)
+        targets = self.arm_ik.split(solution)
+        self._warn_if_lift_saturated(targets, self.last_residual)
+        return targets
+
+    def _warn_if_lift_saturated(self, targets: dict, residual: np.ndarray) -> None:
+        """Say so, out loud, when the lift has run out of travel and the tool is short.
+
+        This is the failure that otherwise looks like nothing. The IK reports a
+        residual, the action is applied, the episode continues, and the only
+        symptom is a gripper that closes a few centimetres above the object --
+        which gets read as the policy aiming badly. `target_z_offset` makes it
+        more likely by design, since it raises every target, and
+        `FrankaOnStretchView`'s own docstring notes that where the lift is already
+        saturated the offset buys nothing. That note is worth a log line when it
+        actually happens.
+
+        Only when both are true: the lift is against a travel limit, *and* the
+        tool is at least `UNREACHABLE_WARNING_M` short. A saturated lift on a
+        target the arm reaches anyway is not a problem, and a large residual with
+        travel left is a different problem -- the message would be wrong about
+        the cause.
+
+        Warned once per episode and counted thereafter. A rollout is ~300 steps
+        at 15Hz and this condition persists for as long as the policy keeps
+        asking, so warning every step would bury the run's own output; the count
+        goes into `get_info` via `unreachable_steps`.
+        """
+        vertical = float(residual[2])
+        if vertical < UNREACHABLE_WARNING_M:
+            return
+        lift = np.asarray(targets.get("lift", []), dtype=float).reshape(-1)
+        if not lift.size:
+            return
+        lift_target = float(lift[0])
+        low, high = commandable_limits(self.stretch_view.get_move_group("lift"))[0]
+        at_limit = (high - lift_target) < LIFT_SATURATION_MARGIN_M or (
+            lift_target - low
+        ) < LIFT_SATURATION_MARGIN_M
+        if not at_limit:
+            return
+
+        self.unreachable_steps += 1
+        message = (
+            f"[retarget] lift is at its {'top' if lift_target > low else 'bottom'} "
+            f"({lift_target:.4f}m of {low:.3f}..{high:.3f}) and the commanded tool pose is "
+            f"still {vertical * 1000:.0f}mm away vertically "
+            f"({self.last_position_error * 1000:.0f}mm in total). Stretch cannot reach where "
+            f"the policy is pointing"
+        )
+        if self.target_z_offset:
+            message += (
+                f", and target_z_offset is adding {self.target_z_offset * 100:.1f}cm of that "
+                f"-- at a saturated lift the offset buys no clearance and only grows the miss"
+            )
+        if self.unreachable_steps == 1:
+            log.warning(f"{message}. Further occurrences this episode are counted, not logged.")
+        else:
+            log.debug(message)
 
     def retarget_robotiq_ctrl(self, value) -> np.ndarray:
         """A Robotiq 0-255 command -> Stretch's two finger targets, in radians."""
@@ -922,8 +1131,10 @@ class FrankaOnStretchView:
             0.0,
             1.0,
         )
-        # 0 is open on the Robotiq and closed on Stretch, hence the flip.
-        finger = STRETCH_FINGER_OPEN + fraction * (STRETCH_FINGER_CLOSED - STRETCH_FINGER_OPEN)
+        # 0 is open on the Robotiq and closed on Stretch, hence the flip. `finger_open`
+        # rather than `STRETCH_FINGER_OPEN` so that "open" means the Robotiq's
+        # aperture; see `ROBOTIQ_MAX_APERTURE_M`.
+        finger = self.finger_open + fraction * (STRETCH_FINGER_CLOSED - self.finger_open)
         return np.array([finger, finger])
 
     def command_franka_joint_pos(self, joint_pos) -> None:
@@ -960,6 +1171,17 @@ FRANKA_TOOL_COLOR = (0.10, 0.85, 0.25, 1.0)
 STRETCH_TOOL_COLOR = (1.00, 0.35, 0.10, 1.0)
 REFERENCE_PLANE_COLOR = (0.10, 0.85, 0.25, 0.20)
 
+REFERENCE_TARGET_COLOR = (0.25, 0.65, 1.00, 1.0)
+"""
+The pose Stretch was *asked* for, when that is not the Franka's own pose.
+
+A third colour because with `target_z_offset` in force there are three points
+worth telling apart and two colours cannot do it: where the Franka's tool is
+(green), where Stretch was commanded to put its own -- that pose raised by the
+offset (this blue) -- and where Stretch got to (orange). At zero offset the first
+two are the same point and only two colours appear.
+"""
+
 # Maps the geom-local +z that `mjGEOM_ARROW` points along onto each axis of the
 # frame being drawn, so one arrow primitive can draw all three.
 _AXIS_TO_ARROW = (
@@ -995,6 +1217,7 @@ def add_frame_marker(
     ball_radius: float = 0.012,
     axis_length: float = 0.07,
     axis_radius: float = 0.004,
+    axes: bool = True,
 ) -> None:
     """Draw a 4x4 pose into a rendered scene: a ball at the origin, arrows on the axes.
 
@@ -1006,11 +1229,19 @@ def add_frame_marker(
 
     Axes are coloured x/y/z as red/green/blue as usual; `color` is the ball, and
     identifies which frame it is.
+
+    `axes=False` draws the ball alone, for a marker that is in the picture as a
+    *position* rather than as a frame. A reference point from another robot is the
+    case that wants it: its orientation is in a different tool convention, so
+    three more arrows beside the ones that matter are clutter that invites the
+    wrong comparison.
     """
     origin = pose[:3, 3]
     _add_decor_geom(
         scene, mujoco.mjtGeom.mjGEOM_SPHERE, [ball_radius] * 3, origin, np.eye(3), color, label
     )
+    if not axes:
+        return
     for axis, axis_color in enumerate(((1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1))):
         _add_decor_geom(
             scene,

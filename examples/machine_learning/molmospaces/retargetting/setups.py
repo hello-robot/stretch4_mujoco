@@ -162,12 +162,13 @@ DROID_FRAME_SIZE = (640, 360)
 """What the checkpoint was trained on. `--exo-crop` brings a fisheye frame to it."""
 
 STRETCH_GRASP_OFFSET_M = 0.09
-STRETCH_Z_OFFSET_FRACTION = 0.0
+STRETCH_TARGET_Z_OFFSET_M = 0.0
 """
 The tool correction the Stretch setups retarget with, measured by search.
 
 The shipped values were `grasp_offset_m = 0.0` (no correction at all) and
-`z_offset_fraction = 0.5`, and together they cost most of what the retargeting
+a target height offset of half a measured shortfall, and together they cost
+most of what the retargeting
 could do. Both faults are geometric and both are visible on a standing robot
 with no policy running -- see `diagnose.py`, which prints them:
 
@@ -177,13 +178,13 @@ with no policy running -- see `diagnose.py`, which prints them:
   placed there is outside the gripper, so the fingers close behind it and it is
   nudged rather than grasped. 0.09 puts it between the pads, which is where the
   Robotiq's own grasp site is on the robot the policy was trained on.
-* **The height.** `z_offset_fraction` of the measured lift shortfall is added to
+* **The height.** `target_z_offset_m` is added to
   every target -- 5.1cm in this kitchen, which is more than three of the four
   benchmark objects are tall. It exists to stop the gripper dragging through a
   countertop where the lift has run out of travel; with the grasp depth
   corrected it costs more than it buys here.
 
-Measured over the four objects, `z_offset_fraction=0` versus `0.5` at four grasp
+Measured over the four objects, no offset versus half a shortfall at four grasp
 offsets: mean score 0.948 against 0.789. The two interact -- at
 `grasp_offset_m=0` the height made no difference at all, because the depth error
 was already losing every grasp.
@@ -432,7 +433,7 @@ SETUPS: dict[str, Setup] = {
             description="Stretch + the same upright pinhole",
             params=RetargetParams(
                 grasp_offset_m=STRETCH_GRASP_OFFSET_M,
-                z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
+                target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
@@ -463,7 +464,7 @@ SETUPS: dict[str, Setup] = {
             description="Stretch + its real 123-degree fisheye",
             params=RetargetParams(
                 grasp_offset_m=STRETCH_GRASP_OFFSET_M,
-                z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
+                target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
@@ -501,7 +502,7 @@ SETUPS: dict[str, Setup] = {
             description="Stretch + that fisheye, rectified and cropped to a synthesised pitch",
             params=RetargetParams(
                 grasp_offset_m=STRETCH_GRASP_OFFSET_M,
-                z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
+                target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
                     STRETCH_STRETCHCAM_HEIGHT,
@@ -882,7 +883,7 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
         if isinstance(self.policy_config, RetargetStretchMolmoBotDroidPolicyConfig):
             self.policy_config.grasp_offset_m = params.grasp_offset_m
             self.policy_config.wrist_tilt_deg = params.wrist_tilt_deg
-            self.policy_config.z_offset_fraction = params.z_offset_fraction
+            self.policy_config.target_z_offset = params.target_z_offset_m
 
 
 def qualified_config_name(class_name: str) -> str:

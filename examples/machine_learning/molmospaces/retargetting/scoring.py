@@ -534,11 +534,11 @@ PARAM_LABELS = {
     "crop_to": "crop",
     "grasp_offset_m": "grasp_off",
     "wrist_tilt_deg": "wrist_tilt",
-    "z_offset_fraction": "z_frac",
+    "target_z_offset_m": "z_offset",
 }
 """Column headings for the parameter fields, short enough to put in a table."""
 
-TOOL_FIELDS = ("grasp_offset_m", "wrist_tilt_deg", "z_offset_fraction")
+TOOL_FIELDS = ("grasp_offset_m", "wrist_tilt_deg", "target_z_offset_m")
 
 PARAM_EXPLANATIONS = {
     "pitch_deg": (
@@ -575,12 +575,13 @@ PARAM_EXPLANATIONS = {
         "already carries. 0 is the retargeting's own behaviour; positive tips the gripper "
         "further down than the policy asked for."
     ),
-    "z_offset_fraction": (
-        "How much of the **measured lift shortfall** to add to every commanded target. "
-        "Stretch's lift runs out of travel where the Franka's does not, so the retargeting "
-        "raises targets to stop the gripper dragging through the counter. The shortfall is "
-        "measured per episode; this is the fraction of it applied. Raise it too far and the "
-        "gripper closes above the object rather than around it."
+    "target_z_offset_m": (
+        "**Metres** to raise every commanded target by. Stretch's lift runs out of travel "
+        "where the Franka's does not, so raising targets buys clearance and stops the gripper "
+        "dragging through the counter -- but only where the lift still has somewhere to go. "
+        "0 is the default: this used to be a fraction of a shortfall measured at the Franka's "
+        "home pose, which is above Stretch's ceiling, so it corrected targets that needed no "
+        "correcting. Raise it too far and the gripper closes above the object."
     ),
 }
 """One sentence on what each searched parameter actually does, for the report.

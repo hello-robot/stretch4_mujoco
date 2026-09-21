@@ -618,7 +618,7 @@ def _params_from_description(base, text: str):
     for name, field in (
         ("grasp_offset", "grasp_offset_m"),
         ("wrist_tilt", "wrist_tilt_deg"),
-        ("z_frac", "z_offset_fraction"),
+        ("z_offset", "target_z_offset"),
     ):
         if name in numbers:
             changes[field] = numbers[name]

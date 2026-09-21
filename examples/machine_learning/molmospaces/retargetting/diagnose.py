@@ -13,9 +13,13 @@ It answers three questions, in the order they matter:
 1. **How far above the object does a commanded grasp land?**
    `FrankaOnStretchView.target_z_offset` raises every retargeted target, to stop
    Stretch's gripper dragging through the countertop where its lift has run out
-   of travel. It is `z_offset_fraction` of a shortfall measured per episode, so
-   the number that actually gets applied is not written down anywhere -- and if
-   it is larger than the object is tall, the gripper closes above it.
+   of travel. It is a hand-set number and defaults to **0**: it used to be a
+   fraction of the shortfall measured below, applied automatically, and that is
+   removed -- the shortfall is measured at the Franka's *home* pose, which is
+   above Stretch's ceiling, so it corrected targets that needed no correcting.
+   The measurement is still printed here, because knowing the ceiling is useful;
+   it is just no longer wired to anything. If the offset you set by hand is
+   larger than the object is tall, the gripper closes above it.
 
 2. **Where is the grasp centre, relative to the fingers?**
    The retargeting drives `grasp_center_link` to the pose the policy asked for
@@ -162,7 +166,14 @@ def report_gripper(model, data, view, namespace: str) -> float:
 
 
 def report_height_offset(view, namespace: str) -> float:
-    """Print the per-episode lift shortfall and what each `z_offset_fraction` does with it."""
+    """Print the lift shortfall at the Franka's home pose, and what offsets would do.
+
+    Reported, not applied. `measure_tool_height_offset()` is no longer used by the
+    policy -- see `StretchMolmoBotDroidPolicyConfig.target_z_offset` -- and this is
+    the diagnostic it survives as: the number says how far above Stretch's reach
+    the Franka's home tool sits, which is worth knowing when a rollout starts
+    there.
+    """
     click.secho("\n== the target height offset ==", bold=True)
     proxy = fr.FrankaOnStretchView(
         view,
@@ -172,25 +183,33 @@ def report_height_offset(view, namespace: str) -> float:
     )
     shortfall = proxy.measure_tool_height_offset()
     click.echo(f"measure_tool_height_offset(): {shortfall:+.4f} m")
-    click.echo("this is multiplied by z_offset_fraction and added to every commanded target:")
+    click.echo(
+        "nothing multiplies this any more: `target_z_offset` is set by hand and defaults\n"
+        "to 0. For reference, were you to apply a fraction of it by hand:"
+    )
     for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
         offset = shortfall * fraction
-        click.echo(f"  z_offset_fraction={fraction:.2f} -> every grasp {offset * 100:+.1f} cm high")
+        click.echo(
+            f"  target_z_offset_m={offset:.3f} ({fraction:.2f} of the shortfall) "
+            f"-> every grasp {offset * 100:+.1f} cm high"
+        )
     return shortfall
 
 
-def report_objects(shortfall: float) -> None:
+def report_objects(shortfall: float, offset: float) -> None:
     """Print how each target object's height compares with the offset being applied."""
     click.secho("\n== the objects, against that offset ==", bold=True)
     episodes = mini_benchmark.build_episodes()
     counter = None
-    click.echo(f"{'object':14s} {'rest z':>8s} {'above counter':>14s}   verdict at z_offset_fraction=0.5")
+    click.echo(
+        f"{'object':14s} {'rest z':>8s} {'above counter':>14s}   "
+        f"verdict at target_z_offset_m={offset:.3f}"
+    )
     for episode, target in zip(episodes, mini_benchmark.TARGETS):
         rest_z = float(episode["task"]["pickup_obj_start_pose"][2])
         if counter is None:
             counter = rest_z  # only used if the ray cast below fails
         height = rest_z - COUNTER_Z
-        offset = shortfall * 0.5
         verdict = (
             click.style("above the object entirely", fg="red")
             if offset > height
@@ -234,12 +253,14 @@ def report_grasp_offset(view, namespace: str, shortfall: float) -> None:
 
 @click.command()
 @click.option(
-    "--z-offset-fraction",
+    "--target-z-offset",
     type=float,
-    default=0.5,
-    help="The fraction to report the objects against. The policy config's default is 0.5.",
+    default=0.0,
+    show_default=True,
+    help="The offset, in metres, to report the objects against. The policy config's "
+    "default is 0; raise it to see which objects a hand-set offset would close above.",
 )
-def main(z_offset_fraction: float) -> None:
+def main(target_z_offset: float) -> None:
     import logging
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -248,10 +269,10 @@ def main(z_offset_fraction: float) -> None:
     model, data, view, namespace = build_standing_robot()
     report_gripper(model, data, view, namespace)
     shortfall = report_height_offset(view, namespace)
-    report_objects(shortfall)
+    report_objects(shortfall, target_z_offset)
     report_grasp_offset(view, namespace, shortfall)
     click.secho(
-        "\nBoth numbers above are searchable: --dim z_offset_fraction=0:0.5:3 "
+        "\nBoth numbers above are searchable: --dim target_z_offset_m=0:0.05:3 "
         "--dim grasp_offset_m=0:0.09:4",
         fg="green",
     )

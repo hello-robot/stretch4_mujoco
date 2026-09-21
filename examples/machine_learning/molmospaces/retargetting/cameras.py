@@ -292,19 +292,26 @@ class RetargetParams:
     asked for.
     """
 
-    z_offset_fraction: float = 0.5
+    target_z_offset_m: float = 0.0
     """
-    How much of the measured lift shortfall to add to every target.
+    Metres to raise every commanded target by.
 
-    `StretchMolmoBotDroidPolicyConfig.z_offset_fraction`, exposed because it
-    trades grasp depth against clearance in the same way `grasp_offset_m` does
-    and the two interact.
+    `StretchMolmoBotDroidPolicyConfig.target_z_offset`, exposed because it trades
+    grasp depth against clearance in the same way `grasp_offset_m` does and the
+    two interact.
+
+    Absolute metres rather than the fraction-of-a-measurement this used to be.
+    The measurement it scaled -- `measure_tool_height_offset()` -- is taken at the
+    Franka's home pose, which is above Stretch's lift ceiling, so it describes a
+    pose the robot cannot reach and applied a correction to every target that
+    mostly did not need one. See
+    `StretchMolmoBotDroidPolicyConfig.target_z_offset`.
     """
 
     def describe(self) -> str:
         return (
             f"{self.exo.describe()} | grasp_offset={self.grasp_offset_m:+.3f}m "
-            f"wrist_tilt={self.wrist_tilt_deg:+.1f}deg z_frac={self.z_offset_fraction:.2f}"
+            f"wrist_tilt={self.wrist_tilt_deg:+.1f}deg z_offset={self.target_z_offset_m:+.3f}m"
         )
 
 
