@@ -37,6 +37,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -84,6 +85,41 @@ CONFIG_MODULE = "examples.machine_learning.molmospaces.retargetting.setups"
 
 PARAMS_ENV_VAR = "STRETCH_RETARGET_PARAMS"
 """JSON blob naming the setup and its parameters. See the module docstring."""
+
+PROBE_SINK_ENV_VAR = "STRETCH_RETARGET_PROBE_SINK"
+"""
+Directory each rollout process appends its per-episode probe records to.
+
+The same injection route as `PARAMS_ENV_VAR`, and the reason a search can run
+`--num-workers` above 1 at all: with several workers the process that watches a
+rollout is not the process collecting results, so the probe has to leave its
+records somewhere shared. A worker re-imports *this* module (it is the config
+module named in the "module:Class" string) and installs the hook below at import
+time, exactly as `configs.py` installs the MP4 recorder from
+`VIDEO_EXPORT_ENV_VAR`.
+"""
+
+
+def install_worker_hooks() -> None:
+    """Install the probe and the MP4 recorder in this process, if asked for.
+
+    Called at import, so it runs in the parent *and* in every rollout worker --
+    the parent's own call is harmless because both installers are idempotent.
+    Wrapped because a worker that cannot record telemetry should still run the
+    rollout; losing a trial to a missing directory would be worse than losing its
+    probe data.
+    """
+    sink = os.environ.get(PROBE_SINK_ENV_VAR)
+    if not sink:
+        return
+    try:
+        from examples.machine_learning.molmospaces.retargetting.scoring import install_probe
+        from examples.machine_learning.molmospaces.visualize import install_eval_video_hook
+
+        install_probe(Path(sink))
+        install_eval_video_hook()
+    except Exception as error:  # noqa: BLE001 - telemetry must not sink a worker
+        log.warning(f"[retarget] could not install the rollout hooks: {error}")
 
 EXO_CAMERA = FRANKA_EXO_CAMERA
 """The observation key the third-person view arrives under, on either robot."""
@@ -158,6 +194,35 @@ before treating them as the retargeting's defaults everywhere:
     run_benchmarks.py --policy molmobot_droid --benchmark pick
 """
 
+HEAD_CAMERA_PITCH_DEG = 43.0
+"""
+The pitch Stretch's head camera is actually built at, in degrees.
+
+Measured off the MJCF: `camera_right_link`'s optical frame decomposes to yaw -90,
+pitch 43, roll -90, and 43 here is 47 degrees below horizontal. It is a fixed
+property of the shell -- there is no head tilt joint on an SE4 -- which is
+exactly why `virtual_pitch_deg` exists.
+"""
+
+RECTIFIED_CROP_NOTE = """
+Why the rectified setups sweep a *virtual* pitch.
+
+`pitch_deg` moves the camera, and on a real Stretch nothing moves it: the head
+cameras are bolted to the shell at 43 degrees. So a sweep that finds a better
+physical pitch has found something you would have to re-manufacture the robot to
+use.
+
+The fisheye's 123-degree field is much wider than the 640x360 window the
+checkpoint wants, though, so a view that looks like it was taken at another
+pitch can be cut out of the frame the hardware already produces -- rectify, then
+crop off-centre. These setups pin the camera at `HEAD_CAMERA_PITCH_DEG` and
+sweep `virtual_pitch_deg` over the same values the fisheye setups sweep
+`pitch_deg` over, so each rectified trial has a physically-tilted twin at the
+same angle. If the pair scores alike, the tilt is available in software on the
+robot as built; if the rectified one is worse, the difference is what
+rectification and cropping cost.
+"""
+
 HEAD_CAMERA_ROLL_DEG = -90.0
 """
 How far Stretch's head cameras are rolled about their view axis: a quarter turn.
@@ -199,6 +264,21 @@ class Setup:
 
     description: str
     params: RetargetParams
+
+    camera_dims: tuple[str, ...] = ("pitch_deg", "fovy")
+    """
+    What `--search sweep`'s camera stage varies for this setup.
+
+    Empty means the setup is not swept at all and gets a single run at its own
+    parameters. `franka_baseline` is empty for that reason: it is the control --
+    the camera MolmoBot ships with, on the robot the checkpoint was trained on --
+    and a "better" pitch for it would answer a question nobody asked while
+    costing 15 of the 16 trials.
+
+    The rectified setups swap `pitch_deg` for `virtual_pitch_deg`, because the
+    thing worth measuring about a rectified fisheye is not where you could bolt
+    it but what you can cut out of it; see `RECTIFIED_CROP_NOTE`.
+    """
 
     @property
     def eval_config(self) -> str:
@@ -311,7 +391,8 @@ SETUPS: dict[str, Setup] = {
         Setup(
             key="franka_baseline",
             robot="franka",
-            description="Franka + the DROID shoulder camera MolmoBot ships with",
+            camera_dims=(),
+            description="Franka + the DROID shoulder camera MolmoBot ships with (control, not swept)",
             params=RetargetParams(
                 exo=ExoCameraParams(
                     mount_body="robot_0/fr3_link0",
@@ -397,7 +478,8 @@ SETUPS: dict[str, Setup] = {
         Setup(
             key="franka_rectified",
             robot="franka",
-            description="Franka + that fisheye, rectified",
+            camera_dims=("virtual_pitch_deg", "fovy"),
+            description="Franka + that fisheye, rectified and cropped to a synthesised pitch",
             params=RetargetParams(
                 exo=_stretch_head_camera_params(
                     FRANKA_EXO_MOUNT_BODY,
@@ -407,13 +489,16 @@ SETUPS: dict[str, Setup] = {
                     roll_deg=HEAD_CAMERA_ROLL_DEG,
                     fisheye=FISHEYE_RECTIFIED,
                     quarter_turns=-1,
+                    crop_to=DROID_FRAME_SIZE,
+                    virtual_pitch_deg=HEAD_CAMERA_PITCH_DEG,
                 )
             ),
         ),
         Setup(
             key="stretch_rectified",
             robot="stretch",
-            description="Stretch + that fisheye, rectified",
+            camera_dims=("virtual_pitch_deg", "fovy"),
+            description="Stretch + that fisheye, rectified and cropped to a synthesised pitch",
             params=RetargetParams(
                 grasp_offset_m=STRETCH_GRASP_OFFSET_M,
                 z_offset_fraction=STRETCH_Z_OFFSET_FRACTION,
@@ -425,6 +510,8 @@ SETUPS: dict[str, Setup] = {
                     roll_deg=HEAD_CAMERA_ROLL_DEG,
                     fisheye=FISHEYE_RECTIFIED,
                     quarter_turns=-1,
+                    crop_to=DROID_FRAME_SIZE,
+                    virtual_pitch_deg=HEAD_CAMERA_PITCH_DEG,
                 )
             ),
         ),
@@ -639,6 +726,7 @@ def register_overrides() -> None:
 
 
 register_overrides()
+install_worker_hooks()
 
 
 # =============================================================================

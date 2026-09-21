@@ -26,7 +26,10 @@ recorder uses.
 from __future__ import annotations
 
 import csv
+import json
 import logging
+import os
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -65,6 +68,9 @@ class EpisodeScore:
 
     setup: str = ""
     target: str = ""
+    scene: int = -1
+    """`house_index` of the scene this episode ran in, or -1 if it could not be read."""
+
     instruction: str = ""
     success: bool = False
     steps: int = 0
@@ -228,11 +234,27 @@ class GraspProbe:
     point is comparing a Franka rollout with a Stretch one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sink: Path | None = None) -> None:
+        self.sink = sink
+        """
+        Directory to append each finished episode to, as JSON, or None for memory only.
+
+        This is what makes `--num-workers` more than 1 possible. The probe is a
+        hook in whichever *process* runs the rollout, and with several workers
+        that is not the process collecting results -- a worker's in-memory list
+        dies with the worker. Writing one JSON line per episode into a shared
+        directory, and having the parent read the directory once the evaluation
+        returns, is the same trick `configs.VIDEO_EXPORT_ENV_VAR` uses to get MP4s
+        out of workers, for the same reason.
+
+        One file per process, appended to, so two workers never interleave
+        writes into one file.
+        """
         self.episodes: list[EpisodeScore] = []
         self._current: EpisodeScore | None = None
         self._object_name: str = ""
         self._start_height: float = 0.0
+        self._scene: int = -1
         self._policy: Any = None
 
     # -- the observer protocol ------------------------------------------------
@@ -249,6 +271,7 @@ class GraspProbe:
             self._current = EpisodeScore()
         task_config = task.config.task_config
         self._object_name = task_config.pickup_obj_name
+        self._scene = _house_index(task)
         self._start_height = float(task_config.pickup_obj_start_pose[2])
         self._current.instruction = _task_description(task)
         self._current.success_threshold_m = float(
@@ -290,6 +313,7 @@ class GraspProbe:
             return
         self._current.completed = success is not None
         self._current.success = bool(success)
+        self._current.scene = self._scene
         self._current.retarget_position_error_mean_m = _policy_info(
             self._policy, "retarget_position_error_mean_m"
         )
@@ -297,7 +321,18 @@ class GraspProbe:
             self._policy, "retarget_orientation_error_mean_rad"
         )
         self.episodes.append(self._current)
+        if self.sink is not None:
+            self._write(self._current)
         self._current = None
+
+    def _write(self, episode: EpisodeScore) -> None:
+        """Append one episode to this process's file in the sink directory."""
+        try:
+            self.sink.mkdir(parents=True, exist_ok=True)
+            with (self.sink / f"{os.getpid()}.jsonl").open("a") as handle:
+                handle.write(json.dumps(asdict(episode)) + "\n")
+        except OSError as error:  # noqa: BLE001 - telemetry must not sink a rollout
+            log.warning(f"[probe] could not record an episode: {error}")
 
     # -- the measurements -----------------------------------------------------
 
@@ -316,6 +351,16 @@ class GraspProbe:
         except Exception as error:  # noqa: BLE001
             log.debug(f"[probe] distance: {error}")
             return float("nan")
+
+
+def _house_index(task: Any) -> int:
+    """Which scene this episode is in, for a benchmark with more than one."""
+    for holder in (getattr(task, "config", None), getattr(getattr(task, "env", None), "config", None)):
+        sampler = getattr(holder, "task_sampler_config", None)
+        houses = getattr(sampler, "house_inds", None)
+        if houses:
+            return int(houses[0])
+    return -1
 
 
 def _mj_data(task: Any) -> Any:
@@ -359,7 +404,32 @@ def _policy_info(policy: Any, key: str) -> float:
         return float("nan")
 
 
-def install_probe() -> GraspProbe:
+def collect_probe_records(sink: Path) -> list[EpisodeScore]:
+    """Every episode written into `sink`, by this process and by any workers.
+
+    Sorted by the order they were written within each file and then by file, so
+    a single-worker run comes back in rollout order; with several workers the
+    order is per-worker rather than global, which is why nothing downstream
+    relies on position -- episodes carry their own scene and instruction.
+    """
+    episodes: list[EpisodeScore] = []
+    if not sink.is_dir():
+        return episodes
+    fields = {f.name for f in dataclasses.fields(EpisodeScore)}
+    for path in sorted(sink.glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                log.warning(f"[probe] skipping a malformed record in {path}")
+                continue
+            episodes.append(EpisodeScore(**{k: v for k, v in record.items() if k in fields}))
+    return episodes
+
+
+def install_probe(sink: Path | None = None) -> GraspProbe:
     """Watch every rollout in this process, and return the probe watching them.
 
     Shares the rollout hook the MP4 recorder and the Rerun stream use, so
@@ -369,7 +439,7 @@ def install_probe() -> GraspProbe:
     """
     from examples.machine_learning.molmospaces.visualize import _install_eval_rollout_hook
 
-    probe = GraspProbe()
+    probe = GraspProbe(sink=sink)
     _install_eval_rollout_hook(probe)
     return probe
 
@@ -379,7 +449,9 @@ def install_probe() -> GraspProbe:
 # =============================================================================
 
 EPISODE_FIELDS = (
+    "trial",
     "setup",
+    "scene",
     "target",
     "instruction",
     "success",
@@ -406,10 +478,11 @@ def write_episode_csv(trials: list[TrialResult], path: Path) -> None:
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(EPISODE_FIELDS))
         writer.writeheader()
-        for trial in trials:
+        for index, trial in enumerate(trials):
             for episode in trial.episodes:
                 row = {key: value for key, value in asdict(episode).items() if key in EPISODE_FIELDS}
                 row.update(
+                    trial=index,
                     score=round(episode.score, 4),
                     approach=round(episode.approach, 4),
                     contact=episode.contact,

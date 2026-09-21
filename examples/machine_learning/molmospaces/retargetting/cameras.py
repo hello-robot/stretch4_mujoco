@@ -173,6 +173,27 @@ class ExoCameraParams:
     quarter_turns: int = 0
     """`np.rot90` turns applied after the warp. -1 for the real right head camera."""
 
+    virtual_pitch_deg: float | None = None
+    """Pitch to *synthesise* by moving the crop window, with the camera left where it is.
+
+    A real head camera cannot be tilted -- it is bolted to the shell at
+    `HEAD_CAMERA_ROLL_DEG` and `pitch_deg` 43, and no amount of software changes
+    that. But a 123-degree fisheye sees far more than a 640x360 window needs, so
+    a view that *looks* like it was taken at another pitch can be cut out of the
+    frame the hardware already produces: shifting the crop window up the image
+    is, to first order, the same as pointing the camera up.
+
+    That is what this is for, and it is the only knob here that is deployable on
+    the robot as built. `pitch_deg` moves the camera and answers "would a
+    differently-mounted camera do better"; `virtual_pitch_deg` answers "can we
+    get that from the camera we have". Requires `crop_to`, and only means
+    anything once the frame has been rectified -- cropping a barrel-distorted
+    frame off-centre shifts the distortion with it.
+
+    None leaves the crop centred. See `_pitch_shifted_crop` for the geometry and
+    for where the small-angle approximation gives out.
+    """
+
     crop_to: tuple[int, int] | None = None
     """`(width, height)` to take back out of the frame, or None to leave it.
 
@@ -228,6 +249,12 @@ class ExoCameraParams:
             f"pitch={self.pitch_deg:.1f} roll={self.roll_deg:+.0f} fovy={self.fovy:.1f} "
             f"render={self.render_size[0]}x{self.render_size[1]} "
             f"fisheye={self.fisheye} turns={self.quarter_turns} "
+            + (
+                f"vpitch={self.virtual_pitch_deg:.0f} "
+                if self.virtual_pitch_deg is not None
+                else ""
+            )
+            + 
             f"out={width}x{height}"
         )
 
@@ -334,13 +361,44 @@ def _rectify(frame: np.ndarray) -> np.ndarray:
     return cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
 
-def _centre_crop_resize(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+def _pitch_shift_pixels(frame_height: int, delta_deg: float) -> int:
+    """How far to move the crop window to synthesise `delta_deg` of extra pitch.
+
+    A rectified frame is a pinhole projection, so a point `delta` degrees off the
+    optical axis lands `f * tan(delta)` pixels from the centre. Moving the window
+    by that much therefore re-centres the view on a direction `delta` degrees
+    away -- which is what tilting the camera would have done.
+
+    `f` is the calibration's focal length carried onto this frame. The head
+    camera is calibrated on a 1920x1200 sensor whose *long* axis becomes the
+    frame's vertical after the quarter turn, so the focal length that governs
+    vertical shifts is `fx`, scaled by how tall the rotated frame is.
+
+    Positive `delta_deg` means "look further up", and the window moves up (toward
+    row 0), because image rows increase downward.
+
+    First-order only: `tan` is exact for the re-centring, but the rectification
+    it rides on was fitted to the lens near its own axis, so a synthesised pitch
+    tens of degrees out lands on the part of the fisheye the calibration
+    describes worst. Twenty degrees is comfortable; sixty is not.
+    """
+    settings = FISHEYE_CAMERA.initial_camera_settings
+    focal_x, _ = settings.focal
+    focal = focal_x * (frame_height / float(settings.width))
+    return int(round(-focal * np.tan(np.radians(delta_deg))))
+
+
+def _centre_crop_resize(frame: np.ndarray, size: tuple[int, int], shift_y: int = 0) -> np.ndarray:
     """The largest centred window of `frame` with `size`'s aspect, resized to `size`.
 
     Cropping first and resizing second, rather than resizing straight to
     `size`, because the two are different views: a plain resize squashes a
     portrait frame into a landscape one and shows the policy a scene with the
     wrong proportions, which is not a thing any camera produces.
+
+    `shift_y` moves the window off centre, clamped so it stays inside the frame
+    -- a synthesised pitch that would run off the top of the image gives the
+    most extreme view the lens actually captured rather than a band of black.
     """
     import cv2
 
@@ -350,7 +408,7 @@ def _centre_crop_resize(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     crop_width = max(1, int(round(target_width * scale)))
     crop_height = max(1, int(round(target_height * scale)))
     left = (width - crop_width) // 2
-    top = (height - crop_height) // 2
+    top = int(np.clip((height - crop_height) // 2 + shift_y, 0, height - crop_height))
     window = frame[top : top + crop_height, left : left + crop_width]
     if (crop_width, crop_height) == (target_width, target_height):
         return np.ascontiguousarray(window)
@@ -383,7 +441,14 @@ def postprocess_exo_frame(frame: np.ndarray, params: ExoCameraParams) -> np.ndar
     if params.quarter_turns:
         frame = np.rot90(frame, params.quarter_turns)
     if params.crop_to is not None:
-        frame = _centre_crop_resize(np.ascontiguousarray(frame), params.crop_to)
+        # The shift is computed on the upright frame, because that is the one
+        # whose vertical axis pitch moves.
+        shift = 0
+        if params.virtual_pitch_deg is not None:
+            shift = _pitch_shift_pixels(
+                frame.shape[0], float(params.virtual_pitch_deg) - float(params.pitch_deg)
+            )
+        frame = _centre_crop_resize(np.ascontiguousarray(frame), params.crop_to, shift)
     return np.ascontiguousarray(frame)
 
 
