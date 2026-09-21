@@ -47,6 +47,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import json
+import shutil
 import logging
 import os
 import sys
@@ -63,6 +64,14 @@ if sys.platform == "linux":
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+# Read by CUDA's caching allocator when torch first initialises it, so it has to
+# be set before torch is imported -- which the imports below trigger, and which a
+# rollout worker inherits. The checkpoint's activations arrive in a few large,
+# short-lived blocks, and without this the allocator leaves them as fixed-size
+# segments it cannot reuse for a differently-shaped block: the OOM that prompted
+# this reported 753 MiB "reserved but unallocated" while failing to find 744 MiB.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np  # noqa: E402
 
 from examples.machine_learning.molmospaces.retargetting import mini_benchmark  # noqa: E402
@@ -74,6 +83,7 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
     EpisodeScore,
     GraspProbe,
     TrialResult,
+    collect_probe_records,
     format_trial_table,
     install_probe,
     write_episode_csv,
@@ -81,6 +91,7 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
     write_trial_csv,
 )
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
+    PROBE_SINK_ENV_VAR,
     SETUP_KEYS,
     SETUPS,
     params_to_json,
@@ -152,6 +163,19 @@ DIMENSIONS: dict[str, Dimension] = {
             sweep=(23.0, 33.0, 43.0, 53.0),
         ),
         Dimension(
+            name="virtual_pitch_deg",
+            bounds=(5.0, 60.0),
+            read=lambda p: (
+                p.exo.virtual_pitch_deg if p.exo.virtual_pitch_deg is not None else p.exo.pitch_deg
+            ),
+            write=lambda p, v: _with_exo(p, virtual_pitch_deg=float(v)),
+            description="Pitch synthesised by cropping the rectified fisheye off-centre, "
+            "with the camera left at the 43 degrees it is built at. Same scale as "
+            "pitch_deg, and swept over the same values so each trial has a "
+            "physically-tilted twin. Needs a rectified, cropped setup.",
+            sweep=(23.0, 33.0, 43.0, 53.0),
+        ),
+        Dimension(
             name="fovy",
             bounds=(30.0, 140.0),
             read=lambda p: p.exo.fovy,
@@ -194,7 +218,7 @@ DIMENSIONS: dict[str, Dimension] = {
 
 
 SWEEP_STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("camera", ("pitch_deg", "fovy")),
+    ("camera", ("pitch_deg", "virtual_pitch_deg", "fovy")),
     ("gripper", ("grasp_offset_m", "z_offset_fraction", "wrist_tilt_deg")),
 )
 """
@@ -285,6 +309,16 @@ class TrialRunner:
     probe: GraspProbe
     episode_steps: int | None
     checkpoint: str | None
+    num_workers: int = 1
+    scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT
+    """
+    How many scenes the benchmark should have.
+
+    Carried here, and not left to `mini_benchmark.build`'s own default, because
+    the rebuild-if-missing guard below calls it once per trial: with the default
+    it would decide a benchmark built for `--scenes 2` was the wrong size and
+    rebuild it at 3, silently overriding the flag on the very first trial.
+    """
 
     def run(self, setup_key: str, params: RetargetParams, label: str) -> TrialResult:
         """Evaluate one setup at one point, and score every episode of it."""
@@ -304,7 +338,7 @@ class TrialRunner:
         # deterministic, so the alternative (every remaining trial failing with
         # FileNotFoundError, and the run reporting nine errors) is strictly
         # worse. `build` is a no-op when the file is where it was left.
-        mini_benchmark.build(self.benchmark_dir)
+        mini_benchmark.build(self.benchmark_dir, scene_count=self.scene_count)
 
         # Before the config class is resolved: `run_evaluation` builds the
         # experiment config from the "module:Class" string, and that
@@ -313,6 +347,13 @@ class TrialRunner:
         self.probe.episodes.clear()
 
         trial_dir = self.output_root / "trials" / f"{setup_key}__{label}"
+        # Per trial, so a worker's records cannot be mistaken for the previous
+        # trial's, and so the directory is empty before the evaluation starts.
+        sink = trial_dir / "probe"
+        if sink.is_dir():
+            shutil.rmtree(sink, ignore_errors=True)
+        os.environ[PROBE_SINK_ENV_VAR] = str(sink)
+        self.probe.sink = sink
         log.info(f"[trial] {setup_key} {label}: {params.describe()}")
         try:
             evaluation = run_evaluation(
@@ -320,11 +361,12 @@ class TrialRunner:
                 benchmark_dir=self.benchmark_dir,
                 checkpoint_path=self.checkpoint,
                 output_dir=trial_dir,
-                max_episodes=len(mini_benchmark.TARGETS),
-                # One process, because the probe and the MP4 recorder are hooks
-                # in *this* one: a worker would render and score into its own
-                # memory and hand back nothing but a success count.
-                num_workers=1,
+                max_episodes=None,
+                # Workers are safe now that the probe writes to `sink` and the
+                # MP4 recorder is installed from the environment in each of
+                # them; MolmoSpaces parallelises by house, so this is capped at
+                # the scene count by the caller.
+                num_workers=self.num_workers,
                 task_horizon_steps=self.episode_steps,
                 use_wandb=False,
             )
@@ -335,7 +377,7 @@ class TrialRunner:
             log.debug("", exc_info=True)
             return result
 
-        result.episodes = _label_episodes(list(self.probe.episodes), setup_key)
+        result.episodes = _label_episodes(collect_probe_records(sink), setup_key)
         _attach_videos(result, Path(result.output_dir))
 
         if result.incomplete:
@@ -368,11 +410,12 @@ class TrialRunner:
 def _label_episodes(episodes: list[EpisodeScore], setup_key: str) -> list[EpisodeScore]:
     """Say which object each episode was about, and which setup it belongs to.
 
-    Matched on the instruction rather than on order: the rollout order is the
-    benchmark's and has been stable in practice, but an episode that errors out
-    before its first step still produces a record, and matching on text degrades
-    into "unknown" instead of silently attributing one object's result to
-    another.
+    Matched on the instruction, never on order. Order was already unreliable --
+    an episode that errors before its first step still produces a record -- and
+    with several workers it is meaningless: records arrive per worker, in
+    whichever order the workers finished. The instruction names the object
+    unambiguously, and the episode carries its own `scene`, so the pair
+    identifies it without reference to where it sits in the list.
     """
     by_instruction = {target.instruction: target.key for target in mini_benchmark.TARGETS}
     for index, episode in enumerate(episodes):
@@ -541,6 +584,22 @@ class SimpleCMAES:
     help="A dimension to search, as name=lo:hi (cmaes) or name=lo:hi:steps (grid). "
     "Repeatable. --list-dims prints what is available.",
 )
+@click.option(
+    "--scenes",
+    "scene_count",
+    type=int,
+    default=mini_benchmark.DEFAULT_SCENE_COUNT,
+    help="How many scenes each trial is scored on. The first is the hand-tuned kitchen; "
+    "the rest are borrowed from the released pick benchmark.",
+)
+@click.option(
+    "--num-workers",
+    type=int,
+    default=None,
+    help="Rollout worker processes. Defaults to whichever is smaller: one per scene (more "
+    "would idle, since a house is the unit of work) or as many as fit in free GPU memory "
+    "at ~14 GiB each, because every worker loads its own copy of the checkpoint.",
+)
 @click.option("--population", type=int, default=6, help="CMA-ES points per generation.")
 @click.option("--generations", type=int, default=5, help="CMA-ES generations.")
 @click.option("--seed", type=int, default=0, help="CMA-ES sampling seed.")
@@ -580,6 +639,8 @@ def main(
     setup_keys: tuple[str, ...],
     search: str,
     dim_specs: tuple[str, ...],
+    scene_count: int,
+    num_workers: int | None,
     population: int,
     generations: int,
     seed: int,
@@ -611,6 +672,30 @@ def main(
         return
 
     keys = list(setup_keys) or list(SETUP_KEYS)
+    affordable = affordable_workers(scene_count)
+    workers = num_workers if num_workers is not None else affordable
+    if workers > scene_count:
+        click.secho(
+            f"--num-workers {workers} on {scene_count} scenes: the extra workers will idle, "
+            "because a house is the unit of work.",
+            fg="yellow",
+        )
+    if workers > affordable:
+        click.secho(
+            f"--num-workers {workers} is more than the {affordable} that fit in free GPU "
+            f"memory at ~{WORKER_VRAM_GIB:.0f} GiB each (a worker peaks there mid-inference, "
+            "even though it idles nearer 13). Expect CUDA out-of-memory once two workers "
+            "generate an action chunk at the same moment -- which can be an hour in.",
+            fg="red",
+        )
+    elif num_workers is None and affordable < scene_count:
+        click.secho(
+            f"Using {workers} worker(s) rather than one per scene: only {affordable} fit in "
+            f"free GPU memory at ~{WORKER_VRAM_GIB:.0f} GiB each, because every worker "
+            "loads its own copy of the checkpoint. Fewer --scenes is the other way to "
+            "shorten the run.",
+            fg="yellow",
+        )
     crop = _parse_crop(exo_crop)
     axes = [parse_axis(spec) for spec in dim_specs]
     if search in ("grid", "cmaes") and not axes:
@@ -630,7 +715,15 @@ def main(
     # A dimension the setup's robot ignores would run identical trials and report
     # them as if they differed, which is worse than refusing.
     for axis in axes:
-        inapplicable = [k for k in keys if SETUPS[k].robot not in axis.dimension.robots]
+        inapplicable = [
+            k
+            for k in keys
+            if SETUPS[k].robot not in axis.dimension.robots
+            or (
+                axis.dimension.name in ("pitch_deg", "virtual_pitch_deg")
+                and axis.dimension.name not in SETUPS[k].camera_dims
+            )
+        ]
         if inapplicable:
             raise click.UsageError(
                 f"--dim {axis.dimension.name} only does anything on "
@@ -640,7 +733,7 @@ def main(
             )
 
     if search == "sweep":
-        _announce_sweep(keys)
+        _announce_sweep(keys, scene_count, workers)
 
     # MolmoBot is a clone rather than a dependency, so nothing puts its `olmo`
     # package on the import path. Done here so a missing checkout is a message
@@ -671,19 +764,19 @@ def main(
             "than overwriting them.",
             fg="yellow",
         )
-    benchmark_dir = mini_benchmark.build(output_dir / "benchmark", force=rebuild_benchmark)
-
-    # Both hooks wrap the same rollout, once, for the whole search: the recorder
-    # writes into each evaluation's own output directory, and the probe is
-    # emptied between trials.
+    benchmark_dir = mini_benchmark.build(
+        output_dir / "benchmark", force=rebuild_benchmark, scene_count=scene_count
+    )
     install_eval_video_hook()
-    probe = install_probe()
+    probe = install_probe()  # its sink is set per trial by the runner
     runner = TrialRunner(
         benchmark_dir=benchmark_dir,
         output_root=output_dir,
         probe=probe,
         episode_steps=episode_steps,
         checkpoint=checkpoint,
+        num_workers=workers,
+        scene_count=scene_count,
     )
 
     trials: list[TrialResult] = []
@@ -721,17 +814,29 @@ def main(
     click.secho(f"Wrote {report}", fg="green")
 
 
-def sweep_axes(stage: str, robot: str) -> list[Axis]:
-    """The axes a stage sweeps for a given robot, at their declared sweep values.
+def sweep_axes(stage: str, setup_key: str) -> list[Axis]:
+    """The axes a stage sweeps for one setup, at their declared sweep values.
 
-    Empty when no dimension in the stage applies -- the gripper stage on a
-    Franka setup -- which the caller takes as "skip".
+    Empty when nothing in the stage applies, which the caller takes as "skip".
+    That happens three ways, all deliberate: the gripper stage on a Franka setup
+    (nothing to retarget), any stage on a setup whose `camera_dims` is empty
+    (`franka_baseline`, the control), and a camera dimension the setup does not
+    use -- the rectified setups list `virtual_pitch_deg` where the others list
+    `pitch_deg`.
     """
+    setup = SETUPS[setup_key]
     names = dict(SWEEP_STAGES)[stage]
+    if stage == "camera":
+        names = tuple(name for name in names if name in setup.camera_dims)
+    elif not setup.camera_dims:
+        # A setup pinned out of the camera sweep is pinned out of all of them:
+        # it is a control, and a control with a searched gripper is not one.
+        return []
+
     axes = []
     for name in names:
         dimension = DIMENSIONS[name]
-        if robot not in dimension.robots:
+        if setup.robot not in dimension.robots:
             continue
         values = dimension.sweep
         axes.append(Axis(dimension, min(values), max(values), len(values), values))
@@ -742,11 +847,15 @@ def sweep_plan(keys: list[str]) -> list[tuple[str, str, int]]:
     """`(setup, stage, trial count)` for every stage the sweep will run."""
     plan = []
     for setup_key in keys:
-        robot = SETUPS[setup_key].robot
+        swept = False
         for stage, _ in SWEEP_STAGES:
-            axes = sweep_axes(stage, robot)
+            axes = sweep_axes(stage, setup_key)
             if axes:
                 plan.append((setup_key, stage, len(grid_points(axes))))
+                swept = True
+        if not swept:
+            # A control still runs, once, at its own parameters.
+            plan.append((setup_key, "default", 1))
     return plan
 
 
@@ -763,10 +872,13 @@ def _run_sweep(
     one, so a GPU that filled up mid-sweep costs that stage rather than every
     stage after it.
     """
-    robot = SETUPS[setup_key].robot
     best = base
+    if not any(sweep_axes(stage, setup_key) for stage, _ in SWEEP_STAGES):
+        log.info(f"[sweep] {setup_key}: not swept (control); one run at its own parameters")
+        record(runner.run(setup_key, best, "default"))
+        return
     for stage, _ in SWEEP_STAGES:
-        axes = sweep_axes(stage, robot)
+        axes = sweep_axes(stage, setup_key)
         if not axes:
             log.info(f"[sweep] {setup_key}: no {stage} dimensions apply, skipping")
             continue
@@ -793,6 +905,49 @@ def _run_sweep(
         )
 
 
+WORKER_VRAM_GIB = 17.0
+"""
+GPU memory one rollout worker needs at its *peak*, in GiB.
+
+Each worker is a separate process that loads its own copy of the DROID
+checkpoint -- `molmobot_droid_policy._LOADED_MODELS` caches per process, and
+processes share nothing -- so VRAM, not the scene count, is what caps
+parallelism.
+
+Sized on the peak rather than the steady state, which is the correction that
+matters: a worker sits around 12.7 GiB between inferences and climbs past
+16.5 GiB while generating an action chunk. Two workers therefore fit *most* of
+the time and collide whenever both happen to be mid-inference, which is how a
+run gets an hour in before failing. Measured from an OOM report with two workers
+live: 12.74 + 16.55 = 29.3 GiB of a 31.3 GiB card.
+
+The consequence is worth stating plainly rather than hiding in a number: on a
+32 GiB card this checkpoint supports **one** worker. Parallel rollouts need a
+bigger card, a smaller model, or fewer scenes per trial -- see `--scenes`.
+"""
+
+
+def affordable_workers(scene_count: int) -> int:
+    """How many workers the GPU can actually hold, capped at the scene count.
+
+    More workers than scenes would idle -- MolmoSpaces takes a *house* as its
+    unit of work -- and more workers than VRAM allows would crash partway
+    through, so the default is the smaller of the two. Falls back to the scene
+    count when there is no GPU to ask, which is the CPU case where memory is not
+    the constraint.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return scene_count
+        free_bytes, _ = torch.cuda.mem_get_info()
+        affordable = int(free_bytes / (WORKER_VRAM_GIB * 1024**3))
+    except Exception:  # noqa: BLE001 - a default must not depend on torch importing
+        return 1
+    return max(1, min(scene_count, affordable))
+
+
 SECONDS_PER_ROLLOUT = 45
 """
 Rough wall-clock per rollout, for the estimate printed before a sweep.
@@ -803,7 +958,7 @@ used to print an order of magnitude, so it does not need to be right.
 """
 
 
-def _announce_sweep(keys: list[str]) -> None:
+def _announce_sweep(keys: list[str], scenes: int, workers: int) -> None:
     """Print what the sweep will run before it starts, with a time estimate.
 
     A default that takes hours should say so on the first line rather than in
@@ -811,15 +966,20 @@ def _announce_sweep(keys: list[str]) -> None:
     """
     plan = sweep_plan(keys)
     trials = sum(count for _, _, count in plan)
-    rollouts = trials * len(mini_benchmark.TARGETS)
-    click.secho(f"Sweeping {len(keys)} setup(s): {trials} trials, {rollouts} rollouts.", bold=True)
+    rollouts = trials * len(mini_benchmark.TARGETS) * scenes
+    click.secho(
+        f"Sweeping {len(keys)} setup(s): {trials} trials x {scenes} scenes x "
+        f"{len(mini_benchmark.TARGETS)} objects = {rollouts} rollouts, {workers} workers.",
+        bold=True,
+    )
     for setup_key, stage, count in plan:
-        axes = sweep_axes(stage, SETUPS[setup_key].robot)
-        names = ", ".join(
-            f"{axis.dimension.name}({len(axis.grid_values())})" for axis in axes
+        axes = sweep_axes(stage, setup_key) if stage != "default" else []
+        names = (
+            ", ".join(f"{axis.dimension.name}({len(axis.grid_values())})" for axis in axes)
+            or "its own parameters"
         )
         click.echo(f"  {setup_key:20s} {stage:8s} {count:3d} trials   {names}")
-    hours = rollouts * SECONDS_PER_ROLLOUT / 3600
+    hours = rollouts * SECONDS_PER_ROLLOUT / 3600 / max(1, workers)
     click.secho(
         f"Roughly {hours:.0f} hours. Results are written after every trial, so the run "
         "can be stopped at any point and what it has is already in report.md.",
@@ -849,6 +1009,8 @@ def _run_cmaes(
     setup_key: str,
     base: RetargetParams,
     axes: list[Axis],
+    scene_count: int,
+    num_workers: int | None,
     population: int,
     generations: int,
     seed: int,

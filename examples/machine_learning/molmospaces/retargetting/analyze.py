@@ -92,13 +92,29 @@ def load(run_dir: Path) -> pd.DataFrame:
             "trials.csv; they are written together, so one of them is from another run."
         )
 
+    # `trial` is the explicit grouping key, written since episodes stopped
+    # arriving in order (several workers finish in whichever order they finish).
+    # Older runs predate the column and are still four-to-a-trial, in order.
+    grouped = dict(tuple(episodes.groupby("trial"))) if "trial" in episodes else None
+
     rows = []
     for index, (trial, (_, row)) in enumerate(zip(trials, summary.iterrows())):
         params = trial["params"]["params"]
         exo = params["exo"]
-        # Episodes are grouped four to a trial, in the benchmark's own order.
-        window = episodes.iloc[index * 4 : (index + 1) * 4]
-        picked = {f"picked_{r.target}": bool(r.success) for r in window.itertuples()}
+        window = (
+            grouped.get(index, episodes.iloc[0:0])
+            if grouped is not None
+            else episodes.iloc[index * 4 : (index + 1) * 4]
+        )
+        # One object now appears once per scene, so this is the share of scenes
+        # it was picked up in rather than a yes/no -- which is what makes the
+        # per-object table below a success rate.
+        picked = {}
+        for name in OBJECT_COLUMNS:
+            attempts = window[window.target == name]
+            picked[f"picked_{name}"] = (
+                float(attempts.success.mean()) if len(attempts) else float("nan")
+            )
         rows.append(
             {
                 "setup": trial["setup"],
@@ -115,6 +131,8 @@ def load(run_dir: Path) -> pd.DataFrame:
                 "wrist_tilt_deg": params["wrist_tilt_deg"],
                 "z_offset_fraction": params["z_offset_fraction"],
                 "error": str(row["error"]) if isinstance(row["error"], str) else "",
+                "episodes": int(len(window)),
+                "scenes": int(window.scene.nunique()) if "scene" in window else 1,
                 **picked,
             }
         )
@@ -160,7 +178,8 @@ def analyse(df: pd.DataFrame) -> str:
     parts: list[str] = [
         "# Sweep analysis",
         "",
-        f"{len(df)} trials, {len(df) * 4} rollouts"
+        f"{len(df)} trials, {int(df.episodes.sum())} rollouts across "
+        f"{int(df.scenes.max())} scene(s)"
         + (f", {int((df.error != '').sum())} errored" if (df.error != "").any() else "")
         + ".",
         "",
@@ -186,8 +205,9 @@ def analyse(df: pd.DataFrame) -> str:
         "",
         "## Which objects are winnable",
         "",
-        "Success rate per object over every trial in the sweep — this is a property of "
-        "the objects, not of any setting.",
+        "Success rate per object over every episode in the sweep — this is a property of "
+        "the objects, not of any setting. With more than one scene each object is attempted "
+        "once per scene, so this averages over scenes as well as over settings.",
         "",
         _markdown(
             pd.DataFrame(

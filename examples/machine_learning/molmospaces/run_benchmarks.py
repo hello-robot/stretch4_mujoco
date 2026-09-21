@@ -104,8 +104,19 @@ POLICY_CHOICES = (
     "bc",
     "molmobot",
     "molmobot_droid",
+    "molmobot_droid_retarget",
     "dummy",
 )
+
+RETARGET_CONFIG_MODULE = "examples.machine_learning.molmospaces.retargetting.setups"
+"""
+Where `--policy molmobot_droid_retarget`'s eval config lives.
+
+A second module, because the retargeting study's configs are parameterised by a
+camera and a tool correction that `configs.py`'s are not -- see
+`retargetting/setups.py`. `eval_config_for` therefore returns a fully qualified
+"module:Class" rather than a bare class name.
+"""
 
 
 @dataclass
@@ -124,21 +135,25 @@ class BenchmarkResult:
 
 
 def eval_config_for(policy: str, benchmark_key: str) -> str:
-    """The eval config class name to run `policy` on `benchmark_key`.
+    """The qualified "module:Class" eval config to run `policy` on `benchmark_key`.
 
     'baseline' is the only selector that varies by benchmark: navigation needs a
     path planner and everything else needs the simple_ik manipulator.
     """
+    if policy == "molmobot_droid_retarget":
+        return f"{RETARGET_CONFIG_MODULE}:RetargetStretchDroidEvalConfig"
     if policy == "baseline":
-        return DEFAULT_BASELINE_CONFIGS[benchmark_key]
-    return {
-        "simple_ik": "StretchSimpleIKEvalConfig",
-        "simple_ik_top_down": "StretchSimpleIKTopDownEvalConfig",
-        "bc": "StretchBCEvalConfig",
-        "molmobot": "StretchMolmoBotEvalConfig",
-        "molmobot_droid": "StretchMolmoBotDroidEvalConfig",
-        "dummy": "StretchDummyEvalConfig",
-    }[policy]
+        return qualified_config_name(DEFAULT_BASELINE_CONFIGS[benchmark_key])
+    return qualified_config_name(
+        {
+            "simple_ik": "StretchSimpleIKEvalConfig",
+            "simple_ik_top_down": "StretchSimpleIKTopDownEvalConfig",
+            "bc": "StretchBCEvalConfig",
+            "molmobot": "StretchMolmoBotEvalConfig",
+            "molmobot_droid": "StretchMolmoBotDroidEvalConfig",
+            "dummy": "StretchDummyEvalConfig",
+        }[policy]
+    )
 
 
 def run_benchmark(
@@ -164,7 +179,7 @@ def run_benchmark(
         benchmark=benchmark_key,
         display_name=benchmark.display_name,
         policy=policy,
-        eval_config=config_name,
+        eval_config=config_name.rsplit(":", 1)[-1],
         episodes=0,
         successes=0,
         success_rate=0.0,
@@ -180,11 +195,11 @@ def run_benchmark(
     try:
         benchmark_dir = resolve_benchmark_dir(benchmark_key, alternate=alternate)
         log.info(
-            f"[run] {benchmark.display_name} | {config_name} | "
+            f"[run] {benchmark.display_name} | {config_name.rsplit(':', 1)[-1]} | "
             f"{episodes if episodes is not None else 'all'} episodes | {benchmark_dir}"
         )
         evaluation = run_evaluation(
-            eval_config_cls=qualified_config_name(config_name),
+            eval_config_cls=config_name,
             benchmark_dir=benchmark_dir,
             checkpoint_path=checkpoint,
             output_dir=output_root / benchmark_key,
@@ -339,6 +354,21 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     help="After each benchmark, write captioned review videos, per-episode telemetry "
     "CSVs and a summary. See report.py, which can also be run separately.",
 )
+@click.option(
+    "--retarget-setup",
+    type=str,
+    default="stretch_stretchcam",
+    help="Which retargetting setup --policy molmobot_droid_retarget starts from: its "
+    "camera, lens and tool correction. See `retargetting/params_search.py --list-setups`.",
+)
+@click.option(
+    "--retarget-params",
+    type=str,
+    default=None,
+    help="Override that setup's parameters. Either the one-line description the search "
+    "prints (copy it straight out of report.md or trials.csv), a JSON blob as written to "
+    "trials.jsonl, or @path to a file holding either.",
+)
 @click.option("--list", "list_only", is_flag=True, help="List the benchmarks and exit.")
 def main(
     benchmark_keys: tuple[str, ...],
@@ -355,6 +385,8 @@ def main(
     export_to_mp4: bool,
     export_cameras: tuple[str, ...],
     want_report: bool,
+    retarget_setup: str,
+    retarget_params: str | None,
     list_only: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -398,7 +430,13 @@ def main(
             "`python -m examples.machine_learning.molmospaces.finetuning.finetune "
             "--rollouts <run> --trainer molmobot`."
         )
-    if policy not in ("molmobot", "molmobot_droid") and molmobot_action_type:
+    if policy != "molmobot_droid_retarget" and retarget_params:
+        raise click.UsageError(
+            "--retarget-params only applies to --policy molmobot_droid_retarget."
+        )
+    if policy == "molmobot_droid_retarget":
+        _publish_retarget_params(retarget_setup, retarget_params)
+    if policy not in ("molmobot", "molmobot_droid", "molmobot_droid_retarget") and molmobot_action_type:
         raise click.UsageError(
             "--molmobot-action-type only applies to --policy molmobot and --policy "
             "molmobot_droid."
@@ -410,7 +448,7 @@ def main(
     if molmobot_action_type:
         os.environ[MOLMOBOT_ACTION_TYPE_ENV_VAR] = molmobot_action_type
 
-    if policy in ("molmobot", "molmobot_droid"):
+    if policy in ("molmobot", "molmobot_droid", "molmobot_droid_retarget"):
         # MolmoBot is a clone, not a dependency, so nothing puts its `olmo`
         # package on the import path. Done before the first rollout rather than
         # inside the policy so a missing checkout is a message here, at the
@@ -474,6 +512,140 @@ def main(
     write_results_csv(results, results_path)
     click.echo("\n" + format_results_table(results) + "\n")
     click.secho(f"Wrote {results_path}", fg="green")
+
+
+def _publish_retarget_params(setup_key: str, override: str | None) -> None:
+    """Put the retargeting parameters where the eval config will read them.
+
+    `run_evaluation` builds the experiment config itself, from a class named by a
+    "module:Class" string, so there is no seam to pass a parameter through: the
+    config reads its trial out of the environment instead. This is the same route
+    `params_search.py` uses, which is what lets a configuration found by the
+    search be replayed here on a real benchmark without retyping it.
+
+    `override` is accepted in whichever form it is to hand -- the description
+    line from a report, the JSON from `trials.jsonl`, or a file containing
+    either -- because the point of this flag is copy-and-paste from a result.
+    """
+
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        SETUP_KEYS,
+        SETUPS,
+        params_from_json,
+        publish_params,
+    )
+
+    if setup_key not in SETUPS:
+        raise click.UsageError(
+            f"Unknown --retarget-setup {setup_key!r}. Available: {', '.join(SETUP_KEYS)}."
+        )
+    params = SETUPS[setup_key].params
+
+    if override:
+        text = override
+        if text.startswith("@"):
+            text = Path(text[1:]).expanduser().read_text()
+        text = text.strip()
+        if text.startswith("{"):
+            setup_key, params = params_from_json(text)
+        else:
+            params = _params_from_description(params, text)
+
+    log.info(f"[retarget] {setup_key}: {params.describe()}")
+    publish_params(setup_key, params)
+
+
+def _params_from_description(base, text: str):
+    """Rebuild parameters from the one-line description a report prints.
+
+    The description is written by `RetargetParams.describe()` as `key=value`
+    pairs, and everything in it that a trial can differ by is read back here --
+    the optics as well as the numbers. That matters more than it looks: the lens
+    fields shape the image rather than merely nudging it, so a `fisheye=rectified`
+    description silently keeping the setup's `distorted` lens does not produce a
+    slightly different run, it produces the wrong one.
+
+    What is *not* read back is the mount body and position. Those are fixed by
+    the setup, are quoted in the description for identification rather than
+    editing, and a description naming a different mount is rejected rather than
+    half-applied.
+    """
+    import dataclasses
+    import re
+
+    from examples.machine_learning.molmospaces.retargetting.cameras import FISHEYE_MODES
+
+    mount = re.match(r"\s*(\S+)\s", text)
+    if mount and mount.group(1) != base.exo.mount_body:
+        raise click.UsageError(
+            f"That description is for mount {mount.group(1)}, but --retarget-setup names a "
+            f"setup mounted at {base.exo.mount_body}. Pass the matching --retarget-setup."
+        )
+
+    numbers = {
+        key: float(value)
+        for key, value in re.findall(
+            r"(pitch|roll|fovy|vpitch|grasp_offset|wrist_tilt|z_frac|turns)=([-+0-9.]+)", text
+        )
+    }
+    sizes = {
+        key: (int(width), int(height))
+        for key, width, height in re.findall(r"(render|out)=(\d+)x(\d+)", text)
+    }
+    lens = re.search(r"fisheye=(\w+)", text)
+
+    exo_changes = {}
+    for name, field in (("pitch", "pitch_deg"), ("roll", "roll_deg"), ("fovy", "fovy")):
+        if name in numbers:
+            exo_changes[field] = numbers[name]
+    # `describe()` omits `vpitch=` entirely when there is no synthesised pitch,
+    # so its absence is a value -- "leave the crop centred" -- not a silence to
+    # fall back on the setup through.
+    exo_changes["virtual_pitch_deg"] = numbers.get("vpitch")
+    if "turns" in numbers:
+        exo_changes["quarter_turns"] = int(numbers["turns"])
+    if "render" in sizes:
+        exo_changes["render_size"] = sizes["render"]
+    if lens:
+        if lens.group(1) not in FISHEYE_MODES:
+            raise click.UsageError(
+                f"Unknown fisheye mode {lens.group(1)!r} in --retarget-params. "
+                f"Expected one of: {', '.join(FISHEYE_MODES)}."
+            )
+        exo_changes["fisheye"] = lens.group(1)
+
+    changes = {}
+    for name, field in (
+        ("grasp_offset", "grasp_offset_m"),
+        ("wrist_tilt", "wrist_tilt_deg"),
+        ("z_frac", "z_offset_fraction"),
+    ):
+        if name in numbers:
+            changes[field] = numbers[name]
+
+    if not numbers and not sizes and not lens:
+        raise click.UsageError(
+            "Could not read any parameters out of --retarget-params. Pass the description "
+            "line a report prints, or the JSON from trials.jsonl."
+        )
+
+    params = dataclasses.replace(
+        base, exo=dataclasses.replace(base.exo, **exo_changes), **changes
+    )
+
+    # `out=` is `output_size()`, which is the crop when there is one and the
+    # rotated render otherwise -- so it says whether to crop without the
+    # description having to carry `crop_to` separately.
+    if "out" in sizes:
+        width, height = params.exo.render_size
+        rotated = (height, width) if params.exo.quarter_turns % 2 else (width, height)
+        params = dataclasses.replace(
+            params,
+            exo=dataclasses.replace(
+                params.exo, crop_to=None if sizes["out"] == rotated else sizes["out"]
+            ),
+        )
+    return params
 
 
 def _write_reports(results: list[BenchmarkResult]) -> None:

@@ -204,7 +204,7 @@ def report_objects(shortfall: float) -> None:
 
 
 COUNTER_Z = 0.9384
-"""The counter top in this kitchen, as `mini_benchmark.surface_height` measures it."""
+"""The counter top in the hand-tuned kitchen, as `mini_benchmark.surface_under` measures it."""
 
 
 def report_grasp_offset(view, namespace: str, shortfall: float) -> None:
