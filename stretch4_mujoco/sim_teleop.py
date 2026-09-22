@@ -56,7 +56,13 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 
 # Header constants, mirroring stretch4_body/core/gamepad_teleop.py
-STEP_SLEEP = 1 / 15
+#
+# The robot polls at 15Hz, which is as fast as its servo bus is worth reading. In
+# sim there is no bus -- the server runs at 100Hz -- and 15Hz costs up to 67ms
+# between a d-pad going down and anything being commanded, on top of the joint's
+# own acceleration ramp. Per-step deltas are all derived from this, so raising it
+# changes when commands are issued, not how fast the joints then move.
+STEP_SLEEP = 1 / 50
 
 # Button Hold Durations
 START_BUTTON_HOLD_TIME_S = 3
@@ -448,13 +454,13 @@ class GamepadTeleop:
             )
         if self.use_devices["eoa"]:
             self.wrist_yaw_command = gamepad_joints.CommandWristYaw(
-                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+                motion_profile=self.motion_profile.get_name()
             )
             self.wrist_pitch_command = gamepad_joints.CommandWristPitch(
-                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+                motion_profile=self.motion_profile.get_name()
             )
             self.wrist_roll_command = gamepad_joints.CommandWristRoll(
-                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+                motion_profile=self.motion_profile.get_name()
             )
         if self.use_devices["gripper"]:
             self.gripper = gamepad_joints.CommandStretchGripperPosition(

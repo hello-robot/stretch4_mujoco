@@ -24,10 +24,10 @@ Differences from the robot-side file:
 
 * `RobotParams()` is not available in sim, so the SE4 motion profiles are baked
   into `ROBOT_PARAMS` below, copied verbatim from `robot_params_SE4.py`.
-* Feetech joints are position-stepped rather than velocity-profiled by a servo,
-  so `CommandFeetechJoint._move()` clamps its step to `velocity * dt`. That
-  reproduces "move at most `velocity` over one control period", which is what
-  the robot's move_by(delta, velocity) achieves with its trapezoidal profile.
+* The robot's per-tick `move_by(dx_deg)` jogs become `set_velocity()` here, at
+  the speed that step implies over the robot's control period. The sim joints
+  run trapezoidal profiles of their own, so a stream of position deltas would
+  fight them -- see `CommandFeetechJoint`.
 * The gripper is commanded in aperture radians instead of the robot's percent.
 """
 
@@ -254,9 +254,20 @@ class CommandArm:
 
 
 class CommandFeetechJoint:
-    """Abstract motion command class for Feetech joints."""
+    """Abstract motion command class for Feetech joints.
 
-    def __init__(self, name, dx_deg, vel_type, acc_type, dt: float = DEFAULT_STEP_SLEEP):
+    Jogs are issued as a velocity, not as a position delta per tick. Re-issuing
+    `move_by(dx)` every tick -- which is what this used to do, back when the sim
+    had no velocity profiles -- chains each delta off the *commanded* position, so
+    the goal runs away from the joint at the full jog rate while the profile can
+    only close on it at `sqrt(2 * accel * error)`. The two balance at a permanent
+    lag of `rate**2 / (2 * accel)`, which for the wrists' 3.93 rad/s and
+    7 rad/s**2 is 1.1 rad: the wrist trails the stick by 63 degrees and, because
+    that travel is already committed to the goal, keeps going for another 1.1 rad
+    after the stick is released.
+    """
+
+    def __init__(self, name, dx_deg, vel_type, acc_type):
         self.params = ROBOT_PARAMS[name]
         self.name = name
         self.dead_zone = 0.001
@@ -264,32 +275,23 @@ class CommandFeetechJoint:
         self.max_vel = self.params["motion"][vel_type]["vel"]
         self.acc = self.params["motion"][acc_type]["accel"]
         self.precision_mode = 0.0
-        self.dt = dt
 
     def _get_subsystem(self, robot: "StretchMujocoSimulator"):
         return getattr(robot.end_of_arm, self.name)
 
     def _move(self, dx_deg, robot: "StretchMujocoSimulator", velocity: float | None = None):
         scale = 1.0 - (0.95 * self.precision_mode)
-        dx_deg = dx_deg * scale
 
-        capped_velocity = min(self.max_vel, velocity) if velocity is not None else self.max_vel
+        # `dx_deg` is a per-tick step sized for the robot's control period. Held
+        # down it means a continuous jog, so turn it into the speed it implies
+        # rather than re-issuing it as a position delta every tick -- see the
+        # class docstring for why that distinction matters so much here.
+        v_rad = deg_to_rad(dx_deg) * scale / DEFAULT_STEP_SLEEP
 
-        # The sim's move_by() applies the delta straight to the position actuator, so
-        # the velocity cap has to be applied here as a per-step limit on the delta.
-        dx_rad = deg_to_rad(dx_deg)
-        max_step_rad = capped_velocity * self.dt
-        dx_rad = max(-max_step_rad, min(max_step_rad, dx_rad))
+        cap = min(self.max_vel, velocity) if velocity is not None else self.max_vel
+        v_rad = max(-cap, min(cap, v_rad))
 
-        if dx_rad == 0.0:
-            # A zero-delta move_by is a no-op on the robot, but not in sim: move_by
-            # targets `current measured position + delta`, so on a gravity-loaded joint
-            # (wrist_pitch) it re-targets the sagged position and ratchets the joint down
-            # a little every call. Holding the existing setpoint is what "no motion" means
-            # for a position actuator, so send nothing.
-            return
-
-        self._get_subsystem(robot).move_by(dx_rad, capped_velocity, self.acc)
+        self._get_subsystem(robot).set_velocity(v_rad, self.acc)
 
     def command_button_to_motion(self, direction, robot: "StretchMujocoSimulator"):
         """Make servo move based on a button state.
@@ -314,10 +316,13 @@ class CommandFeetechJoint:
         """Stop the joint motion. To be used whenever the controller is idle/no-inputs
         to stop unnecessary robot motion.
 
-        The robot sends move_by(name, 0) here. In sim the position actuator already
-        holds its setpoint, and re-sending a zero move_by would drift the joint (see
-        `_move`), so this is a no-op.
+        Braking at the `max` acceleration rather than the jog's own, which is what
+        the robot does for every other joint: letting go of the stick should stop
+        the wrist, not coast it to a halt.
         """
+        self._get_subsystem(robot).set_velocity(
+            0.0, self.params["motion"]["max"]["accel"]
+        )
 
 
 class CommandWristYaw(CommandFeetechJoint):
@@ -328,9 +333,8 @@ class CommandWristYaw(CommandFeetechJoint):
         name="wrist_yaw",
         dx_deg=15.0,
         motion_profile: str = "default",
-        dt: float = DEFAULT_STEP_SLEEP,
     ):
-        super().__init__(name, dx_deg, motion_profile, motion_profile, dt=dt)
+        super().__init__(name, dx_deg, motion_profile, motion_profile)
 
 
 class CommandWristPitch(CommandFeetechJoint):
@@ -341,9 +345,8 @@ class CommandWristPitch(CommandFeetechJoint):
         name="wrist_pitch",
         dx_deg=15.0,
         motion_profile: str = "default",
-        dt: float = DEFAULT_STEP_SLEEP,
     ):
-        super().__init__(name, dx_deg, motion_profile, motion_profile, dt=dt)
+        super().__init__(name, dx_deg, motion_profile, motion_profile)
 
 
 class CommandWristRoll(CommandFeetechJoint):
@@ -360,9 +363,8 @@ class CommandWristRoll(CommandFeetechJoint):
         name="wrist_roll",
         dx_deg=15.0,
         motion_profile: str = "default",
-        dt: float = DEFAULT_STEP_SLEEP,
     ):
-        super().__init__(name, dx_deg, motion_profile, motion_profile, dt=dt)
+        super().__init__(name, dx_deg, motion_profile, motion_profile)
 
 
 class CommandStretchGripperPosition:
@@ -389,8 +391,12 @@ class CommandStretchGripperPosition:
 
     def _move(self, dx_rad, robot: "StretchMujocoSimulator"):
         scale = 1.0 - 0.75 * self.precision_mode
-        dx_rad = dx_rad * scale
-        self._get_subsystem(robot).move_by(dx_rad, self.gripper_vel, self.gripper_accel)
+        # Same per-tick-step -> jog-speed conversion as CommandFeetechJoint, and
+        # for the same reason: chained move_by deltas leave the fingers trailing
+        # the button and still closing after it is let go.
+        v_rad = dx_rad * scale / DEFAULT_STEP_SLEEP
+        v_rad = max(-self.gripper_vel, min(self.gripper_vel, v_rad))
+        self._get_subsystem(robot).set_velocity(v_rad, self.gripper_accel)
         self.stop_reqd = True
 
     def open_gripper(self, robot: "StretchMujocoSimulator"):
@@ -400,8 +406,12 @@ class CommandStretchGripperPosition:
         self._move(-self.gripper_step_rad, robot)
 
     def stop_gripper(self, robot: "StretchMujocoSimulator"):
-        """The robot quick-stops the servo here. In sim the gripper actuator holds its
-        setpoint on its own, and a zero move_by would drift it against a grasped object,
-        so this only clears the flag."""
+        """The robot quick-stops the servo here.
+
+        A zero jog holds the commanded aperture where it is, so a grasp keeps its
+        squeeze: the profile stops advancing the setpoint but does not give any of
+        it back, which is what keeps position error -- and grip force -- built up.
+        """
         if self.stop_reqd:
+            self._get_subsystem(robot).set_velocity(0.0, self.gripper_accel)
             self.stop_reqd = False
