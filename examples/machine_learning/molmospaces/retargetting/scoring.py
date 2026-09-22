@@ -438,7 +438,25 @@ def install_probe(sink: Path | None = None) -> GraspProbe:
     to `visualize.py` -- it is reached here rather than reimplemented so there is
     one place that knows how `JsonEvalRunner.run_single_rollout` is wrapped.
     """
-    from examples.machine_learning.molmospaces.visualize import _install_eval_rollout_hook
+    from examples.machine_learning.molmospaces.visualize import (
+        _EVAL_OBSERVERS,
+        _install_eval_rollout_hook,
+    )
+
+    # Idempotent, like `install_eval_video_hook`, and it has to be: this is called
+    # from `setups.install_worker_hooks()` at module import, and that module is
+    # imported again every time `run_evaluation` resolves an eval config from its
+    # "module:Class" string -- once per setup. Installing a fresh probe each time
+    # left every earlier probe registered and still writing, each to the sink it
+    # was built with, so a run of eight setups wrote its first sink eight times
+    # over: 160 records where 20 were run. Measured on
+    # `eval_output/side_by_side_sept20`, whose first sink holds all eight setups'
+    # episodes concatenated in run order.
+    existing = next((o for o in _EVAL_OBSERVERS if isinstance(o, GraspProbe)), None)
+    if existing is not None:
+        if sink is not None:
+            existing.sink = sink
+        return existing
 
     probe = GraspProbe(sink=sink)
     _install_eval_rollout_hook(probe)
