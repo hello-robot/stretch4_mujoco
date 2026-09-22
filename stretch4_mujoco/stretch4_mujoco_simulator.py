@@ -194,6 +194,9 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             """Checks movement, returns True if movement is detected."""
             time.sleep(check_interval)
 
+            if self._has_move_in_flight(actuator, self.pull_status()):
+                return True
+
             if actuator in [
                 Actuators.left_wheel_vel,
                 Actuators.right_wheel_vel,
@@ -240,7 +243,13 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         return True
 
     @require_connection
-    def _move_to(self, actuator: str | Actuators, pos: float) -> None:
+    def _move_to(
+        self,
+        actuator: str | Actuators,
+        pos: float,
+        v_m: float | None = None,
+        a_m: float | None = None,
+    ) -> None:
         """
         Move the actuator to an absolute position.
         Args:
@@ -262,10 +271,16 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             raise Exception(
                 f"Cannot set an absolute position for a continuous joint {actuator.name}"
             )
-        return super()._move_to(actuator=actuator, pos=pos)
+        return super()._move_to(actuator=actuator, pos=pos, v_m=v_m, a_m=a_m)
 
     @require_connection
-    def _move_by(self, actuator: str | Actuators, pos: float):
+    def _move_by(
+        self,
+        actuator: str | Actuators,
+        pos: float,
+        v_m: float | None = None,
+        a_m: float | None = None,
+    ):
         """
         Move the actuator by a relative amount.
         Args:
@@ -290,7 +305,7 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
                 f"Cannot set an absolute position for a continuous joint {actuator.name}"
             )
 
-        return super()._move_by(actuator=actuator, pos=pos)
+        return super()._move_by(actuator=actuator, pos=pos, v_m=v_m, a_m=a_m)
 
     @require_connection
     def _set_base_velocity(self, v_x: float, v_y: float, omega: float) -> None:

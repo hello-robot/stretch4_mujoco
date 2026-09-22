@@ -16,16 +16,30 @@
         <velocity kv="1" gear="6" forcerange="-100 100" />
         <position kp="1" gear="6" forcerange="-100 100"/>
       </default>
+      <!-- Actuator gains are tuned so each joint tracks its commanded setpoint
+           promptly, because since the trapezoidal profiles landed the setpoint is
+           what carries the intended motion: a joint that trails it by 100ms makes
+           every command feel 100ms late no matter what the profile does.
+
+           For a position actuator the lag in following a ramp is (kv + joint
+           damping) / kp, and the damping ratio is (kv + damping) / (2*sqrt(kp*M)).
+           kv is picked per joint for a damping ratio near 1 against that joint's
+           own inertia (M, from the compiled model), so the joints track closely
+           without ringing -- the wrists have no gravity compensation and will
+           swing through a target if left underdamped. -->
       <default class="lift">
-        <joint damping="50" stiffness="0.03" armature="0.01" frictionloss="1.5" />
-        <general gainprm="2500" biasprm="0 -1000 -100" forcerange="-200 200" />
+        <joint damping="20" stiffness="0.03" armature="0.01" frictionloss="1.5" />
+        <general forcerange="-200 200" />
+        <position kp="8000" kv="200" />
         <default class="lift_stretch4">
-          <general gainprm="2500" biasprm="0 -1000 -100" forcerange="-200 200" />
+          <general forcerange="-200 200" />
+          <position kp="8000" kv="200" />
         </default>
       </default>
       <default class="telescope">
-        <joint damping="50" stiffness="0.02" armature="0.01" frictionloss="1.5" />
-        <general gainprm="500" biasprm="0 -1000 -100" forcerange="-150 150" />
+        <joint damping="20" stiffness="0.02" armature="0.01" frictionloss="1.5" />
+        <general forcerange="-175 175" />
+        <position kp="2500" kv="120" />
       </default>
       <default class="head">
         <joint axis="0 0 1" damping="1" />
@@ -41,27 +55,28 @@
       </default>
 
       <default class="wrist">
+        <general forcerange="-400 400" />
         <joint axis="0 0 1" damping="1" />
         <position kp="10" />
         <default class="wrist_yaw">
           <joint armature="0.01" damping="2" frictionloss=".1" />
-          <position kp="20" />
+          <position kp="400" kv="4.3" />
           <default class="wrist_yaw_stretch4">
-            <position kp="20" />
+            <position kp="400" kv="4.3" />
           </default>
         </default>
         <default class="wrist_pitch">
           <joint armature="0.01" damping="2" frictionloss=".1" />
-          <position kp="20" />
+          <position kp="400" kv="3.5" />
           <default class="wrist_pitch_stretch4">
-            <position kp="20" />
+            <position kp="400" kv="3.5" />
           </default>
         </default>
         <default class="wrist_roll">
           <joint armature="0.01" damping="2" frictionloss=".1" />
-          <position kp="20" />
+          <position kp="250" kv="1.2" />
           <default class="wrist_roll_stretch4">
-            <position kp="20" />
+            <position kp="250" kv="1.2" />
           </default>
         </default>
         <default class="finger_open">

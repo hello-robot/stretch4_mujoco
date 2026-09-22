@@ -25,7 +25,6 @@ from stretch4_mujoco.datamodels.status_command import (
     CommandCoordinateFrameArrowsViz,
     CommandKeyframe,
     CommandMove,
-    StatusCommand,
 )
 import stretch4_mujoco.utils as utils
 from stretch4_mujoco.utils import require_connection, block_until_check_succeeds
@@ -114,7 +113,12 @@ class StretchMujocoSimulator:
         return StretchCameras.rgb_stretch3()
 
     def start(
-        self, show_viewer_ui: bool = False, headless: bool = False, use_passive_viewer: bool = True
+        self,
+        show_viewer_ui: bool = False,
+        headless: bool = False,
+        use_passive_viewer: bool = True,
+        viewer_track_body: str | None = None,
+        viewer_look_at_body: str | None = None,
     ) -> None:
         """
         Start the simulator
@@ -123,6 +127,17 @@ class StretchMujocoSimulator:
             show_viewer_ui: bool, whether to show the Mujoco viewer UI
             headless: bool, whether to run the simulation in headless mode
             use_passive_viewer: bool, to use the passive or managed mujoco UI viewer.
+            viewer_track_body: name of a body for the viewer camera to follow,
+                e.g. "stretch4". Worth setting in a large scene, where Mujoco's
+                default framing of the whole model leaves the robot a few pixels
+                across. Only the passive viewer honours it; the managed viewer
+                gives no handle to configure. You can still orbit and zoom
+                normally afterwards.
+            viewer_look_at_body: name of a body to aim the viewer's *free* camera
+                at once, at startup. Same fix as viewer_track_body for the same
+                problem, but the camera then stays where the mouse leaves it
+                instead of following the body -- panning included, which a
+                tracking camera overrides. Ignored if viewer_track_body is set.
         """
         self.is_stop_called = False
 
@@ -154,6 +169,8 @@ class StretchMujocoSimulator:
                 self._cameras_to_use,
                 self._start_translation,
                 self._start_rotation_quat,
+                viewer_track_body,
+                viewer_look_at_body,
             ),
             daemon=False,  # We're gonna handle terminating this in stop_mujoco_process()
         )
@@ -257,10 +274,12 @@ class StretchMujocoSimulator:
         Move the robot to home position
         """
         with self._command_lock:
-            self.data_proxies.set_command(
-                StatusCommand(keyframe=CommandKeyframe(name="home", trigger=True))
-            )
-        self.wait_while_is_moving(Actuators.lift)
+            command = self.data_proxies.get_command()
+            command.set_keyframe(CommandKeyframe(name="home", trigger=True))
+            self.data_proxies.set_command(command)
+
+        # See stow(): the joints ramp into the pose and finish at different times.
+        self.wait_command(timeout=30.0)
 
     @require_connection
     def stow(self) -> None:
@@ -268,11 +287,14 @@ class StretchMujocoSimulator:
         Move the robot to stow position
         """
         with self._command_lock:
-            self.data_proxies.set_command(
-                StatusCommand(keyframe=CommandKeyframe(name="stow", trigger=True))
-            )
+            command = self.data_proxies.get_command()
+            command.set_keyframe(CommandKeyframe(name="stow", trigger=True))
+            self.data_proxies.set_command(command)
 
-        self.wait_while_is_moving(Actuators.wrist_pitch)
+        # Every joint ramps into the pose now, and they finish at different times
+        # (the lift crosses most of its travel while the wrist is long done), so
+        # waiting on one representative joint would return mid-stow.
+        self.wait_command(timeout=30.0)
 
     def is_reached_set_position(self, actuator: str | Actuators, position_tolerance: float = 0.05):
         """
@@ -412,6 +434,12 @@ class StretchMujocoSimulator:
             status = self.pull_status()
             if status.base.active_translate_x or status.base.active_translate_y or status.base.active_rotate:
                 any_moving = True
+
+            # ...and for joints whose motion profile has not finished. A
+            # rate-limited joint leaves the position checks above unmoved for the
+            # first tick or two of a move, while it accelerates from rest.
+            if status.actuators_in_motion:
+                any_moving = True
                     
             if not any_moving:
                 # All joints are stable!
@@ -422,6 +450,29 @@ class StretchMujocoSimulator:
         return False
 
     _last_movement_positions: dict[Actuators, float | tuple[float, float, float]] = {}
+
+    def _has_move_in_flight(self, actuator: Actuators, status: StatusStretchJoints) -> bool:
+        """Whether the server still has a rate-limited move in flight for `actuator`.
+
+        Position stability on its own no longer means "stopped": a rate-limited
+        joint accelerates from rest, so for the first tick or two of a move it has
+        not measurably left where it started. `status.actuators_in_motion` is the
+        server saying otherwise.
+        """
+        in_motion = set(status.actuators_in_motion)
+        if not in_motion:
+            return False
+        if actuator == Actuators.gripper:
+            # Commanded as an aperture, driven as two fingers on Stretch 4.
+            return bool(
+                in_motion
+                & {
+                    Actuators.gripper.name,
+                    Actuators.gripper_left_finger.name,
+                    Actuators.gripper_right_finger.name,
+                }
+            )
+        return actuator.name in in_motion
 
     def wait_while_is_moving(
         self,
@@ -440,6 +491,9 @@ class StretchMujocoSimulator:
         def check_if_moved():
             """Checks movement, returns True if movement is detected."""
             time.sleep(check_interval)
+
+            if self._has_move_in_flight(actuator, self.pull_status()):
+                return True
 
             if actuator in [
                 Actuators.left_wheel_vel,
@@ -487,7 +541,13 @@ class StretchMujocoSimulator:
         return True
 
     @require_connection
-    def _move_to(self, actuator: str | Actuators, pos: float) -> None:
+    def _move_to(
+        self,
+        actuator: str | Actuators,
+        pos: float,
+        v_m: float | None = None,
+        a_m: float | None = None,
+    ) -> None:
         """
         Move the actuator to an absolute position.
         Args:
@@ -511,12 +571,22 @@ class StretchMujocoSimulator:
 
         with self._command_lock:
             command = self.data_proxies.get_command()
-            command.set_move_to(CommandMove(actuator_name=actuator.name, pos=pos, trigger=True))
+            command.set_move_to(
+                CommandMove(
+                    actuator_name=actuator.name, pos=pos, trigger=True, vel=v_m, accel=a_m
+                )
+            )
 
             self.data_proxies.set_command(command)
 
     @require_connection
-    def _move_by(self, actuator: str | Actuators, pos: float):
+    def _move_by(
+        self,
+        actuator: str | Actuators,
+        pos: float,
+        v_m: float | None = None,
+        a_m: float | None = None,
+    ):
         """
         Move the actuator by a relative amount.
         Args:
@@ -542,13 +612,17 @@ class StretchMujocoSimulator:
 
             command.set_move_by(
                 # We set the pos here, and not new_position, because this relative motion math is handled by mujoco_server:
-                CommandMove(actuator_name=actuator.name, pos=pos, trigger=True)
+                CommandMove(
+                    actuator_name=actuator.name, pos=pos, trigger=True, vel=v_m, accel=a_m
+                )
             )
 
             self.data_proxies.set_command(command)
 
     @require_connection
-    def _set_joint_velocity(self, actuator: str | Actuators, v_m: float):
+    def _set_joint_velocity(
+        self, actuator: str | Actuators, v_m: float, a_m: float | None = None
+    ):
         """
         Set continuous velocity for a joint.
         """
@@ -557,7 +631,7 @@ class StretchMujocoSimulator:
 
         with self._command_lock:
             command = self.data_proxies.get_command()
-            command.set_joint_velocity(actuator.name, v_m)
+            command.set_joint_velocity(actuator.name, v_m, a_m)
             self.data_proxies.set_command(command)
 
     @require_connection
@@ -712,13 +786,13 @@ class JointSubsystem:
         return getattr(self._sim.pull_status(), self._name)
 
     def move_to(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
-        self._sim._move_to(self._actuator, x_m)
+        self._sim._move_to(self._actuator, x_m, v_m, a_m)
 
     def move_by(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
-        self._sim._move_by(self._actuator, x_m)
+        self._sim._move_by(self._actuator, x_m, v_m, a_m)
 
     def set_velocity(self, v_m, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
-        self._sim._set_joint_velocity(self._actuator, v_m)
+        self._sim._set_joint_velocity(self._actuator, v_m, a_m)
 
 
 class EndOfArmSubsystem:

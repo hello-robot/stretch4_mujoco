@@ -537,7 +537,13 @@ class GamePadController:
         self.STOP_FRAME_COUNT = 5
 
         # Threading attributes natively managed
-        self.thread_rate_hz = 25.0
+        #
+        # This is the rate the pad's state is refreshed at, so it sets the floor on
+        # how late a button press can reach the control loop -- at 25Hz a press
+        # waited up to 40ms before anything downstream could even see it. Reading
+        # SDL's already-cached axis and button state is cheap, so poll at a rate
+        # that keeps that below the control loop's own period.
+        self.thread_rate_hz = 100.0
         self.thread = None
         self.thread_shutdown_flag = threading.Event()
 
