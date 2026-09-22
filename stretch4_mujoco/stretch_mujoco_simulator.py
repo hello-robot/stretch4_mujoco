@@ -25,7 +25,6 @@ from stretch4_mujoco.datamodels.status_command import (
     CommandCoordinateFrameArrowsViz,
     CommandKeyframe,
     CommandMove,
-    StatusCommand,
 )
 import stretch4_mujoco.utils as utils
 from stretch4_mujoco.utils import require_connection, block_until_check_succeeds
@@ -275,10 +274,12 @@ class StretchMujocoSimulator:
         Move the robot to home position
         """
         with self._command_lock:
-            self.data_proxies.set_command(
-                StatusCommand(keyframe=CommandKeyframe(name="home", trigger=True))
-            )
-        self.wait_while_is_moving(Actuators.lift)
+            command = self.data_proxies.get_command()
+            command.set_keyframe(CommandKeyframe(name="home", trigger=True))
+            self.data_proxies.set_command(command)
+
+        # See stow(): the joints ramp into the pose and finish at different times.
+        self.wait_command(timeout=30.0)
 
     @require_connection
     def stow(self) -> None:
@@ -286,11 +287,14 @@ class StretchMujocoSimulator:
         Move the robot to stow position
         """
         with self._command_lock:
-            self.data_proxies.set_command(
-                StatusCommand(keyframe=CommandKeyframe(name="stow", trigger=True))
-            )
+            command = self.data_proxies.get_command()
+            command.set_keyframe(CommandKeyframe(name="stow", trigger=True))
+            self.data_proxies.set_command(command)
 
-        self.wait_while_is_moving(Actuators.wrist_pitch)
+        # Every joint ramps into the pose now, and they finish at different times
+        # (the lift crosses most of its travel while the wrist is long done), so
+        # waiting on one representative joint would return mid-stow.
+        self.wait_command(timeout=30.0)
 
     def is_reached_set_position(self, actuator: str | Actuators, position_tolerance: float = 0.05):
         """
@@ -537,7 +541,13 @@ class StretchMujocoSimulator:
         return True
 
     @require_connection
-    def _move_to(self, actuator: str | Actuators, pos: float) -> None:
+    def _move_to(
+        self,
+        actuator: str | Actuators,
+        pos: float,
+        v_m: float | None = None,
+        a_m: float | None = None,
+    ) -> None:
         """
         Move the actuator to an absolute position.
         Args:
@@ -561,12 +571,22 @@ class StretchMujocoSimulator:
 
         with self._command_lock:
             command = self.data_proxies.get_command()
-            command.set_move_to(CommandMove(actuator_name=actuator.name, pos=pos, trigger=True))
+            command.set_move_to(
+                CommandMove(
+                    actuator_name=actuator.name, pos=pos, trigger=True, vel=v_m, accel=a_m
+                )
+            )
 
             self.data_proxies.set_command(command)
 
     @require_connection
-    def _move_by(self, actuator: str | Actuators, pos: float):
+    def _move_by(
+        self,
+        actuator: str | Actuators,
+        pos: float,
+        v_m: float | None = None,
+        a_m: float | None = None,
+    ):
         """
         Move the actuator by a relative amount.
         Args:
@@ -592,13 +612,17 @@ class StretchMujocoSimulator:
 
             command.set_move_by(
                 # We set the pos here, and not new_position, because this relative motion math is handled by mujoco_server:
-                CommandMove(actuator_name=actuator.name, pos=pos, trigger=True)
+                CommandMove(
+                    actuator_name=actuator.name, pos=pos, trigger=True, vel=v_m, accel=a_m
+                )
             )
 
             self.data_proxies.set_command(command)
 
     @require_connection
-    def _set_joint_velocity(self, actuator: str | Actuators, v_m: float):
+    def _set_joint_velocity(
+        self, actuator: str | Actuators, v_m: float, a_m: float | None = None
+    ):
         """
         Set continuous velocity for a joint.
         """
@@ -607,7 +631,7 @@ class StretchMujocoSimulator:
 
         with self._command_lock:
             command = self.data_proxies.get_command()
-            command.set_joint_velocity(actuator.name, v_m)
+            command.set_joint_velocity(actuator.name, v_m, a_m)
             self.data_proxies.set_command(command)
 
     @require_connection
@@ -762,13 +786,13 @@ class JointSubsystem:
         return getattr(self._sim.pull_status(), self._name)
 
     def move_to(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
-        self._sim._move_to(self._actuator, x_m)
+        self._sim._move_to(self._actuator, x_m, v_m, a_m)
 
     def move_by(self, x_m, v_m=None, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
-        self._sim._move_by(self._actuator, x_m)
+        self._sim._move_by(self._actuator, x_m, v_m, a_m)
 
     def set_velocity(self, v_m, a_m=None, stiffness=None, req_calibration=True, contact_sensitivity_pos=None, contact_sensitivity_neg=None):
-        self._sim._set_joint_velocity(self._actuator, v_m)
+        self._sim._set_joint_velocity(self._actuator, v_m, a_m)
 
 
 class EndOfArmSubsystem:
