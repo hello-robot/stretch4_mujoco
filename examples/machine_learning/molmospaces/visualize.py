@@ -1528,10 +1528,18 @@ class EpisodeVideoRecorder:
         floor = round(scene.shape[1] * CAMERA_COLUMN_SHARE / (1 - CAMERA_COLUMN_SHARE))
         return max(2, floor, min(round(columns * max(widths)), scene.shape[1]))
 
+    @staticmethod
     def _camera_grid(
-        self, cameras: list[tuple[str, np.ndarray | None]], width: int, height: int
+        cameras: list[tuple[str, np.ndarray | None]], width: int, height: int
     ) -> np.ndarray:
-        """The camera panels, labelled and letterboxed into a `width` x `height` grid."""
+        """The camera panels, labelled and letterboxed into a `width` x `height` grid.
+
+        Static because it reads nothing off the recorder, and because a replay
+        has no recorder to read it off: `retargetting/replay.py` tiles the
+        frames it renders itself through this, so a replayed panel and a
+        recorded one are laid out by the same code rather than two that agree
+        until one of them is edited.
+        """
         import cv2
 
         from examples.machine_learning.molmospaces.report import label_panel

@@ -221,7 +221,8 @@ ROBOTIQ_CTRL_RANGE = (0.0, 255.0)
 STRETCH_FINGER_OPEN = 0.5
 STRETCH_FINGER_CLOSED = 0.0
 
-ROBOTIQ_MAX_APERTURE_M = 0.087
+# ROBOTIQ_MAX_APERTURE_M = 0.087
+ROBOTIQ_MAX_APERTURE_M = 0.120
 """
 How wide the Robotiq 2F-85 opens, in metres -- its 85mm spec, measured on the
 model as 0.0870 between the pads.
