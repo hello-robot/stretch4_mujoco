@@ -42,6 +42,7 @@ from typing import Any
 
 import numpy as np
 
+from examples.machine_learning.molmospaces.added_pickup_repair import install_eval_repair
 from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (
     StretchMolmoBotDroidPolicy,
     StretchMolmoBotDroidPolicyConfig,
@@ -791,6 +792,26 @@ def register_overrides() -> None:
 
 register_overrides()
 install_worker_hooks()
+
+# Unconditionally, and not inside `install_worker_hooks`, which is gated on the
+# probe's environment variable: this one is not telemetry and must apply in every
+# worker whether or not a trial is being recorded.
+#
+# The benchmark's four target objects are *added* pickupables, and an added THOR
+# prefab carries no visual-mesh mass, so MuJoCo derives one from surface area at
+# 1000 kg/m^3. `added_pickup_repair` measures the 29 graspable potato assets at
+# 16-40 kg, median 23. `configs.py` installs this for `run_benchmarks.py`, and
+# this study never imported `configs.py` -- its eval configs derive from
+# MolmoSpaces' `JsonBenchmarkEvalConfig` directly -- so every trial here has been
+# scoring a ~23 kg potato.
+#
+# The signature is unmistakable in `eval_output_sept_19`: over 245 Franka
+# episodes the potato was *touched* 239 times and approached closer than any
+# other object (21mm against 28-79mm), yet lifted a median 5.99mm against the
+# 10mm success threshold, and picked up exactly 0 times -- on the un-retargeted
+# Franka, with the checkpoint's own camera. See `added_pickup_repair`, whose own
+# measurement of this was 0/8 solved before and 3/8 after.
+install_eval_repair()
 
 
 # =============================================================================

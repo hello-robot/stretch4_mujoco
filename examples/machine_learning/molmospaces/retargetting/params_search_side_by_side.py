@@ -89,16 +89,24 @@ from examples.machine_learning.molmospaces.retargetting.cameras import (  # noqa
 )
 from examples.machine_learning.molmospaces.retargetting.params_search import (  # noqa: E402
     DIMENSIONS,
+    _label_episodes,
     affordable_workers,
+    preserve_previous_run,
 )
 from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa: E402
     EpisodeScore,
+    TrialResult,
     collect_probe_records,
+    format_trial_table,
     install_probe,
+    write_episode_csv,
+    write_report,
+    write_trial_csv,
 )
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     PROBE_SINK_ENV_VAR,
     SETUPS,
+    params_to_json,
     publish_params,
     qualified_config_name,
 )
@@ -538,6 +546,31 @@ class RunResult:
     episodes: list[EpisodeScore] = field(default_factory=list)
     error: str | None = None
 
+    params: RetargetParams | None = None
+    """The parameters this setup ran at, so the report can say what it measured."""
+
+    output_dir: str = ""
+    """Where `run_evaluation` wrote, for the report's per-trial link."""
+
+    def as_trial(self) -> TrialResult:
+        """This run as a `scoring.TrialResult`, which is what the report is built from.
+
+        One setup at one point is exactly what `params_search` calls a trial, so
+        the report machinery is reused rather than reimplemented: the same
+        scoring, the same columns, the same meaning of `score`. What differs is
+        only that a side-by-side run has one trial per setup instead of one per
+        searched point.
+        """
+        params = self.params if self.params is not None else SETUPS[self.setup].params
+        return TrialResult(
+            setup=self.setup,
+            params_description=params.describe(),
+            params_json=params_to_json(self.setup, params),
+            episodes=_label_episodes(self.episodes, self.setup),
+            output_dir=self.output_dir,
+            error=self.error or "",
+        )
+
     def outcome_by_key(self) -> dict[str, EpisodeScore]:
         """Probe records, keyed the way `SplitPanelRecorder` keys its panels.
 
@@ -588,10 +621,10 @@ def run_setup(
     probe.sink = sink
     probe.episodes.clear()
 
-    result = RunResult(setup=setup_key, panel_dir=panel_dir)
+    result = RunResult(setup=setup_key, panel_dir=panel_dir, params=params)
     log.info(f"[side-by-side] {setup_key}: {params.describe()}")
     try:
-        run_evaluation(
+        evaluation = run_evaluation(
             eval_config_cls=qualified_config_name(setup.eval_config),
             benchmark_dir=benchmark_dir,
             checkpoint_path=checkpoint,
@@ -601,6 +634,7 @@ def run_setup(
             task_horizon_steps=episode_steps,
             use_wandb=False,
         )
+        result.output_dir = str(evaluation.output_dir)
     # One half failing must still leave the other watchable.
     except Exception as error:  # noqa: BLE001
         result.error = f"{type(error).__name__}: {error}"
@@ -830,6 +864,90 @@ def _slug(text: str) -> str:
 
 
 # =============================================================================
+# The report
+# =============================================================================
+
+
+def write_outputs(runs: list[RunResult], output_dir: Path) -> Path:
+    """Write the same report, CSVs and JSONL `params_search` writes.
+
+    Deliberately the *same* files with the same columns, produced by the same
+    `scoring` functions: a side-by-side run and a search run then score
+    identically and their rows can be read against each other. The only
+    difference is what a row is -- here one setup at its own parameters, there
+    one searched point.
+    """
+    trials = [run.as_trial() for run in runs]
+    write_episode_csv(trials, output_dir / "episodes.csv")
+    write_trial_csv(trials, output_dir / "trials.csv")
+    (output_dir / "trials.jsonl").write_text(
+        "".join(
+            json.dumps({"setup": t.setup, "score": t.score, "params": json.loads(t.params_json)})
+            + "\n"
+            for t in trials
+        )
+    )
+    return write_report(trials, mini_benchmark.TARGET_KEYS, output_dir)
+
+
+def own_records(episodes: list[EpisodeScore], setup: str) -> list[EpisodeScore]:
+    """The setup's *own* episodes, when its sink also caught later setups'.
+
+    A run made before `install_probe` was idempotent left every earlier sink
+    still being written to, so the first setup's file holds all eight setups'
+    episodes concatenated in run order and the last holds only its own. See the
+    comment in `scoring.install_probe`.
+
+    Detected from the data rather than from a count, so it needs no flag to be
+    told how big a run was: every setup sees the same episodes in the same order,
+    so the block ends where the `(scene, instruction)` of the first record comes
+    round again. A correctly-written sink has no repeat and is returned whole.
+    """
+    if not episodes:
+        return episodes
+    signature = lambda e: (e.scene, e.instruction)  # noqa: E731
+    first = signature(episodes[0])
+    for index in range(1, len(episodes)):
+        if signature(episodes[index]) == first:
+            log.warning(
+                f"[side-by-side] {setup}'s probe holds {len(episodes)} episodes but repeats "
+                f"after {index}; taking the first {index} as its own. This run predates the "
+                f"fix to `install_probe`, which left one sink per setup all being written at "
+                f"once -- see `scoring.install_probe`."
+            )
+            return episodes[:index]
+    return episodes
+
+
+def runs_from_disk(
+    output_dir: Path, setup_keys: list[str], param_specs: tuple[str, ...]
+) -> list[RunResult]:
+    """Rebuild each setup's `RunResult` from what a finished run left on disk.
+
+    The probe records are the run's own scoring output and are all the report
+    needs; the parameters are recomputed the way the run computed them, from the
+    setup's defaults and the same `--param` overrides. That means a report built
+    after the fact has to be asked for with the same `--param` flags the run
+    used, which is why the report names them in its own table.
+    """
+    runs = []
+    for key in setup_keys:
+        probe = output_dir / "runs" / key / "probe"
+        episodes = own_records(collect_probe_records(probe), key) if probe.is_dir() else []
+        if not episodes:
+            log.warning(f"[side-by-side] no probe records under {probe}; {key} will be empty")
+        runs.append(
+            RunResult(
+                setup=key,
+                panel_dir=output_dir / "runs" / key / "panels",
+                episodes=episodes,
+                params=_apply_params(SETUPS[key].params, param_specs),
+            )
+        )
+    return runs
+
+
+# =============================================================================
 # The command line
 # =============================================================================
 
@@ -933,6 +1051,14 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
     help="Measure without rendering, which is much faster when you only want the numbers.",
 )
 @click.option(
+    "--report-only",
+    is_flag=True,
+    help="Write report.md and the CSVs from a finished run's probe records and exit. "
+    "No rollouts and no tiling, so it is seconds -- the way to get a report for a run "
+    "that predates this flag, or to refresh one after changing how a score is computed. "
+    "Pass the same --param flags the run used.",
+)
+@click.option(
     "--compose-only",
     is_flag=True,
     help="Skip both evaluations and re-tile the panels already under --output-dir. For "
@@ -948,6 +1074,7 @@ def main(
     output_dir: Path,
     rebuild_benchmark: bool,
     compose_only: bool,
+    report_only: bool,
     replay_as_stretch4: bool,
     replay_z_offset: float,
     replay_limit: int | None,
@@ -979,6 +1106,16 @@ def main(
         replay_mod.report(results, destination, rendered=not replay_no_video)
         return
 
+    setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
+
+    if report_only:
+        runs = runs_from_disk(output_dir, setup_keys, param_specs)
+        report = write_outputs(runs, output_dir)
+        table = format_trial_table([r.as_trial() for r in runs], mini_benchmark.TARGET_KEYS)
+        click.echo("\n" + table)
+        click.secho(f"\nWrote {report}", fg="green")
+        return
+
     if compose_only:
         written = []
         for name in pair_names:
@@ -993,6 +1130,8 @@ def main(
                     result.episodes = collect_probe_records(probe)
             written += compose_pair(*halves, videos_dir / name)
         _report(written, videos_dir)
+        report = write_outputs(runs_from_disk(output_dir, setup_keys, param_specs), output_dir)
+        click.secho(f"Wrote {report}", fg="green")
         return
 
     # MolmoBot is a clone rather than a dependency, so nothing puts its `olmo`
@@ -1023,7 +1162,7 @@ def main(
     recorder = SplitPanelRecorder(output_dir / "runs")
     _install(recorder)
 
-    setups_to_run = [key for name in pair_names for key in MATCHED_PAIRS[name]]
+    setups_to_run = setup_keys
     episodes = scene_count * len(mini_benchmark.TARGETS)
     click.secho(
         f"Running {len(setups_to_run)} setup(s) over {scene_count} scene(s) x "
@@ -1062,6 +1201,12 @@ def main(
         # half still writes what it has, held against the surviving side.
         written += compose_pair(runs[franka_key], runs[stretch_key], videos_dir / name)
     _report(written, videos_dir)
+
+    ordered = [runs[key] for key in setups_to_run]
+    table = format_trial_table([r.as_trial() for r in ordered], mini_benchmark.TARGET_KEYS)
+    click.echo("\n" + table)
+    report = write_outputs(ordered, output_dir)
+    click.secho(f"\nWrote {report}", fg="green")
 
 
 def _install(recorder: SplitPanelRecorder) -> None:

@@ -287,6 +287,34 @@ class StretchMolmoBotDroidPolicyConfig(BasePolicyConfig):
     wants clearance, and see `FrankaOnStretchView` for what it does not fix.
     """
 
+    jaw_mode: str = "auto"
+    """
+    Which way round Stretch holds its jaw: "auto", "flipped" or "upright".
+
+    A parallel jaw grasps the same object the same way either way round, so this
+    is free reach rather than a trade in grasp quality -- what it changes is which
+    poses Stretch's wrist can hold. "auto" is the default and the only mode that
+    gives up nothing, at two IK solves per step; "flipped" is one solve and better
+    on position everywhere, at the price of 0.43 rad at large tool yaws. See
+    `franka_retarget.JAW_MODES`, which records the measurements.
+    """
+
+    match_robotiq_aperture: bool = True
+    """
+    Open Stretch's jaw only as wide as the Robotiq's, rather than as wide as it goes.
+
+    Stretch's hand opens to 188mm and the Robotiq 2F-85 to 87mm, so an un-narrowed
+    "open" command spreads the fingers more than twice as far as any hand in the
+    checkpoint's training data -- a domain gap on the channel a grasping policy
+    reads most closely, and a visibly different gripper in the wrist camera.
+
+    On by default because matching is the fairer comparison, but it is a real
+    change in what Stretch can do: a jaw capped at 87mm cannot go around an object
+    wider than that, which its own 188mm could. Turn it off to get the old
+    behaviour back and to measure how much of a Stretch/Franka difference was the
+    aperture. See `franka_retarget.ROBOTIQ_MAX_APERTURE_M`.
+    """
+
     snap_to_franka_home: bool = True
     """
     Start each episode at the Franka's home tool pose.
