@@ -50,6 +50,18 @@ frame-synchronised to the same action stream. They are synchronised to the same
 *episode* -- same house, same object, same start -- which is what the comparison
 needs.
 
+Replaying instead of running the Stretch half
+--------------------------------------------
+`--replay-as-stretch4` produces the same split screen without the second
+evaluation. The left column is the Franka run's own recorded panels, read back
+off disk; the right is the recorded actions pushed through the retargeting
+kinematically, with the setup's exo camera and Stretch's wrist camera rendered
+underneath it. Both bars say which is which -- RECORDED against REPLAY -- and
+the replayed half carries the retargeting residual and the unreachable-step
+count in place of an outcome it does not have. Seconds rather than an hour, and
+no checkpoint or GPU, which makes it the loop to change a retargeting parameter
+in. See `replay_pair` and `retargetting/replay.py`.
+
 What it is not
 --------------
 Not a search: it runs one point per setup and scores it exactly as
@@ -64,6 +76,7 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -502,12 +515,17 @@ class SplitPanelRecorder(EpisodeVideoRecorder):
             )
 
     def _camera_grid_panel(self, cameras):
-        """The camera row, at the scene panel's width so the two tile cleanly."""
+        """The camera row, at the scene panel's width so the two tile cleanly.
+
+        `replay.camera_row` rather than a local formula, because a replayed
+        Stretch's camera row is tiled against a recorded Franka's and the two
+        have to be laid out identically.
+        """
         if not cameras:
             return None
-        width = self._scene_panel_size[0]
-        height = max(1, int(round(width / max(1, len(cameras)) * 0.6)))
-        return self._camera_grid(cameras, width, height)
+        from examples.machine_learning.molmospaces.retargetting import replay as replay_mod
+
+        return replay_mod.camera_row(cameras, self._scene_panel_size[0])
 
     def _ensure_writer(self, writer, path: Path, frame: np.ndarray):
         """Open `path` sized to `frame` the first time, then hand the writer back."""
@@ -712,14 +730,33 @@ class _Stream:
         self.close()
 
 
+CAPTION_FONT_SCALE = 0.5
+CAPTION_MIN_FONT_SCALE = 0.34
+"""How small a caption may be shrunk before it is clipped instead.
+
+Shrunk rather than clipped because the end of a caption is where its numbers
+are: a replay's bar ends in the retargeting residual and the unreachable-step
+count, which are the two things it exists to say, and a fixed font drops
+exactly those off the right edge. Below `CAPTION_MIN_FONT_SCALE` the text stops
+being readable at video resolution, so past that it is truncated after all.
+"""
+
+
 def _caption(width: int, text: str, success: bool | None) -> np.ndarray:
-    """A caption bar, tinted by outcome."""
+    """A caption bar, tinted by outcome and sized so the whole line fits."""
     import cv2
 
     colour = (40, 90, 40) if success else ((40, 40, 90) if success is not None else (60, 60, 60))
     bar = np.full((CAPTION_HEIGHT, width, 3), colour, dtype=np.uint8)
+    room = width - 20
+    scale = CAPTION_FONT_SCALE
+    while (
+        scale > CAPTION_MIN_FONT_SCALE
+        and cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] > room
+    ):
+        scale -= 0.02
     cv2.putText(
-        bar, text[:120], (10, CAPTION_HEIGHT - 11), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+        bar, text[:160], (10, CAPTION_HEIGHT - 11), cv2.FONT_HERSHEY_SIMPLEX, scale,
         (235, 235, 235), 1, cv2.LINE_AA,
     )
     return bar
@@ -742,12 +779,31 @@ def _half(
     return np.vstack(panels)
 
 
+Captioner = Callable[["RunResult", dict[str, Any], "EpisodeScore | None"], tuple[str, bool | None]]
+"""How one half's caption bar is written: its text, and how the bar is tinted.
+
+A hook rather than a fixed rule because a replay's right-hand half has no
+outcome and no probe record to describe -- what it has is a retargeting
+residual and a count of steps it could not reach -- and captioning it "no probe
+record" would read as a broken run rather than a different experiment. See
+`_replay_captioner`.
+"""
+
+
+def _default_caption(
+    run: "RunResult", meta: dict[str, Any], score: "EpisodeScore | None"
+) -> tuple[str, bool | None]:
+    """What a rollout's own half says: the setup, the task and the outcome."""
+    return _describe(run.setup, meta, score), _picked(score)
+
+
 def compose_pair(
     franka: RunResult,
     stretch: RunResult,
     output_dir: Path,
     fps: float = 15.0,
     panel_width: int = SCENE_PANEL_SIZE[0],
+    caption_for: Captioner = _default_caption,
 ) -> list[Path]:
     """Tile each episode's four panels into one MP4. Returns what it wrote.
 
@@ -781,12 +837,8 @@ def compose_pair(
         scene = _scene_of(left_meta)
         left_score = franka_outcomes.get((scene, instruction))
         right_score = stretch_outcomes.get((_scene_of(right_meta), instruction))
-        left_caption = _caption(
-            panel_width, _describe(franka.setup, left_meta, left_score), _picked(left_score)
-        )
-        right_caption = _caption(
-            panel_width, _describe(stretch.setup, right_meta, right_score), _picked(right_score)
-        )
+        left_caption = _caption(panel_width, *caption_for(franka, left_meta, left_score))
+        right_caption = _caption(panel_width, *caption_for(stretch, right_meta, right_score))
 
         path = output_dir / f"{key}_{_slug(instruction)}.mp4"
         writer = None
@@ -882,6 +934,148 @@ def _describe(setup: str, meta: dict[str, Any], score: EpisodeScore | None) -> s
 def _slug(text: str) -> str:
     """A filesystem-safe fragment of an instruction."""
     return "".join(c if c.isalnum() else "_" for c in text.lower()).strip("_")[:40] or "episode"
+
+
+# =============================================================================
+# The same tiling, from a replay rather than a second rollout
+# =============================================================================
+
+
+def _replay_captioner(stretch_setup: str, results: dict[str, Any]) -> Captioner:
+    """Caption both halves of a replayed pair, saying which is which.
+
+    The two halves of a replay are not two rollouts and must not be captioned as
+    though they were. The left is a recording -- a real Franka rollout, with a
+    real outcome, played back from the MP4 it was recorded to. The right never
+    ran: it is those same actions pushed through the retargeting kinematically,
+    so it has no success, no score and nothing to say about whether the object
+    was picked up. What it has instead is the residual and the unreachable-step
+    count, which is the whole reason to look at it, so those go on the bar and
+    the bar is left grey rather than tinted with an outcome it does not have.
+    """
+
+    def caption(
+        run: RunResult, meta: dict[str, Any], score: EpisodeScore | None
+    ) -> tuple[str, bool | None]:
+        if run.setup != stretch_setup:
+            return f"RECORDED  |  {_describe(run.setup, meta, score)}", _picked(score)
+
+        instruction = meta.get("instruction") or "?"
+        result = results.get(meta.get("key", ""))
+        parts = [f"REPLAY (kinematic)  |  {run.setup}", instruction]
+        if result is not None and len(result.position_error_m):
+            parts.append(
+                f"retarget miss {result.position_error_m.mean() * 1000:.0f}mm mean, "
+                f"{result.position_error_m.max() * 1000:.0f}mm max"
+            )
+            parts.append(f"unreachable {result.unreachable_steps}/{result.episode.steps}")
+        return "  |  ".join(parts), None
+
+    return caption
+
+
+def replay_pair(
+    pair: str,
+    output_dir: Path,
+    params: RetargetParams,
+    scene_count: int,
+    target_z_offset: float,
+    limit: int | None = None,
+    fps: float = 15.0,
+) -> tuple[list[Path], list[Any]]:
+    """Replay one pair's recorded Franka episodes and tile them as the rollouts are.
+
+    The left half is not re-rendered -- it *is* the Franka run's own panels,
+    read back off disk. That is the whole economy of the thing: the expensive
+    half of a side-by-side is the rollout, the recording of it is already there,
+    and a replay only has to produce the other column. It also means the Franka
+    column is the same footage the rollout's own video shows, rather than a
+    second render of the same episode that could differ.
+
+    Episodes are matched to that footage by `RecordedEpisode.panel_key`, and the
+    match is checked on the step count before anything is rendered: a trajectory
+    file and a panel that disagree about how long the episode was are not the
+    same episode, and tiling them would produce a confident-looking comparison
+    of two different rollouts.
+    """
+    from examples.machine_learning.molmospaces.retargetting import replay as replay_mod
+
+    franka_key, stretch_key = MATCHED_PAIRS[pair]
+    franka = RunResult(setup=franka_key, panel_dir=output_dir / "runs" / franka_key / "panels")
+    probe = franka.panel_dir.parent / "probe"
+    if probe.is_dir():
+        franka.episodes = own_records(collect_probe_records(probe), franka_key)
+
+    index = _panel_index(franka.panel_dir)
+    if not index:
+        log.warning(
+            f"[replay] no episodes.json under {franka.panel_dir}; there is no Franka footage "
+            f"to put a replay beside. Run the pair first, without --replay-as-stretch4."
+        )
+        return [], []
+
+    destination = replay_mod.replay_output_dir(output_dir) / pair
+    panel_dir = destination / "panels"
+    results: list[Any] = []
+    by_key: dict[str, Any] = {}
+    written_index: list[dict[str, Any]] = []
+
+    for path in replay_mod.latest_run_trajectories(output_dir / "runs" / franka_key):
+        for episode in replay_mod.load_episodes(path):
+            if limit is not None and len(results) >= limit:
+                break
+            key = episode.panel_key
+            meta = index.get(key)
+            if meta is None:
+                log.warning(
+                    f"[replay] {key} is in {path.name} but not in the recorded panels; "
+                    f"skipping rather than tiling it against nothing."
+                )
+                continue
+            if int(meta.get("steps", -1)) != episode.steps:
+                log.warning(
+                    f"[replay] {key}: the trajectory has {episode.steps} steps and the "
+                    f"recorded panel {meta.get('steps')}; these are not the same episode, "
+                    f"so it is skipped rather than mispaired."
+                )
+                continue
+
+            episode.instruction = meta.get("instruction", "")
+            log.info(f"[replay] {key}: {episode.steps} recorded steps -- {episode.instruction}")
+            result = replay_mod.replay_to_panels(
+                episode,
+                panel_dir,
+                key,
+                exo=params.exo,
+                # The episode's own object, from the benchmark the run used, so
+                # the two halves show the same grasp rather than one hand on a
+                # bowl and one on an empty counter.
+                stage=replay_mod.episode_staging(
+                    output_dir, episode.house, int(meta.get("index", 0)), episode.instruction
+                ),
+                fps=fps,
+                target_z_offset=target_z_offset,
+                tool_correction=(params.wrist_tilt_deg, params.grasp_offset_m),
+                scene_count=scene_count,
+            )
+            results.append(result)
+            by_key[key] = result
+            # The recorded episode's own record, minus the outcome: a replay has
+            # none, and `compose_pair` pairs on the key and the instruction.
+            written_index.append({**meta, "success": None})
+            log.info(f"[replay] {result.summary()}")
+
+    if not results:
+        return [], []
+
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    (panel_dir / "episodes.json").write_text(json.dumps(written_index, indent=2))
+
+    stretch = RunResult(setup=stretch_key, panel_dir=panel_dir)
+    written = compose_pair(
+        franka, stretch, destination, fps=fps, caption_for=_replay_captioner(stretch_key, by_key)
+    )
+    return written, results
 
 
 # =============================================================================
@@ -1050,7 +1244,10 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
     help="Skip the evaluation and instead replay the Franka trajectories already recorded "
     "under --output-dir through the retargeting, as Stretch 4. No policy runs, so it is "
     "seconds rather than minutes -- the fast loop for changing a retargeting parameter and "
-    "seeing what it does to actions that are known to work. See retargetting/replay.py.",
+    "seeing what it does to actions that are known to work. Writes the same split screen a "
+    "run does -- the recorded Franka on the left, the replayed Stretch and its cameras on "
+    "the right, captioned as a replay -- under <output-dir>/replay_as_stretch4/<pair>. See "
+    "retargetting/replay.py.",
 )
 @click.option(
     "--replay-z-offset",
@@ -1069,7 +1266,9 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
 @click.option(
     "--replay-no-video",
     is_flag=True,
-    help="Measure without rendering, which is much faster when you only want the numbers.",
+    help="Measure without rendering, which is much faster when you only want the numbers. "
+    "Nothing is tiled, so this replays every Franka trajectory under --output-dir rather "
+    "than only the ones the pair's own run recorded.",
 )
 @click.option(
     "--report-only",
@@ -1135,17 +1334,52 @@ def main(
         from examples.machine_learning.molmospaces.retargetting import replay as replay_mod
 
         destination = replay_mod.replay_output_dir(output_dir)
-        results = replay_mod.replay_run(
-            output_dir,
-            destination,
-            render=not replay_no_video,
-            limit=replay_limit,
-            target_z_offset=replay_z_offset,
-            # The run's own --scenes, so `scene_for_house` searches a list that
-            # contains the houses the trajectories were recorded in.
-            scene_count=scene_count,
-        )
-        replay_mod.report(results, destination, rendered=not replay_no_video)
+        if replay_no_video:
+            # Nothing to tile, so nothing to pair: every Franka trajectory under
+            # the directory is replayed for its numbers, whichever run left it.
+            results = replay_mod.replay_run(
+                output_dir,
+                destination,
+                render=False,
+                limit=replay_limit,
+                target_z_offset=replay_z_offset,
+                # The run's own --scenes, so `scene_for_house` searches a list
+                # that contains the houses the trajectories were recorded in.
+                scene_count=scene_count,
+            )
+            replay_mod.report(results, destination, rendered=False)
+            return
+
+        written: list[Path] = []
+        results = []
+        for name in pair_names:
+            stretch_key = MATCHED_PAIRS[name][1]
+            params = _apply_params(SETUPS[stretch_key].params, param_specs)
+            # The setup's own z offset unless the flag was actually typed, so a
+            # replay of `stretch_baseline` retargets the way that setup does
+            # rather than the way the flag's default happens to.
+            source = click.get_current_context().get_parameter_source("replay_z_offset")
+            z_offset = (
+                replay_z_offset
+                if source is not None and source.name != "DEFAULT"
+                else params.target_z_offset_m
+            )
+            log.info(
+                f"[replay] {name}: replaying {MATCHED_PAIRS[name][0]}'s recorded episodes as "
+                f"{stretch_key} -- {params.describe()}, target_z_offset={z_offset:+.3f}m"
+            )
+            pair_videos, pair_results = replay_pair(
+                name,
+                output_dir,
+                params,
+                scene_count=scene_count,
+                target_z_offset=z_offset,
+                limit=replay_limit,
+            )
+            written += pair_videos
+            results += pair_results
+        _report(written, destination)
+        replay_mod.report(results, destination, rendered=False)
         return
 
     setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]

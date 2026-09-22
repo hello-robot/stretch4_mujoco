@@ -46,6 +46,15 @@ would have seen its own camera frames and diverged from step one; this shows
 where the retargeting takes Stretch if it is fed the actions that worked. A
 replay that tracks perfectly says the retargeting is not what lost the grasp. A
 replay that cannot follow says it is, and says where.
+
+Watching one
+------------
+`replay_to_video` writes the single third-person panel this module started with.
+`replay_to_panels` writes the two panels
+`params_search_side_by_side.compose_pair` tiles -- the scene, and the camera row
+beneath it -- so a replay can be put beside the Franka footage it was recorded
+from and read as a side-by-side rather than on its own. That is what
+`params_search_side_by_side --replay-as-stretch4` produces.
 """
 
 from __future__ import annotations
@@ -64,6 +73,10 @@ from scipy.spatial.transform import Rotation as R
 
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr
 from examples.machine_learning.molmospaces.retargetting import mini_benchmark
+from examples.machine_learning.molmospaces.retargetting.cameras import (
+    ExoCameraParams,
+    postprocess_exo_frame,
+)
 from examples.machine_learning.molmospaces.stretch.config import Stretch4RobotConfig
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot
 from examples.machine_learning.molmospaces.stretch.robot_view import Stretch4RobotView
@@ -73,6 +86,17 @@ log = logging.getLogger(__name__)
 
 TRAJECTORY_GLOB = "trajectories_batch_*.h5"
 """What the evaluation pipeline names its per-house trajectory files."""
+
+REPLAY_EXO_CAMERA = "replay_exo_camera"
+"""Name of the exo camera this module bolts into a replay scene.
+
+Its own name rather than the evaluation's `exo_camera_1`, because this one is an
+MJCF camera compiled into the model while that one is a MolmoSpaces
+`RobotMountedCameraConfig` placed at runtime. Same pose, same optics, different
+mechanism -- and a shared name would make two different things look like one in
+a traceback. The *panel* is labelled with the evaluation's name, which is what a
+viewer is comparing against.
+"""
 
 FRANKA_ARM_JOINTS = fr.VirtualFranka.N_JOINTS
 """Seven, and the length an action's `arm` entry has to be to be a Franka's."""
@@ -126,6 +150,21 @@ class RecordedEpisode:
     @property
     def steps(self) -> int:
         return len(self.arm_commands)
+
+    @property
+    def panel_key(self) -> str:
+        """The key `SplitPanelRecorder` filed this same episode's panels under.
+
+        The two namings come from different halves of one run and have to be
+        matched for a replay to be tiled against the Franka footage it was
+        recorded from: the trajectory file calls an episode `traj_<i>` within
+        `house_<n>/`, the recorder calls it `house_<n>_ep<i:04d>`. Both count
+        from zero in the order the house's episodes ran, so the index carries
+        across -- and `replay_panels` checks the step counts agree rather than
+        trusting that.
+        """
+        index = self.group.rsplit("_", 1)[-1]
+        return f"house_{self.house}_ep{int(index):04d}" if index.isdigit() else self.group
 
     @property
     def base_xytheta(self) -> np.ndarray:
@@ -197,6 +236,33 @@ def find_trajectory_files(root: Path) -> list[Path]:
             f"house; if the run crashed before saving there will be none."
         )
     return files
+
+
+def latest_run_trajectories(root: Path) -> list[Path]:
+    """The trajectory files of the *newest* run under `root`, and only those.
+
+    `find_trajectory_files` returns everything it can find, which is the right
+    answer for "replay whatever is here" and the wrong one for pairing against a
+    run's recorded panels: a directory that has been evaluated twice holds two
+    `<EvalConfigClass>/<timestamp>/` trees, every house appears in both, and
+    every episode key then arrives twice -- the second overwriting the first's
+    panels with a replay of a different rollout.
+
+    So the newest file decides the run, and only its siblings are read. The
+    layout is `<run>/<EvalConfigClass>/<timestamp>/house_<n>/<file>`, so that
+    run directory is the file's grandparent.
+    """
+    files = find_trajectory_files(root)
+    if not files:
+        return []
+    run_dir = files[0].parent.parent
+    chosen = [path for path in files if path.parent.parent == run_dir]
+    if len(chosen) != len(files):
+        log.info(
+            f"[replay] {root} holds more than one run; replaying the newest "
+            f"({run_dir.name}) and ignoring {len(files) - len(chosen)} older file(s)."
+        )
+    return sorted(chosen)
 
 
 def _house_index(path: Path) -> int:
@@ -302,21 +368,163 @@ def scene_for_house(house_index: int, scene_count: int):
     return scenes[0]
 
 
+BENCHMARK_FILE = Path("benchmark") / "benchmark.json"
+"""Where `mini_benchmark.build` leaves the episode specs, under a run's output directory."""
+
+
+def episode_staging(output_dir: Path, house_index: int, index: int, instruction: str = "") -> dict:
+    """The `scene_modifications` of one episode of the run's own benchmark.
+
+    Which object was on the counter and which of the house's own clutter was
+    taken off it is not in the trajectory file -- the benchmark holds it, and it
+    is the benchmark the rollout was run from, so it is read rather than
+    recomputed. `mini_benchmark.build_episodes` writes scene-major in
+    `TARGETS` order, which is the order the houses' episodes run in, so the
+    index within a house selects the episode.
+
+    `instruction`, when the caller has one, is checked against the spec's own
+    task description: a benchmark rebuilt at a different `--scenes` between the
+    run and the replay would line the indices up against different objects, and
+    staging the wrong object is worse than staging none.
+
+    Returns `{}` when there is no benchmark to read, which stages nothing.
+    """
+    path = Path(output_dir) / BENCHMARK_FILE
+    if not path.is_file():
+        log.warning(
+            f"[replay] no {path}; the replay scene will hold the house but not the object "
+            f"the episode was about."
+        )
+        return {}
+    try:
+        episodes = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        log.warning(f"[replay] could not read {path}: {error}")
+        return {}
+
+    in_house = [e for e in episodes if int(e.get("house_index", -1)) == house_index]
+    if not 0 <= index < len(in_house):
+        log.warning(
+            f"[replay] house {house_index} has {len(in_house)} episodes in {path.name} but "
+            f"episode {index} was asked for; staging nothing."
+        )
+        return {}
+    spec = in_house[index]
+    described = (spec.get("language") or {}).get("task_description", "")
+    if instruction and described and described != instruction:
+        log.warning(
+            f"[replay] house {house_index} episode {index} is {described!r} in the benchmark "
+            f"and {instruction!r} in the recording; staging nothing rather than the wrong "
+            f"object. Rebuild the benchmark at the --scenes the run used."
+        )
+        return {}
+    return spec.get("scene_modifications") or {}
+
+
+def _stage_objects(spec: MjSpec, modifications: dict[str, Any]) -> None:
+    """Put the episode's pickup object on the counter, and take its clutter off.
+
+    The same two edits `JsonEvalTaskSampler.add_auxiliary_objects` makes to the
+    same scene: delete `removed_objects`, attach each of `added_objects` at its
+    recorded pose. A replay used to skip both, on the grounds that it measures
+    the gripper rather than the grasp -- which was true of a replay watched on
+    its own and is not true of one tiled beside the Franka footage, where the
+    left panel shows a hand closing on a bowl and the right showed the same hand
+    closing on an empty counter.
+
+    The object is placed and then left alone. Nothing here steps the simulator,
+    so it neither falls nor is picked up: it marks where the grasp was supposed
+    to happen, and the gap between it and Stretch's gripper is the thing to
+    read. It is not a grasp that failed.
+    """
+    from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+    from molmo_spaces.utils.lazy_loading_utils import install_uid
+
+    from examples.machine_learning.molmospaces.added_pickup_repair import (
+        repair_added_pickup_masses,
+    )
+
+    mini_benchmark._delete_bodies(spec, list(modifications.get("removed_objects") or []))
+
+    poses = modifications.get("object_poses") or {}
+    for object_name, relative in (modifications.get("added_objects") or {}).items():
+        object_xml = Path(ASSETS_DIR) / relative
+        if not object_xml.is_file():
+            object_xml = Path(install_uid(Path(relative).stem))
+        try:
+            object_spec = MjSpec.from_file(str(object_xml))
+            body = object_spec.worldbody.bodies[0]
+            if not body.first_joint():
+                body.add_joint(name="XYZ_jntfree", type=mujoco.mjtJoint.mjJNT_FREE)
+            pose = list(poses.get(object_name, [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+            prefix = object_name.rpartition("/")[0] + "/"
+            frame = spec.worldbody.add_frame(pos=pose[:3], quat=pose[3:7])
+            frame.attach_body(body, prefix, "")
+            # Without it a THOR prefab attached straight from the asset weighs
+            # tens of kilograms; see `settled_pose`. It changes nothing
+            # kinematically, and keeps this scene the one the benchmark settled
+            # the object in rather than a heavier variant of it.
+            repair_added_pickup_masses(spec, [object_name])
+        except Exception as error:  # noqa: BLE001 - a lost object is not a lost replay
+            log.warning(f"[replay] could not stage {object_name}: {error}")
+
+
+def _add_exo_camera(spec: MjSpec, namespace: str, exo: ExoCameraParams) -> None:
+    """Bolt the setup's exo camera into the spec, where the evaluation mounts it.
+
+    The same pose and the same optics `exo_camera_config` hands MolmoSpaces,
+    expressed as an MJCF camera because a replay has no MolmoSpaces environment
+    to place a `RobotMountedCameraConfig` for it. Rendering through a real
+    camera also puts the headlight in the right place for free, which the free-
+    camera path does not; see `StretchCameraRig`.
+
+    A mount body the replay scene does not have is a lost camera panel, not a
+    lost replay: the Franka setups pin the exo camera to an arm link, and there
+    is no arm link here to pin it to.
+    """
+    body_name = exo.mount_body
+    if not body_name.startswith(namespace):
+        body_name = namespace + body_name
+    try:
+        body = spec.body(body_name)
+    except (KeyError, ValueError):
+        body = None
+    if body is None:
+        log.warning(
+            f"[replay] no body {body_name!r} to mount the exo camera on; the replay's "
+            f"camera row will show the wrist camera only."
+        )
+        return
+    body.add_camera(
+        name=namespace + REPLAY_EXO_CAMERA,
+        pos=list(exo.pos),
+        quat=exo.quat_wxyz(),
+        fovy=float(exo.fovy),
+        resolution=list(exo.render_size),
+    )
+
+
 def build_stretch_in_scene(
     house_index: int,
     base_xytheta: np.ndarray,
     scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT,
+    exo: ExoCameraParams | None = None,
+    stage: dict[str, Any] | None = None,
 ):
     """Stretch, spawned in the recorded episode's house at the recorded base pose.
 
     The house is looked up by index rather than by position; see
     `scene_for_house`.
 
-    The objects are *not* staged. A replay measures where the retargeting puts
-    the gripper, which is a question about the robot and the room; the object
-    would only be there to be knocked over by an open-loop playback. What the
-    recording's own `tcp_pose` gives is a better reference than the object
-    anyway: it is where the Franka's gripper actually was at that step.
+    `exo`, when given, mounts that setup's third-person camera on the robot so a
+    replay can show what the policy would have been looking at. Left out, the
+    scene carries only Stretch's own cameras, which is all the numbers need.
+
+    `stage` is the episode's `scene_modifications` -- see `episode_staging` and
+    `_stage_objects`. Left out, the scene is the bare house: no pickup object and
+    the clutter the episode removes still standing. That is enough to measure
+    where the retargeting puts the gripper, which is all a replay used to be
+    asked, and not enough to watch one beside the rollout it came from.
     """
     from molmo_spaces.utils.lazy_loading_utils import (
         install_scene_with_objects_and_grasps_from_path,
@@ -326,6 +534,9 @@ def build_stretch_in_scene(
     scene_path = mini_benchmark.house_scene_path(scene)
     install_scene_with_objects_and_grasps_from_path(str(scene_path))
     spec = MjSpec.from_file(str(scene_path))
+
+    if stage:
+        _stage_objects(spec, stage)
 
     config = Stretch4RobotConfig()
     namespace = config.robot_namespace
@@ -338,6 +549,8 @@ def build_stretch_in_scene(
         quat=R.from_euler("z", yaw).as_quat(scalar_first=True),
     )
     Stretch4Robot.apply_control_overrides(spec, config)
+    if exo is not None:
+        _add_exo_camera(spec, namespace, exo)
 
     model = spec.compile()
     data = MjData(model)
@@ -389,6 +602,9 @@ def replay_episode(
     match_robotiq_aperture: bool = True,
     include_base: bool = True,
     scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT,
+    exo: ExoCameraParams | None = None,
+    stage: dict[str, Any] | None = None,
+    tool_correction: tuple[float, float] | None = None,
     frame_sink: Any = None,
 ) -> ReplayResult:
     """Drive Stretch through one recorded Franka trajectory and measure the result.
@@ -396,9 +612,15 @@ def replay_episode(
     `frame_sink`, if given, is called with `(step, model, data, view, proxy)` after
     every step -- which is how a caller renders a video without this function
     knowing anything about rendering.
+
+    `tool_correction` is `(wrist_tilt_deg, grasp_offset_m)`, the two terms a
+    setup adds to the fixed Franka-to-Stretch tool transform. Passed by a caller
+    replaying *against a setup* -- without it the replay measures the bare
+    retargeting, which is a different question from the one a side-by-side
+    against `stretch_baseline` asks. See `setups.apply_tool_correction`.
     """
     model, data, view, namespace = build_stretch_in_scene(
-        episode.house, episode.base_xytheta, scene_count=scene_count
+        episode.house, episode.base_xytheta, scene_count=scene_count, exo=exo, stage=stage
     )
     proxy = fr.FrankaOnStretchView(
         view,
@@ -408,6 +630,14 @@ def replay_episode(
         target_z_offset=target_z_offset,
         match_robotiq_aperture=match_robotiq_aperture,
     )
+    if tool_correction is not None:
+        from examples.machine_learning.molmospaces.retargetting.setups import (
+            apply_tool_correction,
+        )
+
+        apply_tool_correction(
+            proxy, wrist_tilt_deg=tool_correction[0], grasp_offset_m=tool_correction[1]
+        )
     # The rollout's own opening move, for the reason `RetargetRig.restore`
     # gives: `StretchArmIK` converges on a target near the configuration it is
     # seeded from, and Stretch's stowed pose is nowhere near the first command.
@@ -452,57 +682,188 @@ REPLAY_LOOKAT_HEIGHT_M = 1.05
 """The replay camera, matching `params_search_side_by_side`'s so the two read alike."""
 
 
+class _ScenePanel:
+    """The third-person replay panel: one fixed camera, the two tool markers.
+
+    `base_xytheta` is where the *episode* stood the robot, and it has to be
+    passed in rather than read off the robot when the first frame arrives. With
+    `include_base` set -- the default -- the base is part of what the IK solves,
+    and the opening `snap_to_franka_joint_pos` can drive it metres to reach the
+    Franka's home pose before a single frame is rendered. A camera framed on
+    where the base ended up after that is a camera outside the house looking at
+    the exterior wall, which is exactly what replay videos used to show.
+
+    The renderer still waits for the first frame, because the model arrives with
+    it. The camera is then held, never re-aimed as the base moves, for the
+    reason `params_search_side_by_side.SplitPanelRecorder._scene_frame` gives: a
+    panel that drifts cannot be tiled against one that does not.
+    """
+
+    def __init__(
+        self, base_xytheta: np.ndarray, size: tuple[int, int] = REPLAY_PANEL_SIZE
+    ) -> None:
+        self.size = size
+        self._base = np.asarray(base_xytheta, dtype=float).reshape(-1)[:3]
+        self._renderer: Any = None
+        self._camera: Any = None
+
+    def frame(self, model, data, view, proxy) -> np.ndarray:
+        """One BGR panel: the scene, the commanded frame, and the reached one.
+
+        Green is where the retargeting asked Stretch's tool to be and orange is
+        where it got to, the same colours `tests/test_retargeting.py` uses, so
+        the gap between two balls means the same thing in both. A replay where
+        they stay coincident is a retargeting that could have followed the
+        Franka's actions.
+        """
+        import cv2
+
+        width, height = self.size
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(model, height, width)
+            camera = mujoco.MjvCamera()
+            camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+            base = self._base
+            camera.lookat[:] = [float(base[0]), float(base[1]), REPLAY_LOOKAT_HEIGHT_M]
+            camera.azimuth = math.degrees(float(base[2])) + REPLAY_AZIMUTH_OFFSET_DEG
+            camera.elevation = REPLAY_ELEVATION
+            camera.distance = REPLAY_DISTANCE
+            self._camera = camera
+
+        option = mujoco.MjvOption()
+        option.sitegroup = 0
+        self._renderer.update_scene(data, camera=self._camera, scene_option=option)
+
+        commanded = proxy.franka_tool_pose_to_world(proxy.franka.fk(proxy.last_arm_ctrl))
+        reached = np.asarray(view.get_move_group("wrist").leaf_frame_to_world, dtype=float)
+        fr.add_frame_marker(
+            self._renderer.scene, commanded, color=fr.FRANKA_TOOL_COLOR, label="commanded"
+        )
+        fr.add_frame_marker(
+            self._renderer.scene,
+            reached,
+            color=fr.STRETCH_TOOL_COLOR,
+            label=f"stretch {proxy.last_position_error * 1000:.0f}mm",
+        )
+        return cv2.cvtColor(self._renderer.render(), cv2.COLOR_RGB2BGR)
+
+    def close(self) -> None:
+        if self._renderer is not None:
+            self._renderer.close()
+        self._renderer = None
+
+
+class _CameraPanels:
+    """What a replayed Stretch's policy would have been looking at.
+
+    The exo camera under test plus Stretch's own right wrist camera -- the pair
+    `setups.stretch_camera_system` gives a Stretch setup, rendered here the two
+    ways those two cameras are rendered there: the exo through the MJCF camera
+    `_add_exo_camera` compiled in and then `postprocess_exo_frame` (so a fisheye
+    setup's replay is warped, cropped and turned exactly as the rollout's was),
+    the wrist through `StretchCameraRig`, which is the hardware-accurate path
+    `install_stretch_camera_hooks` patches into the evaluation.
+
+    What it is *not* is what the policy saw, because in a replay no policy ran
+    and the Franka's actions are being followed open-loop. It is what the same
+    camera would have shown of the pose the retargeting actually reached.
+    """
+
+    def __init__(self, model, namespace: str, exo: ExoCameraParams | None) -> None:
+        from examples.machine_learning.molmospaces.demo_droid_on_stretch import (
+            StretchCameraRig,
+        )
+        from examples.machine_learning.molmospaces.retargetting.setups import EXO_CAMERA
+        from examples.machine_learning.molmospaces.stretch.config import (
+            STRETCH_CAMERA_FOR_CAMERA,
+            WRIST_CAMERA_RIGHT,
+        )
+
+        self._exo_name = EXO_CAMERA
+        self._exo_params = exo
+        self._exo_renderer = None
+        camera_name = namespace + REPLAY_EXO_CAMERA
+        mounted = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name) >= 0
+        if exo is not None and mounted:
+            width, height = exo.render_size
+            self._exo_renderer = mujoco.Renderer(model, height, width)
+            self._exo_camera = camera_name
+        self._option = mujoco.MjvOption()
+        self._option.sitegroup = 0
+        self._wrist_name = WRIST_CAMERA_RIGHT
+        self._wrist = StretchCameraRig(
+            model, namespace, {WRIST_CAMERA_RIGHT: STRETCH_CAMERA_FOR_CAMERA[WRIST_CAMERA_RIGHT]}
+        )
+
+    def frames(self, data) -> list[tuple[str, np.ndarray]]:
+        """This step's panels, BGR and in the order the evaluation records them."""
+        import cv2
+
+        panels: list[tuple[str, np.ndarray]] = []
+        if self._exo_renderer is not None:
+            self._exo_renderer.update_scene(
+                data, camera=self._exo_camera, scene_option=self._option
+            )
+            frame = postprocess_exo_frame(self._exo_renderer.render(), self._exo_params)
+            panels.append((self._exo_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)))
+        wrist = self._wrist.render(data)[self._wrist_name]
+        wrist = cv2.cvtColor(np.ascontiguousarray(wrist), cv2.COLOR_RGB2BGR)
+        panels.append((self._wrist_name, wrist))
+        return panels
+
+    def close(self) -> None:
+        if self._exo_renderer is not None:
+            self._exo_renderer.close()
+        self._exo_renderer = None
+
+
+def camera_row(frames: list[tuple[str, np.ndarray | None]], width: int) -> np.ndarray:
+    """The camera panels as one row `width` wide, laid out as a recorded run's are.
+
+    Shared with `params_search_side_by_side.SplitPanelRecorder`, which is the
+    point: the row under a replayed Stretch and the row under the Franka it is
+    tiled against have to be the same shape and the same proportions, or the
+    split screen stops being one picture.
+    """
+    from examples.machine_learning.molmospaces.visualize import EpisodeVideoRecorder
+
+    height = max(1, int(round(width / max(1, len(frames)) * 0.6)))
+    return EpisodeVideoRecorder._camera_grid(frames, width, height)
+
+
+def _ensure_offscreen_buffer(model, *sizes: tuple[int, int]) -> None:
+    """Grow the model's offscreen framebuffer to hold every size about to be rendered.
+
+    A scene declares its own `<visual><global offwidth=...>` and MuJoCo refuses
+    to build a larger renderer, as a hard error. Same guard
+    `stretch.config.install_stretch_camera_hooks` puts on the evaluation path,
+    for the same reason: a fisheye render size is bigger than the 640x480 a
+    scene is likely to declare.
+    """
+    model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), *(s[0] for s in sizes))
+    model.vis.global_.offheight = max(int(model.vis.global_.offheight), *(s[1] for s in sizes))
+
+
 def replay_to_video(
     episode: RecordedEpisode,
     output_path: Path,
     fps: float = 15.0,
     **replay_kwargs: Any,
 ) -> ReplayResult:
-    """`replay_episode`, written to an MP4 with the commanded and reached frames drawn.
-
-    Green is where the retargeting asked Stretch's tool to be and orange is where
-    it got to, the same colours `tests/test_retargeting.py` uses, so the gap
-    between two balls means the same thing in both. A replay where they stay
-    coincident is a retargeting that could have followed the Franka's actions.
-    """
+    """`replay_episode`, written to a single-panel MP4. See `_ScenePanel.frame`."""
     import cv2
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    width, height = REPLAY_PANEL_SIZE
-    state: dict[str, Any] = {"writer": None, "renderer": None, "camera": None}
+    panel = _ScenePanel(episode.base_xytheta)
+    state: dict[str, Any] = {"writer": None}
 
     def sink(step: int, model, data, view, proxy) -> None:
-        if state["renderer"] is None:
-            state["renderer"] = mujoco.Renderer(model, height, width)
-            camera = mujoco.MjvCamera()
-            camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-            base = np.asarray(view.get_move_group("base").joint_pos, dtype=float)
-            camera.lookat[:] = [float(base[0]), float(base[1]), REPLAY_LOOKAT_HEIGHT_M]
-            camera.azimuth = math.degrees(float(base[2])) + REPLAY_AZIMUTH_OFFSET_DEG
-            camera.elevation = REPLAY_ELEVATION
-            camera.distance = REPLAY_DISTANCE
-            state["camera"] = camera
-
-        renderer, camera = state["renderer"], state["camera"]
-        option = mujoco.MjvOption()
-        option.sitegroup = 0
-        renderer.update_scene(data, camera=camera, scene_option=option)
-
-        commanded = proxy.franka_tool_pose_to_world(proxy.franka.fk(proxy.last_arm_ctrl))
-        reached = np.asarray(view.get_move_group("wrist").leaf_frame_to_world, dtype=float)
-        fr.add_frame_marker(
-            renderer.scene, commanded, color=fr.FRANKA_TOOL_COLOR, label="commanded"
-        )
-        fr.add_frame_marker(
-            renderer.scene,
-            reached,
-            color=fr.STRETCH_TOOL_COLOR,
-            label=f"stretch {proxy.last_position_error * 1000:.0f}mm",
-        )
-        frame = cv2.cvtColor(renderer.render(), cv2.COLOR_RGB2BGR)
+        if state["writer"] is None:
+            _ensure_offscreen_buffer(model, REPLAY_PANEL_SIZE)
+        frame = panel.frame(model, data, view, proxy)
         if state["writer"] is None:
             state["writer"] = cv2.VideoWriter(
-                str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+                str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, REPLAY_PANEL_SIZE
             )
         state["writer"].write(frame)
 
@@ -511,8 +872,71 @@ def replay_to_video(
     finally:
         if state["writer"] is not None:
             state["writer"].release()
-        if state["renderer"] is not None:
-            state["renderer"].close()
+        panel.close()
+    return result
+
+
+def replay_to_panels(
+    episode: RecordedEpisode,
+    panel_dir: Path,
+    key: str,
+    exo: ExoCameraParams | None,
+    stage: dict[str, Any] | None = None,
+    fps: float = 15.0,
+    **replay_kwargs: Any,
+) -> ReplayResult:
+    """A replay written as the *two* panels `compose_pair` tiles: scene, and cameras.
+
+    Deliberately the same two files under the same names a rollout's
+    `SplitPanelRecorder` writes -- `<key>_scene.mp4` and `<key>_cams.mp4` in a
+    panel directory -- so the tiling code needs to know nothing about replays.
+    What ends up on the right of the split screen is then produced by the same
+    composer as what is on the left, and the only difference between the halves
+    is the one being investigated.
+    """
+    import cv2
+
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    scene = _ScenePanel(episode.base_xytheta)
+    state: dict[str, Any] = {"scene": None, "cams": None, "cameras": None}
+
+    def open_writer(path: Path, frame: np.ndarray):
+        height, width = frame.shape[:2]
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+        if not writer.isOpened():
+            log.warning(f"[replay] could not open {path}")
+            return None
+        return writer
+
+    def sink(step: int, model, data, view, proxy) -> None:
+        if state["cameras"] is None:
+            sizes = [REPLAY_PANEL_SIZE] + ([exo.render_size] if exo is not None else [])
+            _ensure_offscreen_buffer(model, *sizes)
+            state["cameras"] = _CameraPanels(model, proxy.namespace, exo)
+
+        frame = scene.frame(model, data, view, proxy)
+        if state["scene"] is None:
+            state["scene"] = open_writer(panel_dir / f"{key}_scene.mp4", frame)
+        if state["scene"] is not None:
+            state["scene"].write(frame)
+
+        row = camera_row(state["cameras"].frames(data), REPLAY_PANEL_SIZE[0])
+        if state["cams"] is None:
+            state["cams"] = open_writer(panel_dir / f"{key}_cams.mp4", row)
+        if state["cams"] is not None:
+            state["cams"].write(row)
+
+    try:
+        result = replay_episode(episode, exo=exo, stage=stage, frame_sink=sink, **replay_kwargs)
+    finally:
+        for writer in (state["scene"], state["cams"]):
+            if writer is not None:
+                writer.release()
+        scene.close()
+        if state["cameras"] is not None:
+            state["cameras"].close()
     return result
 
 
