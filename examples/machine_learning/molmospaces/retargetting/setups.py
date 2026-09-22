@@ -43,6 +43,11 @@ from typing import Any
 import numpy as np
 
 from examples.machine_learning.molmospaces.added_pickup_repair import install_eval_repair
+from examples.machine_learning.molmospaces.policies.franka_retarget import (
+    VirtualFranka,
+    change_franka_start_pose_requested,
+    stretch_startable_arm_qpos,
+)
 from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (
     StretchMolmoBotDroidPolicy,
     StretchMolmoBotDroidPolicyConfig,
@@ -162,7 +167,7 @@ aspect disagrees -- which quietly warps the frame differently from the hardware.
 DROID_FRAME_SIZE = (640, 360)
 """What the checkpoint was trained on. `--exo-crop` brings a fisheye frame to it."""
 
-STRETCH_GRASP_OFFSET_M = 0.09
+STRETCH_GRASP_OFFSET_M = 0.00
 STRETCH_TARGET_Z_OFFSET_M = 0.0
 """
 The tool correction the Stretch setups retarget with, measured by search.
@@ -746,6 +751,16 @@ def franka_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None:
         key: list(value)
         for key, value in FrankaRobotConfig.model_fields["init_qpos"].default.items()
     }
+    if change_franka_start_pose_requested():
+        # The Franka half of `--change_franka_start_pose`. The Stretch half is in
+        # `FrankaOnStretchView.__init__`, which adjusts the *virtual* Franka the
+        # retargeting snaps Stretch to; both read the same flag, so the two
+        # conditions cannot end up starting at different poses -- which is the one
+        # thing this flag exists to prevent.
+        episode_spec.robot.init_qpos["arm"] = [
+            float(angle)
+            for angle in stretch_startable_arm_qpos(VirtualFranka(), FRANKA_LINK0_HEIGHT)
+        ]
 
     system = franka_camera_system(params)
     exp_config.camera_config.cameras = list(system.cameras)

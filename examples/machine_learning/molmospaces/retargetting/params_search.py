@@ -74,6 +74,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np  # noqa: E402
 
+from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting import mini_benchmark  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting.cameras import (  # noqa: E402
     ExoCameraParams,
@@ -664,6 +665,16 @@ class SimpleCMAES:
 )
 @click.option("--list-dims", is_flag=True, help="List the searchable dimensions and exit.")
 @click.option("--list-setups", is_flag=True, help="List the seven setups and exit.")
+@click.option(
+    "--change_franka_start_pose",
+    "change_franka_start_pose",
+    is_flag=True,
+    help="Start the Franka rolled half a turn about its approach axis -- which turns its "
+    "wrist camera outwards and leaves the grasp identical -- and capped at Stretch's own "
+    "reach ceiling, so both robots begin an episode at the same pose. Held fixed across "
+    "the whole search rather than searched over. See "
+    "`franka_retarget.stretch_startable_arm_qpos`.",
+)
 def main(
     setup_keys: tuple[str, ...],
     search: str,
@@ -684,8 +695,19 @@ def main(
     replay_limit: int | None,
     replay_no_video: bool,
     list_setups: bool,
+    change_franka_start_pose: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    # Published once, before any trial: every point in the search has to be scored
+    # against the same start pose or the search is climbing two surfaces at once.
+    # Written in both directions -- see `publish_change_franka_start_pose`.
+    fr.publish_change_franka_start_pose(change_franka_start_pose)
+    if change_franka_start_pose:
+        log.info(
+            "[start-pose] every trial starts the Franka rolled half a turn and capped at "
+            f"{fr.STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
+        )
 
     if list_setups:
         for key in SETUP_KEYS:

@@ -104,6 +104,7 @@ from examples.machine_learning.molmospaces.retargetting.diagnose import (  # noq
 )
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     FRANKA_LINK0_HEIGHT,
+    apply_tool_correction,
 )
 
 # =============================================================================
@@ -167,6 +168,16 @@ stall to come back unnoticed.
 What made even the 0.43 rad tolerable is that it never cost *position*, which
 this test asserts separately and at the full tolerance. A regression that started
 trading position away would fail there rather than here.
+
+**`RetargetRig` now defaults to `jaw_mode="upright"`, which brings the 0.43 rad
+back on purpose**, and this tolerance is deliberately *not* loosened to
+accommodate it. The flip closes the gap by substituting a grasp-equivalent pose,
+and that equivalence does not extend to the wrist camera riding on the same
+wrist -- so the substitution is not available to a study whose start pose is
+chosen for where that camera points. The number this test now reports at `yaw_in`
+is the honest cost of forbidding it, and it is the same 0.43 rad the paragraph
+above records from before `JAW_FLIP` existed. Restoring `jaw_mode="auto"` on the
+rig is the one-line way back.
 """
 
 
@@ -202,17 +213,41 @@ at the value a sweep picks is how you see what it costs.
 """
 
 
+GRASP_OFFSET_ENV_VAR = "RETARGET_TEST_GRASP_OFFSET"
+"""
+Environment variable naming the `grasp_offset_m` the rig is built with.
+
+The depth twin of `TARGET_Z_OFFSET_ENV_VAR`, exported for the same reason: one
+flag has to serve both this module's command line and a bare `pytest` run.
+
+It defaults to 0.0 rather than to `setups.STRETCH_GRASP_OFFSET_M`, deliberately.
+These checks measure whether Stretch's tool goes where the retargeting asked, and
+the offset is part of the asking -- running them at 0 keeps "the two grippers
+coincide" as the plain reading of a passing suite, and running them at a swept
+value shows what that value does to the geometry. Neither is the default's job to
+decide.
+"""
+
+
 def configured_target_z_offset() -> float:
     """The offset from the environment, or 0.0. See `TARGET_Z_OFFSET_ENV_VAR`."""
-    raw = os.environ.get(TARGET_Z_OFFSET_ENV_VAR, "").strip()
+    return _configured_offset(TARGET_Z_OFFSET_ENV_VAR)
+
+
+def configured_grasp_offset() -> float:
+    """The grasp offset from the environment, or 0.0. See `GRASP_OFFSET_ENV_VAR`."""
+    return _configured_offset(GRASP_OFFSET_ENV_VAR)
+
+
+def _configured_offset(name: str) -> float:
+    """A number of metres from `name` in the environment, or 0.0 if it is unset."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return 0.0
     try:
         return float(raw)
     except ValueError as error:
-        raise ValueError(
-            f"{TARGET_Z_OFFSET_ENV_VAR}={raw!r} is not a number of metres."
-        ) from error
+        raise ValueError(f"{name}={raw!r} is not a number of metres.") from error
 
 
 @dataclass(frozen=True)
@@ -370,6 +405,19 @@ def build_franka_on_the_pedestal(
     return model, data, view, config.robot_namespace
 
 
+TRAJECTORY_STEPS = 12
+"""
+How many interpolated commands to put between two waypoints when walking the path.
+
+Shared by `walked` and `test_the_grippers_stay_together_along_a_continuous_path`
+so the two cannot drift apart, and matched to how `--visualize` drives the same
+motion. The number matters more than it looks: `StretchArmIK` caps each damped
+step at 5cm and 0.2 rad and seeds the next solve from the last, so a path handed
+to it in one leap per waypoint is a strictly harder problem than the same path in
+twelve -- and a harder one than a rollout poses, which at 15Hz moves the arm in
+far smaller increments than these.
+"""
+
 FRANKA_GRIPPER_SETTLE_STEPS = 300
 """
 How many physics steps the Robotiq needs to reach a commanded opening.
@@ -428,7 +476,17 @@ class Reached:
     """Whether the arm took the half-turned jaw to get here. See `franka_retarget.JAW_FLIP`."""
 
     target_z_offset: float = 0.0
-    """The offset in force, so a `Reached` can say what its own poses mean."""
+    """The height offset in force, so a `Reached` can say what its own poses mean."""
+
+    grasp_offset: float = 0.0
+    """
+    The depth offset in force, in metres. See `RetargetParams.grasp_offset_m`.
+
+    Carried for the same reason as `target_z_offset`: at a non-zero offset
+    `stretch_pose` and `franka_reference_pose` are *supposed* to be this far
+    apart, and a render that did not say so would show a 90mm gap between the two
+    balls and read as a retargeting error of 90mm.
+    """
 
     franka_aperture: float = 0.0
     """How wide the Franka's jaw is, in metres."""
@@ -440,16 +498,45 @@ class Reached:
     def franka_reference_pose(self) -> np.ndarray:
         """The Franka's grasp centre, in Stretch's tool convention, *without* the offset.
 
-        `expected_pose` is this pose raised by `target_z_offset`, so this is the
-        un-offset reference the offset is measured from -- the same physical point
-        as `franka_pose`, rotated so its axes are comparable with Stretch's.
-        Drawn on the Stretch panel so a render at a non-zero offset shows all
-        three of the things that matter: where the Franka's tool is, where Stretch
-        was asked to put its own, and where it got to.
+        `expected_pose` is this pose with both offsets applied, so this is the
+        un-offset reference they are measured from -- the same physical point as
+        `franka_pose`, rotated so its axes are comparable with Stretch's. Drawn on
+        the Stretch panel so a render at a non-zero offset shows all three of the
+        things that matter: where the Franka's tool is, where Stretch was asked to
+        put its own, and where it got to.
+
+        Built from `franka_pose` rather than by subtracting the offsets back off
+        `expected_pose`, so it stays the Franka's actual tool centre however many
+        corrections the tool transform grows -- `grasp_offset_m` is along the
+        approach and `wrist_tilt_deg` rotates the axis it is along, which is not
+        something a subtraction of two scalars can undo.
         """
-        pose = np.array(self.expected_pose, dtype=float, copy=True)
-        pose[2, 3] -= self.target_z_offset
+        pose = np.array(self.franka_pose, dtype=float, copy=True)
+        pose[:3, :3] = pose[:3, :3] @ fr.FRANKA_TO_STRETCH_TOOL
         return pose
+
+    @property
+    def stretch_pose_as_commanded(self) -> np.ndarray:
+        """`stretch_pose`, expressed in the convention the command was given in.
+
+        When the wrist took the half-turned jaw branch, the frame Stretch is
+        actually holding is `JAW_FLIP` away from the one the policy asked for.
+        The two describe the *same grasp* -- that is what `JAW_FLIP` is -- but
+        only one of them is in the frame the command was written in, and drawing
+        the other puts Stretch's axes half a turn from the Franka's on a pair of
+        panels whose whole purpose is that one colour means one direction.
+
+        This is exactly what `FrankaOnStretchView.franka_joint_pos` already does
+        before handing the arm state back to the policy, and for the same reason.
+        The render was the one place still drawing the raw frame, so a legitimate
+        flip looked like the retargeting had inverted the tool.
+
+        The flip is not hidden -- `jaw_flipped` still puts "(jaw flipped)" on the
+        label. What changes is that the axes now show the grasp being commanded
+        rather than the arbitrary one of two ways the wrist is holding it.
+        """
+        pose = np.asarray(self.stretch_pose, dtype=float)
+        return pose @ fr.JAW_FLIP if self.jaw_flipped else pose.copy()
 
     @property
     def vertical_error(self) -> float:
@@ -473,13 +560,35 @@ class RetargetRig:
     re-anchored -- which is what `MolmoBotDroidPolicy._build_proxy` does per
     episode, deliberately, so that the base driving during a solve does not drag
     the frame the policy's actions are interpreted in along with it.
+
+    `jaw_mode` defaults to `"upright"` here, against `FrankaOnStretchView`'s own
+    `"auto"`. Stretch follows the Franka's tool frame and is never allowed to
+    substitute the half-turned one, so what these checks measure is the frame the
+    policy actually commanded rather than a grasp-equivalent stand-in.
+
+    The equivalence `"auto"` trades on is real but narrower than it looks: a
+    parallel jaw grasps the same object the same way either way round, so
+    `grasp_difference` scores a flipped wrist as a perfect match -- and a *camera*
+    bolted to that wrist is mirrored by the same rotation, which no grasp metric
+    can see. With `--change_franka_start_pose` rolling the start precisely to
+    place that camera, a mode free to flip the wrist is free to undo it, and to
+    score itself 0.0003 rad while doing so.
+
+    The cost is stated rather than hidden: `"upright"` cannot hold `yaw_in` and
+    `yaw_out` from a rolled start, where Stretch's asymmetric `wrist_roll_joint`
+    (about [-4.28, +1.14] rad) leaves it 0.43 rad short -- see `JAW_FLIP`. Those
+    are poses this robot reaches only by flipping, and refusing to flip means
+    admitting it cannot reach them, which is the more useful thing for a
+    cross-embodiment study to report.
     """
 
     def __init__(
         self,
         include_base: bool = True,
         target_z_offset: float = 0.0,
-        jaw_mode: str = "auto",
+        grasp_offset: float = 0.0,
+        jaw_mode: str = "upright",
+        change_franka_start_pose: bool | None = None,
     ) -> None:
         self.model, self.data, self.view, self.namespace = build_standing_robot()
         self._home_qpos = self.data.qpos.copy()
@@ -493,7 +602,16 @@ class RetargetRig:
             include_base=include_base,
             target_z_offset=target_z_offset,
             jaw_mode=jaw_mode,
+            change_franka_start_pose=change_franka_start_pose,
         )
+
+        # Through `apply_tool_correction`, which is what a rollout goes through:
+        # the offset lives in the proxy's tool transform, not in a number this
+        # harness carries alongside it, so what the checks below measure is the
+        # same composition `setups.py` installs for an episode.
+        self.grasp_offset = float(grasp_offset)
+        if self.grasp_offset:
+            apply_tool_correction(self.proxy, wrist_tilt_deg=0.0, grasp_offset_m=self.grasp_offset)
 
         (
             self.franka_model,
@@ -530,27 +648,51 @@ class RetargetRig:
 
     @contextmanager
     def franka_ground_truth(self):
-        """Hold `target_z_offset` at zero for the duration.
+        """Hold *every* Stretch-side correction at zero for the duration.
 
         Every pose that describes *the Franka* has to be built inside this. The
-        Franka is the reference the whole comparison is measured against, so the
-        offset is not allowed anywhere near it: `target_z_offset` means "put
-        Stretch's tool this much above where the Franka's is", and it earns that
+        Franka is the reference the whole comparison is measured against, so no
+        correction is allowed anywhere near it: `target_z_offset` means "put
+        Stretch's tool this much above where the Franka's is" and `grasp_offset_m`
+        means "this much deeper along its own approach", and each earns that
         meaning only if the Franka does not move when it changes.
 
-        `franka_tool_pose_to_world` and `stretch_tool_pose_to_franka` both fold
-        the offset in, which is right for the retargeting -- they are how a
-        commanded Stretch target gets raised -- and wrong for generating a
-        waypoint or the command that reaches it. An earlier version of this file
-        used them for both, and the result was exactly backwards: raising the
-        offset moved the Franka *down* and left Stretch's target where it was.
+        `franka_tool_pose_to_world` and `stretch_tool_pose_to_franka` fold both
+        in, which is right for the retargeting -- they are how a commanded Stretch
+        target gets raised and deepened -- and wrong for generating a waypoint or
+        the command that reaches it. An earlier version of this file used them for
+        both, and the result was exactly backwards: raising the offset moved the
+        Franka *down* and left Stretch's target where it was.
+
+        The tool transform is restored to its bare `FRANKA_TO_STRETCH_TOOL`
+        rotation rather than to the identity, because the quarter turn between the
+        two tool conventions is not a correction -- it is what makes a Franka pose
+        expressible as a Stretch one at all, and dropping it would leave the
+        waypoints rotated rather than uncorrected. What `apply_tool_correction`
+        composes on top of it -- the grasp depth and the wrist tilt -- is the
+        correction, and that is what this drops.
+
+        The grasp offset belongs here for a reason worth stating, because the
+        symptom does not name its cause: with the offset left in, a 9cm one moved
+        the *Franka's* commanded pose 9cm along its own approach, which at the
+        `tilt_down` waypoint put it outside the Franka's reach -- and the suite
+        then reported that waypoint as badly chosen rather than the harness as
+        wrong about whose pose it was building.
         """
         offset = self.proxy.target_z_offset
+        correction = self.proxy._tool_correction
+        inverse = self.proxy._tool_correction_inverse
+        bare = np.eye(4)
+        bare[:3, :3] = fr.FRANKA_TO_STRETCH_TOOL
         self.proxy.target_z_offset = 0.0
+        self.proxy._tool_correction = bare
+        self.proxy._tool_correction_inverse = np.linalg.inv(bare)
         try:
             yield
         finally:
             self.proxy.target_z_offset = offset
+            self.proxy._tool_correction = correction
+            self.proxy._tool_correction_inverse = inverse
 
     @property
     def franka_home_command(self) -> np.ndarray:
@@ -560,15 +702,38 @@ class RetargetRig:
     def centred_pose(self) -> np.ndarray:
         """The pose the waypoints are offsets from: the Franka's home, lowered to counter height.
 
-        A pose *the Franka's tool* reaches, and therefore built without the
-        offset -- the waypoints are the fixed ground truth that raising
+        A pose *the Franka's tool* reaches, and therefore built without any tool
+        correction -- the waypoints are the fixed ground truth that raising
         `target_z_offset` is measured against, not something it moves.
+
+        The two halves of `--change_franka_start_pose` are taken differently, which
+        is deliberate and measured rather than a compromise:
+
+        * **The rotation comes from the start pose.** A waypoint is an offset
+          *from where the robot starts*, and `Waypoint.tool_rotation` is applied
+          on the right -- in the tool's own frame -- so a rolled start carries
+          through to every waypoint with each one's own rotation still meaning
+          what it says. Roll the start and the whole set rolls with it, which is
+          the point of rolling it at all.
+
+        * **The position does not.** The height cap lowers the start by 10.3cm,
+          and lowering every waypoint with it puts `reach_in` and `tilt_up`
+          outside the *Franka's* own reach -- measured at 78.7mm and 43.2mm, well
+          past `FRANKA_IK_TOLERANCE_M`. A waypoint the reference robot cannot hold
+          measures nothing, so the set keeps the height it was chosen at. The cap
+          is a statement about how high Stretch can start, not about where the
+          test is entitled to ask either robot to go.
         """
         with self.franka_ground_truth():
-            home = self.proxy.franka_tool_pose_to_world(
-                self.proxy.franka.fk(self.franka_home_command)
+            # Rotation from wherever the Franka starts, position from where it
+            # normally does -- see above.
+            start = self.proxy.franka_tool_pose_to_world(
+                self.proxy.franka.fk(self.proxy.franka.init_qpos)
             )
-        pose = home.copy()
+            home = self.proxy.franka_tool_pose_to_world(
+                self.proxy.franka.fk(self.proxy.franka.default_init_qpos)
+            )
+        pose = start.copy()
         pose[:3, 3] = home[:3, 3] - GRASP_HEIGHT_DROP_M * self.up
         return pose
 
@@ -598,10 +763,19 @@ class RetargetRig:
         Offset-free, because this is the Franka's command: see
         `franka_ground_truth`. What `target_z_offset` then does is raise the
         Stretch target this command retargets to, which is its entire job.
+
+        Seeded from `default_init_qpos` rather than from `franka_home_command`, so
+        that "depends only on its own waypoint" stays true under
+        `--change_franka_start_pose` as well. A seed is not a neutral choice: from
+        the rolled start the solve converged on a different branch and left the
+        `roll_right` waypoint 1.1mm short against a 1.0mm tolerance, which is the
+        harness's seed showing up as the Franka failing to hold a waypoint.
         """
         with self.franka_ground_truth():
             target = self.proxy.stretch_tool_pose_to_franka(pose)
-        return self.proxy.franka.ik(target, self.franka_home_command, iterations=300)
+        return self.proxy.franka.ik(
+            target, self.proxy.franka.default_init_qpos, iterations=300
+        )
 
     def settled_franka_gripper(self, robotiq: float) -> np.ndarray:
         """The Robotiq's joint angles once it has closed on a 0-255 command.
@@ -611,16 +785,36 @@ class RetargetRig:
         stepping costs half a second. The arm is held at the Franka's home pose
         and commanded there while the hand settles, so nothing sags into the
         counter and adds contacts to what should be a free-space motion.
+
+        `default_init_qpos`, specifically, and not `franka_home_command`, which
+        `--change_franka_start_pose` lowers to Stretch's ceiling -- which is close
+        enough to the counter that the fingers close *on it*. Measured: at Robotiq
+        128 the jaw settled to 0.0mm instead of 43.3mm, a contact reported as a
+        gripper-mapping error. The hand's linkage is internal to the hand, so this
+        costs nothing: a configuration settled in free space is the right answer at
+        any arm pose, which is the same reason it is safe to cache at all.
         """
         key = round(float(robotiq), 3)
         if key not in self._settled_gripper:
             scratch = self._franka_gripper_scratch
             scratch.qpos[:] = self.franka_data.qpos
+            # The hand starts from the model's own rest configuration, not from
+            # wherever the last caller left it. Without this the settle is
+            # path-dependent and the cache -- which is keyed on the command alone
+            # -- hands back whichever answer the first caller happened to
+            # produce: settling to 128 from an already-shut hand sticks at 0.0mm,
+            # where settling to it from the rest pose gives 46.1mm. That made the
+            # suite order-dependent, which is the one thing a cache keyed on the
+            # command must not be.
+            scratch.qpos[self._franka_gripper_qposadr] = self.franka_model.qpos0[
+                self._franka_gripper_qposadr
+            ]
             scratch.qvel[:] = 0.0
             scratch.ctrl[:] = 0.0
             view = type(self.franka_view)(scratch, self.franka_namespace)
-            view.get_move_group("arm").joint_pos = self.franka_home_command
-            view.get_move_group("arm").ctrl = self.franka_home_command
+            free_space = self.proxy.franka.default_init_qpos
+            view.get_move_group("arm").joint_pos = free_space
+            view.get_move_group("arm").ctrl = free_space
             view.get_move_group("gripper").ctrl = [key]
             for _ in range(FRANKA_GRIPPER_SETTLE_STEPS):
                 mujoco.mj_step(self.franka_model, scratch)
@@ -709,10 +903,16 @@ class RetargetRig:
         )
 
         # Where the retargeting asked Stretch to go, expressed from the Franka
-        # that is actually standing there: the same point, rotated into Stretch's
-        # tool convention, and raised by whatever `target_z_offset` is set to.
-        expected_pose = franka_pose.copy()
-        expected_pose[:3, :3] = franka_pose[:3, :3] @ fr.FRANKA_TO_STRETCH_TOOL
+        # that is actually standing there: the same point put through the proxy's
+        # own tool correction, then raised by whatever `target_z_offset` is set to.
+        #
+        # The *whole* correction rather than `FRANKA_TO_STRETCH_TOOL` alone, which
+        # is what this used to apply. The two agree exactly while the correction
+        # is a bare rotation, and stop agreeing the moment `grasp_offset_m` or
+        # `wrist_tilt_deg` is non-zero -- at which point the old expression was
+        # asserting that Stretch ignore a correction the retargeting had just
+        # applied, and every check here would fail by the size of the offset.
+        expected_pose = franka_pose @ self.proxy._tool_correction
         expected_pose[2, 3] += self.proxy.target_z_offset
 
         position_error, orientation_error = grasp_difference(stretch_pose, expected_pose)
@@ -726,6 +926,7 @@ class RetargetRig:
             residual=self.proxy.last_residual.copy(),
             jaw_flipped=bool(self.proxy.jaw_flipped),
             target_z_offset=float(self.proxy.target_z_offset),
+            grasp_offset=self.grasp_offset,
             franka_aperture=float(self.franka_view.get_move_group("gripper").inter_finger_dist),
             stretch_aperture=float(self.view.get_move_group("gripper").inter_finger_dist),
         )
@@ -746,14 +947,31 @@ class RetargetRig:
 def rig() -> RetargetRig:
     """One rig for the whole module. See `RetargetRig` on why sharing it is safe."""
     offset = configured_target_z_offset()
+    grasp_offset = configured_grasp_offset()
+    changed_start = fr.change_franka_start_pose_requested()
     if offset:
-        log_line = (
-            f"target_z_offset = {offset:+.4f}m: every commanded grasp is raised by this "
-            f"much, so the checks below are measuring the retargeting as a rollout "
-            f"actually applies it."
+        print(
+            f"\n[retargeting] target_z_offset = {offset:+.4f}m: every commanded grasp is "
+            f"raised by this much, so the checks below are measuring the retargeting as a "
+            f"rollout actually applies it."
         )
-        print(f"\n[retargeting] {log_line}")
-    return RetargetRig(target_z_offset=offset)
+    if grasp_offset:
+        print(
+            f"\n[retargeting] grasp_offset = {grasp_offset:+.4f}m: every commanded grasp is "
+            f"pushed this far along Stretch's approach axis, so the two tool centres are "
+            f"meant to sit this far apart and the checks compare against the offset target."
+        )
+    if changed_start:
+        print(
+            f"\n[retargeting] change_franka_start_pose: the virtual Franka starts rolled half "
+            f"a turn and capped at {fr.STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, so both robots begin "
+            f"an episode at a pose Stretch can actually hold."
+        )
+    return RetargetRig(
+        target_z_offset=offset,
+        grasp_offset=grasp_offset,
+        change_franka_start_pose=changed_start,
+    )
 
 
 def test_the_virtual_franka_agrees_with_a_real_one(rig: RetargetRig) -> None:
@@ -789,29 +1007,105 @@ def test_the_virtual_franka_agrees_with_a_real_one(rig: RetargetRig) -> None:
         )
 
 
+walked_gripper_axes: dict[str, tuple] = {}
+"""
+Each waypoint's finger axes, filled in by `walked` as it walks.
+
+A module-level dict rather than a second fixture because it is written *during*
+the walk -- the axes are read off body poses, which only exist while the robots
+are standing at that waypoint -- and a fixture that returned them would have to
+either walk again or return this same object anyway.
+"""
+
+
+@pytest.fixture(scope="module")
+def walked(rig: RetargetRig) -> dict[str, Reached]:
+    """Every waypoint's `Reached`, from one continuous walk of `WAYPOINTS`.
+
+    The waypoints are driven the way a rollout drives its actions -- in order,
+    each solved from the configuration the last one left -- rather than each
+    snapped to fresh from the home pose. `StretchArmIK` seeds from wherever the
+    robot currently is, so those are not the same question, and only one of them
+    is the one an episode asks: a policy snaps once before its first action and
+    every command after that is a step from the pose the previous one reached.
+
+    Snapping per waypoint measured a robot that teleports home between actions.
+    It flattered the easy poses and, at the hard ones, reported a reachability
+    the arm does not have from where it would actually be standing -- or denied
+    it one it does. Walked, `yaw_in` and `yaw_out` are solved from a wrist
+    already most of the way there, which is the condition they are reached in.
+
+    Module-scoped because the walk is the expensive part and every parametrised
+    check wants a different step of the same one. That makes these checks share
+    state by construction, which is the point: the path *is* the thing under
+    test, and a step of it cannot be reproduced without the steps before it.
+    """
+    rig.restore()
+    commands = [rig.franka_command_for(rig.waypoint_pose(w)) for w in WAYPOINTS]
+    reached: dict[str, Reached] = {}
+    for index, (command, waypoint) in enumerate(zip(commands, WAYPOINTS)):
+        previous = commands[index - 1] if index else command
+        # Interpolated, not jumped. `StretchArmIK` takes damped steps capped at
+        # 5cm and 0.2 rad and seeds each solve from the last, so handing it a
+        # whole waypoint-to-waypoint leap is a different question from the one a
+        # rollout asks -- at 15Hz the policy moves the arm in small increments and
+        # the solver tracks them. Jumped, `yaw_in` settled 0.43 rad short; walked
+        # at the same `TRAJECTORY_STEPS` the continuous-path check uses, it
+        # arrives. The leap was the harness's, not the retargeting's.
+        for step in (range(1, TRAJECTORY_STEPS + 1) if index else range(1, 2)):
+            blend = step / TRAJECTORY_STEPS if index else 1.0
+            result = rig.command(
+                previous + blend * (command - previous),
+                robotiq=waypoint.robotiq,
+                restore=False,
+            )
+        reached[waypoint.label] = result
+        # Captured here, while both robots are actually standing at this
+        # waypoint: the finger axes are read off body poses, so they cannot be
+        # recovered from a `Reached` afterwards, and re-driving the path once per
+        # waypoint to get them back would cost sixteen walks.
+        walked_gripper_axes[waypoint.label] = (
+            _gripper_axes(
+                rig.franka_model, rig.franka_data, rig.franka_namespace, FRANKA_GRIPPER_BODIES
+            ),
+            _gripper_axes(rig.model, rig.data, rig.namespace, STRETCH_GRIPPER_BODIES),
+        )
+    return reached
+
+
 @pytest.mark.parametrize("waypoint", WAYPOINTS, ids=lambda waypoint: waypoint.label)
-def test_stretch_reaches_the_commanded_pose(rig: RetargetRig, waypoint: Waypoint) -> None:
+def test_stretch_reaches_the_commanded_pose(
+    rig: RetargetRig, waypoint: Waypoint, walked: dict[str, Reached]
+) -> None:
     """The whole point: one Franka command, and both grippers end up in the same place.
 
     The comparison is against the Franka instance's own grasp site, not against
     the pose the waypoint asked for, so this stays a test of the retargeting even
     if a waypoint is one the Franka holds imperfectly -- and the assertion above
     it keeps the waypoints honest about that.
+
+    Read off the continuous walk (`walked`) rather than solved fresh here, so the
+    pose is the one an episode would reach: see that fixture.
     """
     requested = rig.waypoint_pose(waypoint)
-    command = rig.franka_command_for(requested)
 
-    reached = rig.command(command)
+    reached = walked[waypoint.label]
 
-    # The Franka's own pose against the waypoint, with the offset taken back out
-    # of `expected_pose`. Both sides are then Franka ground truth, so this asks
-    # the offset-independent question -- did the Franka hold the pose it was
-    # asked for -- and stays true at any `target_z_offset`, which does not move
-    # the Franka at all. (`franka_pose` is in the Franka's own tool convention;
-    # `expected_pose` is the same point rotated into Stretch's, which is the
-    # convention the waypoints are written in.)
-    franka_reached = reached.expected_pose.copy()
-    franka_reached[2, 3] -= rig.proxy.target_z_offset
+    # The Franka's own pose against the waypoint. Both sides are then Franka
+    # ground truth, so this asks the correction-independent question -- did the
+    # Franka hold the pose it was asked for -- and stays true at any
+    # `target_z_offset` or `grasp_offset_m`, neither of which moves the Franka.
+    # (`franka_pose` is in the Franka's own tool convention;
+    # `franka_reference_pose` is the same point rotated into Stretch's, which is
+    # the convention the waypoints are written in.)
+    #
+    # `franka_reference_pose` rather than `expected_pose` with the corrections
+    # subtracted back off, which is what this did while the only correction was a
+    # height: a depth offset is along the approach, so backing it out means
+    # rotating, not subtracting a scalar from z -- and with a grasp offset in
+    # force the old expression reported the Franka as missing its own waypoint by
+    # exactly the offset.
+    franka_reached = reached.franka_reference_pose
     franka_miss, _ = pose_difference(franka_reached, requested)
     assert franka_miss < FRANKA_IK_TOLERANCE_M, (
         f"waypoint {waypoint.label!r} is not a pose the Franka itself holds -- its own IK "
@@ -832,8 +1126,21 @@ def test_stretch_reaches_the_commanded_pose(rig: RetargetRig, waypoint: Waypoint
         f"waypoint {waypoint.label!r}, rotated into Stretch's convention (jaw_mode "
         f"{rig.proxy.jaw_mode!r}). About 1.57 rad here is `FRANKA_TO_STRETCH_TOOL` applied on "
         f"the wrong side or about the wrong axis; about 0.43 rad at a large tool yaw is "
-        f"`jaw_mode=\"flipped\"` running the wrist into a roll limit, which is that mode's "
-        f"known cost -- see `franka_retarget.JAW_MODES`."
+        f"Stretch's `wrist_roll_joint` hitting the end of its asymmetric range (about "
+        f"[-4.28, +1.14] rad) -- see `franka_retarget.JAW_FLIP`. Under `jaw_mode=\"upright\"` "
+        f"that is simply a pose this arm cannot hold: the half-turned wrist reaches it and is "
+        f"not allowed to be substituted, because a flip mirrors the wrist camera as well as "
+        f"the jaw. `yaw_in` and `yaw_out` are the two waypoints this costs."
+        + (
+            "  `change_franka_start_pose` is on, which is the other way into that branch: "
+            "rolling the start half a turn leaves the wrist where the upright branch is no "
+            "longer reachable (16mm and 0.62 rad away at this waypoint, against the flipped "
+            "branch's 0.00mm), so `auto` keeps the flipped one on position and pays for it in "
+            "roll. Measured, not inferred -- and it is the roll half of that flag, not the "
+            "height cap, which costs nothing at any waypoint."
+            if rig.proxy.change_franka_start_pose
+            else ""
+        )
     )
 
 
@@ -876,7 +1183,9 @@ STRETCH_GRIPPER_BODIES = (
 @pytest.mark.parametrize(
     "waypoint", WAYPOINTS[::3] + (WAYPOINTS[10], WAYPOINTS[14]), ids=lambda w: w.label
 )
-def test_both_grippers_end_up_pointing_the_same_way(rig: RetargetRig, waypoint: Waypoint) -> None:
+def test_both_grippers_end_up_pointing_the_same_way(
+    rig: RetargetRig, waypoint: Waypoint, walked: dict[str, Reached]
+) -> None:
     """The two grippers have to be oriented alike in the room, measured off their fingers.
 
     This exists because `test_stretch_reaches_the_commanded_pose` cannot see a
@@ -897,13 +1206,8 @@ def test_both_grippers_end_up_pointing_the_same_way(rig: RetargetRig, waypoint: 
     sign, because a parallel gripper turned half a turn about its own approach
     grasps identically and neither model's "left" has to be the other's.
     """
-    rig.command(rig.franka_command_for(rig.waypoint_pose(waypoint)))
-
-    franka_separation, franka_approach = _gripper_axes(
-        rig.franka_model, rig.franka_data, rig.franka_namespace, FRANKA_GRIPPER_BODIES
-    )
-    stretch_separation, stretch_approach = _gripper_axes(
-        rig.model, rig.data, rig.namespace, STRETCH_GRIPPER_BODIES
+    (franka_separation, franka_approach), (stretch_separation, stretch_approach) = (
+        walked_gripper_axes[waypoint.label]
     )
 
     approach = float(np.dot(franka_approach, stretch_approach))
@@ -964,7 +1268,27 @@ def test_above_the_lift_ceiling_the_error_is_the_lift_shortfall(rig: RetargetRig
     it is *vertical* (the arm is short, not lost), and it is the same quantity
     `measure_tool_height_offset()` reports, which is what the policy config
     sets as `target_z_offset`.
+
+    Under `--change_franka_start_pose` the claim inverts, and so does the check.
+    That flag caps the Franka's start at `STRETCH_MAX_GRASP_HEIGHT_M` precisely so
+    the shortfall is zero, which is the only thing it can mean for the two robots
+    to "start in the same place" -- so there the assertion is that Stretch
+    *reaches* the home pose. Asserting it either way round rather than skipping,
+    because a flag whose whole purpose is to close this gap should have a check
+    that fails if it stops closing it.
     """
+    if rig.proxy.change_franka_start_pose:
+        reached = rig.command(rig.franka_home_command)
+        assert reached.position_error < POSITION_TOLERANCE_M, (
+            f"with change_franka_start_pose on, Stretch missed the Franka's start pose by "
+            f"{reached.position_error * 1000:.1f}mm (vertical component "
+            f"{reached.vertical_error * 1000:+.1f}mm). That start pose is capped at "
+            f"{fr.STRETCH_MAX_GRASP_HEIGHT_M:.4f}m *because* it is one Stretch can hold, so a "
+            f"miss means the cap and the robot's real ceiling have drifted apart -- re-measure "
+            f"with `retargetting.diagnose` and update `STRETCH_MAX_GRASP_HEIGHT_M`."
+        )
+        return
+
     reached = rig.command(rig.franka_home_command)
     # `measure_tool_height_offset` deliberately ignores whatever offset is set and
     # reports the raw shortfall, while the miss measured here is against a target
@@ -1029,6 +1353,16 @@ def test_the_offset_moves_stretch_and_never_the_franka(rig: RetargetRig, offset:
     try:
         reached = rig.command(command, restore=False)
         target = rig.proxy.franka_tool_pose_to_world(rig.proxy.franka.fk(command))
+        # The same target with the height offset taken back out, which is the
+        # baseline the rise is measured from. Not `franka_world`: that is the
+        # Franka's own grasp centre, and any *other* tool correction in force --
+        # `grasp_offset_m`, which moves the target along the approach and so has a
+        # vertical component of its own -- separates the two by a constant this
+        # check is not about. Differencing two poses that share every correction
+        # except the one under test is what isolates it.
+        rig.proxy.target_z_offset = 0.0
+        unraised = rig.proxy.franka_tool_pose_to_world(rig.proxy.franka.fk(command))
+        rig.proxy.target_z_offset = offset
         reported = rig.proxy.franka_joint_pos()
     finally:
         rig.proxy.target_z_offset = previous
@@ -1043,7 +1377,7 @@ def test_the_offset_moves_stretch_and_never_the_franka(rig: RetargetRig, offset:
         f"the real Franka's grasp site moved with the offset, to "
         f"{reached.franka_pose[2, 3]:.4f} from {franka_world[2, 3]:.4f}."
     )
-    rise = target[2, 3] - franka_world[2, 3]
+    rise = target[2, 3] - unraised[2, 3]
     assert rise == pytest.approx(offset, abs=1e-9), (
         f"an offset of {offset} raised Stretch's commanded target by {rise:.4f}m. These are "
         f"the same number by definition -- `franka_tool_pose_to_world` adds the offset and "
@@ -1315,7 +1649,7 @@ def test_the_grippers_stay_together_along_a_continuous_path(rig: RetargetRig) ->
     worth looking at rather than reading -- it is a path, so where it goes wrong
     matters.
     """
-    steps = 12
+    steps = TRAJECTORY_STEPS
     commands = [rig.franka_command_for(rig.waypoint_pose(waypoint)) for waypoint in WAYPOINTS]
     rig.restore()
 
@@ -1677,6 +2011,48 @@ axes needed no rotating, and saying so is cheaper than leaving the reader to
 wonder which panel was adjusted.
 """
 
+START_HOLD_MULTIPLIER = 3
+"""
+How much longer to hold the start frame than a waypoint's arrival.
+
+The waypoints are the same fifteen poses whatever the robots started from -- see
+`RetargetRig.centred_pose` -- so the start frame is the whole of what a
+start-pose flag has to show for itself, and one hold in sixty-odd frames is not
+enough to see it in.
+"""
+
+MARKER_LABEL_SEPARATION_M = 0.003
+"""
+How far apart two markers have to be before both get drawn with their labels.
+
+Purely a legibility threshold. Millimetres, because the labels are drawn at the
+markers and two balls closer together than this land on the same few pixels with
+their text on top of each other -- which is not a smaller version of the
+information, it is none of it.
+"""
+
+
+def stretch_note(reached: Reached) -> str:
+    """The Stretch panel's caption: its axis convention, plus any offset in force.
+
+    The offsets are named down here rather than on the markers because this line
+    has a whole panel width and the markers have whatever pixels they are not
+    overlapping. It matters that they are named *somewhere*: at a grasp offset the
+    two balls sit a whole 9cm apart while `position_error` reads 0mm, and a reader
+    with no caption has every reason to call that a retargeting error of 9cm. It
+    is the opposite -- the retargeting tracked a target that was deliberately
+    moved.
+    """
+    note = STRETCH_AXES_NOTE
+    if reached.grasp_offset:
+        note += (
+            f"  |  grasp_offset {reached.grasp_offset * 100:+.1f}cm: the gap is commanded"
+        )
+    if reached.target_z_offset:
+        note += f"  |  target_z_offset +{reached.target_z_offset * 100:.1f}cm"
+    return note
+
+
 VISUALIZE_FRAME_SIZE = (960, 540)
 """Per-robot frame size for `--visualize`, as (width, height). The pair is twice as wide."""
 
@@ -1684,6 +2060,8 @@ VISUALIZE_FRAME_SIZE = (960, 540)
 def visualize(
     output_dir: Path,
     target_z_offset: float = 0.0,
+    grasp_offset: float = 0.0,
+    change_franka_start_pose: bool = False,
     fps: int = 30,
     seconds_per_move: float = 1.0,
     hold_seconds: float = 0.4,
@@ -1724,7 +2102,11 @@ def visualize(
     """
     import cv2
 
-    rig = RetargetRig(target_z_offset=target_z_offset)
+    rig = RetargetRig(
+        target_z_offset=target_z_offset,
+        grasp_offset=grasp_offset,
+        change_franka_start_pose=change_franka_start_pose,
+    )
     commands = [rig.franka_command_for(rig.waypoint_pose(waypoint)) for waypoint in WAYPOINTS]
     labels = [waypoint.label for waypoint in WAYPOINTS]
 
@@ -1772,12 +2154,17 @@ def visualize(
 
         def render(reached: Reached, label: str) -> np.ndarray:
             hand = f"{reached.franka_aperture * 1000:.0f}mm"
-            # Each half gets its *own* reference height, not one shared number.
-            # The disk means "where this robot's tool is supposed to be", and
-            # with `target_z_offset` in force those are deliberately different
-            # heights: the Franka's stays at its own grasp centre, and only
-            # Stretch's rises. At offset 0 the two coincide, which is the shared
-            # ruler `add_height_plane` was written for.
+            # One height for both halves: the Franka's grasp centre, which is the
+            # reference the whole comparison is against. The disk is the only
+            # shared ruler two separately rendered scenes have, and it is worth
+            # nothing if each panel draws it at its own robot's target -- which is
+            # what this used to do. An offset then moved Stretch's disk and left
+            # the Franka's, so the two panels were ruled at different heights
+            # exactly when there was a difference to read, and on the Stretch
+            # panel the franka ball lifted off a circle that had dropped away
+            # beneath it. Drawn at the reference, an offset reads the way an
+            # offset should: the franka ball sits *on* the disk in both halves and
+            # Stretch's tool is the thing that departs from it, by the offset.
             # The Franka's grasp centre, but with its axes drawn in *Stretch's*
             # tool convention -- `franka_reference_pose` is that same point with
             # the tool rotation already applied. Its own convention is correct
@@ -1799,7 +2186,7 @@ def visualize(
                         f"franka {label} / {hand}",
                     )
                 ],
-                reference_height=float(reached.franka_pose[2, 3]),
+                reference_height=float(reached.franka_reference_pose[2, 3]),
                 note=FRANKA_AXES_NOTE,
             )
             # Three things on the Stretch panel, which is what a non-zero offset
@@ -1807,6 +2194,10 @@ def visualize(
             # was actually asked to go, and where it got to. With no offset the
             # first two coincide and the middle marker is dropped rather than
             # drawn on top of the first.
+            # With a grasp offset in force this ball is also where the *object*
+            # is: the policy aims its Robotiq's grasp site at the thing it wants,
+            # and this is that point. The offset is then the gap between this ball
+            # and Stretch's, which is the whole thing the render is for.
             stretch_markers = [
                 # A position, not a frame -- see `Marker.axes`.
                 Marker(
@@ -1816,12 +2207,21 @@ def visualize(
                     axes=False,
                 )
             ]
-            if reached.target_z_offset:
+            # Only when Stretch did not get there. The marker means "where Stretch
+            # was told to go", so drawing it on a target Stretch reached puts a
+            # second ball and a second label on the same few pixels as the
+            # Stretch frame below -- which at a grasp offset, where the tracking
+            # is exact and the interesting gap is the *other* one, turned all
+            # three labels into one unreadable overlap.
+            commanded_miss = float(
+                np.linalg.norm(reached.expected_pose[:3, 3] - reached.stretch_pose[:3, 3])
+            )
+            if commanded_miss > MARKER_LABEL_SEPARATION_M:
                 stretch_markers.append(
                     Marker(
                         reached.expected_pose,
                         fr.REFERENCE_TARGET_COLOR,
-                        f"commanded +{reached.target_z_offset * 100:.0f}cm",
+                        "commanded",
                         axes=False,
                     )
                 )
@@ -1831,7 +2231,7 @@ def visualize(
                 + [
                     # The one frame on this panel, so its axes are unambiguous.
                     Marker(
-                        reached.stretch_pose,
+                        reached.stretch_pose_as_commanded,
                         fr.STRETCH_TOOL_COLOR,
                         label=f"stretch {reached.position_error * 1000:.0f}mm"
                         f" / jaw {reached.stretch_aperture * 1000:.0f}mm"
@@ -1842,10 +2242,38 @@ def visualize(
                         + (" (jaw flipped)" if reached.jaw_flipped else ""),
                     ),
                 ],
-                reference_height=float(reached.expected_pose[2, 3]),
-                note=STRETCH_AXES_NOTE,
+                reference_height=float(reached.franka_reference_pose[2, 3]),
+                note=stretch_note(reached),
             )
             return fr.side_by_side(franka_frame, stretch_frame)
+
+        # The start pose, before any waypoint. Rendered because it is the one
+        # thing `--change_franka_start_pose` changes, and without it the flag was
+        # invisible here: `restore()` snaps to the start and the loop below then
+        # commands waypoint 0 straight away, so the first frame ever written was
+        # already at a waypoint -- which is built from `default_init_qpos` and so
+        # looks identical whatever the robots started from.
+        start = rig.command(
+            rig.proxy.franka.init_qpos,
+            robotiq=fr.ROBOTIQ_CTRL_RANGE[0],
+            restore=False,
+        )
+        start_frame = cv2.cvtColor(render(start, "start"), cv2.COLOR_RGB2BGR)
+        # Held longer than a waypoint, because it is the only frame in the video
+        # that shows what `--change_franka_start_pose` changes. Everything after
+        # it is a waypoint, and the waypoints are deliberately independent of the
+        # start pose -- so at a normal hold this frame was a tenth of a second out
+        # of six seconds, and the flag looked like it had done nothing.
+        for _ in range(max(hold_frames * START_HOLD_MULTIPLIER, fps)):
+            writer.write(start_frame)
+            written += 1
+        cv2.imwrite(str(output_dir / "00_start.png"), start_frame)
+        click.echo(
+            f"  {'start':16s} tool centres {start.position_error * 1000:6.2f}mm apart, "
+            f"tool frames {start.orientation_error:.4f} rad apart"
+            + ("   <- the only frame --change_franka_start_pose changes"
+               if rig.proxy.change_franka_start_pose else "")
+        )
 
         total = len(commands) * (move_frames + hold_frames) - move_frames
         click.echo(
@@ -1888,7 +2316,7 @@ def visualize(
                 writer.write(arrival)
                 written += 1
 
-            cv2.imwrite(str(output_dir / f"{index:02d}_{label}.png"), arrival)
+            cv2.imwrite(str(output_dir / f"{index + 1:02d}_{label}.png"), arrival)
             click.echo(
                 f"  {label:16s} tool centres {reached.position_error * 1000:6.2f}mm apart, "
                 f"tool frames {reached.orientation_error:.4f} rad apart"
@@ -1901,7 +2329,7 @@ def visualize(
         bold=True,
     )
     click.echo(f"video:  {video_path}  ({written} frames, {written / fps:.1f}s at {fps}fps)")
-    click.echo(f"stills: {output_dir}/NN_<waypoint>.png")
+    click.echo(f"stills: {output_dir}/00_start.png, then NN_<waypoint>.png")
     return video_path
 
 
@@ -1928,6 +2356,26 @@ def visualize(
     "`FrankaOnStretchView.target_z_offset`. Applies to the checks and to "
     "--visualize. The policy's own default is 0; raise this to see what an offset "
     "costs before sweeping it.",
+)
+@click.option(
+    "--grasp-offset",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Metres to push every retargeted target along Stretch's approach axis, as "
+    "`RetargetParams.grasp_offset_m`. Applies to the checks and to --visualize, where "
+    "the offset is drawn: the two tool balls separate by exactly this much and the "
+    "labels name it, so what an offset does to a grasp can be seen rather than "
+    "inferred from a score.",
+)
+@click.option(
+    "--change_franka_start_pose",
+    "change_franka_start_pose",
+    is_flag=True,
+    help="Start the virtual Franka rolled half a turn about its approach axis -- which "
+    "turns the wrist camera outwards and leaves the grasp identical -- and capped at "
+    "Stretch's own reach ceiling, so both robots can begin an episode at the same pose. "
+    "See `franka_retarget.stretch_startable_arm_qpos`.",
 )
 @click.option(
     "--fps",
@@ -1969,6 +2417,8 @@ def cli(
     do_visualize: bool,
     output_dir: Path,
     target_z_offset: float,
+    grasp_offset: float,
+    change_franka_start_pose: bool,
     fps: int,
     seconds_per_move: float,
     hold_seconds: float,
@@ -1989,11 +2439,16 @@ def cli(
     # Exported so the in-process `pytest.main` below reaches it too, which is
     # what makes one flag serve both modes. See `TARGET_Z_OFFSET_ENV_VAR`.
     os.environ[TARGET_Z_OFFSET_ENV_VAR] = repr(float(target_z_offset))
+    os.environ[GRASP_OFFSET_ENV_VAR] = repr(float(grasp_offset))
+    if change_franka_start_pose:
+        os.environ[fr.CHANGE_FRANKA_START_POSE_ENV_VAR] = "1"
 
     if do_visualize:
         visualize(
             output_dir,
             target_z_offset=target_z_offset,
+            grasp_offset=grasp_offset,
+            change_franka_start_pose=change_franka_start_pose,
             fps=fps,
             seconds_per_move=seconds_per_move,
             hold_seconds=hold_seconds,

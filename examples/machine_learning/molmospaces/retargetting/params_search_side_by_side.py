@@ -571,14 +571,23 @@ class RunResult:
             error=self.error or "",
         )
 
-    def outcome_by_key(self) -> dict[str, EpisodeScore]:
+    def outcome_by_key(self) -> dict[tuple[int, str], EpisodeScore]:
         """Probe records, keyed the way `SplitPanelRecorder` keys its panels.
 
-        Matched on instruction rather than order, for the reason
+        Keyed on scene *and* instruction rather than on order, for the reason
         `params_search._label_episodes` gives: with several workers the records
         arrive per worker, in whichever order they finished.
+
+        The scene has to be in the key. A benchmark runs the same four
+        instructions in every house, so keying on the instruction alone collapsed
+        twenty episodes onto four and left each caption showing whichever scene
+        happened to be written last -- which is how `house_1011`'s salt shaker
+        came to be captioned "PICKED UP (score 1.00)" in a run whose own
+        `episodes.csv` records it as a failure. A video that disagrees with the
+        report about what happened is worse than no video, because the report is
+        what gets checked second.
         """
-        return {episode.instruction: episode for episode in self.episodes}
+        return {(episode.scene, episode.instruction): episode for episode in self.episodes}
 
 
 def run_setup(
@@ -769,8 +778,9 @@ def compose_pair(
             continue
 
         instruction = left_meta.get("instruction") or ""
-        left_score = franka_outcomes.get(instruction)
-        right_score = stretch_outcomes.get(instruction)
+        scene = _scene_of(left_meta)
+        left_score = franka_outcomes.get((scene, instruction))
+        right_score = stretch_outcomes.get((_scene_of(right_meta), instruction))
         left_caption = _caption(
             panel_width, _describe(franka.setup, left_meta, left_score), _picked(left_score)
         )
@@ -814,6 +824,17 @@ def compose_pair(
             written.append(path)
             log.info(f"[side-by-side] wrote {path.name} ({length} frames)")
     return written
+
+
+def _scene_of(meta: dict[str, Any]) -> int:
+    """The house index behind a panel record's `house` field (`"house_1011"` -> 1011).
+
+    `SplitPanelRecorder` writes the name; `EpisodeScore.scene` holds the number,
+    so one of the two has to be converted before they can be matched.
+    """
+    house = str(meta.get("house") or "")
+    digits = house.rsplit("_", 1)[-1]
+    return int(digits) if digits.isdigit() else -1
 
 
 def _panel_index(panel_dir: Path) -> dict[str, dict[str, Any]]:
@@ -1064,6 +1085,15 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
     help="Skip both evaluations and re-tile the panels already under --output-dir. For "
     "changing the layout without paying for the rollouts again.",
 )
+@click.option(
+    "--change_franka_start_pose",
+    "change_franka_start_pose",
+    is_flag=True,
+    help="Start the Franka rolled half a turn about its approach axis -- which turns its "
+    "wrist camera outwards and leaves the grasp identical -- and capped at Stretch's own "
+    "reach ceiling, so both halves of the pair begin an episode at the same pose. See "
+    "`franka_retarget.stretch_startable_arm_qpos`.",
+)
 def main(
     pair: str,
     param_specs: tuple[str, ...],
@@ -1079,9 +1109,21 @@ def main(
     replay_z_offset: float,
     replay_limit: int | None,
     replay_no_video: bool,
+    change_franka_start_pose: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    # Before either half runs, and written in both directions: the point of a
+    # matched pair is that the two halves differ in exactly one thing, so a start
+    # pose left over from a previous run in the same shell would undo the pairing.
+    # See `publish_change_franka_start_pose`.
+    fr.publish_change_franka_start_pose(change_franka_start_pose)
+    if change_franka_start_pose:
+        log.info(
+            "[start-pose] both halves start rolled half a turn and capped at "
+            f"{fr.STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
+        )
 
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     output_dir.mkdir(parents=True, exist_ok=True)

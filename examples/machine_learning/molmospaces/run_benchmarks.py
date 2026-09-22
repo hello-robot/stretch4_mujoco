@@ -81,6 +81,10 @@ from examples.machine_learning.molmospaces.configs import (
     qualified_config_name,
     viewer_requested,
 )
+from examples.machine_learning.molmospaces.policies.franka_retarget import (
+    STRETCH_MAX_GRASP_HEIGHT_M,
+    publish_change_franka_start_pose,
+)
 from examples.machine_learning.molmospaces.finetuning.molmobot_repo import (
     MolmoBotSetupError,
     ensure_importable,
@@ -369,6 +373,16 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "prints (copy it straight out of report.md or trials.csv), a JSON blob as written to "
     "trials.jsonl, or @path to a file holding either.",
 )
+@click.option(
+    "--change_franka_start_pose",
+    "change_franka_start_pose",
+    is_flag=True,
+    help="Start the Franka rolled half a turn about its approach axis -- which turns its "
+    "wrist camera outwards and leaves the grasp identical -- and capped at Stretch's own "
+    "reach ceiling, so both robots begin an episode at the same pose. Applies to the "
+    "Franka condition and, through the retargeting, to the Stretch one. See "
+    "`franka_retarget.stretch_startable_arm_qpos`.",
+)
 @click.option("--list", "list_only", is_flag=True, help="List the benchmarks and exit.")
 def main(
     benchmark_keys: tuple[str, ...],
@@ -387,6 +401,7 @@ def main(
     want_report: bool,
     retarget_setup: str,
     retarget_params: str | None,
+    change_franka_start_pose: bool,
     list_only: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -436,6 +451,16 @@ def main(
         )
     if policy == "molmobot_droid_retarget":
         _publish_retarget_params(retarget_setup, retarget_params)
+
+    # Published before the first rollout and before any worker is forked, so both
+    # this process and its children agree on where an episode starts. Written in
+    # both directions -- see `publish_change_franka_start_pose`.
+    publish_change_franka_start_pose(change_franka_start_pose)
+    if change_franka_start_pose:
+        log.info(
+            "[start-pose] the Franka starts rolled half a turn and capped at "
+            f"{STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
+        )
     if policy not in ("molmobot", "molmobot_droid", "molmobot_droid_retarget") and molmobot_action_type:
         raise click.UsageError(
             "--molmobot-action-type only applies to --policy molmobot and --policy "
