@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any
 
 import mujoco
@@ -89,6 +90,40 @@ FRANKA_TO_STRETCH_TOOL = R.from_euler("y", -90, degrees=True).as_matrix()
 # change in position error. See `FrankaOnStretchView._solve_either_jaw`.
 JAW_FLIP = np.eye(4)
 JAW_FLIP[:3, :3] = R.from_euler("x", 180, degrees=True).as_matrix()
+
+ROBOTIQ_ROLL_180 = np.eye(4)
+ROBOTIQ_ROLL_180[:3, :3] = R.from_euler("z", 180, degrees=True).as_matrix()
+"""
+A half turn about the *Robotiq's* approach axis -- the Franka-convention twin of `JAW_FLIP`.
+
+`JAW_FLIP` is the same physical rotation written in Stretch's tool frame, where
+the approach is +x; the Robotiq reaches along +z, so here it is a turn about z.
+Both leave a parallel jaw grasping the identical object the identical way (see
+`JAW_FLIP`) -- what changes is which way round the hand, and therefore the wrist
+camera bolted to it, is facing.
+
+That is the whole point of `change_franka_start_pose`: the grasp is unaffected
+and the picture is not.
+"""
+
+STRETCH_MAX_GRASP_HEIGHT_M = 1.0824
+"""
+The highest `grasp_center_link` gets, in world metres, at the Franka's home tool pose.
+
+Measured on the mini benchmark's standing robot: the Franka's home puts its grasp
+site at 1.1853m and Stretch's lift runs out 0.1028m below that, which is exactly
+what `FrankaOnStretchView.measure_tool_height_offset()` returns. Re-measure with
+
+    python -m examples.machine_learning.molmospaces.retargetting.diagnose
+
+which prints the same shortfall under "the target height offset".
+
+A constant rather than a live measurement because the callers that need it are
+episode overrides, which run before there is a Stretch to measure -- and because
+it is a property of the arm, not of the scene. It is the ceiling for *this* tool
+orientation; a pose reaching further out tops out lower, so treat it as the best
+case rather than as a bound.
+"""
 
 JAW_MODES = ("auto", "flipped", "upright")
 """
@@ -270,6 +305,145 @@ def pose_matrix(pos, quat_wxyz) -> np.ndarray:
     pose[:3, :3] = R.from_quat(np.asarray(quat_wxyz, dtype=float), scalar_first=True).as_matrix()
     pose[:3, 3] = np.asarray(pos, dtype=float)
     return pose
+
+
+CHANGE_FRANKA_START_POSE_ENV_VAR = "STRETCH4_CHANGE_FRANKA_START_POSE"
+"""
+Environment variable behind `--change_franka_start_pose`.
+
+An environment variable rather than an argument because the places that need to
+know are episode overrides and policy constructors, which `run_evaluation` builds
+itself from a "module:Class" string in worker processes it forks -- there is no
+seam to pass a flag along. Same route, and the same reason, as
+`setups.publish_params` and `configs.MOLMOBOT_ACTION_TYPE_ENV_VAR`.
+"""
+
+
+def change_franka_start_pose_requested() -> bool:
+    """Whether this process was asked for the Stretch-startable Franka start pose."""
+    return os.environ.get(CHANGE_FRANKA_START_POSE_ENV_VAR, "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
+
+
+def publish_change_franka_start_pose(enabled: bool) -> None:
+    """Put `--change_franka_start_pose` in the environment, for this process and its workers.
+
+    The write is unconditional in both directions: a run that does *not* pass the
+    flag must clear a variable an earlier run in the same shell exported, or the
+    two conditions of a comparison silently start at different poses -- which is
+    precisely the failure this flag was added to remove.
+    """
+    if enabled:
+        os.environ[CHANGE_FRANKA_START_POSE_ENV_VAR] = "1"
+    else:
+        os.environ.pop(CHANGE_FRANKA_START_POSE_ENV_VAR, None)
+
+
+def stretch_startable_arm_qpos(
+    franka: "VirtualFranka",
+    mount_height_m: float = FRANKA_PEDESTAL_HEIGHT,
+    *,
+    roll_180: bool = True,
+    max_height_m: float = STRETCH_MAX_GRASP_HEIGHT_M,
+    iterations: int = 300,
+) -> np.ndarray:
+    """The Franka's home arm configuration, adjusted so Stretch can start there too.
+
+    Two changes to the home tool pose, both of which exist because the two robots
+    do not start an episode in the same place and the study needs them to:
+
+    * **The wrist rolled** as near half a turn as `fr3_joint7` goes -- see
+      `roll_franka_wrist`, which turns that one joint and leaves the grasp site
+      exactly where it was. A parallel jaw grasps identically either way round, so
+      this costs the grasp nothing; what swings round is the hand, and the wrist
+      camera bolted off to one side of it.
+
+      Worth knowing what it does to that camera, since it is the reason to want
+      it. `gripper/wrist_camera` -- the one the DROID checkpoint reads -- sits
+      7.4cm behind the grasp site at the Franka's home, with a view direction of
+      x=+0.333 in the arm's base frame. After the roll it is 7.0cm the other side,
+      at x=-0.332. That mirroring is not a choice this function makes: with the
+      approach pointing straight down, a half turn about it takes anything offset
+      to one side over to the other, and the camera is offset. Render the camera
+      and look before concluding it is the view you wanted.
+    * **Lowered to `max_height_m`**, Stretch's own ceiling. The Franka's home puts
+      its grasp site at 1.185m and Stretch's lift tops out 10.3cm below that
+      (`STRETCH_MAX_GRASP_HEIGHT_M`), so unretargeted the Stretch condition begins
+      every episode already saturated, reaching for a pose it cannot hold and
+      reporting proprioception from a configuration it never actually reached.
+      Capping the Franka's start is what makes "both robots start in the same
+      place" true rather than aspirational.
+
+    The clamp is applied to the tool's z *in the arm's own base frame*, offset by
+    `mount_height_m`, which is the same number as world z only because every mount
+    this module builds is level -- `franka_mount_pose_from_base` yaws and nothing
+    else. Asserted there rather than re-derived here.
+
+    Returns seven joint angles, IK'd from the home configuration so the result is
+    the nearest way to hold that pose rather than an unrelated branch. The height
+    is a *cap*, not a move: a home pose already below the ceiling is left at its
+    own height and only rolled.
+    """
+    pose = franka.fk(franka.init_qpos)
+    pose[2, 3] = min(float(pose[2, 3]), float(max_height_m) - float(mount_height_m))
+    qpos = franka.ik(pose, franka.init_qpos, iterations=iterations)
+    if roll_180:
+        # The wrist joint first, then a solve for the exact half turn seeded from
+        # it. `fr3_joint7` gets 172.8 of the 180 degrees on its own and the solve
+        # finds the remaining 7.2 in the joints behind it -- seeded from the
+        # rolled wrist, so it converges on the configuration *next to* this one
+        # rather than on some other arm shape that also happens to hold the pose.
+        # See `roll_franka_wrist` for what the seed is worth.
+        qpos = franka.ik(
+            pose @ ROBOTIQ_ROLL_180,
+            roll_franka_wrist(franka, qpos),
+            iterations=iterations,
+        )
+    return qpos
+
+
+def roll_franka_wrist(franka: "VirtualFranka", joint_pos: np.ndarray) -> np.ndarray:
+    """`joint_pos` with the last wrist joint turned as close to half a turn as it goes.
+
+    `fr3_joint7` *is* the roll about the Robotiq's approach axis, so turning it is
+    the whole operation: the grasp site sits on that axis and does not move, the
+    other six joints keep their angles, and what swings round is the hand -- the
+    jaw line, and the wrist camera bolted off to one side of it.
+
+    Done by turning the joint rather than by IK'ing `pose @ ROBOTIQ_ROLL_180`,
+    which is what this used to do and is not the same operation at all: a fresh
+    solve is free to reach the rolled pose from any configuration, and from the
+    Franka's home it picked one with *every* joint moved --
+    `[-0.81, -1.02, 0.60, -2.60, 0.50, 1.66, 2.63]` against a home of
+    `[0, -0.79, 0, -2.36, 0, 1.57, 0]`. That is re-posing the arm, not rolling the
+    wrist, and it moved the elbow and shoulder into a configuration whose
+    consequences (a different jaw branch at large tool yaws) had nothing to do
+    with the roll that was asked for.
+
+    **The joint cannot quite manage a half turn on its own.** `fr3_joint7` runs to
+    +-3.0159 rad and home is 0, so it stops 0.126 rad -- 7.2 degrees -- short
+    either way. That is a property of the arm, not a choice here. Which is why
+    this is a *seed* rather than the answer: `stretch_startable_arm_qpos` turns
+    this joint as far as it goes and then solves for the exact half turn starting
+    from here, so the last 7.2 degrees come out of the joints behind the wrist and
+    the solution stays the one next to this configuration.
+
+    The direction is whichever has more headroom, which from a home of 0 is a
+    tie broken towards positive.
+    """
+    qpos = np.asarray(joint_pos, dtype=float).copy()
+    low, high = franka.joint_limits[6]
+    forward, backward = qpos[6] + math.pi, qpos[6] - math.pi
+    # Whichever half turn the joint can follow furthest before its limit stops it.
+    if min(high, forward) - qpos[6] >= qpos[6] - max(low, backward):
+        qpos[6] = min(high, forward)
+    else:
+        qpos[6] = max(low, backward)
+    return qpos
 
 
 def franka_mount_pose_from_base(base_xytheta, pedestal_height: float = FRANKA_PEDESTAL_HEIGHT):
@@ -474,6 +648,17 @@ class VirtualFranka:
         self._grasp_site_id = self.model.site("gripper/grasp_site").id
         self._base_body_id = self.model.body("fr3_link0").id
         self.init_qpos = np.asarray(config.init_qpos["arm"], dtype=float)
+        self.default_init_qpos = self.init_qpos.copy()
+        """
+        The arm configuration `FrankaRobotConfig` ships, kept whatever `init_qpos` becomes.
+
+        `init_qpos` is rewritten in place when `--change_franka_start_pose` is on
+        (see `FrankaOnStretchView.__init__`), because everything that asks "where
+        does the Franka start" has to get the same answer. This is the other
+        question -- "where does the Franka *normally* start" -- which anything
+        holding a fixed reference against a moving start pose needs, and which a
+        rewritten `init_qpos` would otherwise have destroyed.
+        """
         self.init_gripper_qpos = np.asarray(config.init_qpos["gripper"], dtype=float)
         """The Robotiq driver angles a DROID episode starts from. See `robotiq_ctrl_from_driver`."""
 
@@ -819,6 +1004,7 @@ class FrankaOnStretchView:
         target_z_offset: float = 0.0,
         match_robotiq_aperture: bool = True,
         jaw_mode: str = "auto",
+        change_franka_start_pose: bool | None = None,
     ) -> None:
         if jaw_mode not in JAW_MODES:
             raise ValueError(f"jaw_mode must be one of {JAW_MODES}, not {jaw_mode!r}")
@@ -828,6 +1014,22 @@ class FrankaOnStretchView:
         self.target_z_offset = float(target_z_offset)
 
         self.franka = VirtualFranka()
+        # Rewriting `init_qpos` rather than carrying the adjusted pose alongside
+        # it, because "where the Franka starts" is read from there by everything
+        # that needs it -- `snap_to_franka_joint_pos`, the IK seeds, `reset` --
+        # and a second source of truth would have them disagree about which pose
+        # an episode began at. See `stretch_startable_arm_qpos`.
+        if change_franka_start_pose is None:
+            change_franka_start_pose = change_franka_start_pose_requested()
+        self.change_franka_start_pose = bool(change_franka_start_pose)
+        if self.change_franka_start_pose:
+            self.franka.init_qpos = stretch_startable_arm_qpos(
+                self.franka, float(franka_mount_pose[2, 3])
+            )
+            log.info(
+                "[retarget] change_franka_start_pose: the virtual Franka starts with its wrist "
+                f"rolled and capped at {STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
+            )
         self.arm_ik = StretchArmIK(stretch_view, namespace, include_base=include_base)
 
         # What "fully open" means on Stretch, in finger-joint radians. Narrowed to
