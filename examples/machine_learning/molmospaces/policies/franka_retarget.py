@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import mujoco
@@ -102,7 +103,7 @@ Both leave a parallel jaw grasping the identical object the identical way (see
 `JAW_FLIP`) -- what changes is which way round the hand, and therefore the wrist
 camera bolted to it, is facing.
 
-That is the whole point of `change_franka_start_pose`: the grasp is unaffected
+That is the whole point of `--change_franka_start_pose_flip_wrist`: the grasp is unaffected
 and the picture is not.
 """
 
@@ -221,25 +222,53 @@ ROBOTIQ_CTRL_RANGE = (0.0, 255.0)
 STRETCH_FINGER_OPEN = 0.5
 STRETCH_FINGER_CLOSED = 0.0
 
-# ROBOTIQ_MAX_APERTURE_M = 0.087
-ROBOTIQ_MAX_APERTURE_M = 0.120
+ROBOTIQ_MAX_APERTURE_M = 0.1885
 """
-How wide the Robotiq 2F-85 opens, in metres -- its 85mm spec, measured on the
-model as 0.0870 between the pads.
+How wide Stretch's hand is allowed to open, in metres between the fingertips.
 
-Stretch's hand opens to 0.1885m at `STRETCH_FINGER_OPEN`, which is 2.17 times as
-wide. Left alone, that is a visible domain gap on the channel a grasping policy
-cares most about: told to open, Stretch spreads its fingers more than twice as
-far as any hand in the checkpoint's training data, and the wrist camera sees two
-fingers where the Robotiq's would be a narrow pair. Matching the aperture is what
-`match_robotiq_aperture` does, and it is on by default -- see
+The Robotiq 2F-85 opens to 0.087 between its pads and Stretch's hand to 0.1885
+between its fingertips, 2.17 times as wide. Left alone that is a domain gap on
+the channel a grasping policy cares most about: told to open, Stretch spreads
+its fingers more than twice as far as any hand in the checkpoint's training
+data. `match_robotiq_aperture` narrows it, and is on by default -- see
 `FrankaOnStretchView.finger_open`.
 
-The cost of matching, stated plainly: Stretch can no longer be commanded wider
-than 87mm, so an object it could previously swallow at 188mm is now out of reach
-of its jaw. That is the same limit the Franka condition has, which is the point,
-but it does mean the two conditions become comparable by making Stretch *worse*
-at wide objects rather than by making it better.
+**Matching the tip separation is the wrong invariant, and this is what it should
+be matched on instead.** The Robotiq's pads are held parallel by its linkage, so
+its jaw is the same width all the way in -- 86.6mm at the grasp site, 86.6mm
+three centimetres deeper. Stretch's fingers curve inwards behind their tips and
+meet about 7cm back, so its width falls away with depth, and how deep an object
+sits is exactly what `grasp_offset_m` decides. `retargetting/aperture.py` puts
+both hands in one scene and solves for the tip separation at which Stretch's jaw
+is as wide, *where the object will be*, as the Robotiq's is when told to open:
+
+    grasp_offset_m   0.000   0.015   0.030   0.045   0.055
+    tips to match     99mm   131mm   132mm   167mm   impossible
+
+At 55mm the hand cannot do it at all: wide open it manages 80mm against the
+Robotiq's 87mm. The setting this study shipped for months -- 55mm of offset with
+the tips capped at 120mm -- was therefore wrong twice over, once in asking for a
+depth the hand cannot open around and once in capping it to less than half what
+that depth needs.
+
+**0.1885, not the calibrated 132mm, and the difference is measured.** Replaying
+all 20 recorded `franka_baseline` episodes through the retargeting with the
+physics on, everything else at `stretch_baseline`:
+
+    offset / tips   0.055/120   0.030/132   0.015/131   0.045/167   0.030/188
+    picked             5/20        3/20        3/20        3/20       6/20
+
+Matching the Robotiq's width exactly is the right *fidelity* target -- it makes a
+gripper command mean the same gap on both hands -- and it is not the performance
+optimum. Opening wider than the Robotiq costs nothing in fit and buys clearance
+for the aiming error the retargeting still has, and 0.030/188 is the only
+setting in that table that ever picks up the knife. Set `aperture_m` on a trial
+to get the calibrated value back; `aperture.py --grasp-offset` recomputes it for
+any depth.
+
+At this value `match_robotiq_aperture` is a no-op, because the calibrated
+aperture has reached the end of Stretch's own travel. That is not an accident to
+be tidied away -- it is the finding.
 """
 
 
@@ -281,23 +310,81 @@ def stretch_finger_for_aperture(move_group, model, data, aperture_m: float) -> f
 # makes a Franka tool pose land on a countertop rather than under one.
 FRANKA_PEDESTAL_HEIGHT = 0.75
 
-# Where the virtual Franka stands, in Stretch's own base frame.
-#
-# The notebook this comes from bolted the Franka to one spot in one kitchen
-# (world [6.8, 9.75], yaw 90) and stood Stretch just behind it (world [6.73,
-# 9.7], same yaw), so that a given policy output picked out the same point of the
-# same room on both robots -- which is what made the two runs comparable. A
-# benchmark spawns the robot in a different house every episode, so the same
-# relationship has to be expressed relative to the robot instead of to the world:
-# those two world poses differ by 0.05m along the base's own +x and 0.07m along
-# its -y, and that is what is recorded here.
-#
-# Reading it the other way round is the useful way: the policy's actions are
-# interpreted as those of a Franka standing on a 0.75m pedestal at Stretch's own
-# feet, facing the way Stretch faces. That is the frame the whole retargeting is
-# expressed in, and `franka_mount_pose_from_base()` puts it wherever the robot
-# happens to be standing.
-FRANKA_MOUNT_OFFSET_XY = (0.05, -0.07)
+FRANKA_MOUNT_OFFSET_XY = (0.0, 0.0)
+"""
+Where the virtual Franka stands, in Stretch's own base frame.
+
+The policy's actions are interpreted as those of a Franka standing on a 0.75m
+pedestal at Stretch's feet, facing the way Stretch faces; that is the frame the
+whole retargeting is expressed in, and `franka_mount_pose_from_base()` puts it
+wherever the robot happens to be standing. This offset is the "at Stretch's
+feet" part, and it is zero because a benchmark stands the two robots at the same
+place: `setups._point_base_at` writes one `robot_base_pose` and both the Franka
+and the Stretch condition are spawned from it.
+
+**It used to be `(0.05, -0.07)`, and that was 8.6cm of pure error.** The numbers
+came from the notebook this module was ported from, which bolted a Franka to one
+spot in one kitchen (world [6.8, 9.75], yaw 90) and stood Stretch just behind it
+(world [6.73, 9.7], same yaw) -- two robots at two different places, so a policy
+action picked out the same point of the room on both only if the mount carried
+the difference between them. A benchmark does not stand them apart, so carrying
+that difference displaced every commanded grasp by it.
+
+Measured, on the recorded `franka_baseline` episodes replayed through the
+retargeting (`retargetting/replay.py`, which compares Stretch's tool against the
+Franka's recorded `tcp_pose` step by step):
+
+    offset            closest the tools ever came     at the last step
+    (0.05, -0.07)     82-86 mm                        86-87 mm
+    (0.0, 0.0)        0.2-0.5 mm                      1-7 mm
+
+Which is the whole of it: with the offset gone the retargeting reproduces the
+Franka's own tool trajectory to a fraction of a millimetre, and with it in place
+Stretch reached for a point 8.6cm to one side of the object for the entire
+episode. Nothing else in the retargeting was ever going to recover that -- the
+IK was solving exactly, for the wrong target.
+
+Anything comparing against a *real* Franka standing somewhere other than
+Stretch's own base has to say so, by passing `offset_xy` to
+`franka_mount_pose_from_base`. Nothing in this repository does: the benchmark
+stands them together, and `demo_droid_on_stretch.py` has no Franka to be
+consistent with -- it stands Stretch at the notebook's spot and its own comment
+already says the virtual Franka is "at Stretch's own feet", which this makes
+true. Its grasps move 8.6cm with everything else's.
+"""
+
+
+STRETCH_SPAWN_BASE_OFFSET_XY = (-0.3598, 0.0874)
+"""
+How far to stand Stretch back so its spawn gripper pose is the Franka's, in its own axes.
+
+Measured, with both robots at the mini benchmark's spawn: the Franka's grasp
+site sits 0.3069m forward and 0.0m across of the base it is mounted on, and
+Stretch's grasp centre at `STRETCH_SPAWN_ARM_M` sits 0.6667m forward and 0.0874m
+across of its own. The difference is this. Heights come out within 7mm on their
+own (1.1782m against 1.1853m), which the base could not have fixed anyway.
+
+**It is expensive, which is why `match_stretch_spawn_pose_to_franka` is off by
+default.** Two costs, both measured:
+
+* **Reach.** Stretch's grasp centre reaches 0.9867m from the base with the arm
+  at its 0.52m stop. The benchmark's objects sit 0.6220m away; after this
+  retreat they sit 0.9818m away, which is 5mm inside the hard limit. Every grasp
+  then depends on the base driving back in, and the base accelerates at
+  0.25 m/s^2.
+* **The camera.** `stretch_baseline` hangs the exo camera off `base_link`, so the
+  camera retreats with the robot -- and the whole premise of that setup is a
+  camera at the same place in the room as the Franka's. 0.36m is not a
+  refinement of that comparison, it is the end of it.
+
+The retreat is cancelled in the virtual Franka's mount (see
+`franka_mount_pose_from_base`'s `offset_xy`), so the frame a policy action means
+is unchanged: what moves is the robot, not the retargeting.
+
+The cheaper version of the same idea, if the point is only that the two grippers
+start together: spawn with the arm stowed at 0 instead, where the retreat is
+0.16m and the objects land 0.782m away with 205mm of reach to spare.
+"""
 
 
 def pose_matrix(pos, quat_wxyz) -> np.ndarray:
@@ -308,40 +395,143 @@ def pose_matrix(pos, quat_wxyz) -> np.ndarray:
     return pose
 
 
-CHANGE_FRANKA_START_POSE_ENV_VAR = "STRETCH4_CHANGE_FRANKA_START_POSE"
+POSE_CONVENTION_ENV_VARS = {
+    "change_franka_start_pose_flip_wrist": "STRETCH4_CHANGE_FRANKA_START_POSE_FLIP_WRIST",
+    "change_franka_start_pose_limit_height": "STRETCH4_CHANGE_FRANKA_START_POSE_LIMIT_HEIGHT",
+    "change_stretch_start_pose_flip_wrist": "STRETCH4_CHANGE_STRETCH_START_POSE_FLIP_WRIST",
+    "map_franka_wrist_to_flipped_stretch4_wrist": "STRETCH4_MAP_FRANKA_WRIST_TO_FLIPPED_STRETCH4_WRIST",
+    "match_stretch_spawn_pose_to_franka": "STRETCH4_MATCH_STRETCH_SPAWN_POSE_TO_FRANKA",
+}
 """
-Environment variable behind `--change_franka_start_pose`.
+One environment variable per field of `PoseConventions`, named after its flag.
 
-An environment variable rather than an argument because the places that need to
-know are episode overrides and policy constructors, which `run_evaluation` builds
+Environment variables rather than arguments because the places that need to know
+are episode overrides and policy constructors, which `run_evaluation` builds
 itself from a "module:Class" string in worker processes it forks -- there is no
 seam to pass a flag along. Same route, and the same reason, as
 `setups.publish_params` and `configs.MOLMOBOT_ACTION_TYPE_ENV_VAR`.
+
+One variable per field rather than one for all of them, so that a run which sets
+some and not others cannot be confused with a run of an older build that knew
+about fewer.
 """
 
 
-def change_franka_start_pose_requested() -> bool:
-    """Whether this process was asked for the Stretch-startable Franka start pose."""
-    return os.environ.get(CHANGE_FRANKA_START_POSE_ENV_VAR, "").strip().lower() not in (
-        "",
-        "0",
-        "false",
-        "no",
+@dataclass(frozen=True)
+class PoseConventions:
+    """How the two robots' start poses and wrist frames are made to relate.
+
+    Every field defaults to False, and each is asked for by its own flag. Off,
+    the Franka starts at the DROID home the checkpoint was trained from and the
+    retargeting is the bare `FRANKA_TO_STRETCH_TOOL` -- which is the condition
+    every measurement in this package was taken under unless it says otherwise.
+
+    These are conventions rather than parameters: none of them changes what a
+    grasp *is*, only which way round a wrist is held and where an episode begins.
+    That is exactly why they need naming and publishing rather than hard-coding --
+    a comparison whose two halves disagree about a convention is not a comparison.
+    """
+
+    change_franka_start_pose_flip_wrist: bool = False
+    """Roll the Franka's start pose half a turn about the Robotiq's approach axis.
+
+    The grasp is unaffected -- see `JAW_FLIP` -- and what swings round is the
+    hand, and the wrist camera bolted off to one side of it. Applied to the real
+    Franka's episode `init_qpos` and to the virtual one the retargeting snaps
+    Stretch to, from the same flag, so the two cannot disagree.
+    """
+
+    change_franka_start_pose_limit_height: bool = False
+    """Cap the Franka's start tool height at `STRETCH_MAX_GRASP_HEIGHT_M`.
+
+    Without it the Stretch condition begins every episode already saturated: the
+    Franka's home puts its grasp site 10.3cm above the highest Stretch's lift can
+    put its own with the tool pointing down, so the arm sits at its stop reaching
+    for a pose it cannot hold and reports proprioception from a configuration it
+    never reached.
+    """
+
+    change_stretch_start_pose_flip_wrist: bool = False
+    """Spawn Stretch with its own wrist rolled half a turn.
+
+    The Stretch-side counterpart of `change_franka_start_pose_flip_wrist`, and it
+    moves Stretch's wrist cameras to the other side of the hand in the same way.
+    Note what it does *not* survive: with `snap_to_franka_home` on -- the default
+    -- the first `get_action` writes the arm and wrist to whatever matches the
+    Franka's start tool pose, so this decides the spawn and the first observation
+    and is then overwritten. Turn the snap off to hold it for the episode.
+    """
+
+    map_franka_wrist_to_flipped_stretch4_wrist: bool = False
+    """Retarget every pose onto the half-turned branch of Stretch's wrist.
+
+    A half turn about the approach axis folded into the tool transform itself
+    (`JAW_FLIP`), rather than chosen per step the way `jaw_mode` chooses it. The
+    two are not the same thing. `jaw_mode="flipped"` holds the flipped branch and
+    then *reports the pose back unflipped*, so the policy never sees it; this
+    changes the frame the retargeting is defined in, so both directions carry the
+    turn and it stays self-consistent -- and Stretch's wrist, with the cameras on
+    it, ends up the other way round for good.
+
+    The grasp is identical either way (see `JAW_FLIP`). The reason to want it is
+    the wrist camera: pair it with `change_franka_start_pose_flip_wrist` to put
+    both robots' wrist cameras on the same side of their respective hands.
+    """
+
+    match_stretch_spawn_pose_to_franka: bool = False
+    """Stand Stretch back far enough that its spawn gripper pose is the Franka's.
+
+    Stretch's arm reaches *further* at its shortest than the Franka's does at its
+    home -- 0.467m against 0.307m from the base, before the spawn extension in
+    `setups.STRETCH_SPAWN_ARM_M` adds its own -- so the only way to make the two
+    grippers start in the same place is to stand Stretch further back. See
+    `setups.STRETCH_SPAWN_BASE_OFFSET_XY`, which measures how far, and what it
+    costs; it is off by default because what it costs is most of the arm's
+    remaining reach and the exo camera's agreement with the Franka's.
+
+    The virtual Franka does *not* move with it: the retreat is cancelled in the
+    mount, so the frame a policy action is interpreted in is unchanged and only
+    the physical robot has moved. That is what keeps this a change to where
+    Stretch stands rather than a change to what the retargeting means.
+    """
+
+    def __bool__(self) -> bool:
+        """True when any convention is being changed from the default."""
+        return any(getattr(self, field) for field in POSE_CONVENTION_ENV_VARS)
+
+    @property
+    def changes_franka_start_pose(self) -> bool:
+        return self.change_franka_start_pose_flip_wrist or self.change_franka_start_pose_limit_height
+
+    def describe(self) -> str:
+        asked = [name for name in POSE_CONVENTION_ENV_VARS if getattr(self, name)]
+        return ", ".join(asked) if asked else "none (DROID home, unflipped)"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
+
+
+def pose_conventions_requested() -> PoseConventions:
+    """Which pose conventions this process was asked for."""
+    return PoseConventions(
+        **{field: _env_flag(variable) for field, variable in POSE_CONVENTION_ENV_VARS.items()}
     )
 
 
-def publish_change_franka_start_pose(enabled: bool) -> None:
-    """Put `--change_franka_start_pose` in the environment, for this process and its workers.
+def publish_pose_conventions(conventions: PoseConventions) -> None:
+    """Put the pose conventions in the environment, for this process and its workers.
 
-    The write is unconditional in both directions: a run that does *not* pass the
-    flag must clear a variable an earlier run in the same shell exported, or the
-    two conditions of a comparison silently start at different poses -- which is
-    precisely the failure this flag was added to remove.
+    Every variable is written in both directions: a run that does *not* ask for a
+    convention must clear a variable an earlier run in the same shell exported,
+    or the two halves of a comparison silently start at different poses -- which
+    is precisely the failure these flags were added to remove.
     """
-    if enabled:
-        os.environ[CHANGE_FRANKA_START_POSE_ENV_VAR] = "1"
-    else:
-        os.environ.pop(CHANGE_FRANKA_START_POSE_ENV_VAR, None)
+    for field, variable in POSE_CONVENTION_ENV_VARS.items():
+        if getattr(conventions, field):
+            os.environ[variable] = "1"
+        else:
+            os.environ.pop(variable, None)
 
 
 def stretch_startable_arm_qpos(
@@ -349,13 +539,18 @@ def stretch_startable_arm_qpos(
     mount_height_m: float = FRANKA_PEDESTAL_HEIGHT,
     *,
     roll_180: bool = True,
-    max_height_m: float = STRETCH_MAX_GRASP_HEIGHT_M,
+    max_height_m: float | None = STRETCH_MAX_GRASP_HEIGHT_M,
     iterations: int = 300,
 ) -> np.ndarray:
     """The Franka's home arm configuration, adjusted so Stretch can start there too.
 
-    Two changes to the home tool pose, both of which exist because the two robots
-    do not start an episode in the same place and the study needs them to:
+    Two changes to the home tool pose, independent of each other and each asked
+    for by its own flag (`StartPoseChanges`), both of which exist because the two
+    robots do not start an episode in the same place and the study needs them to.
+    `roll_180=False` skips the first, `max_height_m=None` skips the second, and
+    with both off this returns `franka.init_qpos` unchanged -- which is what
+    makes "neither flag was passed" cost nothing rather than round-trip the home
+    pose through an IK solve.
 
     * **The wrist rolled** as near half a turn as `fr3_joint7` goes -- see
       `roll_franka_wrist`, which turns that one joint and leaves the grasp site
@@ -389,8 +584,11 @@ def stretch_startable_arm_qpos(
     is a *cap*, not a move: a home pose already below the ceiling is left at its
     own height and only rolled.
     """
+    if not roll_180 and max_height_m is None:
+        return np.asarray(franka.init_qpos, dtype=float).copy()
     pose = franka.fk(franka.init_qpos)
-    pose[2, 3] = min(float(pose[2, 3]), float(max_height_m) - float(mount_height_m))
+    if max_height_m is not None:
+        pose[2, 3] = min(float(pose[2, 3]), float(max_height_m) - float(mount_height_m))
     qpos = franka.ik(pose, franka.init_qpos, iterations=iterations)
     if roll_180:
         # The wrist joint first, then a solve for the exact half turn seeded from
@@ -405,6 +603,30 @@ def stretch_startable_arm_qpos(
             iterations=iterations,
         )
     return qpos
+
+
+def franka_start_arm_qpos(
+    franka: "VirtualFranka",
+    conventions: PoseConventions,
+    mount_height_m: float = FRANKA_PEDESTAL_HEIGHT,
+) -> np.ndarray:
+    """`stretch_startable_arm_qpos` driven by a `PoseConventions`.
+
+    The one place the two Franka start-pose flags are turned into the two
+    arguments, so the Franka half of the change (`setups.franka_episode_override`)
+    and the Stretch half (`FrankaOnStretchView`) cannot disagree about what a
+    flag means.
+    """
+    return stretch_startable_arm_qpos(
+        franka,
+        mount_height_m,
+        roll_180=conventions.change_franka_start_pose_flip_wrist,
+        max_height_m=(
+            STRETCH_MAX_GRASP_HEIGHT_M
+            if conventions.change_franka_start_pose_limit_height
+            else None
+        ),
+    )
 
 
 def roll_franka_wrist(franka: "VirtualFranka", joint_pos: np.ndarray) -> np.ndarray:
@@ -447,20 +669,44 @@ def roll_franka_wrist(franka: "VirtualFranka", joint_pos: np.ndarray) -> np.ndar
     return qpos
 
 
-def franka_mount_pose_from_base(base_xytheta, pedestal_height: float = FRANKA_PEDESTAL_HEIGHT):
+def franka_mount_pose_from_base(
+    base_xytheta,
+    pedestal_height: float = FRANKA_PEDESTAL_HEIGHT,
+    offset_xy: tuple[float, float] | None = None,
+):
     """Where the virtual Franka stands, given where Stretch is standing.
 
     `base_xytheta` is what `StretchBaseGroup.joint_pos` reports: the base's
     (x, y, yaw) in world coordinates. The mount is built from those three numbers
     rather than from the base's 4x4 pose so that a base frame that is pitched or
     rolled -- a robot on a ramp, or mid-transient after a reset -- cannot tip the
-    virtual Franka over with it. See `FRANKA_MOUNT_OFFSET_XY`.
+    virtual Franka over with it.
+
+    `offset_xy` moves the virtual Franka off Stretch's base, in the base's own
+    axes, and defaults to `FRANKA_MOUNT_OFFSET_XY` -- which is zero, because a
+    benchmark stands both robots at the same place. Pass it only to model a real
+    Franka that stood somewhere else; whatever you pass displaces every grasp by
+    exactly that much, so it wants a measurement behind it. See
+    `FRANKA_MOUNT_OFFSET_XY` for the one that used to be here.
+
+    Under `match_stretch_spawn_pose_to_franka` the default gains the *opposite*
+    of `STRETCH_SPAWN_BASE_OFFSET_XY`, which is how that convention moves the
+    robot without moving the frame: Stretch stands back, the virtual Franka
+    stays where the real one is, and a policy action still means the same point
+    of the same room. Read from the environment rather than threaded through
+    every caller for the reason `POSE_CONVENTION_ENV_VARS` gives -- and because
+    a caller that forgot would silently undo the cancellation.
     """
     x, y, theta = np.asarray(base_xytheta, dtype=float).reshape(-1)[:3]
+    if offset_xy is None:
+        offset_xy = FRANKA_MOUNT_OFFSET_XY
+        if pose_conventions_requested().match_stretch_spawn_pose_to_franka:
+            offset_xy = (
+                offset_xy[0] - STRETCH_SPAWN_BASE_OFFSET_XY[0],
+                offset_xy[1] - STRETCH_SPAWN_BASE_OFFSET_XY[1],
+            )
     base = pose_matrix([x, y, 0.0], R.from_euler("z", theta).as_quat(scalar_first=True))
-    offset = pose_matrix(
-        [FRANKA_MOUNT_OFFSET_XY[0], FRANKA_MOUNT_OFFSET_XY[1], pedestal_height], [1, 0, 0, 0]
-    )
+    offset = pose_matrix([offset_xy[0], offset_xy[1], pedestal_height], [1, 0, 0, 0])
     return base @ offset
 
 
@@ -653,7 +899,7 @@ class VirtualFranka:
         """
         The arm configuration `FrankaRobotConfig` ships, kept whatever `init_qpos` becomes.
 
-        `init_qpos` is rewritten in place when `--change_franka_start_pose` is on
+        `init_qpos` is rewritten in place when either start-pose flag is on
         (see `FrankaOnStretchView.__init__`), because everything that asks "where
         does the Franka start" has to get the same answer. This is the other
         question -- "where does the Franka *normally* start" -- which anything
@@ -1005,7 +1251,8 @@ class FrankaOnStretchView:
         target_z_offset: float = 0.0,
         match_robotiq_aperture: bool = True,
         jaw_mode: str = "auto",
-        change_franka_start_pose: bool | None = None,
+        pose_conventions: PoseConventions | None = None,
+        robotiq_aperture_m: float | None = None,
     ) -> None:
         if jaw_mode not in JAW_MODES:
             raise ValueError(f"jaw_mode must be one of {JAW_MODES}, not {jaw_mode!r}")
@@ -1020,17 +1267,15 @@ class FrankaOnStretchView:
         # that needs it -- `snap_to_franka_joint_pos`, the IK seeds, `reset` --
         # and a second source of truth would have them disagree about which pose
         # an episode began at. See `stretch_startable_arm_qpos`.
-        if change_franka_start_pose is None:
-            change_franka_start_pose = change_franka_start_pose_requested()
-        self.change_franka_start_pose = bool(change_franka_start_pose)
-        if self.change_franka_start_pose:
-            self.franka.init_qpos = stretch_startable_arm_qpos(
-                self.franka, float(franka_mount_pose[2, 3])
+        if pose_conventions is None:
+            pose_conventions = pose_conventions_requested()
+        self.pose_conventions = pose_conventions
+        if self.pose_conventions.changes_franka_start_pose:
+            self.franka.init_qpos = franka_start_arm_qpos(
+                self.franka, self.pose_conventions, float(franka_mount_pose[2, 3])
             )
-            log.info(
-                "[retarget] change_franka_start_pose: the virtual Franka starts with its wrist "
-                f"rolled and capped at {STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
-            )
+        if self.pose_conventions:
+            log.info(f"[retarget] pose conventions: {self.pose_conventions.describe()}")
         self.arm_ik = StretchArmIK(stretch_view, namespace, include_base=include_base)
 
         # What "fully open" means on Stretch, in finger-joint radians. Narrowed to
@@ -1040,16 +1285,38 @@ class FrankaOnStretchView:
         # IK's scratch data, which is what keeps the measurement from moving the
         # robot that is about to be commanded.
         self.finger_open = STRETCH_FINGER_OPEN
+        self.robotiq_aperture_m = float(
+            ROBOTIQ_MAX_APERTURE_M if robotiq_aperture_m is None else robotiq_aperture_m
+        )
+        """What "open" means on this hand, in metres between the pads. See `ROBOTIQ_MAX_APERTURE_M`.
+
+        A parameter rather than the constant outright because it is the one
+        number in the retargeting whose right value is a property of the *task*
+        as much as of the two grippers: matched to the Robotiq exactly, Stretch
+        cannot get round anything the Robotiq could only just swallow, and it
+        approaches every object with less clearance for the aiming error the
+        retargeting still has. Left `None` it is the constant, so nothing that
+        does not ask for it sees a change.
+        """
         if match_robotiq_aperture:
             self.finger_open = stretch_finger_for_aperture(
                 self.arm_ik._scratch_view.get_move_group("gripper"),
                 self.arm_ik._scratch_data.model,
                 self.arm_ik._scratch_data,
-                ROBOTIQ_MAX_APERTURE_M,
+                self.robotiq_aperture_m,
             )
 
         self._tool_correction = np.eye(4)
         self._tool_correction[:3, :3] = FRANKA_TO_STRETCH_TOOL
+        if self.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist:
+            # Folded into the transform rather than chosen per step: `JAW_FLIP` is
+            # in Stretch's tool convention, so it composes on the right, after the
+            # axis correction has decided which way the approach points. Both
+            # directions then carry it, because `_tool_correction_inverse` is
+            # taken from this matrix -- which is what keeps the pose the policy
+            # reads back the pose it asked for. See
+            # `PoseConventions.map_franka_wrist_to_flipped_stretch4_wrist`.
+            self._tool_correction = self._tool_correction @ JAW_FLIP
         self._tool_correction_inverse = np.linalg.inv(self._tool_correction)
 
         self._move_groups = {"arm": _ProxyArmGroup(self), "gripper": _ProxyGripperGroup(self)}

@@ -308,10 +308,69 @@ class RetargetParams:
     `StretchMolmoBotDroidPolicyConfig.target_z_offset`.
     """
 
+    aperture_m: float = 0.0
+    """
+    How wide "open" is on Stretch's hand, in metres between the fingertips. 0 keeps the default.
+
+    `franka_retarget.ROBOTIQ_MAX_APERTURE_M` unless this says otherwise. The
+    default matches Stretch's open hand to the Robotiq's, so that a gripper
+    command means the same aperture on both robots -- but Stretch's fingers
+    curve inwards behind their tips and meet about 7cm back, so the width
+    actually available to an object is a strong function of how deep into the
+    jaw `grasp_offset_m` puts it. `diagnose.py`'s jaw profile prints that
+    relation; the short of it is that a deep offset needs a wide hand, and the
+    two parameters cannot be chosen apart.
+
+    Stretch setups only, and it does nothing unless `match_robotiq_aperture` is
+    on -- that flag is what narrows the hand at all.
+    """
+
+    wrist_fov_deg: float = 0.0
+    """
+    Vertical FOV to render Stretch's wrist camera at, in degrees. 0 keeps the hardware's.
+
+    The wrist view is the channel a grasping policy reads most closely at the
+    moment it matters, and the two robots do not offer the same one. Measured on
+    the compiled models, at the same tool pose:
+
+        Franka `gripper/wrist_camera`    155mm from the grasp site, 56.7 deg
+        Stretch `gripper_camera_right`   241mm from the grasp centre, 58.0 deg
+
+    Nearly the same lens, 1.55x the distance -- so an object being grasped
+    subtends 1.55x less of Stretch's frame than of the one the checkpoint was
+    trained on. `MATCHED_WRIST_FOV_DEG` is the FOV at which that ratio comes out
+    at 1, and it is not a cheat: narrowing a rendered FOV is what cropping the
+    centre out of the real camera's frame does, which a Stretch can do in
+    software on hardware it already has.
+
+    What it costs is peripheral vision during the approach, when the object is
+    not yet in the middle of the frame -- which is why this is a parameter to
+    search rather than a correction to apply.
+
+    **Tried, and it did not help.** Two trials of `stretch_baseline` over the
+    same 20 episodes, differing in nothing else:
+
+        wrist_fov_deg   0 (the hardware's 58)   38.3 (matched framing)
+        picked                   4/20                     2/20
+
+    Read that as "no gain", not as "actively worse": two runs of the *same*
+    settings came out 2/20 and 4/20, so a single 20-episode trial resolves
+    nothing finer than about two grasps. What it does rule out is the easy
+    hypothesis -- that Stretch's wrist view being 1.55x further back is most of
+    why a DROID checkpoint cannot grasp through it. Narrowing the lens buys the
+    framing and pays for it in approach, and the two cancel.
+
+    Stretch setups only; the Franka's own wrist camera is the reference and is
+    never moved.
+    """
+
     def describe(self) -> str:
+        extra = "" if not self.wrist_fov_deg else f" wrist_fov={self.wrist_fov_deg:.1f}deg"
+        extra += "" if not self.aperture_m else f" aperture={self.aperture_m * 1000:.0f}mm"
         return (
             f"{self.exo.describe()} | grasp_offset={self.grasp_offset_m:+.3f}m "
             f"wrist_tilt={self.wrist_tilt_deg:+.1f}deg z_offset={self.target_z_offset_m:+.3f}m"
+            f"{extra}"
         )
 
 

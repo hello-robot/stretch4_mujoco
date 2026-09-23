@@ -43,10 +43,11 @@ from typing import Any
 import numpy as np
 
 from examples.machine_learning.molmospaces.added_pickup_repair import install_eval_repair
+from examples.machine_learning.molmospaces.policies import franka_retarget as fr
 from examples.machine_learning.molmospaces.policies.franka_retarget import (
     VirtualFranka,
-    change_franka_start_pose_requested,
-    stretch_startable_arm_qpos,
+    franka_start_arm_qpos,
+    pose_conventions_requested,
 )
 from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (
     StretchMolmoBotDroidPolicy,
@@ -135,6 +136,35 @@ FRANKA_WRIST_FOV = 56.74
 FRANKA_WRIST_RENDER_SIZE = (640, 368)
 """`FrankaDroidCameraSystem`'s wrist camera, reproduced so setup 1 is that system."""
 
+FRANKA_WRIST_CAMERA_REACH_M = 0.1553
+STRETCH_WRIST_CAMERA_REACH_M = 0.2414
+"""
+How far each robot's wrist camera sits from the point its gripper closes on.
+
+Measured on the compiled models at the Franka's home tool pose -- the Franka's
+`gripper/wrist_camera` against `gripper/grasp_site`, Stretch's
+`gripper_camera_right_rgb` against `grasp_center_link`. Stretch's hand is longer
+and its camera is further back along it, which is the whole of the difference.
+"""
+
+MATCHED_WRIST_FOV_DEG = 38.3
+"""
+The wrist FOV at which Stretch frames a grasp the way the Robotiq does, in degrees.
+
+The two cameras have almost the same lens (56.7 degrees against Stretch's 58.0)
+and are not in the same place, so an object at the grasp point subtends
+1.55x less of Stretch's frame. Matching the *framing* rather than the lens
+means solving
+
+    tan(fov_stretch / 2) = tan(fov_franka / 2) * reach_franka / reach_stretch
+
+which is this. Narrowing a render's FOV is what cropping the centre out of the
+real camera's frame does, so this is available on the robot as built -- at the
+cost of the peripheral view during the approach. `RetargetParams.wrist_fov_deg`
+is the knob; nothing sets it by default, because whether the trade is worth it
+is a measurement rather than an argument.
+"""
+
 FRANKA_LINK0_HEIGHT = 0.75
 """
 Height of `fr3_link0` above the floor in a benchmark episode, in metres.
@@ -167,36 +197,52 @@ aspect disagrees -- which quietly warps the frame differently from the hardware.
 DROID_FRAME_SIZE = (640, 360)
 """What the checkpoint was trained on. `--exo-crop` brings a fisheye frame to it."""
 
-STRETCH_GRASP_OFFSET_M = 0.00
+STRETCH_GRASP_OFFSET_M = 0.030
 STRETCH_TARGET_Z_OFFSET_M = 0.0
 """
 The tool correction the Stretch setups retarget with, measured by search.
 
-The shipped values were `grasp_offset_m = 0.0` (no correction at all) and
-a target height offset of half a measured shortfall, and together they cost
-most of what the retargeting
-could do. Both faults are geometric and both are visible on a standing robot
-with no policy running -- see `diagnose.py`, which prints them:
+**The grasp centre.** The retargeting drives `grasp_center_link` to the pose the
+policy asked for its Robotiq's `grasp_site`, but that point is in a quite
+different place on the two hands: on Stretch it sits 1.5cm *past* the fingertips
+and 10.6cm past the finger pads, so an object put there is outside the gripper
+and the fingers close behind it. `grasp_offset_m` pushes the commanded grasp
+centre that much further along the approach, which pulls the object that much
+deeper into the jaw -- 0.015 brings it to the fingertips, 0.106 to the pads.
+`diagnose.py` prints both numbers off the compiled model.
 
-* **The grasp centre.** The retargeting drives `grasp_center_link` to the pose
-  the policy asked for its Robotiq's `grasp_site`, but on Stretch that point
-  sits 1.5cm *past* the fingertips and 10.6cm past the finger pads. An object
-  placed there is outside the gripper, so the fingers close behind it and it is
-  nudged rather than grasped. 0.09 puts it between the pads, which is where the
-  Robotiq's own grasp site is on the robot the policy was trained on.
-* **The height.** `target_z_offset_m` is added to
-  every target -- 5.1cm in this kitchen, which is more than three of the four
-  benchmark objects are tall. It exists to stop the gripper dragging through a
-  countertop where the lift has run out of travel; with the grasp depth
-  corrected it costs more than it buys here.
+Deep is not simply better, for two reasons that bound it from opposite ends.
+The offset drives the fingertips `offset - 0.015` metres *past* the object along
+the approach, and for a top-down grasp that is straight down: at 0.09 the tips
+reach 7.5cm below the object's centre, which for every object in this benchmark
+is through the worktop. And Stretch's fingers converge behind their tips, so the
+deeper the object sits the narrower the jaw it has to fit in -- past about 0.045
+the hand cannot open around what the Robotiq would have swallowed at all. See
+`franka_retarget.ROBOTIQ_MAX_APERTURE_M`, which carries that calibration; the
+two parameters pick a point on one wedge and cannot be chosen apart.
 
-Measured over the four objects, no offset versus half a shortfall at four grasp
-offsets: mean score 0.948 against 0.789. The two interact -- at
-`grasp_offset_m=0` the height made no difference at all, because the depth error
-was already losing every grasp.
+0.030 is where that comes out, measured by replaying the recorded
+`franka_baseline` episodes through the retargeting with the physics on
+(`retargetting/replay.py --replay-as-stretch4`), over all 20 of them:
 
-These are tuned on one kitchen from one robot pose. Confirm on a real benchmark
-before treating them as the retargeting's defaults everywhere:
+    offset (at the aperture calibrated for it)   0.000  0.015  0.030  0.045  0.055
+    picked                                        2/20   3/20   6/20   3/20    5/20
+
+A shallow read of that is that it barely matters, and the reason it looks that
+way is worth knowing: a replay is open loop and the gripper closes on the step
+the *Franka's* did, which is the right step for a hand 9cm shorter. What the
+table can be trusted on is the shape -- nothing at 0, falling away past 0.045 --
+and not on 6 against 5.
+
+**The height.** `target_z_offset_m` raises every target for clearance over the
+worktop; it is 0 here and the measurement it used to be a fraction of is taken
+at the Franka's home pose, above Stretch's lift ceiling, so it corrected targets
+that needed no correcting. Anything larger than the object is tall closes the
+gripper above it: over these counters the four objects stand 2.6cm (knife) to
+5.5cm (salt shaker) proud.
+
+Both are tuned on five kitchens from one robot pose each. Confirm on a real
+benchmark before treating them as the retargeting's defaults everywhere:
 
     run_benchmarks.py --policy molmobot_droid --benchmark pick
 """
@@ -372,6 +418,34 @@ camera without restating the numbers. The angles are the euler form of the
 quaternion `FrankaDroidCameraSystem` uses; see `franka_baseline`.
 """
 
+STRETCH_BASE_LINK_HEIGHT_M = 0.028
+"""
+How far Stretch's `base_link` origin sits above the floor, in metres.
+
+**This is the robot, not a bug, and the robot is not floating.** `base_footprint`
+is the root body and it is exactly on the floor; all six wheel geoms bottom out
+at z = 0.0000; `base_link` is the chassis origin 28mm above that, and
+`base_link_collision` -- the shell -- clears the floor by the same 28mm, which is
+the ground clearance the wheels are there to provide. See
+`stretch.robot.Stretch4Robot.add_robot_to_scene`, which hangs `base_footprint`
+off the holonomic joints, and its module docstring for why the wheels are made
+inert.
+
+It is worth a constant because several heights in this file are reasoned about
+as "height in the room" and then written as an offset from `base_link`, and
+those are the same number only if this is zero. It is not, so every Stretch
+camera here sits 2.8cm higher in the room than its docstring claims, and the
+Franka setups that transplant a Stretch camera (`FRANKA_STRETCHCAM_HEIGHT`) are
+2.8cm lower than the Stretch ones they are paired with.
+
+Nothing subtracts it yet. Correcting it means taking it off
+`STRETCH_BASELINE_HEIGHT` and adding it to `FRANKA_STRETCHCAM_HEIGHT`, which
+moves every camera in the study at once -- and 2.8cm at 1.4m, looking at a
+counter a metre away, is about a degree of framing, well under the run-to-run
+noise in `scoring.REPEAT_NOISE_NOTE`. So it is recorded rather than applied in
+the middle of a comparison.
+"""
+
 STRETCH_BASELINE_HEIGHT = FRANKA_LINK0_HEIGHT + DROID_SHOULDER_CAMERA_POS[2]
 """
 Where the DROID shoulder camera goes on Stretch: 1.41 m above `base_link`.
@@ -381,11 +455,15 @@ the other direction: the camera has to end up at **the same height in the room**
 on both robots, or the pair stops being a comparison of the robot and becomes a
 comparison of two viewpoints. On the Franka the camera sits 0.66 m above
 `fr3_link0`, which is itself 0.75 m up on a pedestal, so 1.41 m above the floor.
-Stretch's `base_link` is on the floor, so that is the number straight through.
+
+Mounted on `base_link` it lands at 1.438 m rather than 1.41 m, because that body
+is not quite on the floor; see `STRETCH_BASE_LINK_HEIGHT_M`. Measured, with both
+robots stood at the mini benchmark's spawn and the same yaw, the two cameras come
+out at the same xy to the millimetre and 28 mm apart in z.
 
 The xy offset and the orientation are carried across unchanged -- it is the same
-camera, looking the same way, at the same height. What differs is the robot under
-it, which is the whole point of the pair.
+camera, looking the same way, at very nearly the same height. What differs is the
+robot under it, which is the whole point of the pair.
 """
 
 FRANKA_LINK1_HEIGHT = 0.333
@@ -667,14 +745,21 @@ def franka_camera_system(params: RetargetParams) -> CameraSystemConfig:
 def stretch_camera_system(params: RetargetParams) -> CameraSystemConfig:
     """The exo camera under test, plus Stretch's own right wrist camera.
 
-    The wrist camera is left as `Stretch4CameraSystem` has it -- an MJCF camera
-    with the hardware's FOV, rendered through `install_stretch_camera_hooks`
-    like any other -- because nothing in this study varies it, and swapping it
-    would add a confound to every Stretch row.
+    The wrist camera is `Stretch4CameraSystem`'s -- an MJCF camera rendered
+    through `install_stretch_camera_hooks` like any other -- at the hardware's
+    own FOV unless `params.wrist_fov_deg` says otherwise. Narrowing it is a
+    centre crop of the real camera's frame expressed as a render setting; see
+    `RetargetParams.wrist_fov_deg` for the measurement that motivates one and
+    for what it costs.
     """
     wrist = next(
         camera for camera in Stretch4CameraSystem().cameras if camera.name == WRIST_CAMERA_RIGHT
     )
+    if params.wrist_fov_deg:
+        # A copy, because `Stretch4CameraSystem()` hands back configs that other
+        # callers in this process share; mutating this one would narrow the
+        # wrist camera of every Stretch evaluation that follows.
+        wrist = wrist.model_copy(update={"fov": float(params.wrist_fov_deg)})
     wrist_size = stretch_config.CAMERA_RENDER_SIZE[WRIST_CAMERA_RIGHT]
     return CameraSystemConfig(
         img_resolution=_buffer_resolution(params.exo.render_size, wrist_size),
@@ -705,7 +790,7 @@ class RetargetStretch4RobotConfig(Stretch4RobotConfig):
     `Stretch4CameraSystem` over the exo camera this study is measuring."""
 
 
-def _point_base_at(task: dict, base_z: float) -> None:
+def _point_base_at(task: dict, base_z: float, retreat: bool = False) -> None:
     """Face the robot's +x at the pickup object, at the height its base belongs at.
 
     Position is left exactly where the episode authored it: the study needs every
@@ -714,6 +799,12 @@ def _point_base_at(task: dict, base_z: float) -> None:
     recomputed rather than trusted because +x is the axis Stretch's arm extends
     along and the Franka's reaches along, so it is what "facing the object"
     means for either.
+
+    `retreat` asks for `stretch_spawn_base_pose`, which moves Stretch back so its
+    spawn gripper pose is the Franka's -- Stretch only, and only when
+    `match_stretch_spawn_pose_to_franka` is on. The yaw is computed from the
+    authored position either way, so the robot still faces the object it was
+    placed to face rather than the point it retreated from.
     """
     base_pose = list(task["robot_base_pose"])
     base_xy = np.asarray(base_pose[:2], dtype=float)
@@ -721,6 +812,8 @@ def _point_base_at(task: dict, base_z: float) -> None:
 
     offset = target_xy - base_xy
     yaw = float(np.arctan2(offset[1], offset[0])) if np.linalg.norm(offset) > 1e-6 else 0.0
+    if retreat:
+        base_xy = np.asarray(stretch_spawn_base_pose(base_xy, yaw), dtype=float)
     task["robot_base_pose"] = [
         float(base_xy[0]),
         float(base_xy[1]),
@@ -751,15 +844,17 @@ def franka_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None:
         key: list(value)
         for key, value in FrankaRobotConfig.model_fields["init_qpos"].default.items()
     }
-    if change_franka_start_pose_requested():
-        # The Franka half of `--change_franka_start_pose`. The Stretch half is in
+    conventions = pose_conventions_requested()
+    if conventions.changes_franka_start_pose:
+        # The Franka half of the start-pose flags. The Stretch half is in
         # `FrankaOnStretchView.__init__`, which adjusts the *virtual* Franka the
-        # retargeting snaps Stretch to; both read the same flag, so the two
-        # conditions cannot end up starting at different poses -- which is the one
-        # thing this flag exists to prevent.
+        # retargeting snaps Stretch to; both read the same two variables through
+        # `start_pose_changes_requested`, so the two conditions cannot end up
+        # starting at different poses -- which is the one thing these flags exist
+        # to prevent.
         episode_spec.robot.init_qpos["arm"] = [
             float(angle)
-            for angle in stretch_startable_arm_qpos(VirtualFranka(), FRANKA_LINK0_HEIGHT)
+            for angle in franka_start_arm_qpos(VirtualFranka(), conventions, FRANKA_LINK0_HEIGHT)
         ]
 
     system = franka_camera_system(params)
@@ -771,25 +866,81 @@ def franka_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None:
     _point_base_at(episode_spec.task, FRANKA_LINK0_HEIGHT - pedestal)
 
 
+STRETCH_SPAWN_ARM_M = 0.2
+"""
+How far Stretch's arm is telescoped out when an episode spawns it, in metres.
+
+`Stretch4RobotConfig.init_qpos` stows the arm at 0, and stowing is load-bearing
+for the *other* benchmarks -- `stretch.episode_overrides.stretch_home_init_qpos`
+explains that an unstowed Stretch spawns with its tool inside whatever the target
+is sitting on. It is not load-bearing here, because this study stands the robot
+where the Franka stands rather than in Stretch's own reach band, and a spawn at
+the very bottom of the arm's 0..0.52 travel is a spawn with the IK's seed pinned
+against a limit in the direction it most often needs to move.
+
+Overridden here rather than in `Stretch4RobotConfig` so that only this study's
+episodes see it.
+"""
+
+
+def stretch_spawn_base_pose(base_xy, yaw: float) -> tuple[float, float]:
+    """`base_xy`, moved back so Stretch's spawn gripper pose is the Franka's.
+
+    A no-op unless `match_stretch_spawn_pose_to_franka` is on. The offset is in
+    the base's own axes, so it is rotated by the spawn yaw before it is applied.
+    """
+    base_xy = np.asarray(base_xy, dtype=float)[:2]
+    if not pose_conventions_requested().match_stretch_spawn_pose_to_franka:
+        return float(base_xy[0]), float(base_xy[1])
+    forward = np.array([np.cos(yaw), np.sin(yaw)])
+    across = np.array([-np.sin(yaw), np.cos(yaw)])
+    moved = (
+        base_xy
+        + forward * fr.STRETCH_SPAWN_BASE_OFFSET_XY[0]
+        + across * fr.STRETCH_SPAWN_BASE_OFFSET_XY[1]
+    )
+    return float(moved[0]), float(moved[1])
+
+
+def stretch_spawn_init_qpos() -> dict[str, list[float]]:
+    """Stretch's per-move-group spawn pose for this study.
+
+    `stretch_home_init_qpos()` with the arm out at `STRETCH_SPAWN_ARM_M`, and the
+    wrist rolled half a turn when `--change_stretch_start_pose_flip_wrist` asks
+    for it -- a roll about the approach axis, so the grasp centre does not move
+    and what swings round is the hand and the two cameras on it.
+
+    The roll goes *negative*: `wrist_roll_joint` runs about [-4.276, +1.135] rad,
+    so +pi is outside its travel and -pi is not. Measured, not assumed, and the
+    grasp centre comes out in the same place to the micrometre either way.
+    """
+    init_qpos = stretch_home_init_qpos()
+    init_qpos["arm"] = [float(STRETCH_SPAWN_ARM_M)]
+    if pose_conventions_requested().change_stretch_start_pose_flip_wrist:
+        yaw, pitch, _ = init_qpos.get("wrist", [0.0, 0.0, 0.0])
+        init_qpos["wrist"] = [float(yaw), float(pitch), -float(np.pi)]
+    return init_qpos
+
+
 def stretch_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None:
     """Put the episode on Stretch 4 with the trial's exo camera.
 
     The camera half of `stretch.episode_overrides.stretch_episode_override`
     replaced -- that one installs all six Stretch cameras, which would render
-    the exo view this study varies as a seventh nobody reads. The base pose and
-    the stowed start configuration are the same.
+    the exo view this study varies as a seventh nobody reads. The base pose is
+    the same; the start configuration is `stretch_spawn_init_qpos`.
     """
     _, params = active_trial()
     _register_cameras(params)
 
     episode_spec.robot.robot_name = "stretch4"
-    episode_spec.robot.init_qpos = stretch_home_init_qpos()
+    episode_spec.robot.init_qpos = stretch_spawn_init_qpos()
 
     system = stretch_camera_system(params)
     exp_config.camera_config.cameras = list(system.cameras)
     exp_config.camera_config.img_resolution = system.img_resolution
 
-    _point_base_at(episode_spec.task, 0.0)
+    _point_base_at(episode_spec.task, 0.0, retreat=True)
 
 
 def register_overrides() -> None:
@@ -843,6 +994,9 @@ class RetargetStretchMolmoBotDroidPolicyConfig(StretchMolmoBotDroidPolicyConfig)
     wrist_tilt_deg: float = 0.0
     """See `RetargetParams.wrist_tilt_deg`."""
 
+    aperture_m: float = 0.0
+    """See `RetargetParams.aperture_m`. 0 keeps `ROBOTIQ_MAX_APERTURE_M`."""
+
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
         # The parent sets these to the un-parameterised classes.
@@ -878,6 +1032,7 @@ class RetargetStretchMolmoBotDroidPolicy(StretchMolmoBotDroidPolicy):
             wrist_tilt_deg=float(getattr(policy_config, "wrist_tilt_deg", 0.0)),
             grasp_offset_m=float(getattr(policy_config, "grasp_offset_m", 0.0)),
         )
+        apply_aperture(proxy, float(getattr(policy_config, "aperture_m", 0.0)))
         return proxy
 
 
@@ -898,15 +1053,53 @@ def apply_tool_correction(proxy: Any, wrist_tilt_deg: float, grasp_offset_m: flo
         FRANKA_TO_STRETCH_TOOL,
     )
 
+    from examples.machine_learning.molmospaces.policies.franka_retarget import JAW_FLIP
+
     correction = np.eye(4)
     correction[:3, :3] = FRANKA_TO_STRETCH_TOOL @ R.from_euler(
         "y", wrist_tilt_deg, degrees=True
     ).as_matrix()
     # +x is Stretch's approach axis; see `franka_retarget.FRANKA_TO_STRETCH_TOOL`.
     correction[:3, 3] = correction[:3, :3] @ np.array([grasp_offset_m, 0.0, 0.0])
+    if getattr(proxy, "pose_conventions", None) and (
+        proxy.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist
+    ):
+        # This rebuilds the transform from scratch, so it has to re-apply the
+        # half turn `FrankaOnStretchView.__init__` folded in -- otherwise asking
+        # for a tool correction would silently undo the convention. On the right,
+        # after the offset, for the same reason it is on the right there: the
+        # turn is about the approach axis, which the rotation above defines.
+        correction = correction @ JAW_FLIP
 
     proxy._tool_correction = correction
     proxy._tool_correction_inverse = np.linalg.inv(correction)
+
+
+def apply_aperture(proxy: Any, aperture_m: float) -> None:
+    """Re-solve a `FrankaOnStretchView`'s open finger angle for a different aperture.
+
+    `FrankaOnStretchView` takes this at construction; the policy builds its proxy
+    through a base class that does not pass it, so this redoes the one
+    measurement that depends on it. Zero leaves the proxy alone, which is what
+    every setup that does not name an aperture wants.
+
+    Does nothing to a proxy built with `match_robotiq_aperture` off -- that hand
+    is already open as wide as it goes, and there is nothing to narrow.
+    """
+    from examples.machine_learning.molmospaces.policies.franka_retarget import (
+        STRETCH_FINGER_OPEN,
+        stretch_finger_for_aperture,
+    )
+
+    if not aperture_m or proxy.finger_open >= STRETCH_FINGER_OPEN:
+        return
+    proxy.robotiq_aperture_m = float(aperture_m)
+    proxy.finger_open = stretch_finger_for_aperture(
+        proxy.arm_ik._scratch_view.get_move_group("gripper"),
+        proxy.arm_ik._scratch_data.model,
+        proxy.arm_ik._scratch_data,
+        float(aperture_m),
+    )
 
 
 # =============================================================================
@@ -983,6 +1176,7 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
             self.policy_config.grasp_offset_m = params.grasp_offset_m
             self.policy_config.wrist_tilt_deg = params.wrist_tilt_deg
             self.policy_config.target_z_offset = params.target_z_offset_m
+            self.policy_config.aperture_m = params.aperture_m
 
 
 def qualified_config_name(class_name: str) -> str:

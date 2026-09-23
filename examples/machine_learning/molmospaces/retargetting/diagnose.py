@@ -165,6 +165,77 @@ def report_gripper(model, data, view, namespace: str) -> float:
     return overhang
 
 
+JAW_PROFILE_DEPTHS_MM = tuple(range(0, -121, -10))
+"""How far past the grasp centre `report_jaw_profile` probes, in millimetres.
+
+Down to 12cm because that is past the point where Stretch's fingers meet -- the
+profile has to include the pinch to show it.
+"""
+
+
+def report_jaw_profile(model, data, view, namespace: str) -> None:
+    """Print how wide the jaw actually is at each depth, which is not what the tips say.
+
+    `inter_finger_dist` -- the number every other part of this study calls the
+    aperture, and the one `ROBOTIQ_MAX_APERTURE_M` is matched against -- is the
+    separation of the two *fingertip bodies*. That is the widest the jaw ever is.
+    Stretch's fingers curve inwards behind the tips and meet about 7cm back, so
+    the width available to an object is a strong function of how deep into the
+    jaw the retargeting puts it, and `grasp_offset_m` is exactly the control that
+    decides that depth.
+
+    Which makes this the measurement that ties the two parameters together: an
+    object at depth `grasp_offset_m` needs the row at that depth to be wider than
+    the object is, and the only way to widen it is to open the hand further --
+    which `match_robotiq_aperture` is capping. Read the two together before
+    moving either.
+
+    Measured by ray-casting across the jaw from its centre line rather than from
+    the geometry, because the fingers are meshes and their inward curve is not in
+    any single number the model exposes.
+    """
+    click.secho("\n== how wide the jaw is, at each depth ==", bold=True)
+    gripper = view.get_move_group("gripper")
+    apertures = [
+        ("matched to the Robotiq's 87mm", 0.087),
+        (f"matched to ROBOTIQ_MAX_APERTURE_M ({fr.ROBOTIQ_MAX_APERTURE_M * 1000:.0f}mm)", fr.ROBOTIQ_MAX_APERTURE_M),
+        ("wide open, unmatched", None),
+    ]
+    for label, aperture in apertures:
+        angle = (
+            fr.STRETCH_FINGER_OPEN
+            if aperture is None
+            else fr.stretch_finger_for_aperture(gripper, model, data, aperture)
+        )
+        view.set_qpos_dict({"gripper": [angle, angle]})
+        mujoco.mj_forward(model, data)
+        pose = np.asarray(view.get_move_group("wrist").leaf_frame_to_world, dtype=float)
+        origin, approach, across = pose[:3, 3], pose[:3, 0], pose[:3, 1]
+
+        click.echo(
+            f"\n{label}: finger {angle:.4f} rad, tips {gripper.inter_finger_dist * 1000:.0f}mm apart"
+        )
+        for depth_mm in JAW_PROFILE_DEPTHS_MM:
+            point = origin + approach * (depth_mm / 1000.0)
+            width = 0.0
+            for direction in (across, -across):
+                # The ray starts between the fingers and the fingers are the
+                # nearest thing either side, so whatever it hits first is the
+                # jaw. `flg_static` is on because the counter is static and a
+                # ray that escapes the jaw should stop at it rather than run on.
+                hit = mujoco.mj_ray(
+                    model, data, point, direction, None, 1, -1, np.zeros(1, dtype=np.int32)
+                )
+                width += hit if hit >= 0 else float("nan")
+            bar = "" if not np.isfinite(width) else "#" * int(width * 200)
+            click.echo(f"  {depth_mm:5d} mm past the grasp centre | {width * 1000:6.1f} mm {bar}")
+
+    click.echo(
+        "\nAn object is left at depth `grasp_offset_m` past the grasp centre, so read the\n"
+        "row at the offset you are using: that is the width the object has to fit in."
+    )
+
+
 def report_height_offset(view, namespace: str) -> float:
     """Print the lift shortfall at the Franka's home pose, and what offsets would do.
 
@@ -268,6 +339,7 @@ def main(target_z_offset: float) -> None:
     click.secho("Measuring the retargeting on a standing robot, no policy involved.", bold=True)
     model, data, view, namespace = build_standing_robot()
     report_gripper(model, data, view, namespace)
+    report_jaw_profile(model, data, view, namespace)
     shortfall = report_height_offset(view, namespace)
     report_objects(shortfall, target_z_offset)
     report_grasp_offset(view, namespace, shortfall)
