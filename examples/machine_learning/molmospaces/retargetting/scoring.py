@@ -52,6 +52,20 @@ differs in nothing but the camera. Contact and lift are downstream of the
 gripper geometry, which `grasp_offset_m` and `wrist_tilt_deg` address.
 """
 
+REPEAT_NOISE_NOTE = """
+How much two runs of the *same* trial differ, measured rather than assumed.
+
+`stretch_baseline`, same parameters, same benchmark, same seed, run twice:
+**2/20 and 4/20 picked**. The checkpoint samples, so a 20-episode trial resolves
+nothing finer than about two grasps, and a ranking whose top rows differ by one
+or two is a ranking of ties.
+
+Worth knowing before reading any table this module writes. The continuous
+`score` is the less noisy of the two numbers and is what a search should climb;
+the success count is what a winner gets declared on, and the success count is
+noisy. Re-run the top two before believing the order.
+"""
+
 CONTACT_DISTANCE_M = 0.02
 """
 How close the gripper has to get to count as having reached the object, in metres.
@@ -112,6 +126,16 @@ class EpisodeScore:
     centimetres is the retargeting working; a persistent 10cm+ means the policy
     is asking for somewhere the robot cannot go from where it is standing, which
     is a different failure from not being able to see the object.
+
+    **Zero here does not mean the grasp was aimed correctly**, and that is worth
+    saying plainly because this column once read 0.000 m down a run where every
+    grasp was 8.6cm to one side: it is the IK's residual, the gap between the
+    target and the nearest pose Stretch could hold, so a solver reaching a
+    *wrong* target exactly reports zero. Whether the target itself is right is a
+    question about the mount and the tool transform, and the only thing that
+    answers it is a comparison against the Franka's own recorded tool pose --
+    `retargetting/replay.py`, whose `franka_gap_m` is that comparison. See
+    `franka_retarget.FRANKA_MOUNT_OFFSET_XY` for the run this happened on.
     """
 
     video: str = ""

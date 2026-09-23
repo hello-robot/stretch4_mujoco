@@ -947,11 +947,18 @@ def _replay_captioner(stretch_setup: str, results: dict[str, Any]) -> Captioner:
     The two halves of a replay are not two rollouts and must not be captioned as
     though they were. The left is a recording -- a real Franka rollout, with a
     real outcome, played back from the MP4 it was recorded to. The right never
-    ran: it is those same actions pushed through the retargeting kinematically,
-    so it has no success, no score and nothing to say about whether the object
-    was picked up. What it has instead is the residual and the unreachable-step
-    count, which is the whole reason to look at it, so those go on the bar and
-    the bar is left grey rather than tinted with an outcome it does not have.
+    ran a policy: it is those same actions pushed through the retargeting.
+
+    What the right half may say about the object depends on which kind of replay
+    it was. A kinematic one writes joint positions and runs `mj_forward`, so the
+    object cannot move and the bar stays grey with the residual and the
+    unreachable-step count on it -- the numbers that are the reason to look at a
+    kinematic replay at all. A physics one steps the scene through the
+    evaluation's own controllers, so the object is grasped or it is not, and that
+    verdict is worth the same tint a rollout's is. It is still not a rollout's
+    verdict: the actions are the Franka's, replayed blind, so it says the
+    retargeting can or cannot hold a grasp the policy already found, and nothing
+    about whether the policy finds it through Stretch's camera.
     """
 
     def caption(
@@ -962,14 +969,22 @@ def _replay_captioner(stretch_setup: str, results: dict[str, Any]) -> Captioner:
 
         instruction = meta.get("instruction") or "?"
         result = results.get(meta.get("key", ""))
-        parts = [f"REPLAY (kinematic)  |  {run.setup}", instruction]
+        grasp = getattr(result, "grasp", None)
+        kind = "physics" if grasp is not None else "kinematic"
+        parts = [f"REPLAY ({kind})  |  {run.setup}", instruction]
+        if grasp is not None:
+            parts.append(
+                "PICKED UP"
+                if grasp.success
+                else f"no grasp (lifted {grasp.best_lift_m * 1000:.0f}mm)"
+            )
         if result is not None and len(result.position_error_m):
             parts.append(
                 f"retarget miss {result.position_error_m.mean() * 1000:.0f}mm mean, "
                 f"{result.position_error_m.max() * 1000:.0f}mm max"
             )
             parts.append(f"unreachable {result.unreachable_steps}/{result.episode.steps}")
-        return "  |  ".join(parts), None
+        return "  |  ".join(parts), (grasp.success if grasp is not None else None)
 
     return caption
 
@@ -982,6 +997,7 @@ def replay_pair(
     target_z_offset: float,
     limit: int | None = None,
     fps: float = 15.0,
+    physics: bool = True,
 ) -> tuple[list[Path], list[Any]]:
     """Replay one pair's recorded Franka episodes and tile them as the rollouts are.
 
@@ -1056,7 +1072,9 @@ def replay_pair(
                 fps=fps,
                 target_z_offset=target_z_offset,
                 tool_correction=(params.wrist_tilt_deg, params.grasp_offset_m),
+                aperture_m=params.aperture_m or None,
                 scene_count=scene_count,
+                physics=physics,
             )
             results.append(result)
             by_key[key] = result
@@ -1258,6 +1276,16 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
     "what a rollout now applies unless told otherwise.",
 )
 @click.option(
+    "--replay-kinematic",
+    "replay_kinematic",
+    is_flag=True,
+    help="Replay without the physics: write the retargeted joint positions and run "
+    "mj_forward, so nothing the gripper touches moves. Faster, and the way to read the "
+    "retargeting's reach on its own -- the residual and the unreachable-step count are "
+    "the same either way. The default steps the scene through the evaluation's own "
+    "controllers instead, so the replay can actually pick the object up and say so.",
+)
+@click.option(
     "--replay-limit",
     type=int,
     default=None,
@@ -1285,13 +1313,45 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
     "changing the layout without paying for the rollouts again.",
 )
 @click.option(
-    "--change_franka_start_pose",
-    "change_franka_start_pose",
+    "--change_franka_start_pose_flip_wrist",
+    "change_franka_start_pose_flip_wrist",
     is_flag=True,
-    help="Start the Franka rolled half a turn about its approach axis -- which turns its "
-    "wrist camera outwards and leaves the grasp identical -- and capped at Stretch's own "
-    "reach ceiling, so both halves of the pair begin an episode at the same pose. See "
-    "`franka_retarget.stretch_startable_arm_qpos`.",
+    help="Start the Franka rolled half a turn about its approach axis. The grasp is "
+    "identical either way round; what swings round is the hand, and the wrist camera "
+    "bolted off to one side of it. See `franka_retarget.PoseConventions`.",
+)
+@click.option(
+    "--change_franka_start_pose_limit_height",
+    "change_franka_start_pose_limit_height",
+    is_flag=True,
+    help="Cap the Franka's start tool height at Stretch's own reach ceiling, so the "
+    "Stretch condition does not begin every episode with its lift already at its stop. "
+    "See `franka_retarget.PoseConventions`.",
+)
+@click.option(
+    "--change_stretch_start_pose_flip_wrist",
+    "change_stretch_start_pose_flip_wrist",
+    is_flag=True,
+    help="Spawn Stretch with its own wrist rolled half a turn, the counterpart of "
+    "--change_franka_start_pose_flip_wrist. Overwritten by the snap to the Franka's home "
+    "unless snap_to_franka_home is off. See `franka_retarget.PoseConventions`.",
+)
+@click.option(
+    "--match_stretch_spawn_pose_to_franka",
+    "match_stretch_spawn_pose_to_franka",
+    is_flag=True,
+    help="Stand Stretch back far enough that its spawn gripper pose is the Franka's, "
+    "cancelling the retreat in the virtual Franka's mount so the frame is unchanged. "
+    "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
+    "it -- see `setups.STRETCH_SPAWN_BASE_OFFSET_XY` for both numbers.",
+)
+@click.option(
+    "--map_franka_wrist_to_flipped_stretch4_wrist",
+    "map_franka_wrist_to_flipped_stretch4_wrist",
+    is_flag=True,
+    help="Retarget every pose onto the half-turned branch of Stretch's wrist, by folding "
+    "the turn into the tool transform itself -- so it holds for the whole episode and both "
+    "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
 def main(
     pair: str,
@@ -1308,21 +1368,30 @@ def main(
     replay_z_offset: float,
     replay_limit: int | None,
     replay_no_video: bool,
-    change_franka_start_pose: bool,
+    replay_kinematic: bool,
+    change_franka_start_pose_flip_wrist: bool,
+    change_franka_start_pose_limit_height: bool,
+    change_stretch_start_pose_flip_wrist: bool,
+    map_franka_wrist_to_flipped_stretch4_wrist: bool,
+    match_stretch_spawn_pose_to_franka: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    # Before either half runs, and written in both directions: the point of a
-    # matched pair is that the two halves differ in exactly one thing, so a start
-    # pose left over from a previous run in the same shell would undo the pairing.
-    # See `publish_change_franka_start_pose`.
-    fr.publish_change_franka_start_pose(change_franka_start_pose)
-    if change_franka_start_pose:
-        log.info(
-            "[start-pose] both halves start rolled half a turn and capped at "
-            f"{fr.STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
-        )
+    conventions = fr.PoseConventions(
+        change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
+        change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
+        change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
+        map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
+        match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,
+    )
+    # Before anything runs, and every variable written in both directions: the
+    # point of a matched pair is that its two halves differ in exactly one thing,
+    # so a convention left over from a previous run in the same shell would undo
+    # the pairing. See `publish_pose_conventions`.
+    fr.publish_pose_conventions(conventions)
+    if conventions:
+        log.info(f"[pose] conventions: {conventions.describe()}")
 
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1337,15 +1406,31 @@ def main(
         if replay_no_video:
             # Nothing to tile, so nothing to pair: every Franka trajectory under
             # the directory is replayed for its numbers, whichever run left it.
+            # The tool correction still has to come from somewhere, and it is the
+            # first pair's Stretch setup plus whatever --param says -- otherwise
+            # this measures a retargeting no setup uses and `--param
+            # grasp_offset_m=...` would be silently ignored, which is the one
+            # thing anybody runs this flag to sweep.
+            params = _apply_params(SETUPS[MATCHED_PAIRS[pair_names[0]][1]].params, param_specs)
+            source = click.get_current_context().get_parameter_source("replay_z_offset")
+            z_offset = (
+                replay_z_offset
+                if source is not None and source.name != "DEFAULT"
+                else params.target_z_offset_m
+            )
+            log.info(f"[replay] {params.describe()}, target_z_offset={z_offset:+.3f}m")
             results = replay_mod.replay_run(
                 output_dir,
                 destination,
                 render=False,
                 limit=replay_limit,
-                target_z_offset=replay_z_offset,
+                target_z_offset=z_offset,
+                tool_correction=(params.wrist_tilt_deg, params.grasp_offset_m),
+                aperture_m=params.aperture_m or None,
                 # The run's own --scenes, so `scene_for_house` searches a list
                 # that contains the houses the trajectories were recorded in.
                 scene_count=scene_count,
+                physics=not replay_kinematic,
             )
             replay_mod.report(results, destination, rendered=False)
             return
@@ -1375,6 +1460,7 @@ def main(
                 scene_count=scene_count,
                 target_z_offset=z_offset,
                 limit=replay_limit,
+                physics=not replay_kinematic,
             )
             written += pair_videos
             results += pair_results

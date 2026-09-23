@@ -504,6 +504,41 @@ def _add_exo_camera(spec: MjSpec, namespace: str, exo: ExoCameraParams) -> None:
     )
 
 
+@dataclass
+class ReplayScene:
+    """One compiled replay scene, and how to put it back the way it was compiled.
+
+    A scene is nearly all of what a replay costs: installing the house's assets,
+    assembling the MJCF and compiling it take seconds, against tens of
+    milliseconds for the kinematics or the couple of seconds of stepping that
+    follow. A parameter search runs the same episode at a dozen points and
+    nothing about the scene differs between them, so it builds one of these once
+    and hands it back to `replay_episode` each time. `reset` is what makes that
+    sound: `mj_resetData` restores `qpos0`, which for the staged pickup object is
+    the pose the benchmark settled it in, so every trial starts from the same
+    counter rather than from wherever the last one left the bowl.
+    """
+
+    model: Any
+    data: MjData
+    view: Stretch4RobotView
+    namespace: str
+    init_qpos: dict[str, Any]
+
+    object_name: str = ""
+    """The staged pickup object's body name, or empty if the scene holds none.
+
+    Carried on the scene rather than re-derived per replay because it is decided
+    by what was compiled in: a caller reusing a scene passes no `stage`, and
+    asking it for the object name again would get nothing.
+    """
+
+    def reset(self) -> None:
+        mujoco.mj_resetData(self.model, self.data)
+        self.view.set_qpos_dict(self.init_qpos)
+        mujoco.mj_forward(self.model, self.data)
+
+
 def build_stretch_in_scene(
     house_index: int,
     base_xytheta: np.ndarray,
@@ -525,6 +560,9 @@ def build_stretch_in_scene(
     the clutter the episode removes still standing. That is enough to measure
     where the retargeting puts the gripper, which is all a replay used to be
     asked, and not enough to watch one beside the rollout it came from.
+
+    Returns a `ReplayScene`, which a caller replaying the same episode more than
+    once should keep and hand back rather than rebuild.
     """
     from molmo_spaces.utils.lazy_loading_utils import (
         install_scene_with_objects_and_grasps_from_path,
@@ -557,9 +595,16 @@ def build_stretch_in_scene(
     view = Stretch4RobotView(data, namespace)
     qpos = dict(config.init_qpos)
     qpos["base"] = [x, y, yaw]
-    view.set_qpos_dict(qpos)
-    mujoco.mj_forward(model, data)
-    return model, data, view, namespace
+    scene = ReplayScene(
+        model=model,
+        data=data,
+        view=view,
+        namespace=namespace,
+        init_qpos=qpos,
+        object_name=staged_object_name(stage),
+    )
+    scene.reset()
+    return scene
 
 
 @dataclass
@@ -583,17 +628,286 @@ class ReplayResult:
 
     unreachable_steps: int = 0
 
+    grasp: "GraspOutcome | None" = None
+    """What the object did, when the replay was stepped with the physics on.
+
+    `None` for a kinematic replay, which cannot have an opinion: it writes joint
+    positions and runs `mj_forward`, so the object never moves and "it did not
+    pick it up" is a property of the replay rather than of the retargeting. See
+    `replay_episode`'s `physics`.
+    """
+
     def summary(self) -> str:
         if not len(self.position_error_m):
             return f"{self.episode.group}: nothing replayed"
 
-        return (
+        line = (
             f"{self.episode.group:8s} {self.episode.instruction[:28]:30s} "
             f"{self.episode.steps:4d} steps  "
             f"residual mean {self.position_error_m.mean() * 1000:6.1f}mm "
             f"max {self.position_error_m.max() * 1000:6.1f}mm  "
             f"unreachable {self.unreachable_steps:4d}"
         )
+        if self.grasp is not None:
+            line += (
+                f"  {'PICKED  ' if self.grasp.success else 'no grasp'}"
+                f" approach {self.grasp.approach:4.2f}"
+                f" gap {self.grasp.min_distance_m * 1000:5.1f}mm"
+                f" lift {self.grasp.best_lift_m * 1000:5.1f}mm"
+            )
+        return line
+
+
+# =============================================================================
+# Grasping, when the replay is allowed to touch anything
+# =============================================================================
+
+GRASP_SUCCESS_LIFT_M = 0.01
+"""How far the object has to come off its start height to count, in metres.
+
+`PickTaskConfig.succ_pos_threshold`, which is what the benchmark scores on and
+therefore the only threshold worth measuring against here.
+"""
+
+SETTLE_SECONDS = 0.4
+"""How long the scene is stepped, with the robot holding still, before a replay begins.
+
+The staged object is attached at the pose the benchmark settled it in, but it is
+attached into a *different* compilation -- Stretch's, not the Franka's -- so it
+arrives with whatever penetration the two models' contact parameters disagree
+about and drops a fraction of a millimetre. Stepping that out first is what makes
+`best_lift_m` a measurement of the grasp rather than of the settle.
+"""
+
+
+@dataclass
+class GraspOutcome:
+    """Whether a physics replay actually picked the object up, and how close it came.
+
+    The same four numbers `scoring.EpisodeScore` records for a real rollout, and
+    deliberately so: a replay is only useful as a stand-in for a rollout if the
+    two are scored the same way, and `scoring.EpisodeScore` is what the report
+    ranks setups on. `success` is `PickTask.get_info`'s own test -- the object
+    off its start height by `GRASP_SUCCESS_LIFT_M` while nothing but the robot is
+    touching it -- rather than a lift threshold on its own, which would pass an
+    object still resting on the counter that the gripper had shoved uphill.
+    """
+
+    object_name: str = ""
+    success: bool = False
+    touched: bool = False
+    start_distance_m: float = float("nan")
+    min_distance_m: float = float("nan")
+    best_lift_m: float = 0.0
+    """The furthest off its start height the object got *while only the robot held it*.
+
+    Gated on the same contact test as `success` for the same reason: an object
+    the gripper has driven into the counter and wedged upwards has not been
+    lifted, and an ungated maximum would report it as a near miss worth chasing.
+    """
+
+    final_gap_m: float = float("nan")
+    """Finger separation at the end, in metres. A hand that shut to 0 gripped nothing."""
+
+    min_finger_gap_m: float = float("inf")
+    """The closest the *fingers* ever came to the object, surface to surface, in metres.
+
+    `min_distance_m` above is the one `scoring.EpisodeScore` uses -- tool frame to
+    object origin -- and it is the wrong number to read a Stretch grasp off for
+    two reasons that both make a good grasp look like a miss. Stretch's tool
+    frame sits 1.5cm *past* its fingertips where the Robotiq's sits between its
+    pads, and `grasp_offset_m` deliberately drives that frame past the object by
+    another few centimetres. So a hand closed perfectly around a potato reports
+    five or six centimetres of "distance". This measures between the geoms that
+    actually touch it, so zero means the fingers are on the object and nothing
+    else does.
+    """
+
+    @property
+    def approach(self) -> float:
+        """Fraction of the opening gripper-to-object gap that was closed, in [0, 1]."""
+        if not np.isfinite(self.start_distance_m) or self.start_distance_m <= 1e-6:
+            return 0.0
+        closed = (self.start_distance_m - self.min_distance_m) / self.start_distance_m
+        return float(np.clip(closed, 0.0, 1.0))
+
+
+class _GraspWatch:
+    """Watches one staged object through a physics replay.
+
+    Reads the same three things `PickTask` and `scoring.GraspProbe` read -- the
+    object's height against where it started, which root bodies are touching it,
+    and how far the grasp frame is from it -- so a replay's verdict and a
+    rollout's are the same verdict.
+    """
+
+    FINGER_BODIES = ("gripper_finger_right_link", "gripper_finger_left_link")
+
+    def __init__(
+        self, model, data, view: Stretch4RobotView, object_name: str, namespace: str = ""
+    ) -> None:
+        self.model, self.data, self.view = model, data, view
+        self.outcome = GraspOutcome(object_name=object_name)
+        self.body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, object_name)
+        if self.body < 0:
+            log.warning(
+                f"[replay] no body {object_name!r} in the compiled scene; the replay will run "
+                f"but cannot say whether it grasped anything."
+            )
+            self.root = -1
+        else:
+            self.root = int(model.body_rootid[self.body])
+        self.robot_root = int(view.base.root_body_id)
+        self.start_z = float("nan")
+        self.object_geoms = self._collidable(self.body) if self.body >= 0 else []
+        self.finger_geoms = [
+            geom
+            for name in self.FINGER_BODIES
+            for geom in self._collidable(
+                mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, namespace + name)
+            )
+        ]
+
+    def _collidable(self, body_id: int) -> list[int]:
+        """The geoms under `body_id` that can touch something.
+
+        Visual-only geoms are excluded -- a decorative shell that overhangs the
+        fingers would report a gap of zero while the pads were still centimetres
+        off -- and so is a body that is not in the model, which is how a gripper
+        whose links are named differently degrades to "no finger measurement"
+        rather than to a traceback.
+        """
+        if body_id is None or body_id < 0:
+            return []
+        from molmo_spaces.utils.mj_model_and_data_utils import descendant_geoms
+
+        return [
+            geom
+            for geom in descendant_geoms(self.model, body_id, visible_only=False)
+            if self.model.geom_contype[geom] or self.model.geom_conaffinity[geom]
+        ]
+
+    @property
+    def live(self) -> bool:
+        return self.body >= 0
+
+    def start(self) -> None:
+        """Freeze the object's rest height, after the settle. The denominator of a lift."""
+        if not self.live:
+            return
+        self.start_z = float(self.data.xpos[self.body][2])
+        self.outcome.start_distance_m = self._distance()
+        self.outcome.min_distance_m = self.outcome.start_distance_m
+
+    def _distance(self) -> float:
+        tool = np.asarray(self.view.get_move_group("gripper").leaf_frame_to_world, dtype=float)
+        return float(np.linalg.norm(tool[:3, 3] - np.asarray(self.data.xpos[self.body])))
+
+    def _contacts(self) -> tuple[bool, bool]:
+        """`(the robot is touching it, something else is)`. See `PickTask.get_info`."""
+        robot = other = False
+        model = self.model
+        for contact in self.data.contact:
+            root1 = int(model.body_rootid[model.geom_bodyid[contact.geom1]])
+            root2 = int(model.body_rootid[model.geom_bodyid[contact.geom2]])
+            if (root1 == self.root) ^ (root2 == self.root):
+                who = root1 if root1 != self.root else root2
+                if who == self.robot_root:
+                    robot = True
+                else:
+                    other = True
+                    break
+        return robot, other
+
+    def _finger_gap(self) -> float:
+        """Surface-to-surface metres between the nearest finger geom and the object."""
+        if not (self.object_geoms and self.finger_geoms):
+            return float("inf")
+        closest = float("inf")
+        for finger in self.finger_geoms:
+            for geom in self.object_geoms:
+                gap = mujoco.mj_geomDistance(self.model, self.data, finger, geom, 1.0, None)
+                closest = min(closest, float(gap))
+        return closest
+
+    def step(self) -> None:
+        if not self.live:
+            return
+        outcome = self.outcome
+        outcome.min_distance_m = min(outcome.min_distance_m, self._distance())
+        outcome.min_finger_gap_m = min(outcome.min_finger_gap_m, self._finger_gap())
+        robot, other = self._contacts()
+        outcome.touched = outcome.touched or robot
+        if robot and not other:
+            lift = float(self.data.xpos[self.body][2]) - self.start_z
+            outcome.best_lift_m = max(outcome.best_lift_m, lift)
+            outcome.success = outcome.success or lift >= GRASP_SUCCESS_LIFT_M
+
+    def finish(self) -> None:
+        if not self.live:
+            return
+        self.outcome.final_gap_m = float(self.view.get_move_group("gripper").inter_finger_dist)
+
+
+def staged_object_name(stage: dict[str, Any] | None) -> str:
+    """The body name `_stage_objects` will give the episode's pickup object.
+
+    `added_objects` is keyed by the name MolmoSpaces attaches the prefab under,
+    and `_stage_objects` attaches it with that same name as its prefix -- so the
+    key is the compiled body name, and the one `PickTask` would have scored.
+    """
+    added = list((stage or {}).get("added_objects") or {})
+    return added[0] if added else ""
+
+
+class _Actuation:
+    """The control stack MolmoSpaces puts between a policy's targets and `mj_data.ctrl`.
+
+    Rebuilt here rather than borrowed from `Stretch4Robot`, which needs a whole
+    `MlSpacesExpConfig` and an environment to exist; what a replay needs is the
+    two things that stand between a retargeted target and the actuator, and both
+    are constructible from a move group alone. Same controllers, same wrapper,
+    same `ctrl_dt` -- see `stretch.robot.Stretch4Robot.__init__`, which this
+    mirrors, and `stretch.motion_limits`, which is why an unshaped replay would
+    move the lift at eight times the hardware's top speed and bounce the object
+    off the counter.
+    """
+
+    GROUPS = ("base", "lift", "arm", "wrist", "gripper")
+
+    def __init__(self, view: Stretch4RobotView, ctrl_dt: float) -> None:
+        from molmo_spaces.controllers.joint_pos import JointPosController
+
+        from examples.machine_learning.molmospaces.stretch.motion_limits import rate_limited
+
+        self.controllers = {
+            group: rate_limited(JointPosController(view.get_move_group(group)), group, ctrl_dt)
+            for group in self.GROUPS
+        }
+
+    def update(self, targets: dict[str, Any]) -> None:
+        """Set this policy step's targets. Groups left out are told to hold still.
+
+        The same rule `Robot.update_control` follows, and it matters for the base:
+        with `include_base` off there is no base entry in a retargeted action, and
+        a controller left holding a stale target would keep driving towards it.
+        """
+        for group, controller in self.controllers.items():
+            value = targets.get(group)
+            if value is not None:
+                controller.set_target(np.asarray(value, dtype=float).reshape(-1))
+            elif not controller.stationary:
+                controller.set_to_stationary()
+
+    def hold(self) -> None:
+        """Target wherever the robot is now -- what a settle needs."""
+        for controller in self.controllers.values():
+            controller.set_to_stationary()
+
+    def apply(self) -> None:
+        """One control interval. `Robot.compute_control`."""
+        for controller in self.controllers.values():
+            controller.robot_move_group.ctrl = controller.compute_ctrl_inputs()
 
 
 def replay_episode(
@@ -606,6 +920,12 @@ def replay_episode(
     stage: dict[str, Any] | None = None,
     tool_correction: tuple[float, float] | None = None,
     frame_sink: Any = None,
+    physics: bool = False,
+    policy_dt_ms: float = 66.0,
+    ctrl_dt_ms: float = 2.0,
+    sim_dt_ms: float = 2.0,
+    aperture_m: float | None = None,
+    scene: "ReplayScene | None" = None,
 ) -> ReplayResult:
     """Drive Stretch through one recorded Franka trajectory and measure the result.
 
@@ -618,10 +938,59 @@ def replay_episode(
     replaying *against a setup* -- without it the replay measures the bare
     retargeting, which is a different question from the one a side-by-side
     against `stretch_baseline` asks. See `setups.apply_tool_correction`.
+
+    `physics` decides what kind of replay this is, and it is the difference
+    between two quite different questions:
+
+    * Off (the default): joint targets are *written* and `mj_forward` run, so the
+      robot is teleported through the retargeted configurations and nothing it
+      touches moves. That measures the retargeting's reach -- `position_error_m`,
+      `franka_gap_m`, `unreachable_steps` -- and it is all those numbers need.
+      It cannot pick anything up, so a video of one showing an object sitting
+      still is not a failed grasp; it is a replay with the physics off.
+    * On: the targets go through the same controllers an evaluation uses
+      (`_Actuation`) and the scene is stepped at `sim_dt_ms` for each
+      `policy_dt_ms` tick, so the gripper closes on the object, the object has
+      mass and friction, and `ReplayResult.grasp` says whether it came off the
+      counter. That is the question "would the retargeting have held this grasp
+      if the policy had aimed perfectly", and it is answerable in seconds with no
+      VLA in the loop -- which is what makes tuning `grasp_offset_m` a search
+      rather than a series of twenty-minute benchmark runs.
+
+    The open-loop caveat is the same in both and is worth restating for the
+    physics one: these are the *Franka's* actions, replayed blind. A real Stretch
+    rollout would see its own camera and diverge. A physics replay that grasps
+    says the retargeting can hold the grasp the Franka found; it does not say the
+    policy will find it through Stretch's camera.
+
+    `aperture_m` overrides how wide "open" is on Stretch, in metres between the
+    pads -- `fr.ROBOTIQ_MAX_APERTURE_M` when left out. Only meaningful with
+    `match_robotiq_aperture`, which is what narrows the hand at all.
+
+    A recorded episode stops at the step the *Franka* succeeded on, which raises
+    the obvious worry that Stretch -- whose controllers are shaped to the
+    hardware's joint speeds, so every command arrives as a ramp -- is still
+    tracking the last few when the replay runs out, and that a grasp is being
+    scored mid-reach. Measured, by repeating the final command for 20 and 40
+    further ticks across all 20 episodes: not one outcome changes, and neither
+    does any lift to a tenth of a millimetre. The arm has converged well before
+    the recording ends, so there is no hold here and nothing to tune.
+
+    `scene`, when given, is reset and reused instead of a fresh one being built;
+    the house, the base pose, the exo camera and the staging are then already
+    decided by whoever built it, and `scene_count`, `exo` and `stage` are
+    ignored. See `ReplayScene`, and note that a scene built without `stage` holds
+    no object to grasp however the physics is stepped.
     """
-    model, data, view, namespace = build_stretch_in_scene(
-        episode.house, episode.base_xytheta, scene_count=scene_count, exo=exo, stage=stage
-    )
+    if scene is None:
+        scene = build_stretch_in_scene(
+            episode.house, episode.base_xytheta, scene_count=scene_count, exo=exo, stage=stage
+        )
+    else:
+        scene.reset()
+    model, data, view, namespace = scene.model, scene.data, scene.view, scene.namespace
+    if physics:
+        model.opt.timestep = sim_dt_ms / 1000.0
     proxy = fr.FrankaOnStretchView(
         view,
         namespace,
@@ -629,6 +998,7 @@ def replay_episode(
         include_base=include_base,
         target_z_offset=target_z_offset,
         match_robotiq_aperture=match_robotiq_aperture,
+        robotiq_aperture_m=aperture_m,
     )
     if tool_correction is not None:
         from examples.machine_learning.molmospaces.retargetting.setups import (
@@ -644,16 +1014,42 @@ def replay_episode(
     proxy.reset()
     proxy.snap_to_franka_joint_pos()
 
+    actuation = watch = None
+    if physics:
+        actuation = _Actuation(view, ctrl_dt_ms / 1000.0)
+        actuation.hold()
+        # The snap wrote a configuration straight into `qpos`; settling lets the
+        # controllers take hold of it and the staged object come to rest before
+        # its height is read, so `best_lift_m` measures the grasp and not the drop.
+        for _ in range(max(0, int(round(SETTLE_SECONDS / (sim_dt_ms / 1000.0))))):
+            actuation.apply()
+            mujoco.mj_step(model, data)
+        watch = _GraspWatch(
+            model, data, view, scene.object_name or staged_object_name(stage), namespace
+        )
+        watch.start()
+
+    substeps = max(1, int(round(policy_dt_ms / sim_dt_ms)))
+    commands = list(episode.arm_commands)
     residuals, gaps = [], []
-    for step, command in enumerate(episode.arm_commands):
+    for step, command in enumerate(commands):
         targets = proxy.retarget_franka_joint_pos(command)
-        if step < len(episode.gripper_commands):
-            targets["gripper"] = proxy.retarget_robotiq_ctrl(episode.gripper_commands[step])
-        for group, value in targets.items():
-            move_group = view.get_move_group(group)
-            move_group.joint_pos = value
-            move_group.ctrl = value
-        mujoco.mj_forward(model, data)
+        gripper_step = min(step, len(episode.gripper_commands) - 1)
+        if gripper_step >= 0:
+            targets["gripper"] = proxy.retarget_robotiq_ctrl(episode.gripper_commands[gripper_step])
+
+        if actuation is None:
+            for group, value in targets.items():
+                move_group = view.get_move_group(group)
+                move_group.joint_pos = value
+                move_group.ctrl = value
+            mujoco.mj_forward(model, data)
+        else:
+            actuation.update(targets)
+            for _ in range(substeps):
+                actuation.apply()
+                mujoco.mj_step(model, data)
+            watch.step()
 
         residuals.append(proxy.last_position_error)
         reached = np.asarray(view.get_move_group("wrist").leaf_frame_to_world, dtype=float)
@@ -662,11 +1058,14 @@ def replay_episode(
         if frame_sink is not None:
             frame_sink(step, model, data, view, proxy)
 
+    if watch is not None:
+        watch.finish()
     return ReplayResult(
         episode=episode,
         position_error_m=np.asarray(residuals, dtype=float),
         franka_gap_m=np.asarray(gaps, dtype=float),
         unreachable_steps=int(proxy.unreachable_steps),
+        grasp=watch.outcome if watch is not None else None,
     )
 
 
@@ -947,20 +1346,35 @@ def replay_run(
     limit: int | None = None,
     **replay_kwargs: Any,
 ) -> list[ReplayResult]:
-    """Replay every Franka episode recorded under `root`. Returns what it measured."""
+    """Replay every Franka episode recorded under `root`. Returns what it measured.
+
+    Stages each episode's own pickup object when the replay is a physics one,
+    from the benchmark `root` holds. A physics replay of a scene with nothing in
+    it is a slower way to get the kinematic numbers, so this is not an
+    embellishment -- it is what makes the flag mean anything.
+    """
     results: list[ReplayResult] = []
+    staging = bool(replay_kwargs.get("physics")) and "stage" not in replay_kwargs
     for path in find_trajectory_files(root):
         for episode in load_episodes(path):
             if limit is not None and len(results) >= limit:
                 return results
             name = f"house_{episode.house}_{episode.group}_{_slug(episode.instruction)}"
             log.info(f"[replay] {name}: {episode.steps} recorded steps")
-            if render:
-                results.append(
-                    replay_to_video(episode, output_dir / f"{name}.mp4", **replay_kwargs)
+            kwargs = dict(replay_kwargs)
+            if staging:
+                # `traj_<i>` counts within the house in the order the episodes
+                # ran, which is the order the benchmark lists them in. No
+                # instruction to check it against -- `load_episodes` has none --
+                # so `episode_staging` is trusted on the index alone here.
+                index = episode.group.rsplit("_", 1)[-1]
+                kwargs["stage"] = episode_staging(
+                    root, episode.house, int(index) if index.isdigit() else 0
                 )
+            if render:
+                results.append(replay_to_video(episode, output_dir / f"{name}.mp4", **kwargs))
             else:
-                results.append(replay_episode(episode, **replay_kwargs))
+                results.append(replay_episode(episode, **kwargs))
             log.info(f"[replay] {results[-1].summary()}")
     return results
 
@@ -992,6 +1406,16 @@ def report(results: list[ReplayResult], output_dir: Path, rendered: bool) -> Non
     click.secho(f"\nReplayed {len(results)} Franka episode(s) as Stretch 4:", bold=True)
     for result in sorted(results, key=lambda r: -r.unreachable_steps):
         click.echo(f"  {result.summary()}")
+
+    grasped = [r for r in results if r.grasp is not None]
+    if grasped:
+        picked = sum(1 for r in grasped if r.grasp.success)
+        click.secho(
+            f"\n{picked}/{len(grasped)} picked up. These are the recorded Franka's own "
+            f"actions, so the Franka picked up all {len(grasped)}: the difference is what "
+            f"the retargeting costs a grasp that is known to work.",
+            fg="green" if picked == len(grasped) else "yellow",
+        )
 
     worst = max(results, key=lambda r: r.unreachable_steps)
     if worst.unreachable_steps:

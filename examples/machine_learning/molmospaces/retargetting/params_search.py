@@ -92,6 +92,7 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
     write_trial_csv,
 )
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
+    MATCHED_WRIST_FOV_DEG,
     PROBE_SINK_ENV_VAR,
     SETUP_KEYS,
     SETUPS,
@@ -205,6 +206,30 @@ DIMENSIONS: dict[str, Dimension] = {
             robots=("stretch",),
         ),
         Dimension(
+            name="aperture_m",
+            bounds=(0.06, 0.1885),
+            read=lambda p: p.aperture_m,
+            write=lambda p, v: dataclasses.replace(p, aperture_m=float(v)),
+            description="How wide Stretch's hand opens, in metres between the fingertips. "
+            "0 keeps ROBOTIQ_MAX_APERTURE_M. Its fingers converge behind their tips, so a "
+            "deep grasp_offset_m needs a wide hand -- see diagnose.py's jaw profile. "
+            "Stretch setups only.",
+            sweep=(0.0, 0.12, 0.1885),
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="wrist_fov_deg",
+            bounds=(15.0, 60.0),
+            read=lambda p: p.wrist_fov_deg,
+            write=lambda p, v: dataclasses.replace(p, wrist_fov_deg=float(v)),
+            description="Vertical FOV to render Stretch's wrist camera at, which is a "
+            "centre crop of the real one. 0 keeps the hardware's 58 degrees; "
+            "MATCHED_WRIST_FOV_DEG frames a grasp the way the Robotiq's does. "
+            "Stretch setups only.",
+            sweep=(0.0, MATCHED_WRIST_FOV_DEG, 30.0),
+            robots=("stretch",),
+        ),
+        Dimension(
             name="target_z_offset_m",
             bounds=(0.0, 0.15),
             read=lambda p: p.target_z_offset_m,
@@ -220,8 +245,8 @@ DIMENSIONS: dict[str, Dimension] = {
 
 
 SWEEP_STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("camera", ("pitch_deg", "virtual_pitch_deg", "fovy")),
-    ("gripper", ("grasp_offset_m", "target_z_offset_m", "wrist_tilt_deg")),
+    ("camera", ("pitch_deg", "virtual_pitch_deg", "fovy", "wrist_fov_deg")),
+    ("gripper", ("grasp_offset_m", "aperture_m", "target_z_offset_m", "wrist_tilt_deg")),
 )
 """
 What `--search sweep` does, in order: a full grid per stage, carrying the winner.
@@ -666,14 +691,45 @@ class SimpleCMAES:
 @click.option("--list-dims", is_flag=True, help="List the searchable dimensions and exit.")
 @click.option("--list-setups", is_flag=True, help="List the seven setups and exit.")
 @click.option(
-    "--change_franka_start_pose",
-    "change_franka_start_pose",
+    "--change_franka_start_pose_flip_wrist",
+    "change_franka_start_pose_flip_wrist",
     is_flag=True,
-    help="Start the Franka rolled half a turn about its approach axis -- which turns its "
-    "wrist camera outwards and leaves the grasp identical -- and capped at Stretch's own "
-    "reach ceiling, so both robots begin an episode at the same pose. Held fixed across "
-    "the whole search rather than searched over. See "
-    "`franka_retarget.stretch_startable_arm_qpos`.",
+    help="Start the Franka rolled half a turn about its approach axis. The grasp is "
+    "identical either way round; what swings round is the hand, and the wrist camera "
+    "bolted off to one side of it. See `franka_retarget.PoseConventions`.",
+)
+@click.option(
+    "--change_franka_start_pose_limit_height",
+    "change_franka_start_pose_limit_height",
+    is_flag=True,
+    help="Cap the Franka's start tool height at Stretch's own reach ceiling, so the "
+    "Stretch condition does not begin every episode with its lift already at its stop. "
+    "See `franka_retarget.PoseConventions`.",
+)
+@click.option(
+    "--change_stretch_start_pose_flip_wrist",
+    "change_stretch_start_pose_flip_wrist",
+    is_flag=True,
+    help="Spawn Stretch with its own wrist rolled half a turn, the counterpart of "
+    "--change_franka_start_pose_flip_wrist. Overwritten by the snap to the Franka's home "
+    "unless snap_to_franka_home is off. See `franka_retarget.PoseConventions`.",
+)
+@click.option(
+    "--match_stretch_spawn_pose_to_franka",
+    "match_stretch_spawn_pose_to_franka",
+    is_flag=True,
+    help="Stand Stretch back far enough that its spawn gripper pose is the Franka's, "
+    "cancelling the retreat in the virtual Franka's mount so the frame is unchanged. "
+    "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
+    "it -- see `setups.STRETCH_SPAWN_BASE_OFFSET_XY` for both numbers.",
+)
+@click.option(
+    "--map_franka_wrist_to_flipped_stretch4_wrist",
+    "map_franka_wrist_to_flipped_stretch4_wrist",
+    is_flag=True,
+    help="Retarget every pose onto the half-turned branch of Stretch's wrist, by folding "
+    "the turn into the tool transform itself -- so it holds for the whole episode and both "
+    "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
 def main(
     setup_keys: tuple[str, ...],
@@ -695,19 +751,28 @@ def main(
     replay_limit: int | None,
     replay_no_video: bool,
     list_setups: bool,
-    change_franka_start_pose: bool,
+    change_franka_start_pose_flip_wrist: bool,
+    change_franka_start_pose_limit_height: bool,
+    change_stretch_start_pose_flip_wrist: bool,
+    map_franka_wrist_to_flipped_stretch4_wrist: bool,
+    match_stretch_spawn_pose_to_franka: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    # Published once, before any trial: every point in the search has to be scored
-    # against the same start pose or the search is climbing two surfaces at once.
-    # Written in both directions -- see `publish_change_franka_start_pose`.
-    fr.publish_change_franka_start_pose(change_franka_start_pose)
-    if change_franka_start_pose:
-        log.info(
-            "[start-pose] every trial starts the Franka rolled half a turn and capped at "
-            f"{fr.STRETCH_MAX_GRASP_HEIGHT_M:.4f}m, which Stretch can reach"
-        )
+    conventions = fr.PoseConventions(
+        change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
+        change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
+        change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
+        map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
+        match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,
+    )
+    # Before anything runs, and every variable written in both directions: the
+    # point of a matched pair is that its two halves differ in exactly one thing,
+    # so a convention left over from a previous run in the same shell would undo
+    # the pairing. See `publish_pose_conventions`.
+    fr.publish_pose_conventions(conventions)
+    if conventions:
+        log.info(f"[pose] conventions: {conventions.describe()}")
 
     if list_setups:
         for key in SETUP_KEYS:
