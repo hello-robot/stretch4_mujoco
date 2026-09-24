@@ -82,6 +82,11 @@
           <joint type="hinge" limited="true" range="-0.15 0.15" springref="0"
                  stiffness="1.0" damping="0.01" armature="2e-5"
                  solreflimit="0.005 1" solimplimit="0.95 0.999 0.001" />
+        <!-- The parallel gripper (PG4) fingers are prismatic, 0 closed to -0.04 open.
+             Their joint axis comes from the URDF, so it is not set here. -->
+        <default class="parallel_gripper_finger">
+          <joint range="-0.04 0" damping="10" armature="0.1" frictionloss=".1" />
+          <position ctrlrange="-0.04 0" kp="1000" kv="20" forcerange="-30 30"/>
         </default>
       </default>
 
