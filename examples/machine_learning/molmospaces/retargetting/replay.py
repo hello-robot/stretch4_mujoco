@@ -175,11 +175,29 @@ class RecordedEpisode:
         floor, so reusing the recorded z would put Stretch's wheels half a metre
         up. The xy and the yaw are what the episode chose and are shared between
         the two robots (`setups._point_base_at` places both from the same rule).
+
+        The one thing that is *not* shared is the retreat: under
+        `match_stretch_spawn_pose_to_franka` a Stretch episode stands the robot
+        back by `STRETCH_SPAWN_BASE_OFFSET_XY` and cancels the retreat in the
+        virtual Franka's mount, so the two only compose back to the recorded
+        pose if both halves are applied. `franka_mount_pose_from_base` applies
+        its half off the environment whether or not a caller remembered this
+        one, so a replay that spawned at the bare recorded pose would plant the
+        virtual Franka 0.37m in front of the real one and retarget every step
+        against it -- reaching a wrong target to the millimetre, which is what
+        the residual would then report. Hence `stretch_spawn_base_pose` here,
+        the same call `setups._point_base_at` makes; it is a no-op with the
+        convention off.
         """
+        from examples.machine_learning.molmospaces.retargetting.setups import (
+            stretch_spawn_base_pose,
+        )
+
         position = np.asarray(self.base_pose[:3], dtype=float)
         quaternion = np.asarray(self.base_pose[3:7], dtype=float)
         yaw = float(R.from_quat(quaternion, scalar_first=True).as_euler("xyz")[2])
-        return np.array([position[0], position[1], yaw])
+        x, y = stretch_spawn_base_pose(position[:2], yaw)
+        return np.array([x, y, yaw])
 
 
 def _decode(dataset: Any, index: int) -> Any:
@@ -593,7 +611,18 @@ def build_stretch_in_scene(
     model = spec.compile()
     data = MjData(model)
     view = Stretch4RobotView(data, namespace)
-    qpos = dict(config.init_qpos)
+    # The study's spawn pose, not `Stretch4RobotConfig`'s: an episode puts
+    # Stretch at `setups.stretch_spawn_init_qpos()`, which telescopes the arm out
+    # to `STRETCH_SPAWN_ARM_M` and rolls the wrist when
+    # `--change_stretch_start_pose_flip_wrist` asks. The config's own pose stows
+    # the arm at 0, which is the bottom of its travel and the seed the opening
+    # `snap_to_franka_joint_pos` would then solve the whole episode from -- so a
+    # replay spawned from it is being asked a question no rollout was asked.
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        stretch_spawn_init_qpos,
+    )
+
+    qpos = stretch_spawn_init_qpos()
     qpos["base"] = [x, y, yaw]
     scene = ReplayScene(
         model=model,

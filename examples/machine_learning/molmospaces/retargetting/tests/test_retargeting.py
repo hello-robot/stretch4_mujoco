@@ -181,6 +181,53 @@ rig is the one-line way back.
 """
 
 
+UPRIGHT_WALKED_SHORTFALL_RAD = {"yaw_in": 0.4289}
+"""
+What `jaw_mode="upright"` costs in orientation at each waypoint it cannot walk onto.
+
+**Not that the pose is unreachable -- that the path to it is.** Measured three
+ways at `yaw_in`, which is the distinction worth keeping straight:
+
+    solved fresh from the snap, upright     0.0001 rad
+    walked continuously, upright            0.4289 rad
+    walked continuously, auto               0.0014 rad, on the flipped branch
+
+So the upright branch holds this pose perfectly well when it is solved for
+directly, and gets trapped on the way there: `StretchArmIK` seeds each solve
+from where the arm already is, and walking onto a large tool yaw winds
+Stretch's `wrist_roll_joint` (about [-4.28, +1.14] rad) up against its end. The
+half-turned branch is in open range throughout, which is what `auto` takes and
+what this rig forbids -- because a flip mirrors the wrist camera as well as the
+jaw. See `RetargetRig` on why it forbids it, and `walked` on why the checks
+measure the path rather than fresh solves.
+
+Pinned rather than asserted away, which is the same thing
+`test_above_the_lift_ceiling_the_error_is_the_lift_shortfall` does to the lift's
+travel and for the same reason: a limitation that is merely tolerated goes quiet
+when it changes. `test_the_flip_is_what_buys_the_yawed_in_waypoint` holds the
+other end of it -- that `auto` recovers this by flipping -- so if the flip ever
+stops being the mechanism, that fails too.
+
+`yaw_out` is *not* here. The prose used to say the mode cost both; measured,
+upright walks onto `yaw_out` at 0.0004 rad and only `yaw_in` falls out.
+"""
+
+UPRIGHT_WALKED_SHORTFALL_TOLERANCE_RAD = 0.01
+"""How far the pinned shortfalls above may move before they are worth looking at."""
+
+
+def upright_shortfall(rig: "RetargetRig", label: str) -> float | None:
+    """What this waypoint is known to cost the rig when walked onto, or None if it should reach it.
+
+    Only `"upright"` pays it. Under `"auto"` the flip is available and every
+    waypoint comes in on tolerance; under `"flipped"` the *other* two waypoints
+    pay instead, which is not what this rig runs and is not pinned here.
+    """
+    if rig.proxy.jaw_mode != "upright":
+        return None
+    return UPRIGHT_WALKED_SHORTFALL_RAD.get(label)
+
+
 GRASP_HEIGHT_DROP_M = 0.155
 """
 How far below the Franka's home tool height the waypoints are centred.
@@ -1121,6 +1168,19 @@ def test_stretch_reaches_the_commanded_pose(
         f"has left its workspace; a much smaller residual means the IK thinks it succeeded, "
         f"which points at the transform chain instead."
     )
+    shortfall = upright_shortfall(rig, waypoint.label)
+    if shortfall is not None:
+        assert reached.orientation_error == pytest.approx(
+            shortfall, abs=UPRIGHT_WALKED_SHORTFALL_TOLERANCE_RAD
+        ), (
+            f"waypoint {waypoint.label!r} is one `jaw_mode='upright'` is known not to walk onto, and "
+            f"the orientation it costs has moved: {reached.orientation_error:.4f} rad against "
+            f"the {shortfall:.4f} rad pinned in UPRIGHT_WALKED_SHORTFALL_RAD. Smaller "
+            f"means the upright branch has gained reach and the pin should be updated or "
+            f"dropped; larger means it has lost some. Either way it is a change in the "
+            f"envelope rather than in the transform chain -- see `franka_retarget.JAW_FLIP`."
+        )
+        return
     assert reached.orientation_error < ORIENTATION_TOLERANCE_RAD, (
         f"Stretch's tool frame is {reached.orientation_error:.4f} rad from the Franka's at "
         f"waypoint {waypoint.label!r}, rotated into Stretch's convention (jaw_mode "
@@ -1219,9 +1279,26 @@ def test_both_grippers_end_up_pointing_the_same_way(
         f"axis, or missing."
     )
     separation = abs(float(np.dot(franka_separation, stretch_separation)))
+    apart = float(math.acos(np.clip(separation, -1.0, 1.0)))
+    # The jaw line is what the roll limit costs, so a waypoint the upright branch
+    # cannot hold shows the shortfall here rather than a clean match. The approach
+    # direction above is unaffected and is asserted at the full tolerance either
+    # way -- a mode that could not point the hand at the object would be a broken
+    # transform, not an envelope limit.
+    shortfall = upright_shortfall(rig, waypoint.label)
+    if shortfall is not None:
+        assert apart == pytest.approx(shortfall, abs=UPRIGHT_WALKED_SHORTFALL_TOLERANCE_RAD), (
+            f"waypoint {waypoint.label!r} is one `jaw_mode='upright'` is known not to walk onto, and "
+            f"the angle between the two jaw lines has moved: {math.degrees(apart):.1f} degrees "
+            f"against the {math.degrees(shortfall):.1f} pinned in "
+            f"UPRIGHT_WALKED_SHORTFALL_RAD. Read it with that constant, not as a "
+            f"transform error -- the fingers are measured off the bodies here, so this is the "
+            f"same roll shortfall seen from the hardware end."
+        )
+        return
     assert separation > math.cos(ORIENTATION_TOLERANCE_RAD), (
         f"at waypoint {waypoint.label!r} the grippers' fingers separate along lines "
-        f"{math.degrees(math.acos(np.clip(separation, -1, 1))):.1f} degrees apart, so one "
+        f"{math.degrees(apart):.1f} degrees apart, so one "
         f"would be grasping across what the other grasps along -- a rotation about the "
         f"approach axis that `FRANKA_TO_STRETCH_TOOL` is not applying."
     )
@@ -1444,14 +1521,43 @@ def test_the_target_height_offset_raises_the_pose_by_exactly_itself(rig: Retarge
     )
 
 
+GRIPPER_OPENNESS_TOLERANCE = 0.05
+"""
+How far apart the two hands' *fractions* of their own travel may be.
+
+A fraction rather than millimetres, and that is a deliberate step back from what
+this used to assert. It compared the two apertures in metres, on the grounds
+that `match_robotiq_aperture` made a command mean the same physical gap on both
+hands -- which was true while `ROBOTIQ_MAX_APERTURE_M` was the Robotiq's own
+0.087, and is not true now, because matching tip separation turned out to be the
+wrong invariant. `retargetting/aperture.py` measures why: the Robotiq's pads are
+held parallel so its jaw is one width all the way in, while Stretch's fingers
+converge behind their tips, so the two hands cannot be the same width both at
+the tips and where the object sits. The aperture is now chosen for the latter
+and comes out wider at the tips. See `franka_retarget.ROBOTIQ_MAX_APERTURE_M`.
+
+What survives that, and is what this check was always for, is the *shape* of the
+mapping: the same 0-255 puts both hands at the same fraction of their own
+travel. An inverted flip fails it at every command but the midpoint, a
+doubly-applied one fails it everywhere, and neither depends on how wide either
+hand happens to be.
+
+0.05 because the Robotiq reaches its aperture through a linkage that is not
+linear in the command while `retarget_robotiq_ctrl` is, and Stretch's fingers
+are nearly linear in their angle. Measured over nine commands, the two fractions
+agree to 0.000 at each end and bulge to 0.026 around the middle:
+
+    robotiq        0     32     64     96    128    160    192    224    255
+    franka     1.000  0.894  0.780  0.659  0.532  0.401  0.266  0.131  0.000
+    stretch    1.000  0.880  0.757  0.633  0.506  0.379  0.251  0.123  0.000
+
+The bulge is mechanism, not error, and the tolerance is about twice it -- room
+for solver jitter, and far too tight for an inverted flip to pass unnoticed.
+"""
+
 GRIPPER_APERTURE_TOLERANCE_M = 0.005
 """
-How far apart the two grippers' apertures may be, in metres.
-
-In metres, and that is the point: before `match_robotiq_aperture` the two hands
-were different sizes and only the *fraction* of each one's travel could be
-compared, which said nothing about whether an object of a given width fitted.
-Now a command means the same gap on both, so the comparison is the physical one.
+Slack on the claim that Stretch's jaw is never *narrower* than the Robotiq's, in metres.
 
 Measured across the range: 0.4mm apart at open, 0.1mm at shut, bulging to 2.7mm
 around the middle. That bulge is mechanism, not error -- `retarget_robotiq_ctrl`
@@ -1568,16 +1674,35 @@ def test_both_grippers_open_the_same_amount(rig: RetargetRig, robotiq: float) ->
     cannot be posed; `FRANKA_GRIPPER_SETTLE_STEPS` explains why, and it is the
     reason this check is worth its runtime.
     """
-    reached = rig.command(rig.franka_command_for(rig.centred_pose()), robotiq=robotiq)
+    pose = rig.franka_command_for(rig.centred_pose())
+    widest = rig.command(pose, robotiq=0.0)
+    reached = rig.command(pose, robotiq=robotiq)
 
-    assert reached.stretch_aperture == pytest.approx(
-        reached.franka_aperture, abs=GRIPPER_APERTURE_TOLERANCE_M
-    ), (
-        f"at Robotiq {robotiq:.0f} the Franka's jaw is {reached.franka_aperture * 1000:.1f}mm "
-        f"wide and Stretch's is {reached.stretch_aperture * 1000:.1f}mm. Roughly double means "
-        f"`match_robotiq_aperture` is off, so an open command spreads Stretch's fingers to "
-        f"their own 188mm; near-opposite values mean the flip in `retarget_robotiq_ctrl` has "
-        f"been applied twice or not at all (0 is open on the Robotiq, shut on Stretch)."
+    def openness(aperture: float, at_full_open: float) -> float:
+        return float(aperture / at_full_open) if at_full_open > 1e-9 else 0.0
+
+    franka_open = openness(reached.franka_aperture, widest.franka_aperture)
+    stretch_open = openness(reached.stretch_aperture, widest.stretch_aperture)
+    assert stretch_open == pytest.approx(franka_open, abs=GRIPPER_OPENNESS_TOLERANCE), (
+        f"at Robotiq {robotiq:.0f} the Franka's hand is {franka_open:.0%} of the way open and "
+        f"Stretch's is {stretch_open:.0%} ({reached.franka_aperture * 1000:.1f}mm of "
+        f"{widest.franka_aperture * 1000:.1f}mm against {reached.stretch_aperture * 1000:.1f}mm "
+        f"of {widest.stretch_aperture * 1000:.1f}mm). Near-opposite fractions mean the flip in "
+        f"`retarget_robotiq_ctrl` has been applied twice or not at all -- 0 is open on the "
+        f"Robotiq and shut on Stretch. This is about the shape of the mapping, not the width: "
+        f"see `GRIPPER_OPENNESS_TOLERANCE` for why the widths are no longer equal."
+    )
+
+    # The property the aperture is actually chosen for: anything the Robotiq
+    # could close around, Stretch can too. It is the one the shipped setting
+    # violated -- tips capped at 120mm left Stretch a third of the Robotiq's
+    # width at the depth the object sat -- so it is worth an assertion of its own.
+    assert reached.stretch_aperture >= reached.franka_aperture - GRIPPER_APERTURE_TOLERANCE_M, (
+        f"at Robotiq {robotiq:.0f} Stretch's jaw is {reached.stretch_aperture * 1000:.1f}mm "
+        f"and the Robotiq's {reached.franka_aperture * 1000:.1f}mm, so Stretch is the narrower "
+        f"of the two and cannot go round something the policy's own hand could. "
+        f"`ROBOTIQ_MAX_APERTURE_M` is too small -- `retargetting/aperture.py` computes what it "
+        f"should be for the grasp depth in use."
     )
 
 
@@ -1655,6 +1780,7 @@ def test_the_grippers_stay_together_along_a_continuous_path(rig: RetargetRig) ->
 
     worst_position = (0.0, "", 0.0)
     worst_orientation = (0.0, "")
+    worst_unreachable: dict[str, float] = {}
     for index, command in enumerate(commands):
         previous = commands[index - 1] if index else command
         for step in range(1, steps + 1):
@@ -1665,7 +1791,24 @@ def test_the_grippers_stay_together_along_a_continuous_path(rig: RetargetRig) ->
             worst_position = max(
                 worst_position, (reached.position_error, label, reached.vertical_error)
             )
-            worst_orientation = max(worst_orientation, (reached.orientation_error, label))
+            # A leg that *touches* a pose this mode cannot hold is tallied on its
+            # own: its orientation error is the roll shortfall, arriving or
+            # leaving, not drift. Both ends, because a leg away from such a pose
+            # starts at it -- measured, the first step out of `yaw_in` still
+            # carries 0.365 rad of it. Position is tallied across every leg
+            # regardless, because the shortfall costs none, which is the claim
+            # that makes it tolerable at all.
+            touched = [
+                end
+                for end in (WAYPOINTS[index - 1].label, WAYPOINTS[index].label)
+                if upright_shortfall(rig, end) is not None
+            ]
+            if touched:
+                worst_unreachable[touched[-1]] = max(
+                    worst_unreachable.get(touched[-1], 0.0), reached.orientation_error
+                )
+            else:
+                worst_orientation = max(worst_orientation, (reached.orientation_error, label))
 
     error, label, vertical = worst_position
     offset = rig.proxy.target_z_offset
@@ -1701,6 +1844,61 @@ def test_the_grippers_stay_together_along_a_continuous_path(rig: RetargetRig) ->
         f"at {label}, past the {TRAJECTORY_ORIENTATION_TOLERANCE_RAD} rad that the wrist's "
         f"five DOFs are known to cost on this path. Run --visualize to see where it goes."
     )
+    for target, reached_error in sorted(worst_unreachable.items()):
+        shortfall = UPRIGHT_WALKED_SHORTFALL_RAD[target]
+        assert reached_error == pytest.approx(
+            shortfall, abs=UPRIGHT_WALKED_SHORTFALL_TOLERANCE_RAD
+        ), (
+            f"walking continuously onto {target!r} -- a waypoint `jaw_mode='upright'` is known "
+            f"not to walk onto -- the worst orientation was {reached_error:.4f} rad against the "
+            f"{shortfall:.4f} rad pinned in UPRIGHT_WALKED_SHORTFALL_RAD. Arriving at "
+            f"the same shortfall along a path as from a fresh solve is the point: a mode that "
+            f"cannot hold a pose should fail the same way however it gets there."
+        )
+
+
+def test_the_flip_is_what_buys_the_yawed_in_waypoint() -> None:
+    """The other end of `UPRIGHT_WALKED_SHORTFALL_RAD`: `auto` recovers what `upright` cannot.
+
+    The pinned shortfall says the upright branch walks onto `yaw_in` 0.43 rad
+    short. On its own that is just a number, and it would keep passing if the
+    cause moved -- if the waypoint drifted out of the workspace, say, or the IK
+    started giving up for an unrelated reason. This holds the claim that the
+    *flip* is the mechanism: walk the same path with `auto`, which is free to
+    substitute the half-turned branch, and the same waypoint comes in on
+    tolerance with `jaw_flipped` set.
+
+    Builds its own rig because `jaw_mode` is fixed at construction, and walks
+    rather than snapping because the shortfall is a property of the path -- see
+    `walked` and `UPRIGHT_WALKED_SHORTFALL_RAD`.
+    """
+    label = "yaw_in"
+    rig = RetargetRig(jaw_mode="auto")
+    rig.restore()
+    commands = [rig.franka_command_for(rig.waypoint_pose(w)) for w in WAYPOINTS]
+    reached = None
+    for index, (command, waypoint) in enumerate(zip(commands, WAYPOINTS)):
+        previous = commands[index - 1] if index else command
+        for step in range(1, TRAJECTORY_STEPS + 1):
+            reached = rig.command(
+                previous + (step / TRAJECTORY_STEPS) * (command - previous), restore=False
+            )
+        if waypoint.label == label:
+            break
+
+    assert reached is not None and reached.orientation_error < ORIENTATION_TOLERANCE_RAD, (
+        f"with `jaw_mode='auto'`, walking onto {label!r} should cost almost nothing -- the "
+        f"flipped branch is in open range there -- but it came in "
+        f"{reached.orientation_error:.4f} rad out. If `upright` is also failing its pinned "
+        f"shortfall, the cause is the waypoint or the solver rather than the jaw branch, and "
+        f"`UPRIGHT_WALKED_SHORTFALL_RAD` is measuring something it did not mean to."
+    )
+    assert rig.proxy.jaw_flipped, (
+        f"`jaw_mode='auto'` reached {label!r} without flipping, so the half turn is no longer "
+        f"what buys it and `UPRIGHT_WALKED_SHORTFALL_RAD`'s explanation is stale. Either the "
+        f"wrist's range changed or `_solve_either_jaw`'s hysteresis stopped switching -- see "
+        f"`franka_retarget.JAW_FLIP_GAIN_RAD`."
+    )
 
 
 def test_the_arm_alone_is_short_and_the_base_makes_up_the_difference() -> None:
@@ -1733,6 +1931,76 @@ def test_the_arm_alone_is_short_and_the_base_makes_up_the_difference() -> None:
         f"Either the waypoint is now inside the arm's own corridor -- in which case it is no "
         f"longer testing what `include_base` is for -- or the base is not joining the solve."
     )
+
+
+# =============================================================================
+# Replaying a recorded run as Stretch
+# =============================================================================
+
+
+@pytest.mark.parametrize("retreating", [False, True])
+def test_a_replay_stands_stretch_where_the_mount_expects_it(monkeypatch, retreating) -> None:
+    """A replayed episode's base and the virtual Franka's mount must still compose.
+
+    `match_stretch_spawn_pose_to_franka` is two halves of one move:
+    `setups.stretch_spawn_base_pose` stands Stretch back by
+    `STRETCH_SPAWN_BASE_OFFSET_XY`, and `franka_mount_pose_from_base` cancels
+    exactly that in the mount, so the virtual Franka stays at the pose the
+    episode authored and a policy action keeps meaning the same point of the
+    room. Only the second half reads the environment. A caller that places the
+    base itself -- which is what a replay does, off the *Franka* run's recorded
+    base pose -- therefore gets the cancellation whether or not it applied the
+    retreat, and skipping it plants the virtual Franka 0.37m in front of the
+    real one. The retargeting then tracks that wrong frame to the millimetre,
+    so the residual a replay reports stays near zero and says nothing.
+
+    Checked as the round trip rather than against the offset's own numbers: the
+    claim is that the two halves cancel, and asserting the composition is what
+    would survive the offset being re-measured.
+    """
+    from examples.machine_learning.molmospaces.retargetting.replay import RecordedEpisode
+
+    monkeypatch.setenv(
+        fr.POSE_CONVENTION_ENV_VARS["match_stretch_spawn_pose_to_franka"],
+        "1" if retreating else "0",
+    )
+
+    authored_xy = np.array([2.0, 3.0])
+    yaw = 0.7
+    episode = RecordedEpisode(
+        source=Path("unused.h5"),
+        group="traj_0",
+        house=0,
+        base_pose=np.array(
+            [*authored_xy, FRANKA_LINK0_HEIGHT, *R.from_euler("z", yaw).as_quat(scalar_first=True)]
+        ),
+    )
+
+    base = episode.base_xytheta
+    mount = fr.franka_mount_pose_from_base(base)
+
+    retreat = float(np.linalg.norm(base[:2] - authored_xy))
+    if retreating:
+        assert retreat > 0.1, (
+            f"with `match_stretch_spawn_pose_to_franka` on, a replay should stand Stretch back "
+            f"from the recorded base, but it moved {retreat * 1000:.1f}mm. "
+            f"`RecordedEpisode.base_xytheta` is no longer applying "
+            f"`setups.stretch_spawn_base_pose`, and the mount's cancellation is now uncancelled."
+        )
+    else:
+        assert retreat == pytest.approx(0.0, abs=1e-9), (
+            f"with the convention off the retreat is meant to be a no-op, but the replay's base "
+            f"moved {retreat * 1000:.1f}mm off the recorded one."
+        )
+
+    assert np.linalg.norm(mount[:2, 3] - authored_xy) == pytest.approx(0.0, abs=1e-9), (
+        f"the virtual Franka came out at {np.round(mount[:2, 3], 4).tolist()} rather than the "
+        f"recorded base {authored_xy.tolist()}. The retreat and the mount's cancellation are "
+        f"supposed to be the same displacement in opposite directions; they are "
+        f"{np.linalg.norm(mount[:2, 3] - authored_xy) * 100:.1f}cm apart, and every pose a "
+        f"replay retargets is off by that much while its residual reports success."
+    )
+
 
 
 # =============================================================================
