@@ -57,7 +57,10 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from molmo_spaces.configs.camera_configs import RobotMountedCameraConfig
+from molmo_spaces.configs.camera_configs import (
+    FixedExocentricCameraConfig,
+    RobotMountedCameraConfig,
+)
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
 log = logging.getLogger(__name__)
@@ -95,10 +98,35 @@ class ExoCameraParams:
     mount_body: str = "robot_0/base_link"
     """Body the camera is pinned to, namespace included.
 
-    On Stretch this is `base_link`, which is stationary. On the Franka it is
+    On Stretch this is `base_link`. On the Franka it is
     `fr3_link1`, which turns with joint 1, so that view yaws with the arm the way
     Stretch's head camera yaws with the base its arm reaches from. See
     `setups.FRANKA_EXO_MOUNT_BODY`.
+
+    `base_link` is *not* stationary, whatever this docstring used to claim: with
+    `include_base` on -- the default -- the retargeting IK drives the base as
+    three more DOFs. A camera that must not move needs `world_fixed`, not a
+    mount body that looks like it stays put.
+    """
+
+    world_fixed: bool = False
+    """Whether this camera is a fixture in the room rather than a camera on the robot.
+
+    Set, the camera is placed once from where `mount_body` sits at spawn and then
+    left there for the episode; clear, it re-solves from the body every step.
+
+    The distinction is not cosmetic on Stretch, and `mount_body` alone does not
+    carry it. Every Stretch setup mounts on `base_link`, but they mean opposite
+    things by it: the *stretchcam*, *fisheye* and *rectified* setups are showing
+    what Stretch's head camera sees, which genuinely rides the robot -- their
+    Franka twins mount on `fr3_link1` precisely so that view yaws with the arm
+    too. `stretch_baseline` is the other case: a DROID shoulder camera
+    transplanted into the room, whose Franka twin hangs off `fr3_link0`, a base
+    bolted to a pedestal that never moves. Pinning that one to `base_link` made
+    it yaw with a base the retargeting IK drives, which is neither what DROID
+    trained on nor comparable with the Franka half of its own pair.
+
+    See `fixed_exo_camera_config`.
     """
 
     pos: tuple[float, float, float] = (0.0788406, -0.075, 1.4587)
@@ -392,6 +420,47 @@ def exo_camera_config(name: str, params: ExoCameraParams) -> RobotMountedCameraC
         reference_body_names=[params.mount_body],
         camera_offset=list(params.pos),
         camera_quaternion=params.quat_wxyz(),
+        fov=float(params.fovy),
+    )
+
+
+def fixed_exo_camera_config(
+    name: str, params: ExoCameraParams, mount_pose: np.ndarray
+) -> FixedExocentricCameraConfig:
+    """`params` frozen into a world-fixed camera, as it would sit on `mount_pose`.
+
+    `mount_pose` is the 4x4 world pose the camera's mount body holds *at spawn*.
+    The camera is placed exactly where `exo_camera_config` would put it there,
+    and then left alone for the episode.
+
+    The arithmetic is `camera_manager.create_quaternion_camera_pose`'s, copied
+    rather than called because that one needs a live environment and this runs
+    on an episode spec, before there is one. MolmoSpaces' camera convention is
+    the load-bearing half: forward is the *negative* z of the composed rotation
+    and up is its +y, and `FixedExocentricCameraConfig` takes those two vectors
+    rather than a quaternion (its own TODO notes the gap). Deriving them from
+    the same expression the mounted path uses is what makes the two place the
+    camera identically -- write the quaternion's axes in by hand and the view
+    tilts by however wrong the guess was, silently, in a render nobody diffs.
+
+    Why this exists: a `RobotMountedCameraConfig` re-solves its pose from the
+    body every step, so a camera pinned to Stretch's `base_link` swings with the
+    base -- and with `include_base` on, the retargeting IK drives the base. The
+    Franka's baseline camera hangs off `fr3_link0`, a robot bolted to a pedestal,
+    so it never moved and the difference was invisible until a Stretch rollout
+    turned. An exocentric camera that yaws with the robot it is watching is not
+    the DROID view the checkpoint was trained on, and the two baselines are only
+    comparable if neither moves. See `setups.stretch_episode_override`.
+    """
+    mount_pose = np.asarray(mount_pose, dtype=float)
+    rotation = mount_pose[:3, :3]
+    position = rotation @ np.asarray(params.pos, dtype=float) + mount_pose[:3, 3]
+    world = rotation @ params.rotation().as_matrix()
+    return FixedExocentricCameraConfig(
+        name=name,
+        pos=list(position),
+        forward=list(-world[:, 2]),
+        up=list(world[:, 1]),
         fov=float(params.fovy),
     )
 
