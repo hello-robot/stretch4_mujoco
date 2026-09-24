@@ -1174,7 +1174,7 @@ def runs_from_disk(
                 setup=key,
                 panel_dir=output_dir / "runs" / key / "panels",
                 episodes=episodes,
-                params=_apply_params(SETUPS[key].params, param_specs),
+                params=_apply_params(SETUPS[key].params, param_specs, key),
             )
         )
     return runs
@@ -1185,8 +1185,45 @@ def runs_from_disk(
 # =============================================================================
 
 
-def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParams:
-    """`--param name=value`, applied through the same handles `params_search` searches."""
+def _typed(name: str) -> bool:
+    """Whether `name` was given on the command line, rather than left at its default.
+
+    The overrides that default to "whatever the setup already says" all need this
+    distinction, and a sentinel default cannot carry it: 0.0 is a legitimate
+    value for every one of them. Click's `get_parameter_source` is what knows.
+    Outside a click context -- a test, an importer -- nothing was typed.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return False
+    source = ctx.get_parameter_source(name)
+    return source is not None and source.name != "DEFAULT"
+
+
+def _apply_params(
+    base: RetargetParams, specs: tuple[str, ...], setup_key: str
+) -> RetargetParams:
+    """A setup's params as this invocation wants them: `--param`, then the flags.
+
+    `--stretch4-grasp-offset` is read off the click context rather than passed
+    in, so that every path that rebuilds a setup's params picks it up: the run
+    loop, the replay, and `runs_from_disk`, which is what `--report-only` and
+    `--compose-only` label their tables from. A report naming the setup's default
+    offset while the run it describes used another one would be quietly wrong,
+    and quietly is the problem -- nobody re-checks a number the tool printed.
+
+    `setup_key` is what decides whether it applies at all. `grasp_offset_m` is a
+    correction to the Franka-to-Stretch tool transform (`apply_tool_correction`),
+    so it means nothing on a Franka setup -- writing it there would put a number
+    in that row of `trials.csv` that describes nothing the run did. Hence the
+    name: it is the Stretch side's offset, and the Franka half of a pair keeps
+    its own 0.
+
+    Applied after `--param` so it wins over a `--param grasp_offset_m=` naming
+    the same number; the dedicated flag is the more specific statement. Note the
+    asymmetry that leaves: `--param` is applied to whichever setup it is handed,
+    Franka included, which is what its own help means by "where it applies".
+    """
     params = base
     for spec in specs:
         name, _, value = spec.partition("=")
@@ -1197,6 +1234,9 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
         if not value:
             raise click.UsageError(f"--param {spec!r} should be name=value.")
         params = DIMENSIONS[name].write(params, float(value))
+    if _typed("stretch4_grasp_offset") and SETUPS[setup_key].robot == "stretch":
+        offset = click.get_current_context().params["stretch4_grasp_offset"]
+        params = DIMENSIONS["grasp_offset_m"].write(params, float(offset))
     return params
 
 
@@ -1274,6 +1314,21 @@ def _apply_params(base: RetargetParams, specs: tuple[str, ...]) -> RetargetParam
     show_default=True,
     help="target_z_offset to replay with, in metres. The default is 0, which is also "
     "what a rollout now applies unless told otherwise.",
+)
+@click.option(
+    "--stretch4-grasp-offset",
+    "--stretch4_grasp_offset",
+    "stretch4_grasp_offset",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="grasp_offset_m for every Stretch setup this invocation touches, in metres -- "
+    "how far along the approach axis Stretch's commanded grasp centre sits from where "
+    "the retargeting puts the Franka's. Applies to the evaluation runs and to a replay "
+    "alike, and overrides --param grasp_offset_m. Stretch only, because it is a term in "
+    "the Franka-to-Stretch tool transform and means nothing on a Franka: the Franka half "
+    "of a pair keeps its own 0. Left untyped, each setup keeps its own offset. The one "
+    "parameter a grasp is most sensitive to; see setups.apply_tool_correction.",
 )
 @click.option(
     "--replay-kinematic",
@@ -1366,6 +1421,7 @@ def main(
     report_only: bool,
     replay_as_stretch4: bool,
     replay_z_offset: float,
+    stretch4_grasp_offset: float,
     replay_limit: int | None,
     replay_no_video: bool,
     replay_kinematic: bool,
@@ -1411,13 +1467,9 @@ def main(
             # this measures a retargeting no setup uses and `--param
             # grasp_offset_m=...` would be silently ignored, which is the one
             # thing anybody runs this flag to sweep.
-            params = _apply_params(SETUPS[MATCHED_PAIRS[pair_names[0]][1]].params, param_specs)
-            source = click.get_current_context().get_parameter_source("replay_z_offset")
-            z_offset = (
-                replay_z_offset
-                if source is not None and source.name != "DEFAULT"
-                else params.target_z_offset_m
-            )
+            stretch_key = MATCHED_PAIRS[pair_names[0]][1]
+            params = _apply_params(SETUPS[stretch_key].params, param_specs, stretch_key)
+            z_offset = replay_z_offset if _typed("replay_z_offset") else params.target_z_offset_m
             log.info(f"[replay] {params.describe()}, target_z_offset={z_offset:+.3f}m")
             results = replay_mod.replay_run(
                 output_dir,
@@ -1439,16 +1491,11 @@ def main(
         results = []
         for name in pair_names:
             stretch_key = MATCHED_PAIRS[name][1]
-            params = _apply_params(SETUPS[stretch_key].params, param_specs)
+            params = _apply_params(SETUPS[stretch_key].params, param_specs, stretch_key)
             # The setup's own z offset unless the flag was actually typed, so a
             # replay of `stretch_baseline` retargets the way that setup does
             # rather than the way the flag's default happens to.
-            source = click.get_current_context().get_parameter_source("replay_z_offset")
-            z_offset = (
-                replay_z_offset
-                if source is not None and source.name != "DEFAULT"
-                else params.target_z_offset_m
-            )
+            z_offset = replay_z_offset if _typed("replay_z_offset") else params.target_z_offset_m
             log.info(
                 f"[replay] {name}: replaying {MATCHED_PAIRS[name][0]}'s recorded episodes as "
                 f"{stretch_key} -- {params.describe()}, target_z_offset={z_offset:+.3f}m"
@@ -1542,7 +1589,7 @@ def main(
     runs: dict[str, RunResult] = {}
     for setup_key in setups_to_run:
         base = SETUPS[setup_key].params
-        params = _apply_params(base, param_specs)
+        params = _apply_params(base, param_specs, setup_key)
         runs[setup_key] = run_setup(
             setup_key,
             params,

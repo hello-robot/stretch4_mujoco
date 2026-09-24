@@ -1306,17 +1306,16 @@ class FrankaOnStretchView:
                 self.robotiq_aperture_m,
             )
 
+        # The bare axis correction, under every convention. The half turn that
+        # `map_franka_wrist_to_flipped_stretch4_wrist` asks for is *not* folded
+        # in here: folding it in would make the retargeting's own frame the
+        # half-turned one, so the grasp orientation this reports and accepts
+        # would be the Franka's rolled half a turn rather than the Franka's. The
+        # convention takes Stretch's flipped wrist as its natural state instead
+        # and maps the Franka's grasp orientation onto that -- which is a choice
+        # of *branch*, made below, not a change of frame.
         self._tool_correction = np.eye(4)
         self._tool_correction[:3, :3] = FRANKA_TO_STRETCH_TOOL
-        if self.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist:
-            # Folded into the transform rather than chosen per step: `JAW_FLIP` is
-            # in Stretch's tool convention, so it composes on the right, after the
-            # axis correction has decided which way the approach points. Both
-            # directions then carry it, because `_tool_correction_inverse` is
-            # taken from this matrix -- which is what keeps the pose the policy
-            # reads back the pose it asked for. See
-            # `PoseConventions.map_franka_wrist_to_flipped_stretch4_wrist`.
-            self._tool_correction = self._tool_correction @ JAW_FLIP
         self._tool_correction_inverse = np.linalg.inv(self._tool_correction)
 
         self._move_groups = {"arm": _ProxyArmGroup(self), "gripper": _ProxyGripperGroup(self)}
@@ -1324,7 +1323,29 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = self.franka.init_qpos.copy()
         self.last_gripper_ctrl = np.array([ROBOTIQ_CTRL_RANGE[0]])
         self.last_residual = np.zeros(6)
-        self.jaw_flipped = jaw_mode == "flipped"
+        self.jaw_natural_flipped = (
+            jaw_mode == "flipped"
+            or self.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist
+        )
+        """Which branch this wrist rests in -- the state it starts and returns to.
+
+        `map_franka_wrist_to_flipped_stretch4_wrist` makes it the half-turned
+        one: Stretch's natural state is the flipped wrist, and the Franka's grasp
+        orientation is mapped onto it from there. That mapping is what
+        `_tool_correction` stays free of and what `franka_joint_pos` undoes when
+        reporting, so the orientation the policy commands and reads back is the
+        Franka's, not the Franka's rolled half a turn.
+
+        A default rather than a pin, under `jaw_mode="auto"`: the arm sits here
+        and `_solve_either_jaw` leaves it only where the wrist physically cannot
+        hold this branch -- Stretch's `wrist_roll_joint` range is asymmetric, and
+        at large tool yaws the half-turned branch runs into its limit and settles
+        0.43 rad short (see `JAW_MODES`). Pinning it instead costs real reach:
+        measured on the recorded knife episode, a pinned branch takes the
+        retargeting residual from 4.0mm mean to 198.5mm. `jaw_mode="flipped"`
+        still pins it, for a caller that wants that.
+        """
+        self.jaw_flipped = self.jaw_natural_flipped
         """Whether the arm is currently holding the half-turned jaw. See `JAW_FLIP`."""
         self.unreachable_steps = 0
         """Steps this episode whose target was out of reach with the lift saturated."""
@@ -1394,7 +1415,7 @@ class FrankaOnStretchView:
         # disagree -- the reported arm state is read back through that flag, and
         # a snap that picked one branch while the flag said the other would
         # report an arm half a turn from the one Stretch is holding.
-        self.jaw_flipped = self.jaw_mode == "flipped"
+        self.jaw_flipped = self.jaw_natural_flipped
         solution, residual, self.jaw_flipped = self._solve_either_jaw(target)
         for group, value in self.arm_ik.split(solution).items():
             move_group = self.stretch_view.get_move_group(group)
