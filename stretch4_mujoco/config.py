@@ -1,3 +1,4 @@
+import copy
 import math
 
 robot_settings = {
@@ -113,6 +114,21 @@ robot_settings_se4 = {
 }
 
 
+# The parallel gripper (PG4) tool. Its fingers are prismatic, from 0 (closed) to
+# -0.04 m (open) each, per the eoa_wrist_dw4_tool_pg4 URDF. The `gripper`
+# actuator keeps the standard gripper's aperture-radians range so commands, jog
+# rates and teleop mappings carry over unchanged; only the finger end of the
+# linear aperture -> finger map is swapped, which then reads in metres.
+robot_settings_se4_pg4 = copy.deepcopy(robot_settings_se4)
+robot_settings_se4_pg4["gripper_conversion"].update(
+    {
+        "urdf_open_rad": -0.04,
+        "urdf_closed_rad": 0.0,
+        "urdf_offset": 0.0,
+    }
+)
+
+
 depth_limits = {"gripper": 1, "d435i": 10} # Keep d435i for depth cameras.
 
 
@@ -173,7 +189,8 @@ def _gripper_rate_scale(actuator_name: str, settings: dict) -> float:
 
     if actuator_name in ("gripper_left_finger", "gripper_right_finger"):
         conversion = settings["gripper_conversion"]
-        scale *= (conversion["urdf_open_rad"] - conversion["urdf_closed_rad"]) / (
+        # abs(): the parallel gripper's fingers open towards negative positions.
+        scale *= abs(conversion["urdf_open_rad"] - conversion["urdf_closed_rad"]) / (
             _aperture_open_rad(settings)
         )
     return scale

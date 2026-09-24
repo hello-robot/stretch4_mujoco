@@ -24,6 +24,9 @@ Usage:
 
     # Or any scene XML on disk
     python -m examples.molmo_environment --scene /path/to/scene.xml
+
+    # With the parallel gripper (PG4) instead of the standard gripper (SG4)
+    python -m examples.molmo_environment --parallel_gripper
 """
 
 import re
@@ -232,6 +235,7 @@ def add_stretch_to_scene(
     robot_xml_path: str | None = None,
     floor_geom_names: list[str] | None = None,
     match_solver_options: bool = True,
+    tool_name: str | None = None,
 ) -> MjsBody:
     """
     Attach the generated Stretch 4 MJCF to a MolmoSpaces scene spec, in place.
@@ -260,13 +264,15 @@ def add_stretch_to_scene(
             `find_floor_geoms(spec)`.
         match_solver_options: overwrite the scene's `<option>` with the Stretch
             model's, see `apply_stretch_solver_options()`.
+        tool_name: the stretch4_urdf tool to generate the Stretch with, or None
+            for the standard gripper (SG4). Ignored if `robot_xml_path` is given.
 
     Returns:
         The attached root body.
     """
     if robot_xml_path is None:
         # Regenerates the MJCF from the URDF via mjcf_generator.generate_mjcf().
-        robot_xml_path = Stretch4MujocoSimulator.get_robot_xml_path()
+        robot_xml_path = Stretch4MujocoSimulator.get_robot_xml_path(tool_name)
     if floor_geom_names is None:
         floor_geom_names = find_floor_geoms(spec)
 
@@ -303,6 +309,7 @@ def build_model(
     floor_geom_names: list[str] | None = None,
     match_solver_options: bool = True,
     write_to_file: str | None = None,
+    tool_name: str | None = None,
 ) -> MjModel:
     """
     Load a MolmoSpaces scene, attach Stretch 4 to it, and compile it.
@@ -321,6 +328,7 @@ def build_model(
         quat=quat,
         floor_geom_names=floor_geom_names,
         match_solver_options=match_solver_options,
+        tool_name=tool_name,
     )
 
     model = spec.compile()
@@ -422,6 +430,11 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
     help="Overwrite the scene's <option> with the values the Stretch model is tuned for.",
 )
 @click.option("--write-to-file", type=str, default=None, help="Write the combined scene XML here")
+@click.option(
+    "--parallel_gripper",
+    is_flag=True,
+    help="Use the parallel gripper (PG4) instead of the standard Stretch 4 gripper (SG4).",
+)
 @click.option("--headless", is_flag=True, help="Run without the MuJoCo viewer")
 @click.option("--keyboard", is_flag=True, help="Drive the robot with the keyboard (WASDQE, ...)")
 @click.option("--gamepad", is_flag=True, help="Drive the robot with an Xbox-style gamepad")
@@ -458,6 +471,7 @@ def main(
     floor_geom: tuple[str, ...],
     match_solver_options: bool,
     write_to_file: str | None,
+    parallel_gripper: bool,
     headless: bool,
     keyboard: bool,
     gamepad: bool,
@@ -468,6 +482,8 @@ def main(
 ):
     if keyboard and gamepad:
         raise click.UsageError("Pass at most one of --keyboard/--gamepad.")
+
+    tool_name = Stretch4MujocoSimulator.PARALLEL_GRIPPER_TOOL_NAME if parallel_gripper else None
 
     scene_xml_path = scene or resolve_molmospaces_scene(dataset, split, house_index, variant)
 
@@ -480,6 +496,7 @@ def main(
         floor_geom_names=list(floor_geom) or None,
         match_solver_options=match_solver_options,
         write_to_file=write_to_file,
+        tool_name=tool_name,
     )
 
     rerun_logger = RerunLogger()
@@ -490,6 +507,7 @@ def main(
         model=model,
         cameras_to_use=cameras_to_use,
         camera_hz=10.0 if lidar else 30.0,
+        tool_name=tool_name,
     )
     sim.start(headless=headless)
 

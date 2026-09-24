@@ -75,6 +75,12 @@
             <position ctrlrange="0.0 0.5" kp="500" kv="20" forcerange="-30 30"/>
           </default>
         </default>
+        <!-- The parallel gripper (PG4) fingers are prismatic, 0 closed to -0.04 open.
+             Their joint axis comes from the URDF, so it is not set here. -->
+        <default class="parallel_gripper_finger">
+          <joint range="-0.04 0" damping="10" armature="0.1" frictionloss=".1" />
+          <position ctrlrange="-0.04 0" kp="1000" kv="20" forcerange="-30 30"/>
+        </default>
       </default>
 
       <default class="visualgeom">

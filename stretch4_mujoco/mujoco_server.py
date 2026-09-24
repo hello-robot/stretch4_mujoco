@@ -568,6 +568,11 @@ class MujocoServer:
                 self.use_diff_drive = False
                 break
 
+        self.is_parallel_gripper = any(
+            mujoco.mj_name2id(self.mjmodel, mujoco.mjtObj.mjOBJ_JOINT, name) != -1
+            for name in ("finger_left_joint", "finger_right_joint")
+        )
+
         self._base_in_pos_motion = False
 
         self.viewer_track_body = viewer_track_body
@@ -609,6 +614,8 @@ class MujocoServer:
         # This assumes self.use_diff_drive==True means we're using Stretch 3. This could be ambiguous. TODO: Add an explicit flag for robot version.
         if self.use_diff_drive:
             return config.robot_settings
+        if self.is_parallel_gripper:
+            return config.robot_settings_se4_pg4
         return config.robot_settings_se4
 
     def _build_joint_profiles(self) -> dict[str, TrapezoidalProfile]:
