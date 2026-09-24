@@ -203,18 +203,31 @@ STRETCH_TARGET_Z_OFFSET_M = 0.0
 The tool correction the Stretch setups retarget with, measured by search.
 
 **The grasp centre.** The retargeting drives `grasp_center_link` to the pose the
-policy asked for its Robotiq's `grasp_site`, but that point is in a quite
-different place on the two hands: on Stretch it sits 1.5cm *past* the fingertips
-and 10.6cm past the finger pads, so an object put there is outside the gripper
-and the fingers close behind it. `grasp_offset_m` pushes the commanded grasp
-centre that much further along the approach, which pulls the object that much
-deeper into the jaw -- 0.015 brings it to the fingertips, 0.106 to the pads.
-`diagnose.py` prints both numbers off the compiled model.
+policy asked for its Robotiq's `grasp_site`, and the two hands carry that frame
+in nearly the same place on themselves. Measured on the *surfaces* an object
+touches, from each hand's own grasp frame along its approach, with the Robotiq
+open and Stretch's fingers at the 132mm tip separation that matches its jaw:
+
+    Robotiq pads          -33.6 ..  +4.0 mm     grasp site 4.0mm behind the pad front
+    Stretch fingertips    -48.8 .. +13.1 mm     grasp centre 13.1mm behind the tip front
+
+So `grasp_offset_m = +0.003` is what centres the two gripping surfaces on each
+other, and +0.030 is not a geometric alignment at all -- it drives Stretch's
+fingertips 27mm deeper than the Robotiq's pads ever go.
+`retargetting/grasp_center_alignment.py` measures this and renders it.
+
+This paragraph used to say the grasp centre sits 1.5cm past the fingertips and
+10.6cm past the pads, and read 0.015 and 0.106 off those. Both are distances to
+a finger mesh's *frame origin* -- what `diagnose.report_gripper` reports out of
+`geom_xpos` -- and Stretch's fingertip meshes have their origin some centimetres
+behind their front face, so the numbers overstate the overhang by about the
+length of a fingertip. The conclusion they invited, that an object at the
+commanded point is outside the hand entirely, is not what the meshes say.
 
 Deep is not simply better, for two reasons that bound it from opposite ends.
-The offset drives the fingertips `offset - 0.015` metres *past* the object along
+The offset drives the fingertips `offset + 0.013` metres *past* the object along
 the approach, and for a top-down grasp that is straight down: at 0.09 the tips
-reach 7.5cm below the object's centre, which for every object in this benchmark
+reach 10.3cm below the object's centre, which for every object in this benchmark
 is through the worktop. And Stretch's fingers converge behind their tips, so the
 deeper the object sits the narrower the jaw it has to fit in -- past about 0.045
 the hand cannot open around what the Robotiq would have swallowed at all. See
@@ -1072,23 +1085,18 @@ def apply_tool_correction(proxy: Any, wrist_tilt_deg: float, grasp_offset_m: flo
         FRANKA_TO_STRETCH_TOOL,
     )
 
-    from examples.machine_learning.molmospaces.policies.franka_retarget import JAW_FLIP
-
     correction = np.eye(4)
     correction[:3, :3] = FRANKA_TO_STRETCH_TOOL @ R.from_euler(
         "y", wrist_tilt_deg, degrees=True
     ).as_matrix()
     # +x is Stretch's approach axis; see `franka_retarget.FRANKA_TO_STRETCH_TOOL`.
     correction[:3, 3] = correction[:3, :3] @ np.array([grasp_offset_m, 0.0, 0.0])
-    if getattr(proxy, "pose_conventions", None) and (
-        proxy.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist
-    ):
-        # This rebuilds the transform from scratch, so it has to re-apply the
-        # half turn `FrankaOnStretchView.__init__` folded in -- otherwise asking
-        # for a tool correction would silently undo the convention. On the right,
-        # after the offset, for the same reason it is on the right there: the
-        # turn is about the approach axis, which the rotation above defines.
-        correction = correction @ JAW_FLIP
+    # No half turn here, under any convention.
+    # `map_franka_wrist_to_flipped_stretch4_wrist` is a choice of *branch* --
+    # `FrankaOnStretchView` holds the half-turned wrist for the episode -- not a
+    # rotation of the frame the retargeting is defined in. Re-applying one here
+    # would compose with that branch and the two would cancel, which is exactly
+    # what this used to do.
 
     proxy._tool_correction = correction
     proxy._tool_correction_inverse = np.linalg.inv(correction)
