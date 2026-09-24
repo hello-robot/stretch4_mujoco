@@ -21,7 +21,7 @@ dependencies = [
     "coal>=3.0.3",
     "pygame>=2.5.0",
     "hello-robot-stretch4-flying-gripper>=2026.7.2",
-    "hello-robot-stretch4-kinematics",
+ #   "hello-robot-stretch4-kinematics",
 ]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},
@@ -69,4 +69,28 @@ molmo = [
 ]
 digital-twin = [
     "hello-robot-stretch4-body",
+]
+
+# What MolmoBot's model needs to *run* -- `run_benchmarks.py --policy molmobot`.
+# Training happens in the virtualenv inside the checkout, built from MolmoBot's
+# own pyproject; evaluation cannot, because a rollout is a MolmoSpaces
+# simulation with MolmoBot's weights inside it, in one interpreter. So its
+# runtime dependencies belong here, in an extra of their own rather than in
+# `molmo`, since nothing else in this repository imports them.
+# `finetuning/molmobot_repo.INFERENCE_REQUIREMENTS` is the same list, checked at
+# the command line before a benchmark loads.
+molmobot = [
+    "accelerate",
+    "av",
+    "cached_path",
+    "cached_property",
+    "einops",
+    "einops-exts",
+    "fiddle",
+    "hydra-core",
+    "rich",
+    "sentencepiece",
+    "tokenizers",
+    "torchmetrics",
+    "transformers",
 ]
