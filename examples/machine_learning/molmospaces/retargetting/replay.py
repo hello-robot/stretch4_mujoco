@@ -487,7 +487,9 @@ def _stage_objects(spec: MjSpec, modifications: dict[str, Any]) -> None:
             log.warning(f"[replay] could not stage {object_name}: {error}")
 
 
-def _add_exo_camera(spec: MjSpec, namespace: str, exo: ExoCameraParams) -> None:
+def _add_exo_camera(
+    spec: MjSpec, namespace: str, exo: ExoCameraParams, mount_pose: np.ndarray | None = None
+) -> None:
     """Bolt the setup's exo camera into the spec, where the evaluation mounts it.
 
     The same pose and the same optics `exo_camera_config` hands MolmoSpaces,
@@ -500,6 +502,28 @@ def _add_exo_camera(spec: MjSpec, namespace: str, exo: ExoCameraParams) -> None:
     lost replay: the Franka setups pin the exo camera to an arm link, and there
     is no arm link here to pin it to.
     """
+    if mount_pose is not None and exo.world_fixed:
+        # Into the world, not onto the robot. A camera bolted to `base_link`
+        # rides the base, and the base is a degree of freedom the retargeting IK
+        # drives -- so the exo view yaws whenever the solver reaches by turning.
+        # The rollout's own camera is frozen the same way; see
+        # `cameras.fixed_exo_camera_config` for why, and note `_ScenePanel`
+        # already pins the third-person panel to the episode's base pose for the
+        # same reason. The composition is MuJoCo's: a camera's `pos`/`quat` are
+        # in its parent's frame, and here the parent is the world.
+        mount_pose = np.asarray(mount_pose, dtype=float)
+        rotation = mount_pose[:3, :3]
+        spec.worldbody.add_camera(
+            name=namespace + REPLAY_EXO_CAMERA,
+            pos=list(rotation @ np.asarray(exo.pos, dtype=float) + mount_pose[:3, 3]),
+            quat=list(
+                R.from_matrix(rotation @ exo.rotation().as_matrix()).as_quat(scalar_first=True)
+            ),
+            fovy=float(exo.fovy),
+            resolution=list(exo.render_size),
+        )
+        return
+
     body_name = exo.mount_body
     if not body_name.startswith(namespace):
         body_name = namespace + body_name
@@ -606,7 +630,18 @@ def build_stretch_in_scene(
     )
     Stretch4Robot.apply_control_overrides(spec, config)
     if exo is not None:
-        _add_exo_camera(spec, namespace, exo)
+        # From the *authored* base pose, matching `setups.stretch_episode_override`:
+        # `base_xytheta` arrives already retreated under
+        # `match_stretch_spawn_pose_to_franka`, and the Franka's baseline camera
+        # sits at the pose before that retreat.
+        from examples.machine_learning.molmospaces.retargetting.setups import (
+            base_link_pose,
+            stretch_authored_base_xy,
+        )
+
+        _add_exo_camera(
+            spec, namespace, exo, mount_pose=base_link_pose(stretch_authored_base_xy([x, y], yaw), yaw)
+        )
 
     model = spec.compile()
     data = MjData(model)

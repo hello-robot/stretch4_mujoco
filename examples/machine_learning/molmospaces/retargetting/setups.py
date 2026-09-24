@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from examples.machine_learning.molmospaces.added_pickup_repair import install_eval_repair
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr
@@ -61,6 +62,7 @@ from examples.machine_learning.molmospaces.retargetting.cameras import (
     RetargetParams,
     clear_exo_cameras,
     exo_camera_config,
+    fixed_exo_camera_config,
     register_exo_camera,
 )
 from examples.machine_learning.molmospaces.retargetting.franka_droid_policy import (
@@ -588,6 +590,11 @@ SETUPS: dict[str, Setup] = {
                     # thing the transplant cannot preserve, because Stretch has
                     # no link that moves the way `fr3_link0` does.
                     mount_body="robot_0/base_link",
+                    # A fixture in the room, not a camera on the robot: the
+                    # Franka half of this pair hangs off `fr3_link0` and never
+                    # moves, so this one must not either. `base_link` still says
+                    # where it goes at spawn. See `ExoCameraParams.world_fixed`.
+                    world_fixed=True,
                     pos=(
                         DROID_SHOULDER_CAMERA_POS[0],
                         DROID_SHOULDER_CAMERA_POS[1],
@@ -789,7 +796,9 @@ def franka_camera_system(params: RetargetParams) -> CameraSystemConfig:
     )
 
 
-def stretch_camera_system(params: RetargetParams) -> CameraSystemConfig:
+def stretch_camera_system(
+    params: RetargetParams, exo_mount_pose: np.ndarray | None = None
+) -> CameraSystemConfig:
     """The exo camera under test, plus Stretch's own right wrist camera.
 
     The wrist camera is `Stretch4CameraSystem`'s -- an MJCF camera rendered
@@ -808,9 +817,20 @@ def stretch_camera_system(params: RetargetParams) -> CameraSystemConfig:
         # wrist camera of every Stretch evaluation that follows.
         wrist = wrist.model_copy(update={"fov": float(params.wrist_fov_deg)})
     wrist_size = stretch_config.CAMERA_RENDER_SIZE[WRIST_CAMERA_RIGHT]
+    # World-fixed when the caller knows where the mount body will be, which an
+    # episode override does and a config resolved before any episode does not.
+    # Stretch's exo camera hangs off `base_link`, and `base_link` is not
+    # stationary the way this module used to assume: with `include_base` on, the
+    # retargeting IK drives the base, so a mounted camera yaws with it. See
+    # `cameras.fixed_exo_camera_config`.
+    exo = (
+        fixed_exo_camera_config(EXO_CAMERA, params.exo, exo_mount_pose)
+        if params.exo.world_fixed and exo_mount_pose is not None
+        else exo_camera_config(EXO_CAMERA, params.exo)
+    )
     return CameraSystemConfig(
         img_resolution=_buffer_resolution(params.exo.render_size, wrist_size),
-        cameras=[exo_camera_config(EXO_CAMERA, params.exo), wrist],
+        cameras=[exo, wrist],
     )
 
 
@@ -930,6 +950,39 @@ episodes see it.
 """
 
 
+def base_link_pose(base_xy, yaw: float) -> np.ndarray:
+    """Where Stretch's `base_link` sits in the world when the base is at `base_xy`/`yaw`.
+
+    The 4x4 an exo camera mounted on `base_link` is composed against. Measured:
+    `base_link` is the chassis origin, so it carries the base's xy and yaw and
+    sits `STRETCH_BASE_LINK_HEIGHT_M` above the floor -- which is the same
+    28mm `STRETCH_BASELINE_HEIGHT` subtracts, from the other direction.
+    """
+    base_xy = np.asarray(base_xy, dtype=float)[:2]
+    pose = np.eye(4)
+    pose[:3, :3] = R.from_euler("z", yaw).as_matrix()
+    pose[:3, 3] = [base_xy[0], base_xy[1], STRETCH_BASE_LINK_HEIGHT_M]
+    return pose
+
+
+def stretch_authored_base_xy(base_xy, yaw: float) -> tuple[float, float]:
+    """The inverse of `stretch_spawn_base_pose`: a retreated spawn, put back.
+
+    A replay is handed the pose the robot actually spawns at, which already
+    carries the retreat; what the exo camera has to be pinned to is the pose the
+    episode authored, because that is where the Franka's own camera sits. Also a
+    no-op with the convention off.
+    """
+    base_xy = np.asarray(base_xy, dtype=float)[:2]
+    if not pose_conventions_requested().match_stretch_spawn_pose_to_franka:
+        return float(base_xy[0]), float(base_xy[1])
+    offset = fr.stretch_spawn_base_offset_xy()
+    forward = np.array([np.cos(yaw), np.sin(yaw)])
+    across = np.array([-np.sin(yaw), np.cos(yaw)])
+    moved = base_xy - forward * offset[0] - across * offset[1]
+    return float(moved[0]), float(moved[1])
+
+
 def stretch_spawn_base_pose(base_xy, yaw: float) -> tuple[float, float]:
     """`base_xy`, moved back so Stretch's spawn gripper pose is the Franka's.
 
@@ -982,11 +1035,23 @@ def stretch_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None
     episode_spec.robot.robot_name = "stretch4"
     episode_spec.robot.init_qpos = stretch_spawn_init_qpos()
 
-    system = stretch_camera_system(params)
+    # Before the camera is built, because the camera is pinned to where this
+    # leaves the robot -- and read from the pose the episode *authored*, not the
+    # one the retreat produces. Under `match_stretch_spawn_pose_to_franka`
+    # Stretch stands back from the authored spot while the Franka does not, and
+    # `franka_baseline` puts its own exo camera at the authored one; pinning
+    # Stretch's to the retreated pose would stand the two baselines' cameras
+    # apart by the retreat and there would be nothing left to compare. See
+    # `fr.stretch_spawn_base_offset_xy`, whose second documented cost this is.
+    authored_xy = np.asarray(episode_spec.task["robot_base_pose"][:2], dtype=float)
+    _point_base_at(episode_spec.task, 0.0, retreat=True)
+    yaw = float(
+        R.from_quat(episode_spec.task["robot_base_pose"][3:7], scalar_first=True).as_euler("xyz")[2]
+    )
+
+    system = stretch_camera_system(params, exo_mount_pose=base_link_pose(authored_xy, yaw))
     exp_config.camera_config.cameras = list(system.cameras)
     exp_config.camera_config.img_resolution = system.img_resolution
-
-    _point_base_at(episode_spec.task, 0.0, retreat=True)
 
 
 def register_overrides() -> None:
