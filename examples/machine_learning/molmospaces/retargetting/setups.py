@@ -387,8 +387,12 @@ STRETCH_STRETCHCAM_HEIGHT = 1.4587
 Stretch's head camera above `base_link`, in metres.
 
 `camera_right_link`'s true offset (1.5432) less that body's own 0.0845, exactly
-as `demo_droid_on_stretch.RECONSTRUCTED_EXO_CAMERA` has it. Stretch's base sits
-on the floor, so this is also the camera's height above the floor.
+as `demo_droid_on_stretch.RECONSTRUCTED_EXO_CAMERA` has it.
+
+Above `base_link`, which is what `_stretch_head_camera_params` wants and so is
+right as it stands. It is *not* the height above the floor -- add
+`STRETCH_BASE_LINK_HEIGHT_M` for that, which is what `FRANKA_STRETCHCAM_HEIGHT`
+does when it puts the same camera on a robot with a different base.
 """
 
 FRANKA_EXO_MOUNT_BODY = "robot_0/fr3_link1"
@@ -446,31 +450,44 @@ noise in `scoring.REPEAT_NOISE_NOTE`. So it is recorded rather than applied in
 the middle of a comparison.
 """
 
-STRETCH_BASELINE_HEIGHT = FRANKA_LINK0_HEIGHT + DROID_SHOULDER_CAMERA_POS[2]
+STRETCH_BASELINE_ROOM_HEIGHT = FRANKA_LINK0_HEIGHT + DROID_SHOULDER_CAMERA_POS[2]
 """
-Where the DROID shoulder camera goes on Stretch: 1.41 m above `base_link`.
+How high the DROID shoulder camera is **above the floor**: 1.41 m.
 
-Derived, and the derivation is the same one `FRANKA_STRETCHCAM_HEIGHT` runs in
-the other direction: the camera has to end up at **the same height in the room**
-on both robots, or the pair stops being a comparison of the robot and becomes a
-comparison of two viewpoints. On the Franka the camera sits 0.66 m above
-`fr3_link0`, which is itself 0.75 m up on a pedestal, so 1.41 m above the floor.
+On the Franka it sits 0.66 m above `fr3_link0`, which is itself 0.75 m up on a
+pedestal. That is the number the pair is built around: the camera has to end up
+at the same height in the room on both robots, or the pair stops being a
+comparison of the robot and becomes a comparison of two viewpoints.
+"""
 
-Mounted on `base_link` it lands at 1.438 m rather than 1.41 m, because that body
-is not quite on the floor; see `STRETCH_BASE_LINK_HEIGHT_M`. Measured, with both
-robots stood at the mini benchmark's spawn and the same yaw, the two cameras come
-out at the same xy to the millimetre and 28 mm apart in z.
+STRETCH_BASELINE_HEIGHT = STRETCH_BASELINE_ROOM_HEIGHT - STRETCH_BASE_LINK_HEIGHT_M
+"""
+Where to mount it on Stretch: 1.382 m above `base_link`, which is 1.41 m above the floor.
+
+The two are not the same number and that is the whole of this constant.
+`ExoCameraParams.pos` is a `camera_offset` from `mount_body` -- see
+`cameras.exo_camera_config` -- so a height reasoned about as "above the floor"
+and written straight into it lands 28 mm high, because `base_link` is the
+chassis origin and sits that far up (`STRETCH_BASE_LINK_HEIGHT_M`).
+
+It used to be written straight in. Measured, with both robots stood at the mini
+benchmark's spawn and the same yaw, the two cameras came out at the same xy to
+the millimetre and 28 mm apart in z; with this subtraction they agree in z too.
 
 The xy offset and the orientation are carried across unchanged -- it is the same
-camera, looking the same way, at very nearly the same height. What differs is the
-robot under it, which is the whole point of the pair.
+camera, looking the same way, at the same height. What differs is the robot under
+it, which is the whole point of the pair.
 """
 
 FRANKA_LINK1_HEIGHT = 0.333
 """`fr3_link1`'s origin above `fr3_link0`, measured off the compiled model."""
 
 FRANKA_STRETCHCAM_HEIGHT = (
-    STRETCH_STRETCHCAM_HEIGHT + 0.0845 - FRANKA_LINK0_HEIGHT - FRANKA_LINK1_HEIGHT
+    STRETCH_STRETCHCAM_HEIGHT
+    + STRETCH_BASE_LINK_HEIGHT_M
+    + 0.0845
+    - FRANKA_LINK0_HEIGHT
+    - FRANKA_LINK1_HEIGHT
 )
 """
 Where Stretch's head camera goes on a Franka: 0.460 above `fr3_link1`.
@@ -481,10 +498,12 @@ up at **the same height in the room** on both robots. That is what makes setups
 viewpoints -- the whole premise of transplanting Stretch's camera onto a Franka
 is that the camera does not move, only the arm under it does.
 
-Stretch's head camera is 1.5432 m above the floor, and its base sits on the
-floor. A benchmark Franka does not: `fr3_link0` is 0.75 m up on a pedestal
-(`FRANKA_LINK0_HEIGHT`) and `fr3_link1` another 0.333 m above that, so matching
-the height in the room means 1.5432 - 0.75 - 0.333 = 0.460 m above `fr3_link1`.
+Stretch's head camera is 1.5432 m above `base_link`, which is
+`STRETCH_BASE_LINK_HEIGHT_M` off the floor, so 1.5712 m above the floor -- the
+distinction this constant used to miss, and it was 28 mm low for it. A benchmark
+Franka's `fr3_link0` is 0.75 m up on a pedestal (`FRANKA_LINK0_HEIGHT`) and
+`fr3_link1` another 0.333 m above that, so matching the height in the room means
+1.5712 - 0.75 - 0.333 = 0.488 m above `fr3_link1`.
 
 The number that looks like Stretch's -- 1.21024, which is 1.5432 less
 `fr3_link1`'s own 0.333 -- is the offset that would be right if `fr3_link0`
