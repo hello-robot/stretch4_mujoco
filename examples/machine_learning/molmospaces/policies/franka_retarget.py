@@ -354,37 +354,67 @@ true. Its grasps move 8.6cm with everything else's.
 """
 
 
-STRETCH_SPAWN_BASE_OFFSET_XY = (-0.3598, 0.0874)
+STRETCH_SPAWN_GRASP_FORWARD_AT_ARM_0_M = 0.4667
+"""How far forward of its own base Stretch's grasp centre sits with the arm stowed at 0.
+
+Measured at the mini benchmark's spawn. The telescoping arm extends along this
+same axis, so the grasp centre at any extension is this plus the extension --
+which is what `stretch_spawn_base_offset_xy` relies on.
 """
-How far to stand Stretch back so its spawn gripper pose is the Franka's, in its own axes.
 
-Measured, with both robots at the mini benchmark's spawn: the Franka's grasp
-site sits 0.3069m forward and 0.0m across of the base it is mounted on, and
-Stretch's grasp centre at `STRETCH_SPAWN_ARM_M` sits 0.6667m forward and 0.0874m
-across of its own. The difference is this. Heights come out within 7mm on their
-own (1.1782m against 1.1853m), which the base could not have fixed anyway.
+STRETCH_SPAWN_GRASP_ACROSS_M = 0.0874
+"""How far *across* its own base Stretch's grasp centre sits. Independent of the extension."""
 
-**It is expensive, which is why `match_stretch_spawn_pose_to_franka` is off by
-default.** Two costs, both measured:
+FRANKA_SPAWN_GRASP_FORWARD_M = 0.3069
+"""How far forward of the base it is mounted on the Franka's grasp site sits at its home pose."""
 
-* **Reach.** Stretch's grasp centre reaches 0.9867m from the base with the arm
-  at its 0.52m stop. The benchmark's objects sit 0.6220m away; after this
-  retreat they sit 0.9818m away, which is 5mm inside the hard limit. Every grasp
-  then depends on the base driving back in, and the base accelerates at
-  0.25 m/s^2.
-* **The camera.** `stretch_baseline` hangs the exo camera off `base_link`, so the
-  camera retreats with the robot -- and the whole premise of that setup is a
-  camera at the same place in the room as the Franka's. 0.36m is not a
-  refinement of that comparison, it is the end of it.
 
-The retreat is cancelled in the virtual Franka's mount (see
-`franka_mount_pose_from_base`'s `offset_xy`), so the frame a policy action means
-is unchanged: what moves is the robot, not the retargeting.
+def stretch_spawn_base_offset_xy() -> tuple[float, float]:
+    """How far to stand Stretch back so its spawn gripper pose is the Franka's, in its own axes.
 
-The cheaper version of the same idea, if the point is only that the two grippers
-start together: spawn with the arm stowed at 0 instead, where the retreat is
-0.16m and the objects land 0.782m away with 205mm of reach to spare.
-"""
+    Derived rather than hard-coded, because it depends on
+    `setups.STRETCH_SPAWN_ARM_M`: the retreat has to cancel where Stretch's grasp
+    centre actually is at spawn, and the arm telescopes along the very axis being
+    retreated. Pinned to a number it came out at 0.3598 for a 0.2m spawn
+    extension and stayed there when the extension changed, which retreated the
+    robot 0.1m too far and left `match_stretch_spawn_pose_to_franka` overshooting
+    by exactly the difference -- the grippers landing 0.1m apart in the
+    *opposite* direction to the one the convention exists to fix.
+
+    At the 0.2m extension this reproduces the measured (-0.3598, 0.0874); with
+    the arm stowed at 0 it is the 0.16m the cheap version of this idea costs.
+
+    **It is expensive, which is why `match_stretch_spawn_pose_to_franka` is off
+    by default.** Two costs, both scaling with the retreat:
+
+    * **Reach.** Stretch's grasp centre reaches 0.9867m from the base with the
+      arm at its 0.52m stop, and the benchmark's objects sit 0.6220m away. After
+      the retreat they sit that much further off -- at a 0.2m spawn extension,
+      0.9818m, which is 5mm inside the hard limit. Every grasp then depends on
+      the base driving back in, and the base accelerates at 0.25 m/s^2. A shorter
+      spawn extension buys this back a millimetre for a millimetre.
+    * **The camera.** `stretch_baseline` hangs the exo camera off `base_link`, so
+      the camera retreats with the robot -- and the whole premise of that setup is
+      a camera at the same place in the room as the Franka's. 0.36m is not a
+      refinement of that comparison, it is the end of it.
+
+    Heights are not addressed and cannot be: they come out within 7mm on their
+    own (1.1782m against 1.1853m), which the base could not have fixed anyway.
+
+    The retreat is cancelled in the virtual Franka's mount (see
+    `franka_mount_pose_from_base`'s `offset_xy`), so the frame a policy action
+    means is unchanged: what moves is the robot, not the retargeting.
+    """
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        STRETCH_SPAWN_ARM_M,
+    )
+
+    forward = (
+        STRETCH_SPAWN_GRASP_FORWARD_AT_ARM_0_M
+        + float(STRETCH_SPAWN_ARM_M)
+        - FRANKA_SPAWN_GRASP_FORWARD_M
+    )
+    return (-forward, STRETCH_SPAWN_GRASP_ACROSS_M)
 
 
 def pose_matrix(pos, quat_wxyz) -> np.ndarray:
@@ -465,13 +495,22 @@ class PoseConventions:
     map_franka_wrist_to_flipped_stretch4_wrist: bool = False
     """Retarget every pose onto the half-turned branch of Stretch's wrist.
 
-    A half turn about the approach axis folded into the tool transform itself
-    (`JAW_FLIP`), rather than chosen per step the way `jaw_mode` chooses it. The
-    two are not the same thing. `jaw_mode="flipped"` holds the flipped branch and
-    then *reports the pose back unflipped*, so the policy never sees it; this
-    changes the frame the retargeting is defined in, so both directions carry the
-    turn and it stays self-consistent -- and Stretch's wrist, with the cameras on
-    it, ends up the other way round for good.
+    Implemented as `jaw_mode="flipped"`, which `FrankaOnStretchView.__init__`
+    upgrades to when this is set: the half-turned branch is pinned for the
+    episode and the pose is *reported back unflipped*, so the policy still
+    commands and reads the Franka's own grasp orientation rather than the
+    Franka's rolled half a turn. The turn is deliberately *not* folded into
+    `_tool_correction` -- that would make the retargeting's own frame the
+    half-turned one, and `setups.apply_tool_correction` would compose a second
+    turn on top of it and the two would cancel.
+
+    A pin rather than a per-step preference because the branch is the whole
+    point of the convention: under `jaw_mode="auto"` the wrist leaves the
+    half-turned branch at the first tool yaw that runs it into
+    `wrist_roll_joint`'s limit and never comes back, which is this convention
+    quietly expiring mid-episode with the cameras swinging round as it goes.
+    What the pin costs is reach at large yaws -- see `JAW_MODES`, which measures
+    it at 0.43 rad of orientation.
 
     The grasp is identical either way (see `JAW_FLIP`). The reason to want it is
     the wrist camera: pair it with `change_franka_start_pose_flip_wrist` to put
@@ -485,7 +524,7 @@ class PoseConventions:
     home -- 0.467m against 0.307m from the base, before the spawn extension in
     `setups.STRETCH_SPAWN_ARM_M` adds its own -- so the only way to make the two
     grippers start in the same place is to stand Stretch further back. See
-    `setups.STRETCH_SPAWN_BASE_OFFSET_XY`, which measures how far, and what it
+    `fr.stretch_spawn_base_offset_xy`, which measures how far, and what it
     costs; it is off by default because what it costs is most of the arm's
     remaining reach and the exo camera's agreement with the Franka's.
 
@@ -690,7 +729,7 @@ def franka_mount_pose_from_base(
     `FRANKA_MOUNT_OFFSET_XY` for the one that used to be here.
 
     Under `match_stretch_spawn_pose_to_franka` the default gains the *opposite*
-    of `STRETCH_SPAWN_BASE_OFFSET_XY`, which is how that convention moves the
+    of `stretch_spawn_base_offset_xy()`, which is how that convention moves the
     robot without moving the frame: Stretch stands back, the virtual Franka
     stays where the real one is, and a policy action still means the same point
     of the same room. Read from the environment rather than threaded through
@@ -701,10 +740,8 @@ def franka_mount_pose_from_base(
     if offset_xy is None:
         offset_xy = FRANKA_MOUNT_OFFSET_XY
         if pose_conventions_requested().match_stretch_spawn_pose_to_franka:
-            offset_xy = (
-                offset_xy[0] - STRETCH_SPAWN_BASE_OFFSET_XY[0],
-                offset_xy[1] - STRETCH_SPAWN_BASE_OFFSET_XY[1],
-            )
+            retreat = stretch_spawn_base_offset_xy()
+            offset_xy = (offset_xy[0] - retreat[0], offset_xy[1] - retreat[1])
     base = pose_matrix([x, y, 0.0], R.from_euler("z", theta).as_quat(scalar_first=True))
     offset = pose_matrix([offset_xy[0], offset_xy[1], pedestal_height], [1, 0, 0, 0])
     return base @ offset
@@ -1270,6 +1307,20 @@ class FrankaOnStretchView:
         if pose_conventions is None:
             pose_conventions = pose_conventions_requested()
         self.pose_conventions = pose_conventions
+        # A pin, not a seed. `map_franka_wrist_to_flipped_stretch4_wrist` is
+        # wanted for the wrist cameras, which are bolted to the hand, so which
+        # branch the wrist holds is the one thing this convention controls that
+        # anything downstream can see. Left in "auto" it does not survive the
+        # episode: `JAW_FLIP_GAIN_RAD` is hysteresis about the branch *in use*,
+        # with no restoring force towards `jaw_natural_flipped`, so the first
+        # tool yaw that runs the half-turned branch into `wrist_roll_joint`'s
+        # limit evicts the wrist for good and the convention expires mid-reach.
+        # Only "auto" is upgraded, so a caller that asked for "upright" outright
+        # still gets the mode it named.
+        if self.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist and (
+            self.jaw_mode == "auto"
+        ):
+            self.jaw_mode = "flipped"
         if self.pose_conventions.changes_franka_start_pose:
             self.franka.init_qpos = franka_start_arm_qpos(
                 self.franka, self.pose_conventions, float(franka_mount_pose[2, 3])
@@ -1323,27 +1374,29 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = self.franka.init_qpos.copy()
         self.last_gripper_ctrl = np.array([ROBOTIQ_CTRL_RANGE[0]])
         self.last_residual = np.zeros(6)
-        self.jaw_natural_flipped = (
-            jaw_mode == "flipped"
-            or self.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist
-        )
+        self.jaw_natural_flipped = self.jaw_mode == "flipped"
         """Which branch this wrist rests in -- the state it starts and returns to.
 
         `map_franka_wrist_to_flipped_stretch4_wrist` makes it the half-turned
-        one: Stretch's natural state is the flipped wrist, and the Franka's grasp
-        orientation is mapped onto it from there. That mapping is what
+        one, by way of the `jaw_mode` upgrade above: Stretch's natural state is
+        the flipped wrist, and the Franka's grasp orientation is mapped onto it
+        from there. Derived from `self.jaw_mode` rather than from the convention
+        directly, so an explicit `jaw_mode="upright"` is not contradicted by a
+        natural branch claiming the opposite. That mapping is what
         `_tool_correction` stays free of and what `franka_joint_pos` undoes when
         reporting, so the orientation the policy commands and reads back is the
         Franka's, not the Franka's rolled half a turn.
 
-        A default rather than a pin, under `jaw_mode="auto"`: the arm sits here
-        and `_solve_either_jaw` leaves it only where the wrist physically cannot
+        Under `jaw_mode="auto"` this is a default rather than a pin: the arm
+        sits here and `_solve_either_jaw` leaves it wherever the wrist cannot
         hold this branch -- Stretch's `wrist_roll_joint` range is asymmetric, and
         at large tool yaws the half-turned branch runs into its limit and settles
         0.43 rad short (see `JAW_MODES`). Pinning it instead costs real reach:
         measured on the recorded knife episode, a pinned branch takes the
         retargeting residual from 4.0mm mean to 198.5mm. `jaw_mode="flipped"`
-        still pins it, for a caller that wants that.
+        pins it, and `map_franka_wrist_to_flipped_stretch4_wrist` now selects
+        that mode -- a convention held for the wrist cameras has to outlast the
+        first reorientation to be worth anything.
         """
         self.jaw_flipped = self.jaw_natural_flipped
         """Whether the arm is currently holding the half-turned jaw. See `JAW_FLIP`."""

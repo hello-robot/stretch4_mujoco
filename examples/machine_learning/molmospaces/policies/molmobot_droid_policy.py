@@ -595,13 +595,24 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         # Taken as given, never measured. See `target_z_offset`.
         proxy.target_z_offset = float(policy_config.target_z_offset)
 
+        # Before the snap, not after, and `replay.replay_episode` does the same.
+        # `reset()` calls `StretchArmIK.releash()`, which re-centres the base's
+        # leash on wherever the robot is standing *at that moment*. With
+        # `include_base` -- the default -- the opening snap is a whole-body solve
+        # that can drive the base to reach the Franka's home pose, so re-leashing
+        # afterwards makes the snap's excursion the new centre and the episode
+        # gets that yaw for free on top of its own leash, with nothing pulling the
+        # base back towards where the episode meant to stand it. Leashing first
+        # bounds the snap itself, which is what `_ScenePanel` already assumes when
+        # it frames a replay camera on the episode's base pose rather than the
+        # robot's.
+        proxy.reset()
         if policy_config.snap_to_franka_home:
             residual = proxy.snap_to_franka_joint_pos()
             log.debug(
                 f"[droid] snapped to the Franka home pose, residual "
                 f"{np.round(residual, 4).tolist()}"
             )
-        proxy.reset()
 
         log.info(
             f"[droid] virtual Franka at {np.round(proxy.franka_mount_pose[:3, 3], 3).tolist()}, "

@@ -208,12 +208,27 @@ in nearly the same place on themselves. Measured on the *surfaces* an object
 touches, from each hand's own grasp frame along its approach, with the Robotiq
 open and Stretch's fingers at the 132mm tip separation that matches its jaw:
 
-    Robotiq pads          -33.6 ..  +4.0 mm     grasp site 4.0mm behind the pad front
-    Stretch fingertips    -48.8 .. +13.1 mm     grasp centre 13.1mm behind the tip front
+    depth (mm)          +10    0   -10   -20   -30   -40   -50   -60   -70
+    Robotiq pads         --    87    87    87    87    90    68    19    --
+    Stretch fingertip   127   124   108   108    87    65    44    23     3
 
-So `grasp_offset_m = +0.003` is what centres the two gripping surfaces on each
-other, and +0.030 is not a geometric alignment at all -- it drives Stretch's
-fingertips 27mm deeper than the Robotiq's pads ever go.
+The Robotiq's pads are parallel, so its jaw is one width all the way in and its
+grasp site sits 4.0mm behind their front edge. Stretch's fingertip is a wedge:
+it starts at +13.1mm, 127mm wide, and tapers to nothing about 70mm in.
+
+The landmark that survives that asymmetry is the **front edge**, where each hand
+first touches anything -- and Stretch's fingertip reaches 9.1mm further along the
+approach than the Robotiq's pads do. So `grasp_offset_m = -0.009` makes the two
+tip lines flush, and the geometric answer is a few millimetres either side of
+zero. +0.030 is not a geometric alignment at all: it drives Stretch's fingertips
+39mm past the Robotiq's pad front, and 27mm deeper than its pads ever reach.
+
+Do not read a *midpoint* off the two rows. The Robotiq's midpoint means
+something because its band is uniform; Stretch's is the middle of a surface
+running from 127mm wide to 3mm, and matching the two says nothing. Nor does
+"the depth where Stretch's jaw is as wide as the Robotiq's" pick an offset --
+`aperture.py` solves for the tip separation that makes that true at whatever
+offset it is handed, so it holds at every offset and distinguishes none.
 `retargetting/grasp_center_alignment.py` measures this and renders it.
 
 This paragraph used to say the grasp centre sits 1.5cm past the fingertips and
@@ -898,7 +913,7 @@ def franka_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None:
     _point_base_at(episode_spec.task, FRANKA_LINK0_HEIGHT - pedestal)
 
 
-STRETCH_SPAWN_ARM_M = 0.2
+STRETCH_SPAWN_ARM_M = 0.1
 """
 How far Stretch's arm is telescoped out when an episode spawns it, in metres.
 
@@ -919,18 +934,17 @@ def stretch_spawn_base_pose(base_xy, yaw: float) -> tuple[float, float]:
     """`base_xy`, moved back so Stretch's spawn gripper pose is the Franka's.
 
     A no-op unless `match_stretch_spawn_pose_to_franka` is on. The offset is in
-    the base's own axes, so it is rotated by the spawn yaw before it is applied.
+    the base's own axes, so it is rotated by the spawn yaw before it is applied,
+    and it is derived from `STRETCH_SPAWN_ARM_M` rather than pinned -- see
+    `fr.stretch_spawn_base_offset_xy`, which explains what pinning it cost.
     """
     base_xy = np.asarray(base_xy, dtype=float)[:2]
     if not pose_conventions_requested().match_stretch_spawn_pose_to_franka:
         return float(base_xy[0]), float(base_xy[1])
+    offset = fr.stretch_spawn_base_offset_xy()
     forward = np.array([np.cos(yaw), np.sin(yaw)])
     across = np.array([-np.sin(yaw), np.cos(yaw)])
-    moved = (
-        base_xy
-        + forward * fr.STRETCH_SPAWN_BASE_OFFSET_XY[0]
-        + across * fr.STRETCH_SPAWN_BASE_OFFSET_XY[1]
-    )
+    moved = base_xy + forward * offset[0] + across * offset[1]
     return float(moved[0]), float(moved[1])
 
 

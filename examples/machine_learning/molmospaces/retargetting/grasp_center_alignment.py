@@ -21,22 +21,34 @@ projects it on the hand's own approach axis, which is the surface an object
 actually touches. From the Robotiq's grasp site, with the Robotiq open and
 Stretch's hand at the 132mm tip separation that matches its 87mm jaw:
 
-    Robotiq pads                         -33.6 ..  +4.0 mm   (centre -14.8)
-    Stretch fingertips, grasp_offset 0   -48.8 .. +13.1 mm   (centre -17.9)
+    Robotiq pads                         -33.6 ..  +4.0 mm
+    Stretch fingertips, grasp_offset 0   -48.8 .. +13.1 mm
 
-So both hands carry their grasp frame near the tip end of their own gripping
-surface -- the Robotiq 4.0mm behind its pad front, Stretch 13.1mm behind its
-fingertip front -- and the two surfaces are already within 3mm of concentric.
-The offset that centres them is +0.003, not the +0.030 the study ships and not
-the +0.106 "to the pads" that the geom-origin reading implies.
+Both hands carry their grasp frame near the tip end of their own gripping
+surface: the Robotiq 4.0mm behind its pad front, Stretch 13.1mm behind its
+fingertip front. The offset that makes those two front edges flush is -0.009 --
+not the +0.030 the study ships, and not the +0.106 "to the pads" that the
+geom-origin reading implies.
 
-That is a statement about *position* and not about *grip*. The Robotiq's pads are
-parallel, so its jaw is 86.6mm wide at every depth; Stretch's fingers converge
-behind their tips, so its jaw narrows continuously and is only 87mm wide about
-15mm in. Aligning the surfaces and holding the object in a jaw of the same width
-are therefore different requests with different answers -- see
-`aperture.py`, which answers the second one -- and `ROBOTIQ_MAX_APERTURE_M`
-carries the trade.
+**The front edge is the only landmark the two hands share**, and the reason is
+the shape of the jaws. Ray-cast across each at a range of depths from its own
+grasp frame:
+
+    depth (mm)          +10    0   -10   -20   -30   -40   -50   -60   -70
+    Robotiq pads         --    87    87    87    87    90    68    19    --
+    Stretch fingertip   127   124   108   108    87    65    44    23     3
+
+The Robotiq's pads are parallel, so its jaw is one width all the way in and any
+point of it means the same thing. Stretch's fingertip is a wedge. So the
+*midpoints* of the two spans above are not comparable -- one is the middle of a
+uniform pad, the other the middle of a taper -- and this module reports that
+figure only to say so.
+
+Nor does "put the object where Stretch's jaw is as wide as the Robotiq's" pick
+an offset: `aperture.py` solves for the tip separation that makes that true at
+whatever offset it is handed (0.030 -> 132mm tips, 0.015 -> 131mm), so it holds
+at every offset and singles out none. Where the object sits and how wide the jaw
+is there are two knobs, and `ROBOTIQ_MAX_APERTURE_M` carries the trade.
 
 The lift ceiling, which invalidates the obvious version of this measurement
 -------------------------------------------------------------------------
@@ -325,14 +337,20 @@ def report(rows: list[dict]) -> None:
     centred = float(np.median([row["offset_m"] + row["centre_gap_mm"] / 1000.0 for row in usable]))
     fronted = float(np.median([row["offset_m"] + row["front_gap_mm"] / 1000.0 for row in usable]))
     click.secho(
-        f"\n  grasp_offset_m = {centred:+.4f} centres the two gripping surfaces on each other."
-        f"\n  grasp_offset_m = {fronted:+.4f} lines up their front edges instead.",
+        f"\n  grasp_offset_m = {fronted:+.4f} makes the two hands' front edges flush.",
         fg="green",
     )
     click.echo(
-        "\n  Both are statements about position. Holding the object in a jaw as wide as the\n"
-        "  Robotiq's is a different request -- Stretch's jaw narrows with depth and the\n"
-        "  Robotiq's does not -- and `aperture.py` is what answers that one."
+        "  That is the landmark to use: it is where each hand first touches anything, and\n"
+        "  it is the one thing the two surfaces have in common. The Robotiq's pads are\n"
+        "  parallel and Stretch's fingertip is a wedge, so there is no second landmark\n"
+        "  that means the same thing on both hands.\n"
+        f"\n  (Their midpoints would coincide at {centred:+.4f}, and that number is not worth\n"
+        "  much: the Robotiq's midpoint is the middle of a uniform pad, Stretch's is the\n"
+        "  middle of a taper running from 127mm wide to 3mm.)\n"
+        "\n  Neither is the same question as holding the object in a jaw as wide as the\n"
+        "  Robotiq's. That one cannot pick an offset at all -- `aperture.py` solves for the\n"
+        "  tip separation that makes it true at whatever offset it is given."
     )
 
 
