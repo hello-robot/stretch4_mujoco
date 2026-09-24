@@ -52,11 +52,14 @@ class StretchMujocoSimulator:
         cameras_to_use: list[StretchCameras] = [],
         start_translation: list | None = None,
         start_rotation_quat: list | None = None,
+        tool_name: str | None = None,
     ) -> None:
         self.scene_xml_path = scene_xml_path
         self.model = model
         self.camera_hz = camera_hz
-        self.urdf_model = utils.URDFmodel(self.get_urdf_path())
+        self.tool_name = tool_name
+        self.urdf_path = self.get_urdf_path(tool_name)
+        self.urdf_model = utils.URDFmodel(self.urdf_path)
         self._server_process = None
         self._cameras_to_use = cameras_to_use
         self._start_translation = start_translation
@@ -89,19 +92,24 @@ class StretchMujocoSimulator:
         return str(utils.models_path / "scene.xml")
 
     @staticmethod
-    def get_robot_xml_path() -> str:
+    def get_robot_xml_path(tool_name: str | None = None) -> str:
         """
         Returns the default robot XML path for the Stretch Mujoco Simulator.
+
+        The Stretch 3 MJCF is prebuilt, so only its default tool (None) is available.
         """
+        if tool_name is not None:
+            raise ValueError(f"Stretch 3 has no MJCF for tool '{tool_name}'.")
         return utils.get_absolute_path_stretch_xml(
             str(utils.models_path / "stretch_3" / "stretch.xml")
         )
 
     @staticmethod
-    def get_urdf_path() -> str:
+    def get_urdf_path(tool_name: str | None = None) -> str:
         pkg_path = utils.get_urdf_package_path("stretch_urdf")
         model_name = "SE3"  # RE1V0, RE2V0, SE3
-        tool_name = "eoa_wrist_dw3_tool_sg3"  # eoa_wrist_dw3_tool_sg3, tool_stretch_gripper, etc
+        if tool_name is None:
+            tool_name = "eoa_wrist_dw3_tool_sg3"  # eoa_wrist_dw3_tool_sg3, tool_stretch_gripper, etc
 
         return str(pkg_path / model_name / utils.get_urdf_file_name(model_name, tool_name))
 

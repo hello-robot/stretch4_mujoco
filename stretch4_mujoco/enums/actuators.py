@@ -56,9 +56,9 @@ class Actuators(Enum):
         if self == Actuators.gripper:
             return ["joint_gripper_slide", "gripper_slide_joint"]
         if self == Actuators.gripper_left_finger:
-            return ["joint_gripper_finger_left", "gripper_finger_left_joint"]
+            return ["joint_gripper_finger_left", "gripper_finger_left_joint", "finger_left_joint"]
         if self == Actuators.gripper_right_finger:
-            return ["joint_gripper_finger_right", "gripper_finger_right_joint"]
+            return ["joint_gripper_finger_right", "gripper_finger_right_joint", "finger_right_joint"]
         if self == Actuators.head_pan:
             return ["joint_head_pan", "head_pan_joint"]
         if self == Actuators.head_tilt:
@@ -100,6 +100,10 @@ class Actuators(Enum):
         if "joint_gripper_finger_left" in joint_name or "gripper_finger_left" in joint_name:
             return Actuators.gripper_left_finger
         if "joint_gripper_finger_right" in joint_name or "gripper_finger_right" in joint_name:
+            return Actuators.gripper_right_finger
+        if joint_name == "finger_left_joint":  # parallel gripper
+            return Actuators.gripper_left_finger
+        if joint_name == "finger_right_joint":
             return Actuators.gripper_right_finger
         if joint_name in ("joint_head_pan", "head_pan_joint"):
             return Actuators.head_pan

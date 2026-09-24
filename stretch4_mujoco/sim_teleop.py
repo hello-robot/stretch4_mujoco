@@ -900,7 +900,7 @@ def _build_flying_gripper_controller(sim: StretchMujocoSimulator):
     from yourdfpy import urdf as ud
 
     out_dir = tempfile.mkdtemp(prefix="sim_gamepad_teleop_")
-    robot = ud.URDF.load(type(sim).get_urdf_path())
+    robot = ud.URDF.load(sim.urdf_path)
     urdf_path = make_planar_ik_urdf(
         robot, "sim_gamepad_teleop", out_dir, is_merge_arm=True, is_fixed_wrist=False
     )
