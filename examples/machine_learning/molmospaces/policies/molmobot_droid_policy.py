@@ -640,8 +640,51 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
                 "gripper": proxy.get_move_group("gripper").joint_pos,
             },
             DROID_EXO_CAMERA_KEY: self._camera(obs, policy_config.exo_camera),
-            DROID_WRIST_CAMERA_KEY: self._camera(obs, policy_config.wrist_camera),
+            DROID_WRIST_CAMERA_KEY: self._wrist_camera(
+                obs, policy_config.wrist_camera, proxy
+            ),
         }
+
+    @staticmethod
+    def _wrist_camera(obs: dict, name: str, proxy: FrankaOnStretchView) -> np.ndarray:
+        """The wrist frame, turned back upright when the wrist is held half over.
+
+        `JAW_FLIP` is a half turn about the tool's *approach* axis, and Stretch's
+        wrist camera looks along that axis -- so holding the flipped branch rolls
+        the camera 180 degrees about its own optical axis. Measured on the
+        compiled model at four tool poses: 180.000 degrees, with the axis of that
+        rotation 0.003 degrees off the camera's own -z. The viewpoint moves about
+        110mm, which is the camera crossing to the other side of the hand and is
+        the *reason* to want the flipped branch -- Stretch's gripper camera has a
+        better view of the grasp from there.
+
+        What is not wanted is the roll. The DROID checkpoint reads the wrist view
+        more closely than any other channel (see `cameras.RetargetParams.
+        wrist_fov_deg`), and it was trained on a Franka whose hand is not turned
+        over: hand it an upside-down frame and its corrections come back
+        inverted, which looks exactly like an arm driving away from the object it
+        is reaching for. Undoing the roll in image space keeps the better
+        viewpoint and returns the orientation the checkpoint expects -- the same
+        trick `ExoCameraParams.quarter_turns` plays for the head camera, which is
+        bolted on sideways for reasons equally uninteresting to a policy.
+
+        Keyed on `jaw_flipped` rather than on the pose convention because that
+        flag is the physical truth: under `jaw_mode="auto"` the branch can change
+        mid-episode, and the compensation has to change with it.
+
+        Exact only where the branch is: at a tool yaw that runs the wrist into
+        its roll limit the arm settles short of the half turn (158.9 degrees at
+        one of the four poses measured; see `JAW_MODES`), and a full turn back
+        then over-corrects by the shortfall. Still much nearer upright than
+        leaving it, and `retarget_orientation_error_mean_rad` already reports
+        when the branch is not being held.
+        """
+        frame = StretchMolmoBotDroidPolicy._camera(obs, name)
+        if not proxy.jaw_flipped:
+            return frame
+        # `ascontiguousarray` again, for `_camera`'s reason: `rot90` returns a
+        # view with negative strides and `torch.from_numpy` refuses those.
+        return np.ascontiguousarray(np.rot90(frame, 2))
 
     @staticmethod
     def _camera(obs: dict, name: str) -> np.ndarray:
