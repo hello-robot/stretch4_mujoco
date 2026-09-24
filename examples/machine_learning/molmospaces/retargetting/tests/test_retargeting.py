@@ -47,6 +47,10 @@ cannot win -- `test_above_the_lift_ceiling...` pins that shortfall to the number
     python -m examples.machine_learning.molmospaces.retargetting.tests.test_retargeting \
         --visualize
 
+    # the same render with the two robots in one scene, standing where they really
+    # stand: the Franka a translucent green ghost inside Stretch, not colliding with it
+    python -m ...test_retargeting --visualize --overlay_robots
+
     # either mode at the target height offset a rollout actually applies
     python -m ...test_retargeting --target-z-offset 0.05
     python -m ...test_retargeting --target-z-offset 0.05 --visualize
@@ -81,7 +85,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,6 +109,7 @@ from examples.machine_learning.molmospaces.retargetting.diagnose import (  # noq
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     FRANKA_LINK0_HEIGHT,
     apply_tool_correction,
+    stretch_spawn_base_pose,
 )
 
 # =============================================================================
@@ -638,6 +643,7 @@ class RetargetRig:
         pose_conventions: fr.PoseConventions | None = None,
     ) -> None:
         self.model, self.data, self.view, self.namespace = build_standing_robot()
+        self._stand_stretch_where_the_conventions_ask()
         self._home_qpos = self.data.qpos.copy()
 
         base_xytheta = np.asarray(self.view.get_move_group("base").joint_pos, dtype=float)
@@ -690,6 +696,48 @@ class RetargetRig:
         self.forward = np.array([math.cos(yaw), math.sin(yaw), 0.0])
         self.left = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
         self.up = np.array([0.0, 0.0, 1.0])
+
+    def _stand_stretch_where_the_conventions_ask(self) -> None:
+        """Apply `match_stretch_spawn_pose_to_franka`'s retreat, before anything reads the base.
+
+        A no-op unless that convention is on, and the same helper an episode
+        spawns through (`setups.stretch_spawn_base_pose`) so the harness cannot
+        retreat by a different amount than a rollout does.
+
+        It has to happen here, and the symptom of it not happening is worth
+        writing down because it is the quiet kind. The convention is two halves of
+        one move: the robot stands back by `stretch_spawn_base_offset_xy()`, and
+        `franka_mount_pose_from_base` cancels exactly that in the mount, so the
+        virtual Franka stays put and a policy action keeps meaning the same point
+        of the room. **Only the second half reads the environment.** A caller that
+        places the base itself gets the cancellation whether or not it applied the
+        retreat -- so this harness, which stood Stretch at the mini benchmark's
+        spawn under every convention, was getting the cancellation alone and
+        planting the virtual Franka 0.37m in front of where it belongs.
+
+        Which does not fail a single check, and that is the point. The waypoints
+        are built from the virtual Franka's home pose, so they moved forward with
+        it; Stretch was asked to reach 0.37m further into the room than the
+        benchmark's counter and tracked that target to the millimetre, and every
+        assertion in this file passed while both robots drove their grippers down
+        through the countertop. It is visible in `--visualize` and it was visible
+        in nothing else.
+
+        `test_a_replay_stands_stretch_where_the_mount_expects_it` is the same
+        composition checked for the replay path, which hit this first;
+        `test_the_conventions_do_not_move_the_virtual_franka_off_the_counter` is
+        it for this one.
+        """
+        base = np.asarray(self.view.get_move_group("base").joint_pos, dtype=float).reshape(-1)
+        x, y, yaw = float(base[0]), float(base[1]), float(base[2])
+        moved_x, moved_y = stretch_spawn_base_pose((x, y), yaw)
+        if (moved_x, moved_y) == (x, y):
+            return
+        # Through `set_qpos_dict`, which is how `build_standing_robot` placed it
+        # in the first place -- the base's three joints carry its world pose, so
+        # writing them is standing the robot somewhere else.
+        self.view.set_qpos_dict({"base": [moved_x, moved_y, yaw]})
+        mujoco.mj_forward(self.model, self.data)
 
     # -- the poses -----------------------------------------------------------
 
@@ -1933,6 +1981,65 @@ def test_the_arm_alone_is_short_and_the_base_makes_up_the_difference() -> None:
     )
 
 
+@pytest.mark.parametrize("retreating", [False, True])
+def test_the_conventions_do_not_move_the_virtual_franka_off_the_counter(
+    monkeypatch, retreating
+) -> None:
+    """Whatever `match_stretch_spawn_pose_to_franka` moves, it is not the frame.
+
+    The convention stands Stretch back by `stretch_spawn_base_offset_xy()` and
+    cancels exactly that in the mount, so what moves is the robot and not the
+    point of the room a policy action means. This asserts the composition from
+    the harness's end: the virtual Franka comes out at the benchmark's own base
+    spot either way, and Stretch is the only thing that moved.
+
+    Pinning the mount pins the waypoints, which is what this is really about.
+    Every pose in `WAYPOINTS` is an offset from the virtual Franka's home tool
+    pose, so a mount 0.37m into the room is fifteen waypoints 0.37m into the
+    room -- `RetargetRig._stand_stretch_where_the_conventions_ask` has the
+    account of what that looked like, which was both robots reaching down
+    through the countertop while every check in this file passed.
+
+    Parametrized on the convention rather than asserted only when it is on,
+    because "the mount did not move" is worth nothing unless the retreat it is
+    cancelling actually happened -- so the off case pins the no-op and the on
+    case pins that Stretch really did stand back.
+    """
+    monkeypatch.setenv(
+        fr.POSE_CONVENTION_ENV_VARS["match_stretch_spawn_pose_to_franka"],
+        "1" if retreating else "0",
+    )
+    rig = RetargetRig(
+        pose_conventions=fr.PoseConventions(match_stretch_spawn_pose_to_franka=retreating)
+    )
+
+    spawn = np.asarray(mini_benchmark.ROBOT_BASE_XY, dtype=float)
+    base = np.asarray(rig.view.get_move_group("base").joint_pos, dtype=float)[:2]
+    retreat = float(np.linalg.norm(base - spawn))
+    if retreating:
+        assert retreat > 0.1, (
+            f"with `match_stretch_spawn_pose_to_franka` on, the harness should stand Stretch "
+            f"back from the benchmark's spawn, but it moved {retreat * 1000:.1f}mm. The mount "
+            f"cancels the retreat whether or not the retreat happened, so an unapplied one "
+            f"does not cancel out -- it displaces the virtual Franka by its whole length."
+        )
+    else:
+        assert retreat == pytest.approx(0.0, abs=1e-9), (
+            f"with the convention off the retreat is meant to be a no-op, but Stretch spawned "
+            f"{retreat * 1000:.1f}mm off the benchmark's own base pose."
+        )
+
+    drift = float(np.linalg.norm(rig.mount_pose[:2, 3] - spawn))
+    assert drift == pytest.approx(0.0, abs=1e-9), (
+        f"the virtual Franka came out at {np.round(rig.mount_pose[:2, 3], 4).tolist()} rather "
+        f"than the benchmark's base {np.round(spawn, 4).tolist()}, {drift * 100:.1f}cm away. "
+        f"The retreat and the mount's cancellation are supposed to be the same displacement "
+        f"in opposite directions; every waypoint is built off this pose, so they are all that "
+        f"far into the room -- and the retargeting will track them there to the millimetre "
+        f"and report success."
+    )
+
+
 # =============================================================================
 # Replaying a recorded run as Stretch
 # =============================================================================
@@ -1944,7 +2051,7 @@ def test_a_replay_stands_stretch_where_the_mount_expects_it(monkeypatch, retreat
 
     `match_stretch_spawn_pose_to_franka` is two halves of one move:
     `setups.stretch_spawn_base_pose` stands Stretch back by
-    `STRETCH_SPAWN_BASE_OFFSET_XY`, and `franka_mount_pose_from_base` cancels
+    `stretch_spawn_base_offset_xy()`, and `franka_mount_pose_from_base` cancels
     exactly that in the mount, so the virtual Franka stays at the pose the
     episode authored and a policy action keeps meaning the same point of the
     room. Only the second half reads the environment. A caller that places the
@@ -2000,6 +2107,81 @@ def test_a_replay_stands_stretch_where_the_mount_expects_it(monkeypatch, retreat
         f"{np.linalg.norm(mount[:2, 3] - authored_xy) * 100:.1f}cm apart, and every pose a "
         f"replay retargets is off by that much while its residual reports success."
     )
+
+
+
+def test_the_overlay_scene_shows_the_two_robots_the_checks_actually_drive(
+    rig: RetargetRig,
+) -> None:
+    """`--overlay_robots` renders a third scene, so pin that it is not its own opinion.
+
+    The overlay is a second copy of both robots, posed by copying joint positions
+    across (`OverlayScene.sync`). That is a picture of the comparison rather than
+    part of it -- but a picture is what people will read the retargeting off, and
+    a copy that quietly dropped a joint would draw a robot with a straight arm
+    standing next to a perfectly correct set of numbers. So the copy is checked
+    the only way it can be: by asking both scenes where the same two hands ended
+    up and requiring the same answer to the micron.
+
+    The exactness is not ambition. Nothing is solved in the overlay and nothing is
+    stepped in it; the same joint values go through the same FK in the same model,
+    so anything other than bit-for-bit agreement means a joint was missed, not
+    that a tolerance was tight.
+
+    Collisions are the other half. The two robots stand inside one another on
+    purpose -- that is what an overlay is -- so the Franka is flagged to collide
+    with nothing, and this asserts that no contact involving it survives a
+    `mj_forward` at a waypoint where the two are deepest in each other.
+    """
+    overlay = OverlayScene(rig)
+    stretch_hand = rig.namespace + "grasp_center_link"
+    franka_hand = "fr3_link7"
+
+    def body_of(geom) -> str:
+        """The name of the body a contacting geom belongs to."""
+        return overlay.model.body(overlay.model.geom_bodyid[geom]).name
+
+    for waypoint in WAYPOINTS:
+        rig.command_waypoint(waypoint)
+        overlay.sync()
+
+        for label, expected, got in (
+            (
+                "stretch",
+                rig.data.body(stretch_hand).xpos,
+                overlay.data.body(stretch_hand).xpos,
+            ),
+            (
+                "franka",
+                rig.franka_data.body(rig.franka_namespace + franka_hand).xpos,
+                overlay.data.body(OVERLAY_FRANKA_NAMESPACE + franka_hand).xpos,
+            ),
+        ):
+            drift = float(np.linalg.norm(np.asarray(expected) - np.asarray(got)))
+            assert drift == pytest.approx(0.0, abs=1e-9), (
+                f"at {waypoint.label} the overlay draws the {label} hand {drift * 1000:.3f}mm "
+                f"from where the model under test has it. The overlay copies joint positions "
+                f"by name and runs the same FK, so this is a joint that did not get copied -- "
+                f"every --overlay_robots frame is a picture of a robot in a pose no check "
+                f"ever measured."
+            )
+
+        touching = [
+            (body_of(overlay.data.contact.geom1[contact]),
+             body_of(overlay.data.contact.geom2[contact]))
+            for contact in range(overlay.data.ncon)
+        ]
+        collided = [
+            pair
+            for pair in touching
+            if any(name.startswith(OVERLAY_FRANKA_NAMESPACE) for name in pair)
+        ]
+        assert not collided, (
+            f"at {waypoint.label} the overlay Franka is in {len(collided)} contact(s) -- "
+            f"{collided[:3]}. It stands inside Stretch by design and is supposed to collide "
+            f"with nothing, so a contact here means the scene would fire the two robots apart "
+            f"if anything ever stepped it."
+        )
 
 
 
@@ -2219,22 +2401,45 @@ class ToolFrameRenderer:
         stack and the middle is where the robot is. Neutral white rather than a
         marker colour: it is a statement about the drawing, not about any one
         thing in it.
+
+        Shrunk to fit rather than allowed to run off the edge. The notes grew a
+        clause per correction -- the axis convention, then the grasp offset, then
+        the height offset, then which robot is which in the overlay -- and the
+        panel did not, so the last clause was being cropped by the frame edge at
+        exactly the settings where it had something to say. A note that falls off
+        the panel is worse than a small one, because nothing in the image shows
+        that it was cut.
         """
         import cv2
 
-        origin = (12, image.shape[0] - 14)
+        margin = 12
+        drawn = cv2.getTextSize(note, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, 1)[0][0]
+        available = image.shape[1] - 2 * margin
+        scale = LABEL_FONT_SCALE * min(1.0, available / max(drawn, 1))
+        origin = (margin, image.shape[0] - 14)
         for thickness, shade in ((3, (0, 0, 0)), (1, (235, 235, 235))):
             cv2.putText(
                 image, note, origin, cv2.FONT_HERSHEY_SIMPLEX,
-                LABEL_FONT_SCALE, shade, thickness, cv2.LINE_AA,
+                scale, shade, thickness, cv2.LINE_AA,
             )
         return image
 
     def _label(self, image: np.ndarray, markers) -> np.ndarray:
-        """Draw each marker's label above its ball, in the ball's own colour."""
+        """Draw each marker's label above its ball, in the ball's own colour.
+
+        Lifted clear of the ball and then, if that still lands it on a label
+        already drawn, lifted further until it does not. The index alone is not
+        enough spacing, which the overlay render is what showed: two balls a grasp
+        offset apart project to almost the same height on screen, so the fixed
+        per-index step was cancelled by the balls' own separation and the franka
+        and stretch labels were written through each other. Moving a label up is
+        the cheap resolution -- it stays nearer its own ball than to any other,
+        and it is still the only label in that colour.
+        """
         import cv2
 
         height, width = image.shape[:2]
+        drawn: list[int] = []
         for index, marker in enumerate(markers):
             if not marker.label:
                 continue
@@ -2243,8 +2448,11 @@ class ToolFrameRenderer:
                 continue
             x, y = placed
             y -= LABEL_LIFT_PX + index * LABEL_STACK_PX
+            while any(abs(y - row) < LABEL_STACK_PX for row in drawn):
+                y -= LABEL_STACK_PX
             if not (0 <= y < height):
                 continue
+            drawn.append(y)
             # The renderer hands back RGB, so the colour goes in unswapped; the
             # caller is what converts the finished frame to BGR.
             rgb = tuple(int(round(255 * channel)) for channel in marker.color[:3])
@@ -2279,6 +2487,31 @@ axes needed no rotating, and saying so is cheaper than leaving the reader to
 wonder which panel was adjusted.
 """
 
+OVERLAY_AXES_NOTE = (
+    "one scene: the green ghost is the franka, solid is stretch  |  all axes in "
+    "Stretch's tool convention: x/red = approach"
+)
+"""
+The overlay panel's standing note. See `OVERLAY_FRANKA_ALPHA` for the translucency.
+
+It has to say which robot is which, because that is the one thing the side-by-side
+render never had to: there, the panel a robot is drawn in names it. Here both are
+in the same picture, standing inside one another, and "the see-through one is the
+reference" is the whole key to reading the image.
+"""
+
+OVERLAY_CAMERA_DISTANCE = 1.8
+"""
+What `--distance` defaults to under `--overlay_robots`.
+
+The ordinary default frames the grippers, which is what a panel per robot is for:
+each half has one robot in it and the tool frames are the thing being compared.
+An overlay at that distance is a different picture -- two whole robots occupying
+one another, with the Franka's forearm across most of the frame -- and it wants
+enough room to see which limb is whose. Only a default: `--distance` still wins
+if it is given.
+"""
+
 START_HOLD_MULTIPLIER = 3
 """
 How much longer to hold the start frame than a waypoint's arrival.
@@ -2300,18 +2533,22 @@ information, it is none of it.
 """
 
 
-def stretch_note(reached: Reached) -> str:
-    """The Stretch panel's caption: its axis convention, plus any offset in force.
+def offsets_note(reached: Reached) -> str:
+    """The part of a panel's caption that names whichever offsets are in force.
 
-    The offsets are named down here rather than on the markers because this line
-    has a whole panel width and the markers have whatever pixels they are not
-    overlapping. It matters that they are named *somewhere*: at a grasp offset the
-    two balls sit a whole 9cm apart while `position_error` reads 0mm, and a reader
-    with no caption has every reason to call that a retargeting error of 9cm. It
-    is the opposite -- the retargeting tracked a target that was deliberately
-    moved.
+    The offsets are named in the caption rather than on the markers because this
+    line has a whole panel width and the markers have whatever pixels they are
+    not overlapping. It matters that they are named *somewhere*: at a grasp
+    offset the two balls sit a whole 9cm apart while `position_error` reads 0mm,
+    and a reader with no caption has every reason to call that a retargeting
+    error of 9cm. It is the opposite -- the retargeting tracked a target that was
+    deliberately moved.
+
+    Split out from `stretch_note` because the overlay panel needs the same
+    sentence under a different statement about axes: one scene has one caption,
+    and it is the same two offsets that have to be named in it.
     """
-    note = STRETCH_AXES_NOTE
+    note = ""
     if reached.grasp_offset:
         note += (
             f"  |  grasp_offset {reached.grasp_offset * 100:+.1f}cm: the gap is commanded"
@@ -2321,8 +2558,258 @@ def stretch_note(reached: Reached) -> str:
     return note
 
 
+def stretch_note(reached: Reached) -> str:
+    """The Stretch panel's caption: its axis convention, plus any offset in force."""
+    return STRETCH_AXES_NOTE + offsets_note(reached)
+
+
+def overlay_note(reached: Reached) -> str:
+    """The overlay panel's caption: which robot is which, plus any offset in force."""
+    return OVERLAY_AXES_NOTE + offsets_note(reached)
+
+
+# =============================================================================
+# The overlay scene
+# =============================================================================
+
+OVERLAY_FRANKA_NAMESPACE = "overlay_franka_0/"
+"""
+The namespace the overlay scene attaches its Franka under.
+
+Not `FrankaRobotConfig.robot_namespace`, which is `robot_0/` -- the same string
+`Stretch4RobotConfig` uses, because each of these robots normally has a scene to
+itself and nothing has ever needed the two names to differ. Compiling both into
+one scene is what makes them collide (`repeated name 'robot_0/base' in body`), so
+the overlay re-prefixes its Franka and `OverlayScene` translates names across.
+Nothing under test is renamed: the retargeting drives the two real models and
+never sees this scene.
+"""
+
+OVERLAY_FRANKA_ALPHA = 0.4
+"""
+How opaque the overlay Franka is drawn, where 1.0 is the model's own colours.
+
+An overlay of two robots standing inside one another is only readable if the one
+in front can be seen through. At full opacity the Franka's forearm and hand cover
+exactly the part of Stretch the picture exists to compare them with -- the render
+would be of a Franka, with a Stretch known to be somewhere behind it.
+
+The Franka is the one made translucent rather than Stretch, because Stretch is
+the robot under test: the ghost should be the reference, and the solid thing the
+answer being checked.
+"""
+
+OVERLAY_FRANKA_TINT = fr.FRANKA_TOOL_COLOR[:3]
+"""
+What colour the overlay Franka is painted.
+
+Translucency alone turned out not to be enough to tell the two apart. Both robots
+are grey plastic and white metal, they stand inside one another, and at a camera
+distance that frames the grippers there is not much of either in shot -- the
+first version of this render was an image in which it was genuinely hard to say
+which limb belonged to which robot, which is a failure of the only thing an
+overlay is for.
+
+So the Franka is painted its own marker colour. That is not a decoration: the
+franka ball and its label are already drawn in `FRANKA_TOOL_COLOR`, so the tint
+says "this robot is the one that ball belongs to" in the one language the picture
+already speaks. Stretch keeps its real colours, being the robot under test.
+"""
+
+_JOINT_QPOS_WIDTH = {
+    mujoco.mjtJoint.mjJNT_FREE: 7,
+    mujoco.mjtJoint.mjJNT_BALL: 4,
+    mujoco.mjtJoint.mjJNT_SLIDE: 1,
+    mujoco.mjtJoint.mjJNT_HINGE: 1,
+}
+"""How many `qpos` entries a joint of each type owns. See `OverlayScene._joint_map`."""
+
+
+def build_overlay_scene(
+    base_xytheta: np.ndarray, mount_pose: np.ndarray
+) -> tuple[MjModel, MjData]:
+    """One kitchen with *both* robots in it: Stretch at `base_xytheta`, a Franka at `mount_pose`.
+
+    The same two robots at the same two poses the checks use -- this only puts
+    them in one model, so that one camera sees both. That is the whole difference
+    from the side-by-side render: there, two separately rendered scenes are placed
+    next to each other and the reader compares two pictures; here the two tool
+    frames are in one picture and the gap between them is a thing to look at
+    rather than something to estimate across a seam. Which is also its limit --
+    the side-by-side render shows each robot unobstructed, and this one does not.
+
+    Nothing is moved apart to make room, because moving them apart would make the
+    picture a lie: the retargeting imagines the Franka standing 5cm in front of
+    Stretch's feet, so the two robots really do occupy the same metre of kitchen
+    and really do intersect. Two things follow, both deliberate:
+
+    * **The Franka's geoms are flagged to collide with nothing.** This scene is
+      rendered and never stepped -- as everywhere else here, joint positions are
+      written and `mj_forward` run -- so no contact would be resolved in any case.
+      The flag is there so that the scene stays inert if it is ever handed to
+      something that *does* step it, instead of firing two robots apart at the
+      speed a metre of overlap earns.
+
+    * **The Franka is drawn translucent.** See `OVERLAY_FRANKA_ALPHA`.
+
+    Returns the model and its data, and no robot views: nothing drives this scene.
+    It is posed from the two real ones by `OverlayScene.sync`.
+    """
+    from molmo_spaces.configs.robot_configs import FrankaRobotConfig
+    from molmo_spaces.robots.franka import FrankaRobot
+    from molmo_spaces.utils.lazy_loading_utils import (
+        install_scene_with_objects_and_grasps_from_path,
+    )
+
+    from examples.machine_learning.molmospaces.stretch.config import Stretch4RobotConfig
+    from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot
+
+    scene = mini_benchmark.house_scene_path()
+    install_scene_with_objects_and_grasps_from_path(str(scene))
+    spec = MjSpec.from_file(str(scene))
+
+    # Stretch first, exactly as `diagnose.build_standing_robot` adds it -- same
+    # house, same base pose. The pose comes in from the rig's own base rather
+    # than from `mini_benchmark`, so the overlay cannot stand its Stretch
+    # somewhere the checks do not.
+    base_xytheta = np.asarray(base_xytheta, dtype=float)
+    stretch_config = Stretch4RobotConfig()
+    Stretch4Robot.add_robot_to_scene(
+        stretch_config,
+        spec,
+        prefix=stretch_config.robot_namespace,
+        pos=[float(base_xytheta[0]), float(base_xytheta[1])],
+        quat=R.from_euler("z", float(base_xytheta[2])).as_quat(scalar_first=True),
+    )
+    Stretch4Robot.apply_control_overrides(spec, stretch_config)
+
+    # Then the Franka, exactly as `build_franka_on_the_pedestal` adds it --
+    # including the pedestal subtracted off the mount height, which is the one
+    # number that is easy to get wrong here and expensive to get wrong.
+    franka_config = FrankaRobotConfig()
+    pedestal = float(franka_config.base_size[2]) if franka_config.base_size else 0.0
+    mount_pose = np.asarray(mount_pose, dtype=float)
+    FrankaRobot.add_robot_to_scene(
+        franka_config,
+        spec,
+        prefix=OVERLAY_FRANKA_NAMESPACE,
+        pos=[float(mount_pose[0, 3]), float(mount_pose[1, 3]), FRANKA_LINK0_HEIGHT - pedestal],
+        quat=list(R.from_matrix(mount_pose[:3, :3]).as_quat(scalar_first=True)),
+    )
+
+    model = spec.compile()
+    _make_overlay_franka_a_ghost(model)
+    return model, MjData(model)
+
+
+def _make_overlay_franka_a_ghost(model: MjModel) -> None:
+    """Paint the overlay Franka translucent green and stop it colliding, in place.
+
+    Done on the compiled model rather than on the spec because each property is
+    one array here, and because the colour has to be put in two places: a geom
+    with no material carries its own `rgba`, and a geom with one takes the
+    material's -- so setting only `geom_rgba` leaves every textured panel of the
+    arm its original colour, which is most of the robot.
+
+    Reaching for materials by name is safe here for one reason and only one: the
+    Franka is attached under `OVERLAY_FRANKA_NAMESPACE`, and MuJoCo prefixes the
+    assets of an attached body along with its bodies, so these materials are the
+    Franka's alone and repainting them cannot touch the house or Stretch.
+    """
+    franka_geoms = [
+        geom
+        for geom in range(model.ngeom)
+        if model.body(model.geom_bodyid[geom]).name.startswith(OVERLAY_FRANKA_NAMESPACE)
+    ]
+    model.geom_rgba[franka_geoms, :3] = OVERLAY_FRANKA_TINT
+    model.geom_rgba[franka_geoms, 3] = OVERLAY_FRANKA_ALPHA
+    # Nothing collides with a geom whose contype and conaffinity are both zero,
+    # which is the whole of "not colliding with each other" -- see
+    # `build_overlay_scene` on why this scene never gets the chance anyway.
+    model.geom_contype[franka_geoms] = 0
+    model.geom_conaffinity[franka_geoms] = 0
+
+    for material in {int(model.geom_matid[geom]) for geom in franka_geoms} - {-1}:
+        model.mat_rgba[material, :3] = OVERLAY_FRANKA_TINT
+        model.mat_rgba[material, 3] = OVERLAY_FRANKA_ALPHA
+
+
+class OverlayScene:
+    """The overlay scene, and the wiring that keeps it showing the real two robots.
+
+    Nothing is simulated in here and no retargeting is done in here. The checks
+    drive the two real models exactly as they always did, and `sync` copies both
+    robots' joint positions into this third one so that it can be photographed.
+    That separation is what stops the overlay from being able to flatter the
+    comparison: a mistake in this class can only produce a picture of a robot in
+    the wrong place, never a different number, and the markers drawn over the
+    picture come from the same `Reached` the side-by-side render uses.
+
+    The copy is by joint *name* rather than by index. The overlay's `qpos`
+    interleaves two robots with a house full of movable objects, so its addresses
+    have nothing to do with either source model's -- but the names still match,
+    once the Franka's namespace is translated (`OVERLAY_FRANKA_NAMESPACE`).
+
+    The Franka's base is a mocap body in both its own scene and this one, spawned
+    from the same `mount_pose`, so there is nothing to copy for it: the arm is the
+    only thing that ever moves.
+    """
+
+    def __init__(self, rig: "RetargetRig") -> None:
+        self._rig = rig
+        base_xytheta = np.asarray(rig.view.get_move_group("base").joint_pos, dtype=float)
+        self.model, self.data = build_overlay_scene(base_xytheta, rig.mount_pose)
+        self._stretch = self._joint_map(rig.model, rig.namespace, rig.namespace)
+        self._franka = self._joint_map(
+            rig.franka_model, rig.franka_namespace, OVERLAY_FRANKA_NAMESPACE
+        )
+
+    def _joint_map(
+        self, source: MjModel, source_namespace: str, overlay_namespace: str
+    ) -> list[tuple[int, int, int]]:
+        """`(source address, overlay address, width)` for every joint of one robot.
+
+        Computed once, because the answer is a property of the two models and the
+        video asks for it a few thousand times. A joint the overlay does not have
+        raises here, at construction, rather than quietly leaving part of a robot
+        at its default pose in every frame -- which is the failure this would
+        otherwise have, and it looks like a broken arm rather than like a bug.
+        """
+        mapping = []
+        for joint in range(source.njnt):
+            name = source.joint(joint).name
+            if not name.startswith(source_namespace):
+                continue
+            overlay = self.model.joint(overlay_namespace + name[len(source_namespace) :])
+            width = _JOINT_QPOS_WIDTH[mujoco.mjtJoint(source.jnt_type[joint])]
+            mapping.append((int(source.jnt_qposadr[joint]), int(overlay.qposadr[0]), width))
+        return mapping
+
+    def sync(self) -> None:
+        """Put both robots where the rig currently has them, and run `mj_forward`.
+
+        Positions only, and `mj_forward` rather than `mj_step`, for the same
+        reason the rest of this file does it that way: the overlay has to show the
+        configuration the retargeting produced, not a configuration some
+        controller settled at afterwards.
+        """
+        for source, mapping in (
+            (self._rig.data, self._stretch),
+            (self._rig.franka_data, self._franka),
+        ):
+            for address, overlay, width in mapping:
+                self.data.qpos[overlay : overlay + width] = source.qpos[address : address + width]
+        mujoco.mj_forward(self.model, self.data)
+
+
 VISUALIZE_FRAME_SIZE = (960, 540)
-"""Per-robot frame size for `--visualize`, as (width, height). The pair is twice as wide."""
+"""
+Panel size for `--visualize`, as (width, height).
+
+One panel per robot side by side, so the default video is twice this wide.
+`--overlay_robots` draws both robots into a single panel and its video is exactly
+this size.
+"""
 
 
 def visualize(
@@ -2330,6 +2817,7 @@ def visualize(
     target_z_offset: float = 0.0,
     grasp_offset: float = 0.0,
     pose_conventions: fr.PoseConventions | None = None,
+    overlay: bool = False,
     fps: int = 30,
     seconds_per_move: float = 1.0,
     hold_seconds: float = 0.4,
@@ -2359,6 +2847,15 @@ def visualize(
     That is the part a still cannot show: the two grippers have to stay together
     *along the way*, and a retargeting that only agreed at the waypoints would be
     visible here as Stretch taking a different route between them.
+
+    `overlay` swaps the pair of panels for a single one, with both robots
+    compiled into one scene and standing where they really stand -- the Franka a
+    translucent green ghost inside Stretch, since that is where the retargeting
+    imagines it. See `build_overlay_scene`. The markers are the same markers and the
+    numbers are the same numbers; what changes is that the two tool frames are in
+    one picture, so how far apart they are is something to see rather than to
+    judge across a seam. It costs the unobstructed view of each robot that the
+    pair of panels gives, which is why it is a flag rather than the default.
 
     Timed in seconds rather than in frames, so the motion plays at the same speed
     whatever `fps` is: `seconds_per_move` is how long the arm takes to travel
@@ -2393,9 +2890,15 @@ def visualize(
 
     width, height = VISUALIZE_FRAME_SIZE
     output_dir.mkdir(parents=True, exist_ok=True)
-    video_path = output_dir / "retargeting.mp4"
+    # Its own file names, so that rendering the same waypoints both ways leaves
+    # both renders on disk to be compared rather than one on top of the other.
+    suffix = "_overlay" if overlay else ""
+    video_path = output_dir / f"retargeting{suffix}.mp4"
     writer = cv2.VideoWriter(
-        str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width * 2, height)
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height) if overlay else (width * 2, height),
     )
     if not writer.isOpened():
         raise RuntimeError(f"Could not open {video_path} for writing")
@@ -2413,14 +2916,96 @@ def visualize(
 
     worst = (0.0, "")
     written = 0
-    # Both renderers held open for the whole video, and given identical camera
-    # settings -- see `ToolFrameRenderer`.
-    with (
-        ToolFrameRenderer(rig.franka_model, **camera) as franka_camera,
-        ToolFrameRenderer(rig.model, **camera) as stretch_camera,
-    ):
+    # One scene or two, the renderers are held open for the whole video and given
+    # identical camera settings -- see `ToolFrameRenderer`. An `ExitStack` because
+    # the overlay opens one where the pair opens two, and a renderer left unclosed
+    # is a leaked EGL context.
+    with ExitStack() as renderers:
+        overlay_scene = OverlayScene(rig) if overlay else None
+        overlay_camera = (
+            renderers.enter_context(ToolFrameRenderer(overlay_scene.model, **camera))
+            if overlay
+            else None
+        )
+        franka_camera = (
+            None
+            if overlay
+            else renderers.enter_context(ToolFrameRenderer(rig.franka_model, **camera))
+        )
+        stretch_camera = (
+            None if overlay else renderers.enter_context(ToolFrameRenderer(rig.model, **camera))
+        )
+
+        def commanded_marker(reached: Reached) -> list[Marker]:
+            """The "commanded" ball, but only when Stretch did not get there.
+
+            The marker means "where Stretch was told to go", so drawing it on a
+            target Stretch reached puts a second ball and a second label on the
+            same few pixels as the Stretch frame -- which at a grasp offset, where
+            the tracking is exact and the interesting gap is the *other* one,
+            turned all three labels into one unreadable overlap.
+            """
+            miss = float(
+                np.linalg.norm(reached.expected_pose[:3, 3] - reached.stretch_pose[:3, 3])
+            )
+            if miss <= MARKER_LABEL_SEPARATION_M:
+                return []
+            return [
+                Marker(reached.expected_pose, fr.REFERENCE_TARGET_COLOR, "commanded", axes=False)
+            ]
+
+        def stretch_marker_label(reached: Reached) -> str:
+            """What the Stretch tool frame's ball says about itself."""
+            return (
+                f"stretch {reached.position_error * 1000:.0f}mm"
+                f" / jaw {reached.stretch_aperture * 1000:.0f}mm"
+                # Worth saying on the frame: when the jaw is flipped the two sets
+                # of axis arrows are half a turn apart on purpose, and the label
+                # is what stops that reading as a bug.
+                + (" (jaw flipped)" if reached.jaw_flipped else "")
+            )
+
+        def render_overlaid(reached: Reached, label: str) -> np.ndarray:
+            """One panel, both robots, one camera. See `OverlayScene`.
+
+            The same three markers the Stretch panel carries below, drawn over a
+            picture that already has the Franka in it -- so the franka ball is no
+            longer a borrowed reference standing in for a robot in the other
+            panel, it is sitting on the hand it belongs to. Its axes are drawn
+            here, unlike on the side-by-side Stretch panel, because there is no
+            second panel to read them off: both frames are in Stretch's tool
+            convention, which the note says, and the whole point of the picture is
+            that one colour means one direction across both robots.
+            """
+            overlay_scene.sync()
+            hand = f"{reached.franka_aperture * 1000:.0f}mm"
+            markers = (
+                [
+                    Marker(
+                        reached.franka_reference_pose,
+                        fr.FRANKA_TOOL_COLOR,
+                        f"franka {label} / {hand}",
+                    )
+                ]
+                + commanded_marker(reached)
+                + [
+                    Marker(
+                        reached.stretch_pose_as_commanded,
+                        fr.STRETCH_TOOL_COLOR,
+                        label=stretch_marker_label(reached),
+                    )
+                ]
+            )
+            return overlay_camera.frame(
+                overlay_scene.data,
+                markers=markers,
+                reference_height=float(reached.franka_reference_pose[2, 3]),
+                note=overlay_note(reached),
+            )
 
         def render(reached: Reached, label: str) -> np.ndarray:
+            if overlay:
+                return render_overlaid(reached, label)
             hand = f"{reached.franka_aperture * 1000:.0f}mm"
             # One height for both halves: the Franka's grasp centre, which is the
             # reference the whole comparison is against. The disk is the only
@@ -2475,39 +3060,16 @@ def visualize(
                     axes=False,
                 )
             ]
-            # Only when Stretch did not get there. The marker means "where Stretch
-            # was told to go", so drawing it on a target Stretch reached puts a
-            # second ball and a second label on the same few pixels as the
-            # Stretch frame below -- which at a grasp offset, where the tracking
-            # is exact and the interesting gap is the *other* one, turned all
-            # three labels into one unreadable overlap.
-            commanded_miss = float(
-                np.linalg.norm(reached.expected_pose[:3, 3] - reached.stretch_pose[:3, 3])
-            )
-            if commanded_miss > MARKER_LABEL_SEPARATION_M:
-                stretch_markers.append(
-                    Marker(
-                        reached.expected_pose,
-                        fr.REFERENCE_TARGET_COLOR,
-                        "commanded",
-                        axes=False,
-                    )
-                )
             stretch_frame = stretch_camera.frame(
                 rig.data,
                 markers=stretch_markers
+                + commanded_marker(reached)
                 + [
                     # The one frame on this panel, so its axes are unambiguous.
                     Marker(
                         reached.stretch_pose_as_commanded,
                         fr.STRETCH_TOOL_COLOR,
-                        label=f"stretch {reached.position_error * 1000:.0f}mm"
-                        f" / jaw {reached.stretch_aperture * 1000:.0f}mm"
-                        # Worth saying on the frame: when the jaw is flipped the
-                        # two sets of axis arrows are half a turn apart on
-                        # purpose, and the label is what stops that reading as a
-                        # bug.
-                        + (" (jaw flipped)" if reached.jaw_flipped else ""),
+                        label=stretch_marker_label(reached),
                     ),
                 ],
                 reference_height=float(reached.franka_reference_pose[2, 3]),
@@ -2535,7 +3097,7 @@ def visualize(
         for _ in range(max(hold_frames * START_HOLD_MULTIPLIER, fps)):
             writer.write(start_frame)
             written += 1
-        cv2.imwrite(str(output_dir / "00_start.png"), start_frame)
+        cv2.imwrite(str(output_dir / f"00_start{suffix}.png"), start_frame)
         click.echo(
             f"  {'start':16s} tool centres {start.position_error * 1000:6.2f}mm apart, "
             f"tool frames {start.orientation_error:.4f} rad apart"
@@ -2584,7 +3146,7 @@ def visualize(
                 writer.write(arrival)
                 written += 1
 
-            cv2.imwrite(str(output_dir / f"{index + 1:02d}_{label}.png"), arrival)
+            cv2.imwrite(str(output_dir / f"{index + 1:02d}_{label}{suffix}.png"), arrival)
             click.echo(
                 f"  {label:16s} tool centres {reached.position_error * 1000:6.2f}mm apart, "
                 f"tool frames {reached.orientation_error:.4f} rad apart"
@@ -2597,7 +3159,7 @@ def visualize(
         bold=True,
     )
     click.echo(f"video:  {video_path}  ({written} frames, {written / fps:.1f}s at {fps}fps)")
-    click.echo(f"stills: {output_dir}/00_start.png, then NN_<waypoint>.png")
+    click.echo(f"stills: {output_dir}/00_start{suffix}.png, then NN_<waypoint>{suffix}.png")
     return video_path
 
 
@@ -2607,6 +3169,14 @@ def visualize(
     "do_visualize",
     is_flag=True,
     help="Render both robots through the waypoints to an MP4 and per-waypoint stills.",
+)
+@click.option(
+    "--overlay_robots",
+    "overlay_robots",
+    is_flag=True,
+    help="Render both robots into one scene instead of side by side: same kitchen, "
+    "same camera, the Franka a translucent green ghost standing where the retargeting "
+    "imagines it, with collisions between the two switched off. Needs --visualize.",
 )
 @click.option(
     "--output-dir",
@@ -2664,7 +3234,7 @@ def visualize(
     help="Stand Stretch back far enough that its spawn gripper pose is the Franka's, "
     "cancelling the retreat in the virtual Franka's mount so the frame is unchanged. "
     "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
-    "it -- see `setups.STRETCH_SPAWN_BASE_OFFSET_XY` for both numbers.",
+    "it -- see `fr.stretch_spawn_base_offset_xy` for both numbers.",
 )
 @click.option(
     "--map_franka_wrist_to_flipped_stretch4_wrist",
@@ -2707,10 +3277,12 @@ def visualize(
     default=1.15,
     show_default=True,
     help="Free-camera distance. The default frames the grippers rather than the robots -- "
-    "the tool frames are what there is to compare.",
+    "the tool frames are what there is to compare. --overlay_robots pulls this default "
+    "back, having two whole robots in one panel rather than one each.",
 )
 def cli(
     do_visualize: bool,
+    overlay_robots: bool,
     output_dir: Path,
     target_z_offset: float,
     grasp_offset: float,
@@ -2730,11 +3302,18 @@ def cli(
 
     With no flags this runs the same assertions `pytest` does, printing a table
     of how far apart the two grippers end up at each waypoint. `--visualize`
-    renders both robots walking through those same waypoints instead.
+    renders both robots walking through those same waypoints instead, side by
+    side -- or, with `--overlay_robots`, both in one scene.
     """
     import logging
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+
+    # Said rather than ignored: `--overlay_robots` changes how the render is
+    # drawn and there is nothing for it to change about the checks, so on its own
+    # it would run the suite and look as though the flag had done something.
+    if overlay_robots and not do_visualize:
+        raise click.UsageError("--overlay_robots only means anything with --visualize.")
 
     # Exported so the in-process `pytest.main` below reaches it too, which is
     # what makes one flag serve both modes. See `TARGET_Z_OFFSET_ENV_VAR`.
@@ -2750,11 +3329,19 @@ def cli(
     fr.publish_pose_conventions(conventions)
 
     if do_visualize:
+        # Only when the user did not say otherwise -- see `OVERLAY_CAMERA_DISTANCE`.
+        if overlay_robots and (
+            click.get_current_context().get_parameter_source("distance")
+            is click.core.ParameterSource.DEFAULT
+        ):
+            distance = OVERLAY_CAMERA_DISTANCE
+
         visualize(
             output_dir,
             target_z_offset=target_z_offset,
             grasp_offset=grasp_offset,
             pose_conventions=conventions,
+            overlay=overlay_robots,
             fps=fps,
             seconds_per_move=seconds_per_move,
             hold_seconds=hold_seconds,

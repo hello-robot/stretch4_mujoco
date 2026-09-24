@@ -178,7 +178,7 @@ class RecordedEpisode:
 
         The one thing that is *not* shared is the retreat: under
         `match_stretch_spawn_pose_to_franka` a Stretch episode stands the robot
-        back by `STRETCH_SPAWN_BASE_OFFSET_XY` and cancels the retreat in the
+        back by `stretch_spawn_base_offset_xy()` and cancels the retreat in the
         virtual Franka's mount, so the two only compose back to the recorded
         pose if both halves are applied. `franka_mount_pose_from_base` applies
         its half off the environment whether or not a caller remembered this

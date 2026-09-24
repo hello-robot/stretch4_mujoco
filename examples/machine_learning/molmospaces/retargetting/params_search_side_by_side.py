@@ -1398,7 +1398,7 @@ def _apply_params(
     help="Stand Stretch back far enough that its spawn gripper pose is the Franka's, "
     "cancelling the retreat in the virtual Franka's mount so the frame is unchanged. "
     "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
-    "it -- see `setups.STRETCH_SPAWN_BASE_OFFSET_XY` for both numbers.",
+    "it -- see `fr.stretch_spawn_base_offset_xy` for both numbers.",
 )
 @click.option(
     "--map_franka_wrist_to_flipped_stretch4_wrist",
