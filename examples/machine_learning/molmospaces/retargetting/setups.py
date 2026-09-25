@@ -72,6 +72,8 @@ from examples.machine_learning.molmospaces.retargetting.franka_droid_policy impo
 )
 from examples.machine_learning.molmospaces.stretch import config as stretch_config
 from examples.machine_learning.molmospaces.stretch.config import (
+    HEAD_CAMERA_LEFT,
+    WRIST_CAMERA_LEFT,
     WRIST_CAMERA_RIGHT,
     Stretch4CameraSystem,
     Stretch4RobotConfig,
@@ -771,6 +773,135 @@ def _register_cameras(params: RetargetParams) -> None:
 
 
 # =============================================================================
+# Which of Stretch's own cameras the policy is shown
+# =============================================================================
+
+
+STRETCH_CAMERA_CHOICE_ENV_VARS = {
+    "use_left_gripper_camera": "STRETCH4_USE_LEFT_GRIPPER_CAMERA",
+    "use_left_fisheye_camera": "STRETCH4_USE_LEFT_FISHEYE_CAMERA",
+}
+"""
+One environment variable per field of `StretchCameraChoices`, named after its flag.
+
+Environment variables for `POSE_CONVENTION_ENV_VARS`' reason and by the same
+route: the eval config and the episode override that read these are built by
+`run_evaluation` from a "module:Class" string, in worker processes there is no
+argument to pass a flag along. One variable per field so that a run setting some
+and not others cannot be confused with a run of a build that knew about fewer.
+"""
+
+
+@dataclass(frozen=True)
+class StretchCameraChoices:
+    """Which physical Stretch camera feeds each of the policy's two channels.
+
+    Stretch carries two of everything this study reads -- a stereo pair on the
+    gripper and a pair of head fisheyes -- and the setups below have always used
+    the right one of each. These say "use the other one instead", and they are
+    choices rather than parameters in exactly `PoseConventions`' sense: nothing
+    about the retargeting, the grasp or the search space moves, only which lens
+    the same frame is taken through.
+
+    **Stretch only, and they break the pairing.** Both halves of a matched pair
+    are meant to differ in one thing; a Franka has no left gripper camera and no
+    head fisheye to switch to, so its half keeps the cameras it always had and a
+    run with either of these on differs from its Franka in two things rather
+    than one. Read such a pair as "can Stretch do the task through this camera",
+    not as "which camera is better than the Franka's".
+    """
+
+    use_left_gripper_camera: bool = False
+    """Read the wrist channel from `gripper_camera_left_rgb` rather than the right.
+
+    The two are a stereo pair on the *same* side of the hand, not one camera per
+    side: measured on the compiled model at the home pose they sit 20mm apart
+    across the approach axis, both looking straight down it, both 241mm from
+    `grasp_center_link` -- and the grasp centre is exactly midway between them,
+    10mm off each one's optical axis.
+
+    So this does not change the viewpoint in any way a policy should care about,
+    and that is the point of having it: a grasp that succeeds through one and
+    fails through the other is 10mm of parallax and a different finger doing the
+    occluding, which is the scale of difference worth ruling out before looking
+    for larger explanations. It composes with the half-turned wrist --
+    `map_franka_wrist_to_flipped_stretch4_wrist` rolls the whole hand, so
+    whichever camera is selected is rolled with it and
+    `StretchMolmoBotDroidPolicy._wrist_camera` turns its frame back upright
+    either way.
+    """
+
+    use_left_fisheye_camera: bool = False
+    """Read the exo channel from Stretch's real left head fisheye, `camera_left_link`.
+
+    This *replaces* the parameterised exo camera rather than re-aiming it: what
+    the policy is shown is `Stretch4CameraSystem`'s own `head_camera_left`,
+    rendered through `install_stretch_camera_hooks` -- the hardware-accurate
+    path, with the fisheye warp and the quarter turn the simulator applies -- so
+    the frame is the one the robot would actually produce. Every
+    `ExoCameraParams` field is therefore inert on the exo channel while this is
+    on: the pitch, the FOV, the crop and the setup's whole premise of holding
+    one mount point while the optics change. `--param` naming a camera dimension
+    still writes it into `trials.csv`, where it describes nothing the run did.
+
+    The left fisheye is not a mirror of the right one the setups reproduce.
+    Measured from `base_link`: the same height and the same 47-degree downward
+    tilt, 150mm across to the other side of the head (+0.075 against -0.075 in
+    y), and bolted on turned the opposite way -- `rotate_number_of_times` is +1
+    where the right camera's is -1. Both come out 400x640, portrait, which is
+    what `stretch_fisheye` already hands this checkpoint.
+
+    Useful mostly on `baseline`, where the exo channel is otherwise a DROID
+    shoulder camera transplanted into the room and this asks the flat question
+    the transplant exists to avoid: what happens if the policy just gets
+    Stretch's own view.
+    """
+
+    def __bool__(self) -> bool:
+        """True when either channel is being taken off its default camera."""
+        return any(getattr(self, field) for field in STRETCH_CAMERA_CHOICE_ENV_VARS)
+
+    @property
+    def wrist_camera(self) -> str:
+        """The `Stretch4CameraSystem` camera the wrist channel reads."""
+        return WRIST_CAMERA_LEFT if self.use_left_gripper_camera else WRIST_CAMERA_RIGHT
+
+    @property
+    def exo_camera(self) -> str:
+        """The camera the exo channel reads: `EXO_CAMERA` unless the fisheye is asked for."""
+        return HEAD_CAMERA_LEFT if self.use_left_fisheye_camera else EXO_CAMERA
+
+    def describe(self) -> str:
+        asked = [name for name in STRETCH_CAMERA_CHOICE_ENV_VARS if getattr(self, name)]
+        return ", ".join(asked) if asked else "none (right gripper camera, exo camera under test)"
+
+
+def stretch_camera_choices() -> StretchCameraChoices:
+    """Which of Stretch's cameras this process was asked to read."""
+    return StretchCameraChoices(
+        **{
+            field: os.environ.get(variable, "").strip().lower() not in ("", "0", "false", "no")
+            for field, variable in STRETCH_CAMERA_CHOICE_ENV_VARS.items()
+        }
+    )
+
+
+def publish_stretch_camera_choices(choices: StretchCameraChoices) -> None:
+    """Put the camera choices in the environment, for this process and its workers.
+
+    Both variables written in both directions, for `publish_pose_conventions`'
+    reason: a run that does not ask for a camera must clear one an earlier run in
+    the same shell exported, or it silently reads a channel off a lens it never
+    chose.
+    """
+    for field, variable in STRETCH_CAMERA_CHOICE_ENV_VARS.items():
+        if getattr(choices, field):
+            os.environ[variable] = "1"
+        else:
+            os.environ.pop(variable, None)
+
+
+# =============================================================================
 # Camera systems
 # =============================================================================
 
@@ -799,7 +930,7 @@ def franka_camera_system(params: RetargetParams) -> CameraSystemConfig:
 def stretch_camera_system(
     params: RetargetParams, exo_mount_pose: np.ndarray | None = None
 ) -> CameraSystemConfig:
-    """The exo camera under test, plus Stretch's own right wrist camera.
+    """The exo camera under test, plus Stretch's own wrist camera.
 
     The wrist camera is `Stretch4CameraSystem`'s -- an MJCF camera rendered
     through `install_stretch_camera_hooks` like any other -- at the hardware's
@@ -807,16 +938,35 @@ def stretch_camera_system(
     centre crop of the real camera's frame expressed as a render setting; see
     `RetargetParams.wrist_fov_deg` for the measurement that motivates one and
     for what it costs.
+
+    Which physical camera each channel reads is `StretchCameraChoices`, off the
+    environment rather than off `params`: it is a choice of lens, not a point in
+    the search space, and the process that runs a trial is not the one that
+    chose it. With `use_left_fisheye_camera` the exo camera under test is not
+    placed at all -- Stretch's own left head fisheye takes the channel, and
+    every `ExoCameraParams` field is inert on it.
     """
+    choices = stretch_camera_choices()
     wrist = next(
-        camera for camera in Stretch4CameraSystem().cameras if camera.name == WRIST_CAMERA_RIGHT
+        camera for camera in Stretch4CameraSystem().cameras if camera.name == choices.wrist_camera
     )
     if params.wrist_fov_deg:
         # A copy, because `Stretch4CameraSystem()` hands back configs that other
         # callers in this process share; mutating this one would narrow the
         # wrist camera of every Stretch evaluation that follows.
         wrist = wrist.model_copy(update={"fov": float(params.wrist_fov_deg)})
-    wrist_size = stretch_config.CAMERA_RENDER_SIZE[WRIST_CAMERA_RIGHT]
+    wrist_size = stretch_config.CAMERA_RENDER_SIZE[choices.wrist_camera]
+
+    if choices.use_left_fisheye_camera:
+        head = next(
+            camera for camera in Stretch4CameraSystem().cameras if camera.name == HEAD_CAMERA_LEFT
+        )
+        return CameraSystemConfig(
+            img_resolution=_buffer_resolution(
+                stretch_config.CAMERA_RENDER_SIZE[HEAD_CAMERA_LEFT], wrist_size
+            ),
+            cameras=[head, wrist],
+        )
     # World-fixed when the caller knows where the mount body will be, which an
     # episode override does and a config resolved before any episode does not.
     # Stretch's exo camera hangs off `base_link`, and `base_link` is not
@@ -1274,6 +1424,15 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
         system = stretch_camera_system(params)
         self.camera_config.cameras = list(system.cameras)
         self.camera_config.img_resolution = system.img_resolution
+        # The two channel names have to be read off the same `StretchCameraChoices`
+        # the camera system was built from, or the policy asks the observation
+        # for a camera nothing rendered -- which `_camera` raises on, at the
+        # first step of every episode. Set on the DROID config rather than this
+        # study's subclass of it, because that is where the fields are declared.
+        if isinstance(self.policy_config, StretchMolmoBotDroidPolicyConfig):
+            choices = stretch_camera_choices()
+            self.policy_config.exo_camera = choices.exo_camera
+            self.policy_config.wrist_camera = choices.wrist_camera
         # Guarded so that a subclass swapping the policy out -- for a dummy
         # policy, to check that a setup's scene and cameras load without waiting
         # on a VLA -- gets the cameras without being rejected for lacking the

@@ -119,8 +119,10 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     PROBE_SINK_ENV_VAR,
     SETUPS,
+    StretchCameraChoices,
     params_to_json,
     publish_params,
+    publish_stretch_camera_choices,
     qualified_config_name,
 )
 from examples.machine_learning.molmospaces.visualize import (  # noqa: E402
@@ -1408,6 +1410,24 @@ def _apply_params(
     "the turn into the tool transform itself -- so it holds for the whole episode and both "
     "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
+@click.option(
+    "--use_left_gripper_camera",
+    "use_left_gripper_camera",
+    is_flag=True,
+    help="Feed the policy's wrist channel Stretch's left gripper camera instead of its "
+    "right. The two are a stereo pair 20mm apart on the same side of the hand, both 241mm "
+    "from the grasp centre and 10mm either side of it, so this is a parallax check rather "
+    "than a new viewpoint. Stretch only. See `setups.StretchCameraChoices`.",
+)
+@click.option(
+    "--use_left_fisheye_camera",
+    "use_left_fisheye_camera",
+    is_flag=True,
+    help="Feed the policy's exo channel Stretch's real left head fisheye, warped and "
+    "turned as the hardware produces it, in place of the exo camera under test -- which "
+    "leaves every camera parameter of the trial inert. Stretch only, so the Franka half of "
+    "the pair keeps its own camera. See `setups.StretchCameraChoices`.",
+)
 def main(
     pair: str,
     param_specs: tuple[str, ...],
@@ -1430,6 +1450,8 @@ def main(
     change_stretch_start_pose_flip_wrist: bool,
     map_franka_wrist_to_flipped_stretch4_wrist: bool,
     match_stretch_spawn_pose_to_franka: bool,
+    use_left_gripper_camera: bool,
+    use_left_fisheye_camera: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -1448,6 +1470,17 @@ def main(
     fr.publish_pose_conventions(conventions)
     if conventions:
         log.info(f"[pose] conventions: {conventions.describe()}")
+
+    # Published the same way and for the same reason: a camera left selected by
+    # an earlier run in the same shell would put the two halves of a pair on
+    # different lenses. See `setups.publish_stretch_camera_choices`.
+    camera_choices = StretchCameraChoices(
+        use_left_gripper_camera=use_left_gripper_camera,
+        use_left_fisheye_camera=use_left_fisheye_camera,
+    )
+    publish_stretch_camera_choices(camera_choices)
+    if camera_choices:
+        log.info(f"[camera] Stretch reads: {camera_choices.describe()}")
 
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     output_dir.mkdir(parents=True, exist_ok=True)
