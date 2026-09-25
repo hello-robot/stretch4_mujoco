@@ -88,6 +88,7 @@ import sys
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 
@@ -2566,6 +2567,50 @@ def stretch_note(reached: Reached) -> str:
 def overlay_note(reached: Reached) -> str:
     """The overlay panel's caption: which robot is which, plus any offset in force."""
     return OVERLAY_AXES_NOTE + offsets_note(reached)
+
+
+@pytest.mark.parametrize("jaw_flipped", [False, True])
+@pytest.mark.parametrize("keep", [False, True])
+def test_keep_flipped_wrist_camera_frame_gates_the_half_turn(jaw_flipped, keep) -> None:
+    """The half turn happens on the flipped branch alone, and only with the flag off.
+
+    `StretchMolmoBotDroidPolicy._wrist_camera` turns the wrist frame half round
+    when the jaw is held flipped, to undo the roll `JAW_FLIP` puts on a camera
+    that looks down the approach axis. The turn also lands the gripper at the top
+    of a frame the checkpoint has it entering from the bottom, because the flip
+    carries the camera across the axis as well as rolling it -- so which framing
+    the checkpoint prefers is a rollout question and
+    `PoseConventions.keep_flipped_wrist_camera_frame` is how the other half of it
+    gets run.
+
+    All four combinations, because the two halves of that comparison are only
+    worth running if the flag is inert where there is no turn to skip: an upright
+    jaw must hand back the same frame either way, or a pair that differs in this
+    flag alone differs in more than this flag.
+
+    Contiguity is asserted with them. `np.rot90` returns a negative-stride view
+    and `torch.from_numpy` refuses those, so the turn has to copy -- a regression
+    there fails at the checkpoint rather than here, with a message about strides.
+    """
+    from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (
+        StretchMolmoBotDroidPolicy,
+    )
+
+    frame = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+    proxy = SimpleNamespace(
+        jaw_flipped=jaw_flipped,
+        pose_conventions=fr.PoseConventions(keep_flipped_wrist_camera_frame=keep),
+    )
+
+    shown = StretchMolmoBotDroidPolicy._wrist_camera({"wrist": frame}, "wrist", proxy)
+
+    expected = np.rot90(frame, 2) if jaw_flipped and not keep else frame
+    assert np.array_equal(shown, expected), (
+        f"jaw_flipped={jaw_flipped}, keep_flipped_wrist_camera_frame={keep}: the frame "
+        f"handed to the checkpoint is {'not ' if jaw_flipped and not keep else ''}turned "
+        f"when it should be the other way round."
+    )
+    assert shown.flags["C_CONTIGUOUS"], "torch.from_numpy will refuse a negative-stride view"
 
 
 # =============================================================================
