@@ -1219,13 +1219,18 @@ class _ScenePanel:
 class _CameraPanels:
     """What a replayed Stretch's policy would have been looking at.
 
-    The exo camera under test plus Stretch's own right wrist camera -- the pair
+    The exo camera under test plus Stretch's own wrist camera -- the pair
     `setups.stretch_camera_system` gives a Stretch setup, rendered here the two
     ways those two cameras are rendered there: the exo through the MJCF camera
     `_add_exo_camera` compiled in and then `postprocess_exo_frame` (so a fisheye
     setup's replay is warped, cropped and turned exactly as the rollout's was),
     the wrist through `StretchCameraRig`, which is the hardware-accurate path
     `install_stretch_camera_hooks` patches into the evaluation.
+
+    `StretchCameraChoices` decides which physical camera each channel is, the
+    same as in a rollout. Under `use_left_fisheye_camera` there is no exo camera
+    under test to render: the exo channel is one of Stretch's own cameras, so it
+    goes through the rig alongside the wrist.
 
     What it is *not* is what the policy saw, because in a replay no policy ran
     and the Franka's actions are being followed open-loop. It is what the same
@@ -1236,26 +1241,38 @@ class _CameraPanels:
         from examples.machine_learning.molmospaces.demo_droid_on_stretch import (
             StretchCameraRig,
         )
-        from examples.machine_learning.molmospaces.retargetting.setups import EXO_CAMERA
+        from examples.machine_learning.molmospaces.retargetting.setups import (
+            stretch_camera_choices,
+        )
         from examples.machine_learning.molmospaces.stretch.config import (
             STRETCH_CAMERA_FOR_CAMERA,
-            WRIST_CAMERA_RIGHT,
         )
 
-        self._exo_name = EXO_CAMERA
+        # Whichever of Stretch's cameras a rollout would have been shown, so a
+        # replay's panels are of the same lenses as the run they replay. Off the
+        # environment, which is where `publish_stretch_camera_choices` put them.
+        choices = stretch_camera_choices()
+        self._exo_name = choices.exo_camera
         self._exo_params = exo
         self._exo_renderer = None
         camera_name = namespace + REPLAY_EXO_CAMERA
         mounted = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name) >= 0
-        if exo is not None and mounted:
+        if exo is not None and mounted and not choices.use_left_fisheye_camera:
             width, height = exo.render_size
             self._exo_renderer = mujoco.Renderer(model, height, width)
             self._exo_camera = camera_name
         self._option = mujoco.MjvOption()
         self._option.sitegroup = 0
-        self._wrist_name = WRIST_CAMERA_RIGHT
-        self._wrist = StretchCameraRig(
-            model, namespace, {WRIST_CAMERA_RIGHT: STRETCH_CAMERA_FOR_CAMERA[WRIST_CAMERA_RIGHT]}
+        # The exo channel goes through the rig too when it is one of Stretch's
+        # own cameras: that is the path `install_stretch_camera_hooks` gives it
+        # in the evaluation, warp and quarter turn included.
+        self._rig_names = [choices.wrist_camera]
+        if choices.use_left_fisheye_camera:
+            self._rig_names.insert(0, self._exo_name)
+        self._rig = StretchCameraRig(
+            model,
+            namespace,
+            {name: STRETCH_CAMERA_FOR_CAMERA[name] for name in self._rig_names},
         )
 
     def frames(self, data) -> list[tuple[str, np.ndarray]]:
@@ -1269,9 +1286,10 @@ class _CameraPanels:
             )
             frame = postprocess_exo_frame(self._exo_renderer.render(), self._exo_params)
             panels.append((self._exo_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)))
-        wrist = self._wrist.render(data)[self._wrist_name]
-        wrist = cv2.cvtColor(np.ascontiguousarray(wrist), cv2.COLOR_RGB2BGR)
-        panels.append((self._wrist_name, wrist))
+        rendered = self._rig.render(data)
+        for name in self._rig_names:
+            frame = cv2.cvtColor(np.ascontiguousarray(rendered[name]), cv2.COLOR_RGB2BGR)
+            panels.append((name, frame))
         return panels
 
     def close(self) -> None:
