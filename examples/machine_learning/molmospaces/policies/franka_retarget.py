@@ -518,24 +518,42 @@ class PoseConventions:
         stretch, flipped, unrotated      v = -0.265  bottom
         stretch, flipped, turned back    v = +0.265  **top**
 
-    and the grasp centre with them, -0.243 against the turned frame's +0.243.
-    So the turn fixes the far scene and breaks the near field: it lands the
-    gripper at the top of a frame that every DROID wrist view has it entering
-    from the bottom, and the vertical axis of that view is the channel a
-    wrist-camera policy reads for height and pitch. The symptom is an approach
-    that tracks well until the wrist view starts to dominate and then pitches the
-    wrong way a few centimetres out.
+    and the grasp centre with them, -0.243 against the turned frame's +0.243. So
+    the turn fixes the far scene and costs the near field: it lands the gripper at
+    the top of a frame that every DROID wrist view has it entering from the
+    bottom.
 
-    On, this skips the turn. Off -- the default -- is the behaviour every
-    measurement taken before this flag was added ran under, so a result can still
-    be compared against them. Pair it with
-    `map_franka_wrist_to_flipped_stretch4_wrist`, which is the only convention
-    under which it does anything at all: with the jaw upright there is no turn to
-    skip and this is inert.
+    **Tried, and it is much worse.** `stretch_baseline` on the flipped branch,
+    the same episodes, differing in nothing but this flag: with the turn the arm
+    tracks the object to within a few centimetres and then pitches the wrong way;
+    without it the arm does not arrive at all, driving away from the object or
+    stalling. So the two errors are not comparable in size, and the reason is
+    that only one of them is a *sign*. The unrotated frame has the whole scene
+    180 degrees out -- the 179.89 degree figure above -- and a policy closing a
+    visual loop through it reads every lateral correction backwards, which is an
+    inverted controller rather than a biased one. The turn's own cost is a static
+    framing offset: the loop keeps its sign and the alignment it converges to is
+    wrong. A biased controller reaches the object and misses it; an inverted one
+    never arrives.
 
-    The reproduction is a projection, not a rollout, and it assumes the compiled
-    models' nominal camera mounts. Which of the two framings the checkpoint
-    actually prefers is a rollout question, which is what the flag is for.
+    Which leaves the turn as necessary and not sufficient, and moves the
+    remaining close-range failure onto the one term neither branch can rotate
+    away -- the viewpoint. Stretch's camera sits 131mm across the approach axis
+    from the Robotiq's and 101mm further back from the grasp, and no operation on
+    the image fixes parallax. The experiment that isolates it is to drop the
+    flipped branch entirely: with the jaw upright the camera is 17mm from the
+    Robotiq's rather than 131mm, so if the close-range pitch failure is the
+    viewpoint it should ease there, and `map_franka_wrist_to_flipped_stretch4_wrist`
+    is then buying wrist reach at the cost of the wrist view.
+
+    Kept, off by default, as the control that establishes the above: without it
+    "the turn is needed" is an argument rather than a measurement. Off is also
+    what every result taken before this flag existed ran under. Pair it with
+    `map_franka_wrist_to_flipped_stretch4_wrist`, the only convention under which
+    it does anything -- with the jaw upright there is no turn to skip.
+
+    The projections are of the compiled models' nominal camera mounts, not of a
+    rollout; the rollout is the paragraph above.
     """
 
     map_franka_wrist_to_flipped_stretch4_wrist: bool = False

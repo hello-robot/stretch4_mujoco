@@ -98,6 +98,7 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,7 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     PROBE_SINK_ENV_VAR,
     SETUPS,
+    STRETCH_CAMERA_CHOICE_ENV_VARS,
     StretchCameraChoices,
     params_to_json,
     publish_params,
@@ -1588,6 +1590,128 @@ def runs_from_disk(
 # =============================================================================
 
 
+RUN_NAME_PREFIX = "side_by_side"
+"""What every auto-named run directory starts with, before the date and the flags."""
+
+RUN_NAME_ABBREVIATIONS = {
+    "change_franka_start_pose_flip_wrist": "franka-start-flipped",
+    "change_franka_start_pose_limit_height": "limit-height",
+    "change_stretch_start_pose_flip_wrist": "stretch-start-flipped",
+    "keep_flipped_wrist_camera_frame": "unrotated-wrist-cam",
+    "map_franka_wrist_to_flipped_stretch4_wrist": "flipped-wrist",
+    "match_stretch_spawn_pose_to_franka": "matched-spawn",
+    "use_left_gripper_camera": "left-gripper-cam",
+    "use_left_fisheye_camera": "left-fisheye-cam",
+}
+"""
+Short names for the conventions and camera choices, for `run_directory_name`.
+
+The flags themselves are spelled to be unambiguous in a help page, which makes
+them far too long to concatenate six of into a directory name. These are the same
+conventions said briefly.
+
+A field missing from here falls back to its own name with the underscores turned
+to dashes, so a convention added to `PoseConventions` or `StretchCameraChoices`
+later still reaches the directory name rather than silently dropping out of it --
+which would let two runs that differ in that convention land in the same folder
+and overwrite each other.
+"""
+
+
+def _run_name_value(value: float) -> str:
+    """A number for a directory name, signed so -0.009 cannot read as 0.009."""
+    return f"{value:+g}"
+
+
+def _run_name_param(spec: str) -> str:
+    """One `--param name=value` as a directory-name segment."""
+    name, _, value = spec.partition("=")
+    name = "".join(c if c.isalnum() else "-" for c in name.strip()).strip("-")
+    value = value.strip()
+    try:
+        return f"{name}{_run_name_value(float(value))}"
+    except ValueError:
+        safe = "".join(c if c.isalnum() else "-" for c in value).strip("-")
+        return f"{name}-{safe}" if safe else name
+
+
+def run_directory_name(
+    pair: str,
+    conventions: fr.PoseConventions,
+    camera_choices: StretchCameraChoices,
+    param_specs: tuple[str, ...] = (),
+    grasp_offset: float | None = None,
+    today: date | None = None,
+) -> str:
+    """The directory one run of this script writes to, named after what it is.
+
+    A matched pair is only readable next to the other pairs it is being compared
+    against, which means keeping every run rather than overwriting one -- and a
+    run directory is worth nothing later unless its name says which conventions,
+    cameras and parameters produced it. Hand-naming them is what this replaces,
+    and hand-naming is exactly where a name drifts from the flags it claims to
+    describe.
+
+    What goes in: the date, the pair, every convention and camera choice that is
+    on, the Stretch grasp offset when one was typed, and every `--param`
+    override. What stays out is everything operational -- the worker count, the
+    checkpoint path, `--rebuild-benchmark`, `--scenes` -- which changes how a run
+    is produced rather than what it measures. `--scenes` is the arguable one: two
+    scene counts land in the same directory, and the second run's `trials.csv`
+    replaces the first's.
+
+    Deterministic, and sorted where the flags themselves are unordered, so the
+    same command on the same day always resolves to the same directory: a rerun
+    resumes its own folder rather than making a near-duplicate beside it.
+    """
+    stamp = (today or date.today()).strftime("%Y%m%d")
+    segments = [RUN_NAME_PREFIX, stamp, pair]
+    segments += [
+        RUN_NAME_ABBREVIATIONS.get(name, name.replace("_", "-"))
+        for name in fr.POSE_CONVENTION_ENV_VARS
+        if getattr(conventions, name)
+    ]
+    segments += [
+        RUN_NAME_ABBREVIATIONS.get(name, name.replace("_", "-"))
+        for name in STRETCH_CAMERA_CHOICE_ENV_VARS
+        if getattr(camera_choices, name)
+    ]
+    if grasp_offset is not None:
+        segments.append(f"grasp-offset{_run_name_value(grasp_offset)}")
+    segments += sorted(_run_name_param(spec) for spec in param_specs)
+    return "_".join(segments)
+
+
+def _benchmark_for_run(
+    output_root: Path, output_dir: Path, *, force: bool, scene_count: int
+) -> Path:
+    """Build the benchmark once per --output-dir, and leave a copy in the run.
+
+    Two callers want it in two places. `mini_benchmark.build` is idempotent but
+    only against a directory that already holds the file, so building it under
+    each auto-named run would pay a house compile per scene and a settle per
+    object every time -- while the episode specs depend on nothing but
+    `--scenes`. Building it in the root is what makes the second run of a day
+    cheap.
+
+    `replay.episode_staging` then reads `<run>/benchmark/benchmark.json` to learn
+    which object each episode was about, and degrades to staging *nothing* with a
+    warning when that file is missing -- a replay that quietly holds the house
+    and not the object. So the run gets its own copy rather than a reference to
+    the root's, which also keeps a run directory self-contained if it is moved or
+    archived away from its siblings. The files are tens of kilobytes.
+
+    Returns the directory the evaluation should run from, which is the run's own.
+    """
+    import shutil
+
+    built = mini_benchmark.build(output_root / "benchmark", force=force, scene_count=scene_count)
+    benchmark_dir = output_dir / "benchmark"
+    if built.resolve() != benchmark_dir.resolve():
+        shutil.copytree(built, benchmark_dir, dirs_exist_ok=True)
+    return benchmark_dir
+
+
 def _typed(name: str) -> bool:
     """Whether `name` was given on the command line, rather than left at its default.
 
@@ -1690,9 +1814,15 @@ def _apply_params(
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path),
-    default=Path("eval_output") / "side_by_side",
+    default=Path("eval_output"),
     show_default=True,
-    help="Where the benchmark, the two runs and the composed videos go.",
+    help="Where runs are kept. A new run makes itself a directory in here named after "
+    "the date and the flags it was given -- side_by_side_20260925_baseline_flipped-wrist_"
+    "grasp-offset-0.009 and so on -- so runs accumulate side by side instead of "
+    "overwriting each other, and the benchmark is built once here and shared. The path is "
+    "printed when the run starts. --compose-only, --report-only and --replay-as-stretch4 "
+    "read a finished run instead of making one, so for those pass the run's own directory "
+    "and it is used exactly as typed. See `run_directory_name`.",
 )
 @click.option(
     "--rebuild-benchmark", is_flag=True, help="Rebuild the benchmark even if it is there."
@@ -1901,6 +2031,27 @@ def main(
         log.info(f"[camera] Stretch reads: {camera_choices.describe()}")
 
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
+
+    # What --output-dir was typed as, before the run's own directory is appended
+    # to it. The benchmark lives here rather than in the run: its episode specs
+    # depend only on --scenes, and building it costs a house compile per scene
+    # plus a settle per object, which an auto-named directory would otherwise pay
+    # on every run. See `run_directory_name`.
+    output_root = output_dir
+    consuming_a_finished_run = compose_only or report_only or replay_as_stretch4
+    if not consuming_a_finished_run:
+        # Only a new evaluation names its own directory. The three modes above
+        # read a run that already exists, and deriving a name for them would make
+        # re-reporting mean retyping the exact flags that produced it -- and put
+        # a run from any other day out of reach entirely.
+        output_dir = output_dir / run_directory_name(
+            pair,
+            conventions,
+            camera_choices,
+            param_specs=param_specs,
+            grasp_offset=stretch4_grasp_offset if _typed("stretch4_grasp_offset") else None,
+        )
+        click.secho(f"Writing this run to {output_dir}", fg="cyan")
     output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = output_dir / "videos"
 
@@ -2019,8 +2170,8 @@ def main(
         raise click.UsageError(inference_requirements_message(missing))
 
     workers = num_workers if num_workers is not None else affordable_workers(scene_count)
-    benchmark_dir = mini_benchmark.build(
-        output_dir / "benchmark", force=rebuild_benchmark, scene_count=scene_count
+    benchmark_dir = _benchmark_for_run(
+        output_root, output_dir, force=rebuild_benchmark, scene_count=scene_count
     )
 
     # One recorder, re-pointed per run; `set_panel_dir` is what keeps each run's

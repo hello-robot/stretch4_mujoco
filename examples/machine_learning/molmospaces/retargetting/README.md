@@ -13,12 +13,14 @@ free.
 
 ```
 examples/machine_learning/molmospaces/retargetting/
-    params_search.py         the entry point: trials, grid, CMA-ES, report
-    setups.py                the seven setups, their eval configs and overrides
-    cameras.py               the exo camera: mount, fisheye, rectify, crop
-    franka_droid_policy.py   the same checkpoint on a Franka, un-retargeted
-    mini_benchmark.py        one kitchen, one robot pose, four objects
-    scoring.py               the objective, and the report
+    params_search.py               the entry point: trials, grid, CMA-ES, report
+    params_search_side_by_side.py  a matched pair of setups, tiled into one video
+    replay.py                      the recorded Franka actions, retargeted offline
+    setups.py                      the seven setups, their eval configs and overrides
+    cameras.py                     the exo camera: mount, fisheye, rectify, crop
+    franka_droid_policy.py         the same checkpoint on a Franka, un-retargeted
+    mini_benchmark.py              one kitchen, one robot pose, four objects
+    scoring.py                     the objective, and the report
 ```
 
 ## Running it
@@ -74,6 +76,164 @@ Dimensions declare which robot they apply to, so the gripper stage is skipped on
 Franka setups (there is nothing to retarget on the robot the policy was trained
 on), and `--dim grasp_offset_m` on a Franka setup is refused rather than running
 16 identical trials.
+
+## Matched pairs, side by side
+
+`params_search_side_by_side.py` answers a different question from the sweep
+above. The sweep asks "which settings score best on Stretch"; this asks "what
+does the Franka do that Stretch does not, on the *same* episode". It runs a
+matched pair of setups over one benchmark and tiles each episode into one video:
+the Franka's third-person view and its two camera feeds on the left, Stretch's on
+the right, each captioned with its own outcome and the Stretch half with the
+retargeting residual.
+
+```bash
+# the baseline pair, under the conventions this study currently runs it with
+python -m examples.machine_learning.molmospaces.retargetting.params_search_side_by_side \
+    --pair baseline --scenes 2 \
+    --output-dir eval_output \
+    --map_franka_wrist_to_flipped_stretch4_wrist \
+    --change_franka_start_pose_limit_height \
+    --stretch4_grasp_offset -0.009 \
+    --param target_z_offset_m=0.035 \
+    --use_left_gripper_camera
+```
+
+### Where it lands
+
+`--output-dir` is the folder runs are *kept* in, not the run itself. Each run
+names its own directory from the date and the flags it was given and prints the
+path before anything expensive starts:
+
+```
+eval_output/side_by_side_20260925_baseline_limit-height_flipped-wrist_left-gripper-cam_grasp-offset-0.009_target-z-offset-m+0.035/
+    benchmark/      the episode specs this run was generated from
+    runs/           per-setup panels and probe records
+    videos/         one tiled MP4 per episode
+    trials.csv  episodes.csv  trials.jsonl  report.md
+```
+
+So two runs that differ in one flag sit next to each other under the same parent
+rather than overwriting one another, and the name says which is which without
+being hand-typed. The benchmark itself is built once in `--output-dir` and copied
+into each run, because its episode specs depend only on `--scenes` and building
+it costs a house compile per scene. Reruns of the same command on the same day
+resolve to the same directory and resume it.
+
+`--scenes` is deliberately *not* in the name: two scene counts share a directory
+and the second run's `trials.csv` replaces the first's.
+
+Three flags read a finished run instead of producing one, so for those pass the
+run's own directory and it is used exactly as typed:
+
+```bash
+python -m ...params_search_side_by_side --report-only   --output-dir eval_output/side_by_side_2026...
+python -m ...params_search_side_by_side --compose-only  --output-dir eval_output/side_by_side_2026...
+python -m ...params_search_side_by_side --replay-as-stretch4 --output-dir eval_output/side_by_side_2026...
+```
+
+`--replay-as-stretch4` is the cheap loop: it pushes the Franka run's *recorded*
+actions through the retargeting kinematically instead of running the policy
+again, so a retargeting parameter can be changed and measured in seconds with no
+checkpoint and no GPU.
+
+### The conventions
+
+A matched pair is only worth reading if its two halves differ in exactly one
+thing, which is why every convention is a named flag that is published to both
+halves rather than hard-coded. All default off; `PoseConventions` and
+`StretchCameraChoices` carry the measurements behind each.
+
+| flag | what it changes |
+|---|---|
+| `--change_franka_start_pose_flip_wrist` | Start the Franka rolled half a turn about the Robotiq's approach axis. Same grasp; the hand and the camera bolted to it swing round. |
+| `--change_franka_start_pose_limit_height` | Cap the Franka's start tool height at Stretch's reach ceiling, so the Stretch half does not begin every episode with its lift already at its stop. |
+| `--change_stretch_start_pose_flip_wrist` | Spawn Stretch with its own wrist rolled half a turn. Overwritten by the snap to the Franka's home unless `snap_to_franka_home` is off. |
+| `--map_franka_wrist_to_flipped_stretch4_wrist` | Pin Stretch to the half-turned branch of its wrist, which reaches poses the upright branch cannot, and report the pose back unflipped. |
+| `--keep_flipped_wrist_camera_frame` | Skip the half turn the policy's wrist frame is otherwise given on that branch. A control; see below. |
+| `--match_stretch_spawn_pose_to_franka` | Stand Stretch back far enough that its spawn gripper pose is the Franka's. Costs most of the arm's remaining reach. |
+| `--use_left_gripper_camera` | Read the wrist channel from Stretch's left gripper camera. The pair is 20mm apart on the same side of the hand, so this is a parallax check. |
+| `--use_left_fisheye_camera` | Read the exo channel from Stretch's real left head fisheye, which leaves every camera parameter of the trial inert. |
+
+Both camera flags break the pairing on purpose: a Franka has no left gripper
+camera and no head fisheye, so its half keeps the cameras it always had and the
+pair differs in two things rather than one. Read such a run as "can Stretch do
+this through this camera", not as "which camera is better".
+
+### The wrist camera on the flipped branch
+
+Worth knowing before running a pair with `--map_franka_wrist_to_flipped_stretch4_wrist`,
+because it is the one convention whose cost is invisible in the tiled video.
+
+`JAW_FLIP` is a half turn about the tool's approach axis, and Stretch's gripper
+camera looks down that axis — so the flipped branch rolls the camera 180 degrees
+about its own optical axis *and* carries it across to the other side of the axis.
+Measured against the virtual Franka's own wrist camera at the same tool pose:
+
+| | optical axis off by | image-up off by | camera across the axis |
+|---|---:|---:|---:|
+| upright branch | 19.5° | 19.5° | 17mm |
+| flipped, frame unrotated | 19.5° | 160.5° | 131mm |
+| flipped, frame turned back | 19.5° | 19.5° | 131mm |
+
+`StretchMolmoBotDroidPolicy._wrist_camera` turns the frame back, which fixes the
+roll and cannot fix the viewpoint. **Both halves of that matter, and they were
+measured separately.** Skipping the turn (`--keep_flipped_wrist_camera_frame`) is
+much worse than taking it: an unrotated frame has the whole scene 180 degrees
+out, so the policy reads every lateral correction backwards and the arm drives
+away from the object or stalls rather than arriving. Taking the turn leaves a
+static framing error instead — the gripper lands at the top of a frame every
+DROID wrist view has it entering from the bottom — and the arm tracks the object
+to within a few centimetres and then pitches the wrong way.
+
+So the turn is necessary and not sufficient, and what remains is parallax that no
+operation on an image can undo. The open question is whether the close-range
+failure is that 131mm; the way to ask it is to drop the flipped branch, where the
+camera sits 17mm from the Robotiq's instead.
+
+### Tilting the hand, and what it can and cannot fix
+
+`wrist_tilt_deg` pitches Stretch's whole hand relative to the pose the policy
+commanded — `--param wrist_tilt_deg=45` tips the gripper down a further 45
+degrees — and the gripper camera pitches with it. It is worth being exact about
+what that moves, because the obvious expectation is wrong.
+
+**It does not reframe the object.** The camera and the grasp centre are both
+bolted to the hand, so tilting rotates them together about the grasp centre. At
+every tilt the grasp centre sits at the same `v = ±0.243` and the fingertips at
+`v = ±0.265`, 234mm away. If a grasp is failing because the object is framed
+differently from the Robotiq's view of it, tilt cannot reach that.
+
+**What it does move is the aim**, and there the numbers are clean. At
+`wrist_tilt_deg=0` Stretch's wrist camera points 19.5 degrees away from where the
+Franka's points for the same commanded pose — the fixed lens-mounting difference
+both branches carry, and about two thirds of a half-height in a 58 degree frame.
+Tilting nulls it:
+
+| `wrist_tilt_deg` | aim off by | image-up off by | approach rotated by |
+|---:|---:|---:|---:|
+| 0 | 19.47° | 19.46° | 0° |
+| **+19.5** | **0.66°** | **0.04°** | 19.5° |
+| +45 | 25.54° | 25.54° | 45° |
+| -45 | 64.5° | — | 45° |
+
+So +19.5 degrees is the value that makes Stretch's wrist camera look where the
+Franka's looks, and +45 overshoots to *worse than zero*. What it costs is in the
+last column: the tilt rotates the approach direction by the same angle, so
+Stretch comes at the object from somewhere other than where the policy asked.
+That is a change to the grasp, not a correction to a camera, which is why this is
+a searched parameter rather than a fixed one — and why `--param wrist_tilt_deg=45`
+is a reasonable thing to try for a *top-down approach* and a poor way to chase
+the wrist view.
+
+`--param` writes the value into both halves' rows in `trials.csv`, but it only
+acts on the Stretch side (`apply_tool_correction`), so the Franka row's
+`wrist_tilt` is a label and not something that run did.
+
+**The tiled video does not show any of this.** The camera panels are read from
+the raw observation, before the policy's own preprocessing, so the
+`wrist_camera*` tile is the frame the *camera* produced and not the frame the
+checkpoint was handed.
 
 ## The mount is fixed; the optics are not
 

@@ -678,11 +678,13 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         the axis as well as rolling it, turning the image back lands the gripper
         at the *top* of the frame (v = +0.265) where the Franka's sits at the
         bottom (v = -0.19), and puts the grasp centre above the optical centre
-        rather than below it. The turn is therefore right for the scene and wrong
-        for the hand, and which matters more to this checkpoint is a rollout
-        question rather than an argument.
-        `PoseConventions.keep_flipped_wrist_camera_frame` carries the full
-        measurement and is the flag that runs the other half of it.
+        rather than below it. So the turn is right for the scene and wrong for
+        the hand -- and the scene wins decisively. Measured, not argued:
+        `PoseConventions.keep_flipped_wrist_camera_frame` skips the turn and the
+        arm stops arriving at the object at all, because an unrotated frame
+        inverts the sign of every lateral correction while the turn only biases
+        where the loop settles. Read that flag for the measurement, and for what
+        the turn still leaves wrong.
 
         Keyed on `jaw_flipped` rather than on the pose convention because that
         flag is the physical truth: under `jaw_mode="auto"` the branch can change
