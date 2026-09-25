@@ -1597,6 +1597,7 @@ RUN_NAME_ABBREVIATIONS = {
     "change_franka_start_pose_flip_wrist": "franka-start-flipped",
     "change_franka_start_pose_limit_height": "limit-height",
     "change_stretch_start_pose_flip_wrist": "stretch-start-flipped",
+    "change_stretch_start_pose_pitch_deg": "start-pitch",
     "keep_flipped_wrist_camera_frame": "unrotated-wrist-cam",
     "map_franka_wrist_to_flipped_stretch4_wrist": "flipped-wrist",
     "match_stretch_spawn_pose_to_franka": "matched-spawn",
@@ -1666,11 +1667,16 @@ def run_directory_name(
     """
     stamp = (today or date.today()).strftime("%Y%m%d")
     segments = [RUN_NAME_PREFIX, stamp, pair]
-    segments += [
-        RUN_NAME_ABBREVIATIONS.get(name, name.replace("_", "-"))
-        for name in fr.POSE_CONVENTION_ENV_VARS
-        if getattr(conventions, name)
-    ]
+    for name in fr.POSE_CONVENTION_ENV_VARS:
+        value = getattr(conventions, name)
+        if not value:
+            continue
+        segment = RUN_NAME_ABBREVIATIONS.get(name, name.replace("_", "-"))
+        # A numeric convention carries its value, or two runs that differ only in
+        # how far the wrist was pitched would land in the same directory.
+        if not isinstance(value, bool):
+            segment = f"{segment}{_run_name_value(value)}"
+        segments.append(segment)
     segments += [
         RUN_NAME_ABBREVIATIONS.get(name, name.replace("_", "-"))
         for name in STRETCH_CAMERA_CHOICE_ENV_VARS
@@ -1946,6 +1952,21 @@ def _apply_params(
     "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
 @click.option(
+    "--change_stretch_start_pose_pitch_deg",
+    "change_stretch_start_pose_pitch_deg",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Pitch Stretch's wrist by this many degrees about the jaw line at the opening "
+    "snap, and only there. The Franka's home points the hand straight down, which aims "
+    "Stretch's gripper camera at whatever is directly under it; this is the knob for "
+    "letting the first frames see the workspace. Positive tips the gripper up towards "
+    "horizontal. Every step after the snap is retargeted untouched and the pitched arm is "
+    "reported honestly, so the policy commands the pitch away rather than fighting a "
+    "hidden offset -- unlike --param wrist_tilt_deg, which it cannot see. Stretch only. "
+    "See `franka_retarget.PoseConventions`.",
+)
+@click.option(
     "--keep_flipped_wrist_camera_frame",
     "keep_flipped_wrist_camera_frame",
     is_flag=True,
@@ -1969,10 +1990,13 @@ def _apply_params(
     "--use_left_fisheye_camera",
     "use_left_fisheye_camera",
     is_flag=True,
-    help="Feed the policy's exo channel Stretch's real left head fisheye, warped and "
-    "turned as the hardware produces it, in place of the exo camera under test -- which "
-    "leaves every camera parameter of the trial inert. Stretch only, so the Franka half of "
-    "the pair keeps its own camera. See `setups.StretchCameraChoices`.",
+    help="Take the exo channel to Stretch's left head camera. On stretchcam/fisheye/"
+    "rectified this moves the mount both halves of the pair share, from the right head "
+    "camera to the left (y +0.075 against -0.075, a sign and nothing else) -- on the Franka "
+    "as well as on Stretch, with the camera under test and every camera parameter "
+    "unchanged. On baseline, whose exo camera is a fixture in the room rather than a point "
+    "on Stretch's head, it substitutes Stretch's real left fisheye instead and leaves every "
+    "camera parameter inert. See `setups.StretchCameraChoices`.",
 )
 def main(
     pair: str,
@@ -1994,6 +2018,7 @@ def main(
     change_franka_start_pose_flip_wrist: bool,
     change_franka_start_pose_limit_height: bool,
     change_stretch_start_pose_flip_wrist: bool,
+    change_stretch_start_pose_pitch_deg: float,
     keep_flipped_wrist_camera_frame: bool,
     map_franka_wrist_to_flipped_stretch4_wrist: bool,
     match_stretch_spawn_pose_to_franka: bool,
@@ -2007,6 +2032,7 @@ def main(
         change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
         change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
+        change_stretch_start_pose_pitch_deg=change_stretch_start_pose_pitch_deg,
         keep_flipped_wrist_camera_frame=keep_flipped_wrist_camera_frame,
         map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
         match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,

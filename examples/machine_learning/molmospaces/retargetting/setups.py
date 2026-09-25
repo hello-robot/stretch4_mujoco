@@ -755,12 +755,41 @@ def publish_params(setup_key: str, params: RetargetParams) -> None:
 
 
 def active_trial() -> tuple[str, RetargetParams]:
-    """The trial this process is running. Falls back to the first setup's defaults."""
+    """The trial this process is running. Falls back to the first setup's defaults.
+
+    The camera choices are folded in here rather than at each caller, because
+    this is the one place every process -- the two eval configs, both episode
+    overrides, the replay, the probe -- reads its trial through. A mount moved in
+    only some of them would render the episode from one pose and describe it as
+    another. See `StretchCameraChoices.exo_mount_pos`, which is idempotent for
+    the same reason.
+    """
     blob = os.environ.get(PARAMS_ENV_VAR)
     if not blob:
         default = SETUPS[SETUP_KEYS[0]]
-        return default.key, default.params
-    return params_from_json(blob)
+        return default.key, with_camera_choices(default.key, default.params)
+    key, params = params_from_json(blob)
+    return key, with_camera_choices(key, params)
+
+
+def with_camera_choices(
+    setup_key: str, params: RetargetParams, choices: "StretchCameraChoices | None" = None
+) -> RetargetParams:
+    """`params` as this process's `StretchCameraChoices` leave them.
+
+    Only the exo mount, and only on the setups that have a head-camera mount to
+    move -- everything else a camera choice does is a choice of *lens*, applied
+    where the camera system is built rather than written into the parameters.
+
+    Applies to Franka setups as readily as to Stretch ones, which is the point:
+    `HEAD_CAMERA_MOUNTED_SETUPS` are matched pairs, and a flag that moved one
+    half's mount would turn "the same view on two robots" into two views.
+    """
+    choices = stretch_camera_choices() if choices is None else choices
+    moved = choices.exo_mount_pos(setup_key, tuple(params.exo.pos))
+    if tuple(moved) == tuple(params.exo.pos):
+        return params
+    return dataclasses.replace(params, exo=dataclasses.replace(params.exo, pos=moved))
 
 
 def _register_cameras(params: RetargetParams) -> None:
@@ -776,6 +805,51 @@ def _register_cameras(params: RetargetParams) -> None:
 # Which of Stretch's own cameras the policy is shown
 # =============================================================================
 
+
+HEAD_CAMERA_MOUNTED_SETUPS = frozenset(
+    {
+        "franka_stretchcam",
+        "stretch_stretchcam",
+        "franka_fisheye",
+        "stretch_fisheye",
+        "franka_rectified",
+        "stretch_rectified",
+    }
+)
+"""
+The setups whose exo camera is mounted where Stretch's head camera is.
+
+Every one of them is built by `_stretch_head_camera_params`, and every one is a
+*matched pair*: the Franka half and the Stretch half carry the same mount, which
+is what makes a difference between them the robot rather than the view. Listed
+rather than derived, because what makes a setup a member is what its mount pose
+*means* and not the number that happens to be in it.
+
+`baseline` is deliberately not here. Its exo camera is the DROID shoulder camera
+at `DROID_SHOULDER_CAMERA_POS`, which is a fixture in the room rather than a
+point on Stretch's head -- there is no left or right of it to choose, and mirroring
+its y would move it to the other side of the kitchen. See
+`StretchCameraChoices.use_left_fisheye_camera`, which does something different
+there for that reason.
+"""
+
+STRETCH_HEAD_CAMERA_Y_M = 0.075
+"""
+How far off centre each of Stretch's head cameras sits, in metres.
+
+Measured on the compiled model at the home pose: `camera_right_link` at
+(0.0933, **-0.075**, 1.5277) in `base_link`'s frame and `camera_left_link` at
+(0.0933, **+0.075**, 1.5277). They differ in the sign of y and in nothing else --
+same forward offset, same height, both looking straight ahead and 47 degrees
+down. So moving the study's mount from one to the other is a sign, which is what
+`StretchCameraChoices.exo_mount_pos` applies.
+
+The two are not identical in every respect -- the left is bolted on turned the
+opposite way, `rotate_number_of_times` +1 against the right's -1 -- but that is a
+roll about the view axis, which rotates the raw frame rather than moving the
+mount. The study's exo camera is a rendered pinhole with its own `roll_deg`, so
+it does not inherit that.
+"""
 
 STRETCH_CAMERA_CHOICE_ENV_VARS = {
     "use_left_gripper_camera": "STRETCH4_USE_LEFT_GRIPPER_CAMERA",
@@ -832,30 +906,42 @@ class StretchCameraChoices:
     """
 
     use_left_fisheye_camera: bool = False
-    """Read the exo channel from Stretch's real left head fisheye, `camera_left_link`.
+    """Take the exo channel to Stretch's left head camera. What that means depends on the setup.
 
-    This *replaces* the parameterised exo camera rather than re-aiming it: what
-    the policy is shown is `Stretch4CameraSystem`'s own `head_camera_left`,
-    rendered through `install_stretch_camera_hooks` -- the hardware-accurate
-    path, with the fisheye warp and the quarter turn the simulator applies -- so
-    the frame is the one the robot would actually produce. Every
-    `ExoCameraParams` field is therefore inert on the exo channel while this is
-    on: the pitch, the FOV, the crop and the setup's whole premise of holding
-    one mount point while the optics change. `--param` naming a camera dimension
-    still writes it into `trials.csv`, where it describes nothing the run did.
+    **On `HEAD_CAMERA_MOUNTED_SETUPS`** -- `stretchcam`, `fisheye` and
+    `rectified` -- it moves the mount. Those setups exist to hold one point on
+    Stretch's head while the optics around it change, and that point has always
+    been the *right* head camera; this puts it on the left one instead, at
+    (0.0933, **+0.075**, 1.5277) against (0.0933, **-0.075**, 1.5277) in
+    `base_link`'s frame. The two differ in the sign of y and nothing else -- same
+    forward offset, same height, both level and 47 degrees down (see
+    `STRETCH_HEAD_CAMERA_Y_M`). Everything else about the setup is untouched: the
+    camera under test is still the camera under test, every `ExoCameraParams`
+    field still applies, and the move is applied to the **Franka half as well**,
+    so the pair still differs in the robot rather than the view.
 
-    The left fisheye is not a mirror of the right one the setups reproduce.
-    Measured from `base_link`: the same height and the same 47-degree downward
-    tilt, 150mm across to the other side of the head (+0.075 against -0.075 in
-    y), and bolted on turned the opposite way -- `rotate_number_of_times` is +1
-    where the right camera's is -1. Both come out 400x640, portrait, which is
-    what `stretch_fisheye` already hands this checkpoint.
+    **On `baseline`** it substitutes instead, which is the older behaviour and
+    the only thing available there: that setup's exo camera is the DROID shoulder
+    camera, a fixture in the room rather than a point on Stretch's head, so there
+    is no left of it to move to. What the policy is shown is
+    `Stretch4CameraSystem`'s own `head_camera_left`, rendered through
+    `install_stretch_camera_hooks` -- the hardware-accurate path, fisheye warp
+    and quarter turn included. Every `ExoCameraParams` field is inert on the exo
+    channel while that is on, so `--param` naming a camera dimension writes a
+    number into `trials.csv` that describes nothing the run did.
 
-    Useful mostly on `baseline`, where the exo channel is otherwise a DROID
-    shoulder camera transplanted into the room and this asks the flat question
-    the transplant exists to avoid: what happens if the policy just gets
-    Stretch's own view.
-    """
+    The left head camera is not a mirror of the right in every respect: it is
+    bolted on turned the opposite way, `rotate_number_of_times` +1 where the
+    right camera's is -1. That is a roll about the view axis rather than a move,
+    it rotates the raw frame, and it reaches the substitution path only -- the
+    mounted camera the three paired setups render is a pinhole with its own
+    `roll_deg`.
+
+    Read a substituting run as "can the policy do this through Stretch's own
+    view"; read a mounting run as "does this setup do better from the other side
+    of the head", which is a question about 150mm of parallax and about which
+    fingers and which clutter end up occluding the object.
+        """
 
     def __bool__(self) -> bool:
         """True when either channel is being taken off its default camera."""
@@ -866,10 +952,41 @@ class StretchCameraChoices:
         """The `Stretch4CameraSystem` camera the wrist channel reads."""
         return WRIST_CAMERA_LEFT if self.use_left_gripper_camera else WRIST_CAMERA_RIGHT
 
+    def exo_camera_for(self, setup_key: str) -> str:
+        """Which camera the exo channel reads, for one setup.
+
+        `use_left_fisheye_camera` means two different things, and the setup is
+        what decides which. On a `HEAD_CAMERA_MOUNTED_SETUPS` setup there is a
+        head-camera mount to move, so the flag moves it (see `exo_mount_pos`)
+        and the camera under test stays the camera under test -- which is the
+        whole point of those setups, and what keeps the Franka half and the
+        Stretch half of the pair looking at the scene from the same spot.
+        Anywhere else there is no such mount, so the flag substitutes Stretch's
+        real left fisheye for the exo channel instead.
+        """
+        if self.use_left_fisheye_camera and setup_key not in HEAD_CAMERA_MOUNTED_SETUPS:
+            return HEAD_CAMERA_LEFT
+        return EXO_CAMERA
+
     @property
     def exo_camera(self) -> str:
-        """The camera the exo channel reads: `EXO_CAMERA` unless the fisheye is asked for."""
-        return HEAD_CAMERA_LEFT if self.use_left_fisheye_camera else EXO_CAMERA
+        """`exo_camera_for` this process's own trial, for callers that have no key."""
+        return self.exo_camera_for(active_trial()[0])
+
+    def exo_mount_pos(
+        self, setup_key: str, pos: tuple[float, float, float]
+    ) -> tuple[float, float, float]:
+        """`pos`, moved to the left head camera when this setup has one and it is asked for.
+
+        Idempotent: it *sets* the sign of y rather than flipping it, so applying
+        it twice is applying it once. That is deliberate -- it is called both
+        where a worker reads its trial and where the parent describes it for
+        `trials.csv`, and those two must not be able to disagree about which side
+        of the head the camera was on.
+        """
+        if not self.use_left_fisheye_camera or setup_key not in HEAD_CAMERA_MOUNTED_SETUPS:
+            return pos
+        return (pos[0], abs(pos[1]), pos[2])
 
     def describe(self) -> str:
         asked = [name for name in STRETCH_CAMERA_CHOICE_ENV_VARS if getattr(self, name)]
@@ -928,7 +1045,9 @@ def franka_camera_system(params: RetargetParams) -> CameraSystemConfig:
 
 
 def stretch_camera_system(
-    params: RetargetParams, exo_mount_pose: np.ndarray | None = None
+    params: RetargetParams,
+    exo_mount_pose: np.ndarray | None = None,
+    setup_key: str | None = None,
 ) -> CameraSystemConfig:
     """The exo camera under test, plus Stretch's own wrist camera.
 
@@ -947,6 +1066,12 @@ def stretch_camera_system(
     every `ExoCameraParams` field is inert on it.
     """
     choices = stretch_camera_choices()
+    # The setup decides what `use_left_fisheye_camera` means -- substitute the
+    # real fisheye, or move the camera under test to the left head camera's
+    # mount. See `StretchCameraChoices.exo_camera_for`; the mount half is
+    # already in `params.exo.pos` by the time this runs, from `active_trial`.
+    setup_key = active_trial()[0] if setup_key is None else setup_key
+    reads_stretch_exo = choices.exo_camera_for(setup_key) != EXO_CAMERA
     wrist = next(
         camera for camera in Stretch4CameraSystem().cameras if camera.name == choices.wrist_camera
     )
@@ -957,7 +1082,7 @@ def stretch_camera_system(
         wrist = wrist.model_copy(update={"fov": float(params.wrist_fov_deg)})
     wrist_size = stretch_config.CAMERA_RENDER_SIZE[choices.wrist_camera]
 
-    if choices.use_left_fisheye_camera:
+    if reads_stretch_exo:
         head = next(
             camera for camera in Stretch4CameraSystem().cameras if camera.name == HEAD_CAMERA_LEFT
         )
@@ -1179,7 +1304,7 @@ def stretch_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None
     the exo view this study varies as a seventh nobody reads. The base pose is
     the same; the start configuration is `stretch_spawn_init_qpos`.
     """
-    _, params = active_trial()
+    setup_key, params = active_trial()
     _register_cameras(params)
 
     episode_spec.robot.robot_name = "stretch4"
@@ -1199,7 +1324,9 @@ def stretch_episode_override(episode_spec: EpisodeSpec, exp_config: Any) -> None
         R.from_quat(episode_spec.task["robot_base_pose"][3:7], scalar_first=True).as_euler("xyz")[2]
     )
 
-    system = stretch_camera_system(params, exo_mount_pose=base_link_pose(authored_xy, yaw))
+    system = stretch_camera_system(
+        params, exo_mount_pose=base_link_pose(authored_xy, yaw), setup_key=setup_key
+    )
     exp_config.camera_config.cameras = list(system.cameras)
     exp_config.camera_config.img_resolution = system.img_resolution
 
@@ -1376,11 +1503,16 @@ class _RetargetEvalConfig(JsonBenchmarkEvalConfig):
     sim_dt_ms: float = 2.0
     end_on_success: bool = True
 
-    def _apply_trial(self) -> RetargetParams:
-        """Read this process's trial and register its cameras. Called from `model_post_init`."""
-        _, params = active_trial()
+    def _apply_trial(self) -> tuple[str, RetargetParams]:
+        """Read this process's trial and register its cameras. Called from `model_post_init`.
+
+        Returns the setup key with the params, because
+        `StretchCameraChoices.exo_camera_for` needs it: which camera the exo
+        channel reads is a property of the setup as well as of the flag.
+        """
+        key, params = active_trial()
         _register_cameras(params)
-        return params
+        return key, params
 
 
 class RetargetFrankaDroidEvalConfig(_RetargetEvalConfig):
@@ -1396,7 +1528,7 @@ class RetargetFrankaDroidEvalConfig(_RetargetEvalConfig):
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
-        params = self._apply_trial()
+        _, params = self._apply_trial()
         system = franka_camera_system(params)
         self.camera_config.cameras = list(system.cameras)
         self.camera_config.img_resolution = system.img_resolution
@@ -1420,8 +1552,8 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
-        params = self._apply_trial()
-        system = stretch_camera_system(params)
+        setup_key, params = self._apply_trial()
+        system = stretch_camera_system(params, setup_key=setup_key)
         self.camera_config.cameras = list(system.cameras)
         self.camera_config.img_resolution = system.img_resolution
         # The two channel names have to be read off the same `StretchCameraChoices`
@@ -1431,7 +1563,7 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
         # study's subclass of it, because that is where the fields are declared.
         if isinstance(self.policy_config, StretchMolmoBotDroidPolicyConfig):
             choices = stretch_camera_choices()
-            self.policy_config.exo_camera = choices.exo_camera
+            self.policy_config.exo_camera = choices.exo_camera_for(setup_key)
             self.policy_config.wrist_camera = choices.wrist_camera
         # Guarded so that a subclass swapping the policy out -- for a dummy
         # policy, to check that a setup's scene and cameras load without waiting

@@ -42,6 +42,7 @@ orientation rather than trade against it. See `_task_priority_step`.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import os
@@ -429,6 +430,7 @@ POSE_CONVENTION_ENV_VARS = {
     "change_franka_start_pose_flip_wrist": "STRETCH4_CHANGE_FRANKA_START_POSE_FLIP_WRIST",
     "change_franka_start_pose_limit_height": "STRETCH4_CHANGE_FRANKA_START_POSE_LIMIT_HEIGHT",
     "change_stretch_start_pose_flip_wrist": "STRETCH4_CHANGE_STRETCH_START_POSE_FLIP_WRIST",
+    "change_stretch_start_pose_pitch_deg": "STRETCH4_CHANGE_STRETCH_START_POSE_PITCH_DEG",
     "keep_flipped_wrist_camera_frame": "STRETCH4_KEEP_FLIPPED_WRIST_CAMERA_FRAME",
     "map_franka_wrist_to_flipped_stretch4_wrist": "STRETCH4_MAP_FRANKA_WRIST_TO_FLIPPED_STRETCH4_WRIST",
     "match_stretch_spawn_pose_to_franka": "STRETCH4_MATCH_STRETCH_SPAWN_POSE_TO_FRANKA",
@@ -491,6 +493,71 @@ class PoseConventions:
     -- the first `get_action` writes the arm and wrist to whatever matches the
     Franka's start tool pose, so this decides the spawn and the first observation
     and is then overwritten. Turn the snap off to hold it for the episode.
+    """
+
+    change_stretch_start_pose_pitch_deg: float = 0.0
+    """Pitch Stretch's wrist by this many degrees at the snap, and only at the snap.
+
+    Degrees about Stretch's tool y -- the jaw line -- applied to the pose
+    `snap_to_franka_joint_pos` writes the robot into, so positive tips the
+    gripper up towards horizontal and negative tips it down. The Franka's home
+    points its hand straight down, and from there Stretch's gripper camera looks
+    down its own approach axis at whatever is directly beneath the hand rather
+    than out across the counter. This is the knob for "let the first frames see
+    the workspace".
+
+    **Start only, by construction.** It is applied to the snap target and to
+    nothing else: every step after it goes through `retarget_franka_joint_pos`
+    untouched, and `franka_joint_pos` reports the pitched arm honestly rather
+    than hiding it. So the policy's first observation shows a wrist aimed across
+    the workspace, its proprioception agrees that the wrist is aimed there, and
+    from the first action onwards the pose is whatever the policy asks for. The
+    pitch decays because the policy commands it away, not because anything here
+    cancels it.
+
+    That honesty is the whole difference from `RetargetParams.wrist_tilt_deg`,
+    which is the same rotation folded into the *tool transform* instead. That one
+    is subtracted again by `_tool_correction_inverse` before the policy sees it,
+    so the hand sits 19.5 or 45 degrees from where the checkpoint reads it as
+    being, with nothing in the observation saying so -- a constant, unobservable
+    offset in a loop closed through the wrist camera, which the policy drives out
+    within a few steps while believing it is holding still. Read that field for
+    the measurement. This one claims less and therefore survives being true: it
+    moves the start and says so.
+
+    Stretch only, and it does not need `snap_to_franka_home` -- it *is* the snap.
+    `change_stretch_start_pose_flip_wrist`, which rolls the spawn instead, is the
+    one that the snap overwrites.
+
+    **Tried, and it costs grasps where the policy was working.** Eight episodes
+    per cell, everything else held:
+
+        setup              pitch 0      +19        +30
+        stretch_baseline    5/8        1/8        2/8
+        stretch_stretchcam  2/8         --        2/8
+
+    and the continuous measure moves the same way -- mean closest approach to the
+    object on `baseline` goes from 58mm to 100mm at +19 and 109mm at +30, worse
+    in almost every episode rather than in one or two, which is what makes the
+    shift readable at n=8 when the counts alone would not be.
+
+    Not the retargeting: position error stays at 0.6-2.3mm and orientation at
+    0.0003-0.0022 rad across all three. The arm went where it was told; the
+    policy told it somewhere worse.
+
+    The split between the two setups is the whole explanation. `baseline` is the
+    condition whose exo camera *is* the DROID shoulder camera the checkpoint
+    trained on, and it is the best Stretch result in the study -- so the prior
+    driving it is both confident and correct, which is exactly what an
+    out-of-distribution opening derails: the first observation carries a Franka
+    joint vector and an arm posture no DROID episode begins in, and the policy
+    commits a whole action chunk to it. `stretchcam` is already at 2/8 through an
+    exo camera it does not recognise, so the same pitch changes nothing. You can
+    only break what was working.
+
+    Kept off by default and kept at all because the measurement is worth having:
+    it says the opening observation matters a great deal on the one Stretch
+    configuration that works, which is a fact about where to spend effort.
     """
 
     keep_flipped_wrist_camera_frame: bool = False
@@ -607,7 +674,11 @@ class PoseConventions:
         return self.change_franka_start_pose_flip_wrist or self.change_franka_start_pose_limit_height
 
     def describe(self) -> str:
-        asked = [name for name in POSE_CONVENTION_ENV_VARS if getattr(self, name)]
+        asked = [
+            name if isinstance(getattr(self, name), bool) else f"{name}={getattr(self, name):g}"
+            for name in POSE_CONVENTION_ENV_VARS
+            if getattr(self, name)
+        ]
         return ", ".join(asked) if asked else "none (DROID home, unflipped)"
 
 
@@ -615,10 +686,35 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
 
 
+def _pose_convention_types() -> dict[str, type]:
+    """Each convention's declared type, so the environment round-trip cannot guess wrong.
+
+    Read off the dataclass rather than listed separately: a convention added as a
+    number and plumbed as a flag would publish "1" and come back as 1.0 degree,
+    which is a silently different run rather than an error.
+    """
+    return {f.name: f.type for f in dataclasses.fields(PoseConventions)}
+
+
+def _env_number(name: str) -> float:
+    """One numeric convention off the environment. Unset, unparseable or blank is 0."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        if raw:
+            log.warning(f"[retarget] {name}={raw!r} is not a number; reading it as 0.")
+        return 0.0
+
+
 def pose_conventions_requested() -> PoseConventions:
     """Which pose conventions this process was asked for."""
+    types = _pose_convention_types()
     return PoseConventions(
-        **{field: _env_flag(variable) for field, variable in POSE_CONVENTION_ENV_VARS.items()}
+        **{
+            field: (_env_flag(variable) if types[field] is bool else _env_number(variable))
+            for field, variable in POSE_CONVENTION_ENV_VARS.items()
+        }
     )
 
 
@@ -631,10 +727,13 @@ def publish_pose_conventions(conventions: PoseConventions) -> None:
     is precisely the failure these flags were added to remove.
     """
     for field, variable in POSE_CONVENTION_ENV_VARS.items():
-        if getattr(conventions, field):
+        value = getattr(conventions, field)
+        if not value:
+            os.environ.pop(variable, None)
+        elif isinstance(value, bool):
             os.environ[variable] = "1"
         else:
-            os.environ.pop(variable, None)
+            os.environ[variable] = repr(float(value))
 
 
 def stretch_startable_arm_qpos(
@@ -1527,6 +1626,26 @@ class FrankaOnStretchView:
         joint_pos = np.asarray(joint_pos, dtype=float)
 
         target = self.franka_tool_pose_to_world(self.franka.fk(joint_pos))
+        pitch = float(self.pose_conventions.change_stretch_start_pose_pitch_deg)
+        if pitch:
+            # About Stretch's tool y -- the jaw line -- so the approach tips up
+            # or down and the hand does not roll. `target` is already in
+            # Stretch's tool convention here (`franka_tool_pose_to_world` has
+            # applied the correction), so this composes on the right.
+            #
+            # Here and nowhere else: `retarget_franka_joint_pos` is left alone,
+            # so this moves where the episode *begins* and not the frame the
+            # policy's actions are interpreted in. A rotation folded into
+            # `_tool_correction` instead would be undone again by
+            # `_tool_correction_inverse` on the way back out and the policy would
+            # never see it -- see
+            # `PoseConventions.change_stretch_start_pose_pitch_deg`.
+            spin = np.eye(4)
+            spin[:3, :3] = R.from_euler("y", pitch, degrees=True).as_matrix()
+            target = target @ spin
+            log.info(
+                f"[retarget] snapping with the wrist pitched {pitch:+.1f} deg about the jaw line"
+            )
         # Through the same branch selection as a commanded step, so that the
         # configuration the robot is written into and `jaw_flipped` cannot
         # disagree -- the reported arm state is read back through that flag, and

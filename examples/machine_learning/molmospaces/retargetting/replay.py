@@ -1628,6 +1628,7 @@ class _CameraPanels:
             StretchCameraRig,
         )
         from examples.machine_learning.molmospaces.retargetting.setups import (
+            EXO_CAMERA,
             stretch_camera_choices,
         )
         from examples.machine_learning.molmospaces.stretch.config import (
@@ -1638,12 +1639,18 @@ class _CameraPanels:
         # replay's panels are of the same lenses as the run they replay. Off the
         # environment, which is where `publish_stretch_camera_choices` put them.
         choices = stretch_camera_choices()
+        # `exo_camera` resolves through this process's own trial, so a
+        # head-camera-mounted setup keeps its camera under test and only has its
+        # mount moved -- see `StretchCameraChoices.exo_camera_for`. Comparing the
+        # name rather than reading the flag is what keeps this branch in step
+        # with the rollout's.
         self._exo_name = choices.exo_camera
+        reads_stretch_exo = self._exo_name != EXO_CAMERA
         self._exo_params = exo
         self._exo_renderer = None
         camera_name = namespace + REPLAY_EXO_CAMERA
         mounted = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name) >= 0
-        if exo is not None and mounted and not choices.use_left_fisheye_camera:
+        if exo is not None and mounted and not reads_stretch_exo:
             width, height = exo.render_size
             self._exo_renderer = mujoco.Renderer(model, height, width)
             self._exo_camera = camera_name
@@ -1653,7 +1660,7 @@ class _CameraPanels:
         # own cameras: that is the path `install_stretch_camera_hooks` gives it
         # in the evaluation, warp and quarter turn included.
         self._rig_names = [choices.wrist_camera]
-        if choices.use_left_fisheye_camera:
+        if reads_stretch_exo:
             self._rig_names.insert(0, self._exo_name)
         self._rig = StretchCameraRig(
             model,

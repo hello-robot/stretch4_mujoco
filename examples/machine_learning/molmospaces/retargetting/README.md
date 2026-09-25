@@ -150,15 +150,25 @@ halves rather than hard-coded. All default off; `PoseConventions` and
 | `--change_franka_start_pose_limit_height` | Cap the Franka's start tool height at Stretch's reach ceiling, so the Stretch half does not begin every episode with its lift already at its stop. |
 | `--change_stretch_start_pose_flip_wrist` | Spawn Stretch with its own wrist rolled half a turn. Overwritten by the snap to the Franka's home unless `snap_to_franka_home` is off. |
 | `--map_franka_wrist_to_flipped_stretch4_wrist` | Pin Stretch to the half-turned branch of its wrist, which reaches poses the upright branch cannot, and report the pose back unflipped. |
+| `--change_stretch_start_pose_pitch_deg N` | Pitch Stretch's wrist N degrees about the jaw line at the opening snap, and only there. Positive aims it out across the counter. Stretch only. |
 | `--keep_flipped_wrist_camera_frame` | Skip the half turn the policy's wrist frame is otherwise given on that branch. A control; see below. |
 | `--match_stretch_spawn_pose_to_franka` | Stand Stretch back far enough that its spawn gripper pose is the Franka's. Costs most of the arm's remaining reach. |
 | `--use_left_gripper_camera` | Read the wrist channel from Stretch's left gripper camera. The pair is 20mm apart on the same side of the hand, so this is a parallax check. |
-| `--use_left_fisheye_camera` | Read the exo channel from Stretch's real left head fisheye, which leaves every camera parameter of the trial inert. |
+| `--use_left_fisheye_camera` | On `stretchcam`/`fisheye`/`rectified`, move the exo mount to Stretch's **left** head camera (y +0.075 against −0.075) — on both robots, camera under test unchanged. On `baseline`, substitute Stretch's real left fisheye instead, which leaves every camera parameter inert. |
 
-Both camera flags break the pairing on purpose: a Franka has no left gripper
-camera and no head fisheye, so its half keeps the cameras it always had and the
-pair differs in two things rather than one. Read such a run as "can Stretch do
-this through this camera", not as "which camera is better".
+`--use_left_gripper_camera` breaks the pairing on purpose: a Franka has no left
+gripper camera, so its half keeps the one it always had and the pair differs in
+two things rather than one. Read such a run as "can Stretch do this through this
+camera", not as "which camera is better".
+
+`--use_left_fisheye_camera` does *not* break it on the three paired setups. There
+it moves the mount both halves share from Stretch's right head camera to its
+left — (0.0933, −0.075, 1.5277) to (0.0933, **+0.075**, 1.5277) in `base_link`'s
+frame, a sign on y and nothing else — so the Franka half moves with the Stretch
+half and the run still asks "the same view, two robots", 150mm across the head
+from where it asked before. Only on `baseline`, which mounts the DROID shoulder
+camera in the room rather than on Stretch's head, does it substitute Stretch's
+own fisheye and leave the camera parameters inert.
 
 ### The wrist camera on the flipped branch
 
@@ -191,49 +201,115 @@ operation on an image can undo. The open question is whether the close-range
 failure is that 131mm; the way to ask it is to drop the flipped branch, where the
 camera sits 17mm from the Robotiq's instead.
 
-### Tilting the hand, and what it can and cannot fix
+### Letting the first frames see the workspace
+
+The Franka's home points the hand straight down, so Stretch's gripper camera —
+which looks along its own approach axis, 241mm back — starts by staring at
+whatever is directly beneath the hand rather than out across the counter.
+`--change_stretch_start_pose_pitch_deg` tips the wrist at the opening snap so the
+first frames see the workspace:
+
+```bash
+python -m ...params_search_side_by_side --pair baseline \
+    --change_stretch_start_pose_pitch_deg 30 --change_franka_start_pose_limit_height
+```
+
+Measured at the snap, with the Franka's home as the reference:
+
+| flag | the wrist camera looks | the policy reads the wrist as |
+|---:|---|---|
+| 0 | 90.0° below horizontal, straight down | 90.0° below |
+| **+30** | **60.0° below, out across the counter** | 60.0° below |
+| −30 | 60.0° below, back towards the robot | 60.0° below |
+| −45 | 45.0° below, back towards the robot | 45.0° below |
+
+Two things to read off that third column and the section below it.
+
+**The policy can see the pitch**, which is what makes this work where the obvious
+alternative does not. It is applied to the snap *target*, so proprioception
+reports the pitched arm honestly and the checkpoint can act on it. Every step
+after the snap goes through `retarget_franka_joint_pos` untouched, so the frame
+its actions are interpreted in never moves. The pitch then decays over the first
+few steps because the policy commands it away — which is the intent, not a
+failure: it buys the opening frames and nothing else.
+
+**Positive aims out across the counter.** Negative tips the hand back towards the
+robot, which shows the policy a wall.
+
+### Tilting the hand does not aim the camera
 
 `wrist_tilt_deg` pitches Stretch's whole hand relative to the pose the policy
-commanded — `--param wrist_tilt_deg=45` tips the gripper down a further 45
-degrees — and the gripper camera pitches with it. It is worth being exact about
-what that moves, because the obvious expectation is wrong.
+commanded — `--param wrist_tilt_deg=45` — and the gripper camera pitches with it,
+which makes it the obvious knob for "point the wrist camera somewhere else". It
+is not that knob, and two measurements say why.
 
-**It does not reframe the object.** The camera and the grasp centre are both
-bolted to the hand, so tilting rotates them together about the grasp centre. At
-every tilt the grasp centre sits at the same `v = ±0.243` and the fingertips at
-`v = ±0.265`, 234mm away. If a grasp is failing because the object is framed
-differently from the Robotiq's view of it, tilt cannot reach that.
+**It does not reframe the hand.** The camera and the grasp centre are both bolted
+to the hand, so tilting rotates them together about the grasp centre. At every
+tilt from −45 to +45 the grasp centre sits at the same `v = ±0.243` and the
+fingertips at `v = ±0.265`, 234mm away.
 
-**What it does move is the aim**, and there the numbers are clean. At
-`wrist_tilt_deg=0` Stretch's wrist camera points 19.5 degrees away from where the
-Franka's points for the same commanded pose — the fixed lens-mounting difference
-both branches carry, and about two thirds of a half-height in a 58 degree frame.
-Tilting nulls it:
+**And the policy undoes it.** Proprioception is reported back through
+`_tool_correction_inverse`, so the tilt is stripped out on the way to the
+checkpoint. Measured at the `lowest` waypoint with the IK residual at 0.0mm:
 
-| `wrist_tilt_deg` | aim off by | image-up off by | approach rotated by |
-|---:|---:|---:|---:|
-| 0 | 19.47° | 19.46° | 0° |
-| **+19.5** | **0.66°** | **0.04°** | 19.5° |
-| +45 | 25.54° | 25.54° | 45° |
-| -45 | 64.5° | — | 45° |
+| `wrist_tilt_deg` | Stretch's physical approach | what the policy reads back |
+|---:|---:|---|
+| 0 | 90.00° below horizontal | its own command, to 0.00014 rad |
+| +19.5 | 70.51° | its own command, to 0.00056 rad |
+| +45 | 45.01° | its own command, to 0.00292 rad |
 
-So +19.5 degrees is the value that makes Stretch's wrist camera look where the
-Franka's looks, and +45 overshoots to *worse than zero*. What it costs is in the
-last column: the tilt rotates the approach direction by the same angle, so
-Stretch comes at the object from somewhere other than where the policy asked.
-That is a change to the grasp, not a correction to a camera, which is why this is
-a searched parameter rather than a fixed one — and why `--param wrist_tilt_deg=45`
-is a reasonable thing to try for a *top-down approach* and a poor way to chase
-the wrist view.
+The hand is 19.5 and 45 degrees away from where the policy thinks it is, and
+nothing in the observation says so. A checkpoint closing a visual loop drives the
+hand to whatever pose makes the wrist view look right; the camera is bolted to
+the hand, so that pose is the same one with or without the tilt. All the tilt
+changes is which *command* reaches it — so in a rollout the start pose moves and
+the policy pulls the hand back within a few steps. (Note the sign while reading
+the table: positive tips the gripper *up*, towards horizontal.)
+
+**And the pitch itself is a negative result.** Eight episodes per cell,
+everything else held:
+
+| setup | pitch 0 | +19 | +30 | mean closest approach |
+|---|---:|---:|---:|---|
+| `stretch_baseline` | **5/8** | 1/8 | 2/8 | 58mm → 100mm → 109mm |
+| `stretch_stretchcam` | 2/8 | — | 2/8 | unchanged |
+
+Not the retargeting — position error stays at 0.6–2.3mm and orientation at
+0.0003–0.0022 rad in all of them. The arm went where it was told.
+
+The split between the two setups is the explanation. `baseline`'s exo camera
+*is* the DROID shoulder camera the checkpoint trained on, and it is the best
+Stretch result in the study, so the prior driving it is confident and correct —
+which is exactly what an out-of-distribution opening derails. `stretchcam` is
+already at 2/8 through an exo camera the policy does not recognise, so the same
+pitch changes nothing there. You can only break what was working.
+
+### Where the grasps actually are
+
+`stretch_baseline` and `stretch_stretchcam` have **identical wrist channels** —
+the same gripper camera, `wrist_fov_deg` 0 in both — and in the runs above they
+carried identical flags. They differ in the exo camera and nothing else:
+
+| | exo camera | picked |
+|---|---|---:|
+| `stretch_baseline` | the DROID shoulder camera, transplanted | **5/8** |
+| `stretch_stretchcam` | an upright pinhole at Stretch's head pose | 2/8 |
+
+Three grasps, and the wrist view is the same in both. Whatever separates a
+working Stretch configuration from a failing one in this study is the **exo**
+channel, not the wrist one — which is worth knowing before spending another
+sweep on wrist geometry.
+
+So `wrist_tilt_deg` is a grasp parameter, which is what it is searched as
+(`params_search`'s gripper stage tries −45, 0, +45): what it really changes is
+the line the hand approaches along while the loop is still converging. Aiming the
+wrist camera means moving the camera relative to the **hand**, which is a remount
+rather than a retargeting parameter. `ExoCameraParams.pitch_deg` is the head
+camera's version of that knob; the wrist has no equivalent.
 
 `--param` writes the value into both halves' rows in `trials.csv`, but it only
 acts on the Stretch side (`apply_tool_correction`), so the Franka row's
 `wrist_tilt` is a label and not something that run did.
-
-**The tiled video does not show any of this.** The camera panels are read from
-the raw observation, before the policy's own preprocessing, so the
-`wrist_camera*` tile is the frame the *camera* produced and not the frame the
-checkpoint was handed.
 
 ## The mount is fixed; the optics are not
 

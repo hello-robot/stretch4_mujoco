@@ -315,26 +315,43 @@ class RetargetParams:
     Extra pitch, in degrees, between the Franka's tool frame and Stretch's.
 
     Applied about the tool frame's y axis on top of the fixed -90 degree
-    correction the retargeting already carries, so 0 is today's behaviour and 45
-    tips the gripper down by a further 45 degrees relative to what the policy
-    asked for.
+    correction the retargeting already carries, so 0 is today's behaviour.
+    Positive tips the gripper *up*, towards horizontal: measured at the `lowest`
+    waypoint with the IK residual at 0.0mm, a command for 90 degrees below
+    horizontal puts Stretch's approach at 70.51 degrees under +19.5 and at 45.01
+    under +45. (An earlier version of this note said positive tips it down. It
+    does not.)
 
-    **It does not reframe the object in the wrist camera**, which is the thing it
-    is most often reached for. The camera and the grasp centre are both fixed to
-    the hand, so the tilt rotates them together about the grasp centre: measured
-    on the compiled model, the grasp centre stays at v = +-0.243 of the frame
-    and the fingertips at v = +-0.265 at every tilt from -45 to +45.
+    **This is not a camera parameter, and it cannot be used as one.** Two
+    measurements say so, and both matter because the wrist view is what it gets
+    reached for.
 
-    What it moves is the *aim*. At 0 Stretch's gripper camera points 19.5 degrees
-    away from where the Robotiq's wrist camera points for the same commanded
-    pose -- a fixed difference in how the two lenses are bolted on, carried by
-    both jaw branches -- and +19.5 degrees of tilt nulls it to 0.66, with
-    image-up to 0.04. +45 overshoots to 25.5, which is worse than leaving it
-    alone. The cost is in the same number: the approach direction rotates with
-    the hand, so Stretch reaches along a line the policy did not ask for. That is
-    a change to the grasp rather than a correction to a camera, which is why this
-    is searched (`params_search`'s gripper stage tries -45, 0, +45) rather than
-    set.
+    It does not reframe the hand. The camera and the grasp centre are both fixed
+    to the hand, so the tilt rotates them together about the grasp centre: the
+    grasp centre stays at v = +-0.243 of the frame and the fingertips at
+    v = +-0.265 at every tilt from -45 to +45.
+
+    And it does not survive the policy. `franka_joint_pos` reports proprioception
+    back through `_tool_correction_inverse`, so the tilt is undone on the way
+    out: at that same waypoint the policy reads its own command back to 0.00056
+    rad under +19.5 and 0.00292 rad under +45, while Stretch's hand sits 19.5 and
+    45 degrees away from it. The tilt is therefore *invisible* to the policy -- a
+    constant offset between the frame it commands in and the frame the hand is
+    in, which nothing in its observation reports. A checkpoint closing a visual
+    loop drives the hand to whatever pose makes the wrist view look right, and
+    since the camera is bolted to the hand that pose is the same one with or
+    without the tilt. All the tilt changes is which command reaches it. Observed
+    in a rollout: the start pose moves, and the policy pulls the hand back within
+    a few steps.
+
+    What it does change, and what it is searched for (`params_search`'s gripper
+    stage tries -45, 0, +45), is the *grasp*: while the loop is still converging
+    the hand approaches along a line the policy did not ask for, and it puts the
+    arm in physical configurations whose commanded form is inside the training
+    distribution when the physical one is not. To aim the wrist camera without
+    the policy undoing it, the camera has to move relative to the *hand* -- a
+    remount rather than a retargeting parameter. `ExoCameraParams.pitch_deg` is
+    the head camera's version of that knob; the wrist has no equivalent.
     """
 
     target_z_offset_m: float = 0.0

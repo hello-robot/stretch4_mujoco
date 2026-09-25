@@ -2614,6 +2614,199 @@ def test_keep_flipped_wrist_camera_frame_gates_the_half_turn(jaw_flipped, keep) 
     assert shown.flags["C_CONTIGUOUS"], "torch.from_numpy will refuse a negative-stride view"
 
 
+def _approach_pitch_deg(pose: np.ndarray) -> float:
+    """How far below horizontal a Stretch tool pose points, in degrees. +x is the approach."""
+    return float(np.degrees(np.arcsin(-np.clip(pose[:3, 0][2], -1.0, 1.0))))
+
+
+@pytest.mark.parametrize("pitch", [0.0, 30.0, -45.0])
+def test_the_start_pitch_moves_the_snap_and_the_policy_can_see_it(pitch) -> None:
+    """The opening pitch is real, is reported, and is gone by the first commanded step.
+
+    Three properties, and the middle one is why this convention exists where
+    `RetargetParams.wrist_tilt_deg` does not. That parameter folds the same
+    rotation into `_tool_correction`, which `_tool_correction_inverse` subtracts
+    again before the policy reads anything -- so the hand sits tens of degrees
+    from where the checkpoint believes it is, with nothing in the observation
+    saying so, and a loop closed through the wrist camera drives the offset out
+    while believing it is holding still. Applied to the *snap target* instead,
+    the pitch is an honest starting configuration: proprioception reports it, so
+    the policy can act on it rather than fight it.
+
+    The third property is what keeps it a start pose rather than a retargeting
+    change: an ordinary commanded step goes through `retarget_franka_joint_pos`
+    untouched, so the frame the policy's actions are interpreted in is the same
+    one it always was.
+
+    The zero case is parametrized in on purpose. "The snap pitched by 30 degrees"
+    is worth nothing unless the unpitched snap is where it always was, and a sign
+    error in the composition would show up here as the wrong branch of a pose
+    that is otherwise symmetric about straight down.
+    """
+    rig = RetargetRig(
+        jaw_mode="upright",
+        pose_conventions=fr.PoseConventions(change_stretch_start_pose_pitch_deg=pitch),
+    )
+    proxy = rig.proxy
+    proxy.reset()
+    proxy.snap_to_franka_joint_pos()
+
+    # The Franka's home points its hand straight down, so the pitch shows up as
+    # exactly that much off vertical whichever way it is applied.
+    snapped = _approach_pitch_deg(proxy.arm_ik.tool_pose())
+    assert snapped == pytest.approx(90.0 - abs(pitch), abs=0.5), (
+        f"the snap should leave the wrist {90.0 - abs(pitch):.1f} deg below horizontal "
+        f"with a {pitch:+.1f} deg pitch, not {snapped:.1f}"
+    )
+
+    # And the direction: positive aims the hand out across the counter, which is
+    # the whole point -- a pitch that tipped it back at the robot would show the
+    # policy a wall.
+    outward = float(proxy.arm_ik.tool_pose()[:3, 0] @ rig.forward)
+    if pitch:
+        assert np.sign(outward) == np.sign(pitch), (
+            f"a {pitch:+.1f} deg pitch aimed the hand "
+            f"{'out across the counter' if outward > 0 else 'back towards the robot'}"
+        )
+
+    # Visible, which `wrist_tilt_deg` is not.
+    reported = _approach_pitch_deg(
+        proxy.franka_tool_pose_to_world(proxy.franka.fk(proxy.franka_joint_pos()))
+    )
+    assert reported == pytest.approx(snapped, abs=0.5), (
+        f"the arm is {snapped:.1f} deg below horizontal but the policy reads it as "
+        f"{reported:.1f} -- a hidden offset is exactly what this convention exists to avoid"
+    )
+
+    # Start only: the first commanded step lands where the command says.
+    commanded = _approach_pitch_deg(
+        proxy.franka_tool_pose_to_world(proxy.franka.fk(proxy.franka.init_qpos))
+    )
+    assert commanded == pytest.approx(90.0, abs=0.5), (
+        f"a commanded pose came out {commanded:.1f} deg below horizontal; the pitch has "
+        f"leaked into the retargeting instead of staying at the snap"
+    )
+
+
+PAIRED_HEAD_CAMERA_SETUPS = (
+    ("franka_stretchcam", "stretch_stretchcam"),
+    ("franka_fisheye", "stretch_fisheye"),
+    ("franka_rectified", "stretch_rectified"),
+)
+"""The matched pairs built on Stretch's head-camera mount. See `HEAD_CAMERA_MOUNTED_SETUPS`."""
+
+
+@pytest.mark.parametrize("pair", PAIRED_HEAD_CAMERA_SETUPS, ids=lambda p: p[0].split("_")[1])
+def test_the_left_fisheye_moves_both_halves_of_a_head_camera_pair(pair) -> None:
+    """`use_left_fisheye_camera` moves the mount, on the Franka as well as on Stretch.
+
+    Three things, and the second is the one that was wrong: the flag used to
+    substitute Stretch's real left fisheye for the exo channel on *every* setup,
+    which on these three threw away the camera under test, left every
+    `ExoCameraParams` field inert, and did nothing at all to the Franka half --
+    so a pair meant to differ in the robot differed in the camera as well and
+    there was nothing left to compare.
+
+    Both halves are asserted together rather than one at a time because equality
+    between them is the property that matters. A flag that moved the mount
+    correctly on each robot separately but to different places would pass two
+    single-sided checks and still destroy the pairing.
+    """
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        EXO_CAMERA,
+        SETUPS,
+        STRETCH_HEAD_CAMERA_Y_M,
+        StretchCameraChoices,
+        with_camera_choices,
+    )
+
+    franka_key, stretch_key = pair
+    chosen = StretchCameraChoices(use_left_fisheye_camera=True)
+    default = StretchCameraChoices()
+
+    mounts = {}
+    for key in pair:
+        for name, choices in (("off", default), ("on", chosen)):
+            mounts[key, name] = with_camera_choices(key, SETUPS[key].params, choices).exo.pos
+        # The camera under test stays under test -- no substitution here.
+        assert choices.exo_camera_for(key) == EXO_CAMERA, (
+            f"{key} should keep the exo camera it is built around; "
+            f"substituting is `baseline`'s behaviour"
+        )
+
+    for key in pair:
+        assert mounts[key, "off"][1] == pytest.approx(-STRETCH_HEAD_CAMERA_Y_M), (
+            f"{key} should sit at the right head camera by default"
+        )
+        assert mounts[key, "on"][1] == pytest.approx(+STRETCH_HEAD_CAMERA_Y_M), (
+            f"{key} should sit at the left head camera under --use_left_fisheye_camera, "
+            f"not {mounts[key, 'on'][1]:+.4f}"
+        )
+
+    # x and y only. The z of these two is *meant* to differ -- they hang off
+    # different bodies (`fr3_link1` against `base_link`) and the heights are
+    # chosen so both cameras end up at the same height in the room, which is
+    # `FRANKA_STRETCHCAM_HEIGHT`'s whole job. Asserting the full tuple would be
+    # asserting that the setups are broken.
+    assert mounts[franka_key, "on"][:2] == mounts[stretch_key, "on"][:2], (
+        f"the pair's halves must sit at the same point across the head or the comparison "
+        f"is not one: {franka_key} at {mounts[franka_key, 'on']}, "
+        f"{stretch_key} at {mounts[stretch_key, 'on']}"
+    )
+    for key in pair:
+        assert mounts[key, "on"][2] == mounts[key, "off"][2], (
+            f"{key}: the mount height must not move with the camera choice"
+        )
+    # x and z are untouched: this is a sign on y, not a re-aim.
+    for key in pair:
+        off, on = mounts[key, "off"], mounts[key, "on"]
+        assert (off[0], off[2]) == (on[0], on[2]), f"{key}: only y should move, not {off} -> {on}"
+
+
+def test_the_left_fisheye_still_substitutes_on_baseline() -> None:
+    """`baseline` has no head-camera mount to move, so the flag substitutes there.
+
+    Kept as a check rather than left implicit, because the two behaviours are one
+    flag and the split is by setup: a refactor that made the mounting branch
+    universal would silently start mirroring the DROID shoulder camera's y --
+    +0.57m, which is most of the way across the kitchen -- instead of reading
+    Stretch's own fisheye.
+    """
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        HEAD_CAMERA_LEFT,
+        SETUPS,
+        StretchCameraChoices,
+        with_camera_choices,
+    )
+
+    chosen = StretchCameraChoices(use_left_fisheye_camera=True)
+    for key in ("franka_baseline", "stretch_baseline"):
+        before = SETUPS[key].params.exo.pos
+        after = with_camera_choices(key, SETUPS[key].params, chosen).exo.pos
+        assert after == before, f"{key}'s mount should not move: {before} -> {after}"
+    assert chosen.exo_camera_for("stretch_baseline") == HEAD_CAMERA_LEFT
+
+
+def test_moving_the_exo_mount_is_idempotent() -> None:
+    """Applying the camera choices twice is applying them once.
+
+    `active_trial` folds them in for every worker and the parent applies them
+    again where it describes a trial, so the two must agree. Written as a sign
+    rather than a flip for exactly this reason -- see
+    `StretchCameraChoices.exo_mount_pos`.
+    """
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        SETUPS,
+        StretchCameraChoices,
+        with_camera_choices,
+    )
+
+    chosen = StretchCameraChoices(use_left_fisheye_camera=True)
+    once = with_camera_choices("stretch_stretchcam", SETUPS["stretch_stretchcam"].params, chosen)
+    twice = with_camera_choices("stretch_stretchcam", once, chosen)
+    assert once.exo.pos == twice.exo.pos
+
+
 def _side_by_side():
     """The split-screen script, imported late -- it pulls in the whole scoring stack."""
     from examples.machine_learning.molmospaces.retargetting import params_search_side_by_side
@@ -3373,6 +3566,19 @@ def visualize(
     "spawn rather than this harness, which poses the arm itself.",
 )
 @click.option(
+    "--change_stretch_start_pose_pitch_deg",
+    "change_stretch_start_pose_pitch_deg",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Pitch Stretch's wrist this many degrees about the jaw line at the snap. "
+    "Positive aims the gripper camera out across the workspace rather than straight down "
+    "under the hand. Unlike --change_stretch_start_pose_flip_wrist this one does reach "
+    "this harness: `RetargetRig.restore` snaps before every waypoint, so it changes the "
+    "configuration each waypoint's IK is solved from -- which is the rollout condition "
+    "the snap exists to reproduce. See `franka_retarget.PoseConventions`.",
+)
+@click.option(
     "--match_stretch_spawn_pose_to_franka",
     "match_stretch_spawn_pose_to_franka",
     is_flag=True,
@@ -3434,6 +3640,7 @@ def cli(
     change_franka_start_pose_flip_wrist: bool,
     change_franka_start_pose_limit_height: bool,
     change_stretch_start_pose_flip_wrist: bool,
+    change_stretch_start_pose_pitch_deg: float,
     map_franka_wrist_to_flipped_stretch4_wrist: bool,
     match_stretch_spawn_pose_to_franka: bool,
     fps: int,
@@ -3468,6 +3675,7 @@ def cli(
         change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
         change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
+        change_stretch_start_pose_pitch_deg=change_stretch_start_pose_pitch_deg,
         map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
         match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,
     )
