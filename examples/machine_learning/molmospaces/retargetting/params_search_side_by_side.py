@@ -62,6 +62,13 @@ count in place of an outcome it does not have. Seconds rather than an hour, and
 no checkpoint or GPU, which makes it the loop to change a retargeting parameter
 in. See `replay_pair` and `retargetting/replay.py`.
 
+It also writes what the video cannot be read off: `grasp_alignment.csv` and
+`grasp_alignment.png`, holding for every replayed step how far the grasp centre
+sat from the object being grasped and the three angles it was off by -- aimed at
+the object, against the object's own frame, and against the grasp the Franka
+asked for. A parameter sweep is a comparison of those curves; a video is not.
+See `write_alignment_outputs` and `replay.GraspAlignment`.
+
 What it is not
 --------------
 Not a search: it runs one point per setup and scores it exactly as
@@ -71,6 +78,7 @@ Use `params_search.py` to find parameters and this to see what they do.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import math
@@ -1099,6 +1107,345 @@ def replay_pair(
 
 
 # =============================================================================
+# The two traces a replay leaves: where the hand was, and what the mapping cost
+# =============================================================================
+
+ALIGNMENT_CSV_NAME = "grasp_alignment.csv"
+ALIGNMENT_PLOT_NAME = "grasp_alignment.png"
+
+ALIGNMENT_FIELDS = (
+    "episode",
+    "object",
+    "instruction",
+    "step",
+    "distance_mm",
+    "pointing_deg",
+    "object_frame_deg",
+    "retarget_deg",
+)
+
+ALIGNMENT_DISTANCE_COLOR = "#2a78d6"
+"""Categorical slot 1. The distance series, which owns its own panel."""
+
+ALIGNMENT_ANGLE_SERIES: tuple[tuple[str, str, str], ...] = (
+    ("pointing_deg", "aim at object", "#eb6834"),
+    ("object_frame_deg", "frame vs object", "#1baf7a"),
+    ("retarget_deg", "frame vs Franka", "#eda100"),
+)
+"""The three angles, in categorical slots 2-4, fixed so a colour means one thing.
+
+Each line's own meaning is on `replay.GraspAlignment`; between them they separate
+"the hand is not aimed at the object" from "the hand is aimed at it the wrong way
+round" from "the arm could not hold the orientation the Franka asked for", which
+are three different parameters to turn.
+"""
+
+ALIGNMENT_HEAD_INCHES = 0.7
+"""How tall the strip holding the title and the legend is, whatever is under it."""
+
+ALIGNMENT_INK = "#0b0b0b"
+ALIGNMENT_MUTED = "#52514e"
+ALIGNMENT_GRID = "#e6e5e1"
+
+RESIDUAL_CSV_NAME = "retarget_residual.csv"
+RESIDUAL_PLOT_NAME = "retarget_residual.png"
+
+RESIDUAL_FIELDS = (
+    "episode",
+    "instruction",
+    "step",
+    "position_error_mm",
+    "orientation_error_deg",
+    "franka_gap_mm",
+)
+
+RESIDUAL_ANGLE_COLOR = "#eb6834"
+"""Categorical slot 2, as in the alignment plot: the angle, against slot 1's distance."""
+
+
+def alignment_rows(results: list[Any]) -> list[dict[str, Any]]:
+    """Every replayed step of every episode that had an object to measure against."""
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        alignment = result.alignment
+        if alignment is None or not len(alignment.distance_m):
+            continue
+        episode = result.episode
+        for step in range(len(alignment.distance_m)):
+            rows.append(
+                {
+                    "episode": episode.panel_key,
+                    "object": alignment.object_name,
+                    "instruction": episode.instruction,
+                    "step": step,
+                    "distance_mm": round(float(alignment.distance_m[step]) * 1000.0, 3),
+                    "pointing_deg": round(float(alignment.pointing_deg[step]), 3),
+                    "object_frame_deg": round(float(alignment.object_frame_deg[step]), 3),
+                    "retarget_deg": round(float(alignment.retarget_deg[step]), 3),
+                }
+            )
+    return rows
+
+
+def write_alignment_csv(rows: list[dict[str, Any]], path: Path) -> Path:
+    """One row per replayed step: the table both the plot and any later reading are a view of."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(ALIGNMENT_FIELDS))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+@dataclass
+class _Facet:
+    """One episode's panel pair, as the renderer below wants it.
+
+    The two plots this module writes differ only in what goes on the two panels,
+    so what they share is everything else -- the facet grid, the head strip, the
+    spacing, the axis furniture -- and the way to share it is to reduce an
+    episode to this and hand it over.
+    """
+
+    title: str
+    distance_mm: np.ndarray
+    angles: list[tuple[str, str, np.ndarray]]
+    """`(label, colour, degrees)` per angle series drawn on the lower panel."""
+
+
+def _plot_facets(
+    facets: list[_Facet], path: Path, title: str, distance_label: str, angle_label: str
+) -> Path | None:
+    """One facet per episode: a distance panel over an angle panel, sharing the step axis.
+
+    Two stacked panels per episode rather than one pair of y-scales on one pair
+    of axes. They share the step axis and sit in one block, so the distance and
+    the angles are read against each other at a glance -- which is the whole
+    point of putting them together -- without the two scales sharing a plot area,
+    where the crossing point of a millimetre curve and a degree curve is an
+    artefact of how each was scaled and means nothing.
+
+    Returns `None` rather than raising when matplotlib is not installed: the CSV
+    is the measurement and the plot is a view of it, so a missing drawing library
+    should not lose a replay's numbers.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
+    except ImportError:
+        log.warning(f"[replay] matplotlib is not installed, so {path.name} was not drawn.")
+        return None
+
+    if not facets:
+        return None
+
+    columns = 1 if len(facets) == 1 else 2
+    rows = math.ceil(len(facets) / columns)
+    # A strip of its own for the title and the legend, rather than either being
+    # placed relative to the facets. Eight episodes make a figure three screens
+    # tall, and a legend hung off the bottom of that is a legend nobody sees.
+    figure = plt.figure(
+        figsize=(7.4 * columns, ALIGNMENT_HEAD_INCHES + 3.4 * rows), layout="constrained"
+    )
+    head, body = figure.subfigures(
+        2, 1, height_ratios=[ALIGNMENT_HEAD_INCHES, 3.4 * rows], hspace=0.0
+    )
+    # The two panels of one facet are one reading and have to sit closer together
+    # than two facets do. The layout engine spaces the axes *within* each facet;
+    # the gap between facets is the subfigure grid's own, so the two are set
+    # separately rather than fighting over one number.
+    figure.get_layout_engine().set(hspace=0.02, h_pad=0.01)
+    panels = body.subfigures(rows, columns, squeeze=False, hspace=0.16, wspace=0.05).ravel()
+
+    handles: list[Any] = []
+    labels: list[str] = []
+    for panel, facet in zip(panels, facets):
+        steps = np.arange(len(facet.distance_mm))
+        top, bottom = panel.subplots(2, 1, sharex=True)
+
+        top.plot(steps, facet.distance_mm, color=ALIGNMENT_DISTANCE_COLOR, linewidth=1.8)
+        top.set_ylabel(distance_label, color=ALIGNMENT_MUTED, fontsize=9)
+
+        for label, color, values in facet.angles:
+            (line,) = bottom.plot(steps, values, color=color, linewidth=1.8, label=label)
+            if label not in labels:
+                handles.append(line)
+                labels.append(label)
+        bottom.set_ylabel(angle_label, color=ALIGNMENT_MUTED, fontsize=9)
+        bottom.set_xlabel("replay step", color=ALIGNMENT_MUTED, fontsize=9)
+        # Steps are counted, so a short episode should not be ticked at 2.5.
+        bottom.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+        for axes in (top, bottom):
+            axes.grid(True, color=ALIGNMENT_GRID, linewidth=0.8)
+            axes.set_axisbelow(True)
+            for side in ("top", "right"):
+                axes.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                axes.spines[side].set_color(ALIGNMENT_GRID)
+            axes.tick_params(colors=ALIGNMENT_MUTED, labelsize=8)
+
+        panel.suptitle(facet.title, color=ALIGNMENT_INK, fontsize=10)
+
+    # Drawn into the head strip through an invisible axes, which is what makes
+    # the placement independent of how many facets are below it.
+    masthead = head.add_subplot()
+    masthead.axis("off")
+    masthead.set_title(title, color=ALIGNMENT_INK, fontsize=13, pad=2)
+    # One series needs no legend -- the panel's own label names it. Two or more
+    # do, and it goes here so identity is never carried by colour alone.
+    if len(labels) > 1:
+        masthead.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncols=len(labels),
+            frameon=False,
+            fontsize=10,
+            labelcolor=ALIGNMENT_MUTED,
+            borderpad=0.0,
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=140)
+    plt.close(figure)
+    return path
+
+
+def _facet_title(result: Any, fallback: str = "") -> str:
+    """`<panel key> -- <what the episode asked for>`, which is what names a facet."""
+    return f"{result.episode.panel_key} -- {result.episode.instruction or fallback}"
+
+
+def plot_alignment(results: list[Any], path: Path) -> Path | None:
+    """The grasp-alignment figure: distance to the object over the three angles."""
+    facets = [
+        _Facet(
+            title=_facet_title(result, result.alignment.object_name),
+            distance_mm=result.alignment.distance_m * 1000.0,
+            angles=[
+                (label, color, getattr(result.alignment, field_name))
+                for field_name, label, color in ALIGNMENT_ANGLE_SERIES
+            ],
+        )
+        for result in results
+        if result.alignment is not None and len(result.alignment.distance_m)
+    ]
+    return _plot_facets(
+        facets,
+        path,
+        "Grasp centre against the object it was sent to, per replayed step",
+        "to object (mm)",
+        "angle (deg)",
+    )
+
+
+def residual_rows(results: list[Any]) -> list[dict[str, Any]]:
+    """Every replayed step's retargeting residual: what the mapping asked for against what it got.
+
+    A different question from `alignment_rows`, and the pair of them is how a
+    miss gets attributed. That one is measured against the object and answers
+    "was the hand in the right place"; this one is measured against the
+    retargeting's own command and answers "could Stretch hold the pose it was
+    given at all". A replay whose residual is a fraction of a millimetre and
+    whose alignment is 50mm out was aimed badly; one whose residual is 70mm was
+    not aimed badly, it was asked for somewhere the arm cannot go.
+    """
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        steps = len(result.position_error_m)
+        if not steps:
+            continue
+        # The gap is only recorded for the steps the recording has a tool pose
+        # for, which can be fewer than the commands; the rest are left blank
+        # rather than the column being dropped or silently misaligned.
+        gaps = np.full(steps, np.nan)
+        recorded = min(steps, len(result.franka_gap_m))
+        gaps[:recorded] = result.franka_gap_m[:recorded]
+        angles = result.orientation_error_deg
+        for step in range(steps):
+            gap = gaps[step]
+            rows.append(
+                {
+                    "episode": result.episode.panel_key,
+                    "instruction": result.episode.instruction,
+                    "step": step,
+                    "position_error_mm": round(float(result.position_error_m[step]) * 1000.0, 3),
+                    "orientation_error_deg": (
+                        round(float(angles[step]), 3) if step < len(angles) else ""
+                    ),
+                    "franka_gap_mm": "" if np.isnan(gap) else round(float(gap) * 1000.0, 3),
+                }
+            )
+    return rows
+
+
+def plot_residual(results: list[Any], path: Path) -> Path | None:
+    """The retargeting-residual figure: how far short the mapping fell, in mm and in degrees."""
+    facets = [
+        _Facet(
+            title=_facet_title(result),
+            distance_mm=result.position_error_m * 1000.0,
+            angles=[("orientation residual", RESIDUAL_ANGLE_COLOR, result.orientation_error_deg)],
+        )
+        for result in results
+        if len(result.position_error_m)
+    ]
+    return _plot_facets(
+        facets,
+        path,
+        "What the retargeting asked for against what Stretch could hold, per replayed step",
+        "position residual (mm)",
+        "orientation residual (deg)",
+    )
+
+
+def write_residual_outputs(results: list[Any], destination: Path) -> None:
+    """Write the retargeting residual's CSV and plot, and say where they went."""
+    rows = residual_rows(results)
+    if not rows:
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    with (destination / RESIDUAL_CSV_NAME).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(RESIDUAL_FIELDS))
+        writer.writeheader()
+        writer.writerows(rows)
+    click.secho(f"Wrote {destination / RESIDUAL_CSV_NAME} ({len(rows)} steps)", fg="green")
+    plot_path = plot_residual(results, destination / RESIDUAL_PLOT_NAME)
+    if plot_path is not None:
+        click.secho(f"Wrote {plot_path}", fg="green")
+
+
+def write_alignment_outputs(results: list[Any], destination: Path) -> None:
+    """Write the replay's alignment CSV and plot, and say where they went.
+
+    Silent about the episodes it could not measure beyond one line: a replay with
+    no object staged -- `--replay-no-video` without the physics, which stages
+    nothing -- has nothing to be relative *to*, and that is a property of how it
+    was asked for rather than a failure.
+    """
+    rows = alignment_rows(results)
+    if not rows:
+        log.warning(
+            "[replay] no grasp alignment was measured, so no CSV or plot was written. The "
+            "measurement is relative to the episode's pickup object, and a replay only "
+            "stages one when it is given the benchmark to stage it from -- see "
+            "`replay.episode_staging`."
+        )
+        return
+    csv_path = write_alignment_csv(rows, destination / ALIGNMENT_CSV_NAME)
+    click.secho(f"Wrote {csv_path} ({len(rows)} steps)", fg="green")
+    plot_path = plot_alignment(results, destination / ALIGNMENT_PLOT_NAME)
+    if plot_path is not None:
+        click.secho(f"Wrote {plot_path}", fg="green")
+    for result in results:
+        if result.alignment is not None:
+            click.echo(f"  {result.alignment.summary()}")
+
+
+# =============================================================================
 # The report
 # =============================================================================
 
@@ -1306,8 +1653,10 @@ def _apply_params(
     "seconds rather than minutes -- the fast loop for changing a retargeting parameter and "
     "seeing what it does to actions that are known to work. Writes the same split screen a "
     "run does -- the recorded Franka on the left, the replayed Stretch and its cameras on "
-    "the right, captioned as a replay -- under <output-dir>/replay_as_stretch4/<pair>. See "
-    "retargetting/replay.py.",
+    "the right, captioned as a replay -- under <output-dir>/replay_as_stretch4/<pair>. Also "
+    "writes grasp_alignment.csv and grasp_alignment.png there: per step, how far the grasp "
+    "centre was from the object being grasped and the three angles it was off by. See "
+    "retargetting/replay.py and `write_alignment_outputs`.",
 )
 @click.option(
     "--replay-z-offset",
@@ -1518,6 +1867,8 @@ def main(
                 physics=not replay_kinematic,
             )
             replay_mod.report(results, destination, rendered=False)
+            write_alignment_outputs(results, destination)
+            write_residual_outputs(results, destination)
             return
 
         written: list[Path] = []
@@ -1546,6 +1897,8 @@ def main(
             results += pair_results
         _report(written, destination)
         replay_mod.report(results, destination, rendered=False)
+        write_alignment_outputs(results, destination)
+        write_residual_outputs(results, destination)
         return
 
     setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
