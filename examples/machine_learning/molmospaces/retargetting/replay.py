@@ -131,6 +131,17 @@ class RecordedEpisode:
     happens to be standing -- several metres, in a kitchen.
     """
 
+    tcp_rot_world: np.ndarray = field(default_factory=lambda: np.zeros((0, 3, 3)))
+    """`(steps, 3, 3)` the recorded tool's orientation, in world axes.
+
+    The other half of `tcp_world`, and in the *Franka's* own tool convention --
+    the Robotiq reaches along its +z where Stretch's grasp frame reaches along
+    its +x, so this is not directly comparable with a Stretch frame until one of
+    them is carried through `fr.FRANKA_TO_STRETCH_TOOL`. See `StartAlignment`,
+    which is what needs it: a start pose is a position *and* an orientation, and
+    the position agreeing says nothing about whether the hands are held alike.
+    """
+
     base_pose: np.ndarray = field(default_factory=lambda: np.zeros(7))
     """The robot's base pose at the start, as position + quaternion."""
 
@@ -165,6 +176,24 @@ class RecordedEpisode:
         """
         index = self.group.rsplit("_", 1)[-1]
         return f"house_{self.house}_ep{int(index):04d}" if index.isdigit() else self.group
+
+    @property
+    def recorded_base_xytheta(self) -> np.ndarray:
+        """Where the *recording's* robot stood, with no spawn convention applied.
+
+        `base_xytheta` below is where a replay stands Stretch, which under
+        `match_stretch_spawn_pose_to_franka` is a third of a metre further back.
+        This is the pose the recorded footage was framed on, and it is what a
+        panel meant to be tiled against that footage has to aim its camera at --
+        otherwise the two halves of the split screen look at points 0.27m apart
+        and the same grasp appears at two different places on the screen, which
+        reads as the robots starting in different poses when they do not. See
+        `_ScenePanel`.
+        """
+        position = np.asarray(self.base_pose[:3], dtype=float)
+        quaternion = np.asarray(self.base_pose[3:7], dtype=float)
+        yaw = float(R.from_quat(quaternion, scalar_first=True).as_euler("xyz")[2])
+        return np.array([position[0], position[1], yaw])
 
     @property
     def base_xytheta(self) -> np.ndarray:
@@ -226,15 +255,17 @@ def _pose_matrix(pose7: np.ndarray) -> np.ndarray:
 
 
 def _tcp_to_world(trajectory: Any) -> np.ndarray:
-    """`obs/extra/tcp_pose`, lifted out of the robot's base frame into the world."""
+    """`obs/extra/tcp_pose`, lifted out of the robot's base frame into the world.
+
+    `(steps, 4, 4)`. Callers that want only the positions take `[:, :3, 3]`; the
+    orientations are kept because a start pose is not a point.
+    """
     if "obs/extra/tcp_pose" not in trajectory or "obs/extra/robot_base_pose" not in trajectory:
-        return np.zeros((0, 3))
+        return np.zeros((0, 4, 4))
     tcp = np.asarray(trajectory["obs/extra/tcp_pose"], dtype=float)
     base = np.asarray(trajectory["obs/extra/robot_base_pose"], dtype=float)
     steps = min(len(tcp), len(base))
-    return np.array(
-        [(_pose_matrix(base[i]) @ _pose_matrix(tcp[i]))[:3, 3] for i in range(steps)]
-    )
+    return np.array([_pose_matrix(base[i]) @ _pose_matrix(tcp[i]) for i in range(steps)])
 
 
 def find_trajectory_files(root: Path) -> list[Path]:
@@ -338,6 +369,7 @@ def load_episodes(path: Path) -> list[RecordedEpisode]:
                 if "obs/extra/robot_base_pose" in trajectory
                 else np.zeros(7)
             )
+            tcp = _tcp_to_world(trajectory)
             episodes.append(
                 RecordedEpisode(
                     source=path,
@@ -345,7 +377,8 @@ def load_episodes(path: Path) -> list[RecordedEpisode]:
                     house=house,
                     arm_commands=np.asarray(arm, dtype=float),
                     gripper_commands=np.asarray(gripper, dtype=float),
-                    tcp_world=_tcp_to_world(trajectory),
+                    tcp_world=tcp[:, :3, 3],
+                    tcp_rot_world=tcp[:, :3, :3],
                     base_pose=base_pose,
                     success=bool(np.any(np.asarray(trajectory["success"])))
                     if "success" in trajectory
@@ -715,6 +748,9 @@ class ReplayResult:
     `replay_episode`'s `physics`.
     """
 
+    start: "StartAlignment | None" = None
+    """Whether the replay began where the recording did. See `StartAlignment`."""
+
     alignment: "GraspAlignment | None" = None
     """Where the grasp centre sat relative to the object, step by step.
 
@@ -975,6 +1011,132 @@ def _grasp_equivalent_angle_deg(reached: np.ndarray, target: np.ndarray) -> floa
     return min(upright, flipped)
 
 
+STRETCH_APPROACH_COLUMN = 0
+"""Which column of Stretch's grasp frame points out of the hand: +x.
+
+The Robotiq reaches along its own +z and the tool transform lines the two up;
+see `grasp_center_alignment`, which measures both hands' surfaces along this
+same axis, and `fr.JAW_FLIP`, which is the half turn about it.
+"""
+
+FRANKA_APPROACH_COLUMN = 2
+"""The same for the Robotiq's grasp site: +z. See `fr.FRANKA_TO_STRETCH_TOOL`."""
+
+
+@dataclass
+class StartAlignment:
+    """How close the replay's opening pose is to the one the recording started from.
+
+    The question `--replay-as-stretch4` stands or falls on. A replay is
+    open-loop: it pushes the Franka's own actions through the retargeting with
+    nothing watching, so if the two hands do not *begin* in the same place the
+    rest of the episode is a comparison of two different reaches and the
+    residual is measuring the wrong thing. This is that check, taken once per
+    episode immediately after `snap_to_franka_joint_pos` and before any command
+    is applied.
+
+    Decomposed into three, because they fail for different reasons and only one
+    of them is usually the problem:
+
+    * `position_gap_m` -- the grasp centres. Wrong when the base is mis-placed,
+      the lift has run out of travel, or `grasp_offset_m` moved the frame.
+    * `approach_deg` -- where the two hands *point*. This is the one that
+      decides whether the same action means the same reach; a hand pointing 20
+      degrees off will drive into the counter following a trajectory that
+      cleared it.
+    * `roll_deg` -- how far the hand is turned about that pointing axis. A
+      parallel jaw grasps the same object the same way half a turn over (see
+      `fr.JAW_FLIP`), so `roll_equivalent_deg` folds the two branches together:
+      it is 180 degrees of `roll_deg` that costs the *grasp* nothing and moves
+      the wrist cameras to the other side of the hand.
+    """
+
+    position_gap_m: float = float("nan")
+    approach_deg: float = float("nan")
+    roll_deg: float = float("nan")
+    roll_equivalent_deg: float = float("nan")
+    """`roll_deg` folded onto the nearer of the two jaw branches, in [0, 90]."""
+
+    @property
+    def aligned(self) -> bool:
+        """Whether the two hands begin at the same grasp, to the tolerances below."""
+        return (
+            self.position_gap_m < START_POSITION_TOLERANCE_M
+            and self.approach_deg < START_ANGLE_TOLERANCE_DEG
+            and self.roll_equivalent_deg < START_ANGLE_TOLERANCE_DEG
+        )
+
+    def summary(self) -> str:
+        if not np.isfinite(self.position_gap_m):
+            return "start: not measured (the recording carries no tool pose)"
+        flipped = " (jaw half a turn over)" if abs(self.roll_deg) > 90.0 else ""
+        return (
+            f"start {'OK  ' if self.aligned else 'OFF '} "
+            f"{self.position_gap_m * 1000:6.1f}mm  "
+            f"approach {self.approach_deg:5.1f}deg  "
+            f"roll {self.roll_deg:+6.1f}deg{flipped}"
+        )
+
+
+START_POSITION_TOLERANCE_M = 0.005
+"""How far apart the two start grasp centres may be and still count as the same, in metres.
+
+Five millimetres: below the scale at which a grasp starts missing (`fr` puts
+that at a centimetre) and above the IK's own convergence, so a pass means the
+retargeting put the hand where the recording had it rather than that nothing
+was measured.
+"""
+
+START_ANGLE_TOLERANCE_DEG = 2.0
+"""The same for the two angles, in degrees."""
+
+
+def measure_start_alignment(
+    episode: "RecordedEpisode", view: Stretch4RobotView
+) -> StartAlignment:
+    """Where Stretch's hand is against where the recording's hand was, at step zero.
+
+    Called with the robot already snapped and `mj_forward` run. The two frames
+    are in different conventions -- the Robotiq reaches along its +z, Stretch's
+    grasp frame along its +x -- so nothing here compares the frames directly:
+    each hand's own approach axis is taken by its own column, and the roll is
+    measured about that shared direction rather than between two rotation
+    matrices that do not mean the same thing.
+    """
+    if not len(episode.tcp_rot_world) or not len(episode.tcp_world):
+        return StartAlignment()
+
+    stretch = np.asarray(view.get_move_group("gripper").leaf_frame_to_world, dtype=float)
+    recorded_rot = np.asarray(episode.tcp_rot_world[0], dtype=float)
+    approach = stretch[:3, STRETCH_APPROACH_COLUMN]
+    approach = approach / max(float(np.linalg.norm(approach)), 1e-12)
+
+    def flattened(vector: np.ndarray) -> np.ndarray:
+        """`vector` with its component along the approach removed, normalised."""
+        flat = np.asarray(vector, dtype=float) - approach * float(vector @ approach)
+        return flat / max(float(np.linalg.norm(flat)), 1e-12)
+
+    # The jaw axis of each hand -- what the fingers close along -- is the +y of
+    # its own frame in both conventions, which is what makes the roll between
+    # them comparable at all.
+    recorded_jaw = flattened(recorded_rot[:, 1])
+    stretch_jaw = flattened(stretch[:3, 1])
+    roll = float(
+        np.degrees(
+            np.arctan2(
+                float(np.cross(recorded_jaw, stretch_jaw) @ approach),
+                float(recorded_jaw @ stretch_jaw),
+            )
+        )
+    )
+    return StartAlignment(
+        position_gap_m=float(np.linalg.norm(stretch[:3, 3] - episode.tcp_world[0])),
+        approach_deg=_angle_between_deg(recorded_rot[:, FRANKA_APPROACH_COLUMN], approach),
+        roll_deg=roll,
+        roll_equivalent_deg=min(abs(roll), abs(abs(roll) - 180.0)),
+    )
+
+
 @dataclass
 class GraspAlignment:
     """Per step, where the grasp centre sat relative to the object it was sent to.
@@ -1059,13 +1221,7 @@ class _AlignmentWatch:
     does not want it simply ignores `ReplayResult.alignment`.
     """
 
-    APPROACH_COLUMN = 0
-    """Which column of Stretch's grasp frame points out of the hand: +x.
-
-    The Robotiq reaches along its own +z and the tool transform lines the two up;
-    see `grasp_center_alignment`, which measures both hands' surfaces along this
-    same axis, and `fr.JAW_FLIP`, which is the half turn about it.
-    """
+    APPROACH_COLUMN = STRETCH_APPROACH_COLUMN
 
     def __init__(self, model, data, view: Stretch4RobotView, object_name: str) -> None:
         self.model, self.data, self.view = model, data, view
@@ -1276,6 +1432,14 @@ def replay_episode(
     # seeded from, and Stretch's stowed pose is nowhere near the first command.
     proxy.reset()
     proxy.snap_to_franka_joint_pos()
+    # Before the settle and before any command: this is the opening pose the
+    # rest of the episode is replayed blind from, and measuring it after the
+    # physics has had hold of it would fold the controllers' own tracking into
+    # the answer. See `StartAlignment`.
+    mujoco.mj_forward(model, data)
+    start = measure_start_alignment(episode, view)
+    if not start.aligned and np.isfinite(start.position_gap_m):
+        log.warning(f"[replay] {episode.group}: {start.summary()}")
 
     # Named before the physics branch because a kinematic replay stages the
     # object too -- it just cannot move it -- and "where did the retargeting put
@@ -1341,6 +1505,7 @@ def replay_episode(
         franka_gap_m=np.asarray(gaps, dtype=float),
         unreachable_steps=int(proxy.unreachable_steps),
         grasp=watch.outcome if watch is not None else None,
+        start=start,
         alignment=alignment.result(),
     )
 
@@ -1360,13 +1525,22 @@ REPLAY_LOOKAT_HEIGHT_M = 1.05
 class _ScenePanel:
     """The third-person replay panel: one fixed camera, the two tool markers.
 
-    `base_xytheta` is where the *episode* stood the robot, and it has to be
+    `base_xytheta` is where the *recording* stood its robot, and it has to be
     passed in rather than read off the robot when the first frame arrives. With
     `include_base` set -- the default -- the base is part of what the IK solves,
     and the opening `snap_to_franka_joint_pos` can drive it metres to reach the
     Franka's home pose before a single frame is rendered. A camera framed on
     where the base ended up after that is a camera outside the house looking at
     the exterior wall, which is exactly what replay videos used to show.
+
+    The *recording's* base rather than the replay's, and the difference is the
+    point under `match_stretch_spawn_pose_to_franka`: that convention stands
+    Stretch a third of a metre back, and a panel aimed at where Stretch now
+    stands would look at a point 0.27m from the one the recorded Franka panel
+    is aimed at. Tile those two and the same grasp sits at two different places
+    on the screen -- which reads as the robots starting in different poses when
+    the grasp frames coincide to a hundredth of a millimetre. See
+    `RecordedEpisode.recorded_base_xytheta`.
 
     The renderer still waits for the first frame, because the model arrives with
     it. The camera is then held, never re-aimed as the base moves, for the
@@ -1547,7 +1721,7 @@ def replay_to_video(
     import cv2
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    panel = _ScenePanel(episode.base_xytheta)
+    panel = _ScenePanel(episode.recorded_base_xytheta)
     state: dict[str, Any] = {"writer": None}
 
     def sink(step: int, model, data, view, proxy) -> None:
@@ -1590,7 +1764,7 @@ def replay_to_panels(
     import cv2
 
     panel_dir.mkdir(parents=True, exist_ok=True)
-    scene = _ScenePanel(episode.base_xytheta)
+    scene = _ScenePanel(episode.recorded_base_xytheta)
     state: dict[str, Any] = {"scene": None, "cams": None, "cameras": None}
 
     def open_writer(path: Path, frame: np.ndarray):
@@ -1700,6 +1874,42 @@ def report(results: list[ReplayResult], output_dir: Path, rendered: bool) -> Non
     click.secho(f"\nReplayed {len(results)} Franka episode(s) as Stretch 4:", bold=True)
     for result in sorted(results, key=lambda r: -r.unreachable_steps):
         click.echo(f"  {result.summary()}")
+
+    # Before anything else is read off a replay: it is open-loop, so an episode
+    # whose opening pose is not the recording's is not a replay of that episode
+    # and its residual is measuring a different reach.
+    starts = [
+        r.start
+        for r in results
+        if r.start is not None and np.isfinite(r.start.position_gap_m)
+    ]
+    off = [s for s in starts if not s.aligned]
+    if starts and not off:
+        flipped = sum(1 for s in starts if abs(s.roll_deg) > 90.0)
+        note = (
+            f" {flipped} of them with the jaw held half a turn over, which grasps the same "
+            f"object the same way -- see fr.JAW_FLIP."
+            if flipped
+            else ""
+        )
+        click.secho(
+            f"\nEvery episode began where the recording did: "
+            f"at most {max(s.position_gap_m for s in starts) * 1000:.2f}mm and "
+            f"{max(s.approach_deg for s in starts):.2f}deg of approach apart.{note}",
+            fg="green",
+        )
+    elif off:
+        click.secho(
+            f"\n{len(off)} of {len(starts)} episode(s) did NOT begin where the recording did, "
+            f"the worst by {max(s.position_gap_m for s in off) * 1000:.1f}mm and "
+            f"{max(s.approach_deg for s in off):.1f}deg. A replay is open-loop, so those are "
+            f"not replays of those episodes -- their residuals describe a different reach. "
+            f"See replay.StartAlignment.",
+            fg="red",
+        )
+        for result in results:
+            if result.start is not None and not result.start.aligned:
+                click.echo(f"  {result.episode.group:10s} {result.start.summary()}")
 
     grasped = [r for r in results if r.grasp is not None]
     if grasped:
