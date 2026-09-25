@@ -679,6 +679,20 @@ class ReplayResult:
     position_error_m: np.ndarray = field(default_factory=lambda: np.zeros(0))
     """Per step: how far Stretch's tool ended up from where the retargeting asked."""
 
+    orientation_error_deg: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Per step: the other half of the same residual, in degrees.
+
+    The angle between the tool frame the retargeting commanded and the one
+    Stretch's arm actually held. Kept beside `position_error_m` because the two
+    are one measurement -- the 6-vector `StretchArmIK.solve` returns -- and
+    because the arm trades them against each other: five DOFs cannot hold a
+    six-DOF pose, so a solve that tracks the position to a millimetre may be
+    paying for it in degrees, and reading only the position says the retargeting
+    is fine when it is not. See `fr.FrankaOnStretchView.last_orientation_error`,
+    and note that this is the mapping's *own* error -- what it asked for against
+    what it got -- rather than anything to do with where the object is.
+    """
+
     franka_gap_m: np.ndarray = field(default_factory=lambda: np.zeros(0))
     """Per step: how far Stretch's tool ended up from where the *Franka's* actually was.
 
@@ -699,6 +713,15 @@ class ReplayResult:
     positions and runs `mj_forward`, so the object never moves and "it did not
     pick it up" is a property of the replay rather than of the retargeting. See
     `replay_episode`'s `physics`.
+    """
+
+    alignment: "GraspAlignment | None" = None
+    """Where the grasp centre sat relative to the object, step by step.
+
+    `None` when the scene held no object to be measured against -- a replay
+    built without `stage`. Unlike `grasp` this does not need the physics: it
+    reads the two frames the retargeting put where it put them, which a
+    kinematic replay establishes just as well. See `GraspAlignment`.
     """
 
     def summary(self) -> str:
@@ -913,6 +936,182 @@ class _GraspWatch:
         self.outcome.final_gap_m = float(self.view.get_move_group("gripper").inter_finger_dist)
 
 
+# =============================================================================
+# Where the hand ended up relative to the object it was sent to
+# =============================================================================
+
+
+def _angle_between_deg(first, second) -> float:
+    """Degrees between two direction vectors. `nan` when either has no direction."""
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    lengths = float(np.linalg.norm(first)) * float(np.linalg.norm(second))
+    if lengths < 1e-12:
+        return float("nan")
+    return float(np.degrees(np.arccos(np.clip(float(first @ second) / lengths, -1.0, 1.0))))
+
+
+def _frame_angle_deg(reached: np.ndarray, wanted: np.ndarray) -> float:
+    """The geodesic angle between two rotation matrices, in degrees.
+
+    The single number "how far round is one frame from the other", which is what
+    the magnitude of the rotation taking one to the other is.
+    """
+    return float(np.degrees(R.from_matrix(np.asarray(reached).T @ np.asarray(wanted)).magnitude()))
+
+
+def _grasp_equivalent_angle_deg(reached: np.ndarray, target: np.ndarray) -> float:
+    """`_frame_angle_deg`, taking the nearer of the two branches that grasp alike.
+
+    A parallel jaw held half a turn over about its approach axis grasps the
+    identical object the identical way -- that is what `fr.JAW_FLIP` is and why
+    `_solve_either_jaw` is allowed to pick a branch. Measuring the raw angle
+    would therefore report a wrist that flipped mid-episode as 180 degrees out
+    when nothing about the grasp changed, which is a step in the trace that
+    looks like the retargeting falling over and is not.
+    """
+    upright = _frame_angle_deg(reached[:3, :3], target[:3, :3])
+    flipped = _frame_angle_deg(reached[:3, :3], (target @ fr.JAW_FLIP)[:3, :3])
+    return min(upright, flipped)
+
+
+@dataclass
+class GraspAlignment:
+    """Per step, where the grasp centre sat relative to the object it was sent to.
+
+    `GraspOutcome` above answers "did it pick the object up". This answers "and
+    how close did it come to being lined up with it", which is the question a
+    `grasp_offset_m` or `wrist_tilt_deg` sweep is actually turning: an outcome is
+    one bit per episode and says nothing about *where* in the reach the hand went
+    wrong, while these say it step by step.
+
+    Four series on one step axis, three of them angles, because the three
+    disagree exactly where it matters. A hand aimed straight down the line to the
+    object but still 30mm short has a small `pointing_deg` and a large
+    `distance_m`; a hand holding the object dead centre but rolled a quarter turn
+    from the grasp the Franka found has the reverse. Reading one of them alone
+    picks the wrong parameter to turn.
+    """
+
+    object_name: str = ""
+
+    distance_m: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Grasp centre to the object's body origin, in metres.
+
+    The same measurement `GraspOutcome.min_distance_m` reports the minimum of,
+    and it carries the same caveat: `grasp_offset_m` deliberately drives the
+    grasp frame *past* the object, so the floor of this series is roughly that
+    offset rather than zero, and a perfectly closed hand does not read 0mm. It is
+    the trend and the comparison between runs that this is for, not the absolute.
+    """
+
+    pointing_deg: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Between the hand's approach axis and the direction to the object.
+
+    Zero means the hand is aimed straight at the object, whatever the distance.
+    The one angle that means the same thing for every object, since it needs
+    nothing from the object's own frame -- and the one that goes wild as the
+    distance goes to zero, where the direction to the object stops having one.
+    """
+
+    object_frame_deg: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Between the grasp frame and the object's body frame, as a single rotation.
+
+    How far the hand is from the object's own orientation. Comparable across the
+    steps of an episode and across runs of the same episode; *not* comparable
+    between objects, because each prefab's body frame is whatever its author
+    chose and no part of the pipeline canonicalises it to a nominal grasp.
+    """
+
+    retarget_deg: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Between the grasp frame Stretch reached and the one the Franka asked for.
+
+    The Franka's recorded grasp pose, carried through the same tool transform the
+    IK targeted it with, against where Stretch's hand actually ended up -- so
+    zero is the retargeting tracking the recorded grasp exactly, and this is the
+    part of the misalignment that is the arm's five DOFs rather than the policy's
+    aim. Held against the object's distance on the same axis because that is the
+    trade: the orientation Stretch gives up is usually bought somewhere near the
+    object. Jaw-flip equivalent branches are folded together; see
+    `_grasp_equivalent_angle_deg`.
+    """
+
+    def summary(self) -> str:
+        """One line: the alignment at the step the hand came closest to the object."""
+        if not len(self.distance_m):
+            return f"{self.object_name or 'no object'}: nothing measured"
+        step = int(np.argmin(self.distance_m))
+        return (
+            f"{self.object_name or 'object':22s} closest at step {step:4d}  "
+            f"{self.distance_m[step] * 1000:6.1f}mm  "
+            f"aim {self.pointing_deg[step]:5.1f}deg  "
+            f"object frame {self.object_frame_deg[step]:5.1f}deg  "
+            f"vs franka {self.retarget_deg[step]:5.1f}deg"
+        )
+
+
+class _AlignmentWatch:
+    """Takes one `GraspAlignment` reading per replayed step.
+
+    Cheap enough to run unconditionally -- four vector operations against frames
+    MuJoCo has already computed, against `_GraspWatch`'s geom-distance sweep --
+    so a replay measures this whether or not it was asked to, and a caller that
+    does not want it simply ignores `ReplayResult.alignment`.
+    """
+
+    APPROACH_COLUMN = 0
+    """Which column of Stretch's grasp frame points out of the hand: +x.
+
+    The Robotiq reaches along its own +z and the tool transform lines the two up;
+    see `grasp_center_alignment`, which measures both hands' surfaces along this
+    same axis, and `fr.JAW_FLIP`, which is the half turn about it.
+    """
+
+    def __init__(self, model, data, view: Stretch4RobotView, object_name: str) -> None:
+        self.model, self.data, self.view = model, data, view
+        self.object_name = object_name or ""
+        self.body = (
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, self.object_name)
+            if self.object_name
+            else -1
+        )
+        self.distance: list[float] = []
+        self.pointing: list[float] = []
+        self.object_frame: list[float] = []
+        self.retarget: list[float] = []
+
+    @property
+    def live(self) -> bool:
+        """Whether there is an object in the scene to measure against."""
+        return self.body >= 0
+
+    def step(self, target_pose: np.ndarray) -> None:
+        """One reading. `target_pose` is the world pose the IK was just solved for."""
+        if not self.live:
+            return
+        grasp = np.asarray(self.view.get_move_group("gripper").leaf_frame_to_world, dtype=float)
+        origin = np.asarray(self.data.xpos[self.body], dtype=float)
+        to_object = origin - grasp[:3, 3]
+        self.distance.append(float(np.linalg.norm(to_object)))
+        self.pointing.append(_angle_between_deg(grasp[:3, self.APPROACH_COLUMN], to_object))
+        self.object_frame.append(
+            _frame_angle_deg(grasp[:3, :3], np.asarray(self.data.xmat[self.body]).reshape(3, 3))
+        )
+        self.retarget.append(_grasp_equivalent_angle_deg(grasp, target_pose))
+
+    def result(self) -> "GraspAlignment | None":
+        """What was measured, or `None` when there was no object to measure against."""
+        if not self.live:
+            return None
+        return GraspAlignment(
+            object_name=self.object_name,
+            distance_m=np.asarray(self.distance, dtype=float),
+            pointing_deg=np.asarray(self.pointing, dtype=float),
+            object_frame_deg=np.asarray(self.object_frame, dtype=float),
+            retarget_deg=np.asarray(self.retarget, dtype=float),
+        )
+
+
 def staged_object_name(stage: dict[str, Any] | None) -> str:
     """The body name `_stage_objects` will give the episode's pickup object.
 
@@ -1078,6 +1277,12 @@ def replay_episode(
     proxy.reset()
     proxy.snap_to_franka_joint_pos()
 
+    # Named before the physics branch because a kinematic replay stages the
+    # object too -- it just cannot move it -- and "where did the retargeting put
+    # the hand relative to the object" is answerable either way.
+    object_name = scene.object_name or staged_object_name(stage)
+    alignment = _AlignmentWatch(model, data, view, object_name)
+
     actuation = watch = None
     if physics:
         actuation = _Actuation(view, ctrl_dt_ms / 1000.0)
@@ -1088,14 +1293,12 @@ def replay_episode(
         for _ in range(max(0, int(round(SETTLE_SECONDS / (sim_dt_ms / 1000.0))))):
             actuation.apply()
             mujoco.mj_step(model, data)
-        watch = _GraspWatch(
-            model, data, view, scene.object_name or staged_object_name(stage), namespace
-        )
+        watch = _GraspWatch(model, data, view, object_name, namespace)
         watch.start()
 
     substeps = max(1, int(round(policy_dt_ms / sim_dt_ms)))
     commands = list(episode.arm_commands)
-    residuals, gaps = [], []
+    residuals, angular_residuals, gaps = [], [], []
     for step, command in enumerate(commands):
         targets = proxy.retarget_franka_joint_pos(command)
         gripper_step = min(step, len(episode.gripper_commands) - 1)
@@ -1116,6 +1319,13 @@ def replay_episode(
             watch.step()
 
         residuals.append(proxy.last_position_error)
+        angular_residuals.append(np.degrees(proxy.last_orientation_error))
+        # The pose the IK was solved against, repeated rather than threaded out:
+        # `retarget_franka_joint_pos` keeps no copy of it, and a seven-joint
+        # forward pass is cheaper than changing what it returns. `last_arm_ctrl`
+        # is the command it used, clipped the same way.
+        if alignment.live:
+            alignment.step(proxy.franka_tool_pose_to_world(proxy.franka.fk(proxy.last_arm_ctrl)))
         reached = np.asarray(view.get_move_group("wrist").leaf_frame_to_world, dtype=float)
         if step < len(episode.tcp_world):
             gaps.append(float(np.linalg.norm(reached[:3, 3] - episode.tcp_world[step])))
@@ -1127,9 +1337,11 @@ def replay_episode(
     return ReplayResult(
         episode=episode,
         position_error_m=np.asarray(residuals, dtype=float),
+        orientation_error_deg=np.asarray(angular_residuals, dtype=float),
         franka_gap_m=np.asarray(gaps, dtype=float),
         unreachable_steps=int(proxy.unreachable_steps),
         grasp=watch.outcome if watch is not None else None,
+        alignment=alignment.result(),
     )
 
 
