@@ -82,6 +82,7 @@ offset the benchmark actually runs at.
 
 from __future__ import annotations
 
+import datetime
 import math
 import os
 import sys
@@ -2611,6 +2612,105 @@ def test_keep_flipped_wrist_camera_frame_gates_the_half_turn(jaw_flipped, keep) 
         f"when it should be the other way round."
     )
     assert shown.flags["C_CONTIGUOUS"], "torch.from_numpy will refuse a negative-stride view"
+
+
+def _side_by_side():
+    """The split-screen script, imported late -- it pulls in the whole scoring stack."""
+    from examples.machine_learning.molmospaces.retargetting import params_search_side_by_side
+
+    return params_search_side_by_side
+
+
+def test_every_flag_combination_gets_its_own_run_directory() -> None:
+    """No two flag sets can name the same directory, so no run can overwrite another.
+
+    `run_directory_name` exists to stop a sweep from hand-naming its folders, and
+    the one way it could fail quietly is by dropping a flag: two runs that differ
+    in that flag would then land in the same directory, the second overwriting
+    the first's `trials.csv` and panels, and the comparison would read as "these
+    two settings scored the same" rather than as a lost run.
+
+    Every convention and camera choice on its own against the bare name, which
+    catches a field that reaches neither `RUN_NAME_ABBREVIATIONS` nor the
+    fallback -- and catches two fields sharing an abbreviation, which a table
+    edited by hand invites.
+    """
+    sbs = _side_by_side()
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        STRETCH_CAMERA_CHOICE_ENV_VARS,
+        StretchCameraChoices,
+    )
+
+    day = datetime.date(2026, 9, 25)
+    names = {
+        "none": sbs.run_directory_name(
+            "baseline", fr.PoseConventions(), StretchCameraChoices(), today=day
+        )
+    }
+    for one in fr.POSE_CONVENTION_ENV_VARS:
+        names[one] = sbs.run_directory_name(
+            "baseline", fr.PoseConventions(**{one: True}), StretchCameraChoices(), today=day
+        )
+    for one in STRETCH_CAMERA_CHOICE_ENV_VARS:
+        names[one] = sbs.run_directory_name(
+            "baseline", fr.PoseConventions(), StretchCameraChoices(**{one: True}), today=day
+        )
+
+    collisions = {name for name in names.values() if list(names.values()).count(name) > 1}
+    assert not collisions, (
+        f"these flag sets name the same directory and would overwrite each other: "
+        f"{sorted(flag for flag, name in names.items() if name in collisions)}"
+    )
+
+
+def test_a_run_directory_name_keeps_the_sign_of_an_offset() -> None:
+    """-0.009 and +0.009 are different runs, and must be different directories.
+
+    The offsets are the parameters this script is most often swept over and the
+    ones a sign error is least visible in, so the sign is written explicitly
+    rather than left to the number's own formatting -- `grasp-offset-0.009`
+    against `grasp-offset+0.009`.
+    """
+    sbs = _side_by_side()
+    from examples.machine_learning.molmospaces.retargetting.setups import StretchCameraChoices
+
+    def name(offset: float, param: str) -> str:
+        return sbs.run_directory_name(
+            "baseline",
+            fr.PoseConventions(),
+            StretchCameraChoices(),
+            param_specs=(param,),
+            grasp_offset=offset,
+            today=datetime.date(2026, 9, 25),
+        )
+
+    assert name(-0.009, "target_z_offset_m=0.035") != name(0.009, "target_z_offset_m=0.035")
+    assert name(-0.009, "target_z_offset_m=-0.035") != name(-0.009, "target_z_offset_m=0.035")
+
+
+def test_a_run_directory_name_does_not_depend_on_the_order_params_were_typed() -> None:
+    """The same run is the same directory, so a rerun resumes rather than duplicates.
+
+    `--param` is repeatable and click hands it back in the order it was typed,
+    which is not a property of the run -- two invocations that differ only in
+    which override came first are the same experiment and must not leave two
+    near-identical folders behind.
+    """
+    sbs = _side_by_side()
+    from examples.machine_learning.molmospaces.retargetting.setups import StretchCameraChoices
+
+    def name(*specs: str) -> str:
+        return sbs.run_directory_name(
+            "baseline",
+            fr.PoseConventions(),
+            StretchCameraChoices(),
+            param_specs=specs,
+            today=datetime.date(2026, 9, 25),
+        )
+
+    assert name("target_z_offset_m=0.035", "wrist_tilt_deg=5") == name(
+        "wrist_tilt_deg=5", "target_z_offset_m=0.035"
+    )
 
 
 # =============================================================================

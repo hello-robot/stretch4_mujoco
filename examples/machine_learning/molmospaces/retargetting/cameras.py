@@ -318,6 +318,23 @@ class RetargetParams:
     correction the retargeting already carries, so 0 is today's behaviour and 45
     tips the gripper down by a further 45 degrees relative to what the policy
     asked for.
+
+    **It does not reframe the object in the wrist camera**, which is the thing it
+    is most often reached for. The camera and the grasp centre are both fixed to
+    the hand, so the tilt rotates them together about the grasp centre: measured
+    on the compiled model, the grasp centre stays at v = +-0.243 of the frame
+    and the fingertips at v = +-0.265 at every tilt from -45 to +45.
+
+    What it moves is the *aim*. At 0 Stretch's gripper camera points 19.5 degrees
+    away from where the Robotiq's wrist camera points for the same commanded
+    pose -- a fixed difference in how the two lenses are bolted on, carried by
+    both jaw branches -- and +19.5 degrees of tilt nulls it to 0.66, with
+    image-up to 0.04. +45 overshoots to 25.5, which is worse than leaving it
+    alone. The cost is in the same number: the approach direction rotates with
+    the hand, so Stretch reaches along a line the policy did not ask for. That is
+    a change to the grasp rather than a correction to a camera, which is why this
+    is searched (`params_search`'s gripper stage tries -45, 0, +45) rather than
+    set.
     """
 
     target_z_offset_m: float = 0.0
