@@ -35,7 +35,15 @@ Run Stretch 4 on the MolmoSpaces benchmark evaluations.
 
 Results are written as `results.csv` alongside the per-benchmark evaluation
 output, in the same shape MolmoSpaces' own `scripts/benchmarks/eval_to_csv.py`
-produces, so runs from here and from `eval_main.py` can be pooled.
+produces, so runs from here and from `eval_main.py` can be pooled. It is
+rewritten after every benchmark rather than once at the end, so a sweep left
+running overnight leaves behind whatever it had finished when it died.
+
+Ctrl+C winds a sweep up rather than killing it. The first press stops after the
+episode in flight and writes the results: the benchmarks that finished, the one
+that was cut short, and the ones never reached, each marked in the `status`
+column. A second press abandons the rollout where it stands and counts whatever
+trajectories reached disk. See `install_interrupt_handler`.
 """
 
 from __future__ import annotations
@@ -45,9 +53,10 @@ import datetime
 import json
 import logging
 import os
+import signal
 import sys
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import click
@@ -123,6 +132,12 @@ camera and a tool correction that `configs.py`'s are not -- see
 """
 
 
+STATUS_COMPLETED = "completed"
+STATUS_INTERRUPTED = "interrupted"
+STATUS_NOT_RUN = "not run"
+STATUS_ERROR = "error"
+
+
 @dataclass
 class BenchmarkResult:
     """One benchmark's outcome, one row of `results.csv`."""
@@ -135,7 +150,112 @@ class BenchmarkResult:
     successes: int
     success_rate: float
     output_dir: str
+    status: str = STATUS_COMPLETED
+    """One of the STATUS_ constants above: an interrupted row is scored over the
+    episodes it did get through, and a not-run one is where the sweep stopped."""
     error: str = ""
+
+
+@dataclass
+class InterruptState:
+    """How far a Ctrl+C has got. Shared by the handler and the sweep."""
+
+    requested: bool = False
+    """A stop has been asked for, so the sweep ends with the benchmark in flight."""
+
+    forced: bool = False
+    """A second Ctrl+C arrived: the rollout was abandoned rather than wound up."""
+
+    in_evaluation: bool = False
+    """`run_evaluation` is on the stack, so the runner's SIGTERM handler is live."""
+
+
+def install_interrupt_handler(state: InterruptState) -> None:
+    """Make Ctrl+C wind the sweep up instead of killing it.
+
+    An overnight sweep is worth far more stopped than killed, so the first press
+    asks the evaluation to stop and only the second one insists.
+
+    The first press cannot simply raise: the episode counts live in the rollout
+    runner's shared counters, and abandoning `run_evaluation` mid-call loses them
+    along with the trajectories of the house being written. The runner does have a
+    graceful stop -- a shutdown event every worker checks between steps, which
+    makes `run_evaluation` return normally with the episodes finished so far --
+    but the only handle on it from out here is the SIGTERM handler the runner
+    installs when it is constructed, because `run_evaluation` builds the runner
+    itself and never hands it back. So the first press raises SIGTERM on this very
+    process. The second raises KeyboardInterrupt, abandoning the rollout where it
+    stands; what reached disk is then counted by `_salvage_partial_results`.
+    """
+    main_pid = os.getpid()
+
+    def handle(signum, frame):  # noqa: ARG001 - signal handler signature
+        if os.getpid() != main_pid:
+            # A rollout worker. Workers are usually started with spawn or
+            # forkserver and so never see this handler, but forkserver's server
+            # process is forked from this one, so a worker can inherit it.
+            # Leave the stop to the parent's shutdown event, which the worker
+            # checks between steps, rather than tearing it down mid-episode --
+            # and let a second press through in case the parent is already gone.
+            if state.forced:
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                raise KeyboardInterrupt
+            state.forced = True
+            return
+
+        if state.requested:
+            state.forced = True
+            click.secho("\nAbandoning the rollout in flight.", fg="red", err=True)
+            raise KeyboardInterrupt
+
+        state.requested = True
+        if state.in_evaluation and _runner_sigterm_installed():
+            click.secho(
+                "\nStopping after the episode in flight, then writing results. "
+                "Ctrl+C again to stop now.",
+                fg="yellow",
+                err=True,
+            )
+            os.kill(main_pid, signal.SIGTERM)
+            return
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle)
+
+
+def _runner_sigterm_installed() -> bool:
+    """Whether the rollout runner's graceful-shutdown handler is in place.
+
+    It installs itself when the runner is constructed, which happens inside
+    `run_evaluation`; before that, a SIGTERM would simply kill the process.
+    """
+    return signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None)
+
+
+def _salvage_partial_results(benchmark_output_dir: Path) -> tuple[int, int, str]:
+    """Episodes and successes on disk for a benchmark that was cut short.
+
+    Only needed after a forced stop: `run_evaluation` counts the episodes itself
+    and returns them, but a KeyboardInterrupt takes that call and its counters
+    with it, leaving the trajectory files as the only record. It owns its own
+    output directory -- `<benchmark>/<config>/<timestamp>` -- so the newest one
+    under `benchmark_output_dir` is the run that was interrupted.
+
+    A house is written out once it is finished, so what this counts is whole
+    houses; the episodes of the house in flight are gone either way.
+    """
+    from molmo_spaces.utils.eval_utils import collect_episode_results
+
+    runs = [path for path in benchmark_output_dir.glob("*/*") if path.is_dir()]
+    if not runs:
+        return 0, 0, ""
+    newest = max(runs, key=lambda path: path.stat().st_mtime)
+    try:
+        episodes = collect_episode_results(newest)
+    except Exception as error:  # noqa: BLE001 - a half-written trajectory file
+        log.warning(f"[interrupt] could not read the partial results in {newest}: {error}")
+        return 0, 0, str(newest)
+    return len(episodes), sum(1 for episode in episodes if episode.success), str(newest)
 
 
 def eval_config_for(policy: str, benchmark_key: str) -> str:
@@ -160,6 +280,22 @@ def eval_config_for(policy: str, benchmark_key: str) -> str:
     )
 
 
+def _not_run_result(benchmark_key: str, policy: str) -> BenchmarkResult:
+    """A row for a benchmark the sweep never reached, so the CSV says where it stopped."""
+    benchmark = BENCHMARKS[benchmark_key]
+    return BenchmarkResult(
+        benchmark=benchmark_key,
+        display_name=benchmark.display_name,
+        policy=policy,
+        eval_config=eval_config_for(policy, benchmark_key).rsplit(":", 1)[-1],
+        episodes=0,
+        successes=0,
+        success_rate=0.0,
+        output_dir="",
+        status=STATUS_NOT_RUN,
+    )
+
+
 def run_benchmark(
     benchmark_key: str,
     policy: str,
@@ -169,13 +305,17 @@ def run_benchmark(
     checkpoint: str | None = None,
     task_horizon_steps: int | None = None,
     alternate: str | None = None,
+    interrupts: InterruptState | None = None,
 ) -> BenchmarkResult:
     """Evaluate one benchmark and summarise it.
 
     Failures are captured rather than raised: a sweep over eight benchmarks
     should report which one broke and keep going, not lose the seven that worked.
+    A Ctrl+C is captured for the same reason -- see `install_interrupt_handler`.
     """
     from molmo_spaces.evaluation import run_evaluation
+
+    interrupts = interrupts if interrupts is not None else InterruptState()
 
     benchmark = BENCHMARKS[benchmark_key]
     config_name = eval_config_for(policy, benchmark_key)
@@ -202,21 +342,44 @@ def run_benchmark(
             f"[run] {benchmark.display_name} | {config_name.rsplit(':', 1)[-1]} | "
             f"{episodes if episodes is not None else 'all'} episodes | {benchmark_dir}"
         )
-        evaluation = run_evaluation(
-            eval_config_cls=config_name,
-            benchmark_dir=benchmark_dir,
-            checkpoint_path=checkpoint,
-            output_dir=output_root / benchmark_key,
-            max_episodes=episodes,
-            num_workers=num_workers,
-            task_horizon_steps=task_horizon_steps,
-            use_wandb=False,
-        )
+        interrupts.in_evaluation = True
+        try:
+            evaluation = run_evaluation(
+                eval_config_cls=config_name,
+                benchmark_dir=benchmark_dir,
+                checkpoint_path=checkpoint,
+                output_dir=output_root / benchmark_key,
+                max_episodes=episodes,
+                num_workers=num_workers,
+                task_horizon_steps=task_horizon_steps,
+                use_wandb=False,
+            )
+        finally:
+            interrupts.in_evaluation = False
         result.episodes = evaluation.total_count
         result.successes = evaluation.success_count
         result.success_rate = evaluation.success_rate
         result.output_dir = str(evaluation.output_dir)
+        # A graceful stop returns like any other run, having counted the episodes
+        # it did get through -- but they are a slice of the benchmark, not a score
+        # on it, so the row says so.
+        if interrupts.requested:
+            result.status = STATUS_INTERRUPTED
+            log.warning(f"[run] {benchmark.display_name} stopped after {result.episodes} episodes")
+    except KeyboardInterrupt:
+        # Forced: `run_evaluation` never returned, so its counters went with it and
+        # what the run managed is read back off the trajectory files instead.
+        result.status = STATUS_INTERRUPTED
+        result.episodes, result.successes, result.output_dir = _salvage_partial_results(
+            output_root / benchmark_key
+        )
+        result.success_rate = result.successes / result.episodes if result.episodes else 0.0
+        log.warning(
+            f"[run] {benchmark.display_name} abandoned; {result.episodes} episodes "
+            "recovered from the trajectories already written"
+        )
     except Exception as error:  # noqa: BLE001 - one broken benchmark must not sink the sweep
+        result.status = STATUS_ERROR
         result.error = f"{type(error).__name__}: {error}"
         log.error(f"[run] {benchmark.display_name} failed: {result.error}")
         log.debug(traceback.format_exc())
@@ -226,8 +389,10 @@ def run_benchmark(
 
 def write_results_csv(results: list[BenchmarkResult], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Columns off the dataclass rather than off the first row, so a sweep stopped
+    # before it produced any still writes a readable, headed file.
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(asdict(results[0]).keys()))
+        writer = csv.DictWriter(handle, fieldnames=[f.name for f in fields(BenchmarkResult)])
         writer.writeheader()
         for result in results:
             writer.writerow(asdict(result))
@@ -241,12 +406,20 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
             lines.append(f"{result.benchmark:14s} {result.display_name:34s} {'ERROR':>25s}")
             lines.append(f"{'':14s} {result.error}")
             continue
+        if result.status == STATUS_NOT_RUN:
+            lines.append(f"{result.benchmark:14s} {result.display_name:34s} {'NOT RUN':>25s}")
+            continue
         lines.append(
             f"{result.benchmark:14s} {result.display_name:34s} "
             f"{result.episodes:8d} {result.successes:8d} {result.success_rate:6.1%}"
+            f"{'  (interrupted)' if result.status == STATUS_INTERRUPTED else ''}"
         )
 
-    scored = [result for result in results if not result.error and result.episodes]
+    scored = [
+        result
+        for result in results
+        if not result.error and result.episodes and result.status == STATUS_COMPLETED
+    ]
     if len(scored) > 1:
         total_episodes = sum(result.episodes for result in scored)
         total_successes = sum(result.successes for result in scored)
@@ -556,27 +729,56 @@ def main(
     output_root = Path(output_dir) if output_dir else Path("eval_output") / "stretch4" / timestamp
     output_root.mkdir(parents=True, exist_ok=True)
 
-    results = [
-        run_benchmark(
-            benchmark_key=key,
-            policy=policy,
-            episodes=episodes,
-            output_root=output_root,
-            num_workers=num_workers,
-            checkpoint=checkpoint,
-            task_horizon_steps=task_horizon_steps,
-            alternate=alternate,
-        )
-        for key in keys
-    ]
-
-    if want_report:
-        _write_reports(results)
+    interrupts = InterruptState()
+    install_interrupt_handler(interrupts)
 
     results_path = output_root / "results.csv"
+    results: list[BenchmarkResult] = []
+    try:
+        for key in keys:
+            results.append(
+                run_benchmark(
+                    benchmark_key=key,
+                    policy=policy,
+                    episodes=episodes,
+                    output_root=output_root,
+                    num_workers=num_workers,
+                    checkpoint=checkpoint,
+                    task_horizon_steps=task_horizon_steps,
+                    alternate=alternate,
+                    interrupts=interrupts,
+                )
+            )
+            # Rewritten after every benchmark, not once at the end: a sweep left
+            # running overnight can die of things no handler here will see, and
+            # the benchmarks it had finished are worth keeping either way.
+            write_results_csv(results, results_path)
+            if interrupts.requested:
+                break
+    except KeyboardInterrupt:
+        # Raised between benchmarks, where there is no evaluation to wind up. The
+        # sweep still ends the way an interrupted one does.
+        interrupts.requested = True
+
+    # Named rather than simply absent, so the results say where the sweep stopped.
+    not_run = keys[len(results) :]
+    results.extend(_not_run_result(key, policy) for key in not_run)
+
     write_results_csv(results, results_path)
     click.echo("\n" + format_results_table(results) + "\n")
     click.secho(f"Wrote {results_path}", fg="green")
+    if interrupts.requested:
+        stopped = next(
+            (result.benchmark for result in results if result.status == STATUS_INTERRUPTED), None
+        )
+        click.secho(
+            f"Stopped by Ctrl+C {f'during {stopped}' if stopped else 'between benchmarks'}. "
+            f"Not run: {', '.join(not_run) if not_run else 'nothing, the sweep was on its last'}.",
+            fg="yellow",
+        )
+
+    if want_report:
+        _write_reports(results)
 
 
 def _publish_retarget_params(setup_key: str, override: str | None) -> None:
@@ -723,6 +925,11 @@ def _write_reports(results: list[BenchmarkResult]) -> None:
         try:
             build_report(Path(result.output_dir))
             click.secho(f"Report for {result.benchmark}: {result.output_dir}/report", fg="green")
+        except KeyboardInterrupt:
+            # The results are already written by this point, so a Ctrl+C here is
+            # asking to skip the rendering rather than to lose the run.
+            click.secho("Skipping the remaining reports.", fg="yellow")
+            break
         except Exception as error:  # noqa: BLE001 - reporting must not sink the run
             log.error(f"[report] {result.benchmark} failed: {type(error).__name__}: {error}")
 
