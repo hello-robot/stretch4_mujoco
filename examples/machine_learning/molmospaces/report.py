@@ -12,7 +12,8 @@ This reads that output and writes, per episode:
                                   step, the outcome and the instruction
     episode_XXXXXXXX.csv          per-step joint positions, commanded targets,
                                   tool pose and base pose
-    summary.json / summary.md     per-episode outcomes and the run's success rate
+    summary.json / summary.md     the run's success rate, its success by object,
+                                  and the per-episode outcomes behind both
 
     python -m examples.machine_learning.molmospaces.report eval_output/stretch4/<run>
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -41,6 +43,9 @@ CAPTION_HEIGHT_PX = 64
 CAPTION_COLOUR_SUCCESS = (90, 200, 90)
 CAPTION_COLOUR_FAILURE = (90, 90, 220)
 
+OBJECT_INSTANCE_SUFFIX = re.compile(r"_\d+$")
+UNRECORDED_OBJECT = "(unrecorded)"
+
 
 @dataclass
 class EpisodeReport:
@@ -51,10 +56,66 @@ class EpisodeReport:
     steps: int
     success: bool
     instruction: str = ""
+    object_name: str = ""
+    """The target as the task recorded it: a scene path like `pickup/0_0/Bowl_3`,
+    or empty for the tasks that record no object. See `object_label`."""
     video: str = ""
     telemetry: str = ""
     final_reward: float = 0.0
     extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class ObjectStats:
+    """How one kind of object fared across a run. See `object_stats`."""
+
+    object: str
+    episodes: int
+    successes: int
+    success_rate: float
+
+
+def object_label(object_name: str) -> str:
+    """The kind of object behind a recorded object name.
+
+    The target is recorded as a scene path -- `pickup/0_0/Bowl_3` -- whose last
+    segment names one house's third bowl. That index identifies a body within a
+    house rather than an asset across them, so what a sweep is worth grouping by
+    is the kind; the path itself stays on the episode row.
+    """
+    leaf = object_name.rsplit("/", 1)[-1]
+    return OBJECT_INSTANCE_SUFFIX.sub("", leaf) or leaf
+
+
+def object_stats(reports: list[EpisodeReport]) -> list[ObjectStats]:
+    """Success by kind of object, worst first.
+
+    Which objects a policy drops is the first thing asked of a sweep, and the
+    per-episode table cannot answer it: a benchmark puts the same kind of object
+    in front of the robot in house after house, and the row worth reading is the
+    one that pools them.
+
+    Episodes whose task recorded no object -- the opening benchmarks record
+    none -- are pooled under one row rather than dropped, so these counts still
+    add up to the run's.
+    """
+    grouped: dict[str, list[EpisodeReport]] = {}
+    for report in reports:
+        label = object_label(report.object_name) if report.object_name else UNRECORDED_OBJECT
+        grouped.setdefault(label, []).append(report)
+
+    stats = [
+        ObjectStats(
+            object=label,
+            episodes=len(group),
+            successes=sum(report.success for report in group),
+            success_rate=sum(report.success for report in group) / len(group),
+        )
+        for label, group in grouped.items()
+    ]
+    # Worst first, and the most-attempted of equally bad ones first: this table
+    # is read to find what the policy is failing on.
+    return sorted(stats, key=lambda stat: (stat.success_rate, -stat.episodes, stat.object))
 
 
 def decode_json_blob(row: np.ndarray) -> dict:
@@ -150,13 +211,18 @@ def _report_episode(
     )
     success = bool(np.any(success_flags))
 
+    scene = _scene(trajectory)
+    instruction = scene.get("task_description")
+    recorded_object = scene.get("object_name")
+
     stem = f"{house}_episode_{episode_index:08d}"
     report = EpisodeReport(
         house=house,
         episode=episode_index,
         steps=num_steps,
         success=success,
-        instruction=_instruction(trajectory),
+        instruction=instruction if isinstance(instruction, str) else "",
+        object_name=recorded_object if isinstance(recorded_object, str) else "",
         final_reward=float(trajectory["rewards"][-1]) if "rewards" in trajectory else 0.0,
     )
 
@@ -172,24 +238,23 @@ def _report_episode(
     return report
 
 
-def _instruction(trajectory) -> str:
-    """The episode's language instruction, if the task recorded one.
+def _scene(trajectory) -> dict:
+    """Everything the task recorded once per episode: the description, the target.
 
-    It lives in the scalar `obs_scene` dataset -- a JSON string holding the
-    task type, the description and the referral expressions -- rather than in
-    the per-step `task_info` blob, which carries only progress metrics.
+    It is the scalar `obs_scene` dataset, a single JSON string, rather than the
+    per-step `task_info` blob, which carries only progress metrics. Read whole
+    and in one go, since the caller wants several fields of it.
     """
     if "obs_scene" not in trajectory:
-        return ""
+        return {}
     raw = trajectory["obs_scene"][()]
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", "replace")
     try:
         scene = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return ""
-    description = scene.get("task_description")
-    return description if isinstance(description, str) else ""
+        return {}
+    return scene if isinstance(scene, dict) else {}
 
 
 def _write_telemetry(trajectory, qpos_rows, action_rows, num_steps: int, path: Path) -> None:
@@ -373,6 +438,7 @@ def _write_summary(reports: list[EpisodeReport], output_dir: Path) -> None:
     successes = sum(report.success for report in reports)
     total = len(reports)
     rate = successes / total if total else 0.0
+    by_object = object_stats(reports)
 
     (output_dir / "summary.json").write_text(
         json.dumps(
@@ -380,6 +446,7 @@ def _write_summary(reports: list[EpisodeReport], output_dir: Path) -> None:
                 "episodes": total,
                 "successes": successes,
                 "success_rate": rate,
+                "by_object": [asdict(stat) for stat in by_object],
                 "results": [asdict(report) for report in reports],
             },
             indent=2,
@@ -391,12 +458,27 @@ def _write_summary(reports: list[EpisodeReport], output_dir: Path) -> None:
         "",
         f"**{successes}/{total} successful** ({rate:.1%})",
         "",
-        "| house | episode | steps | outcome | instruction | video | telemetry |",
-        "| ----- | ------- | ----- | ------- | ----------- | ----- | --------- |",
+        "## By object",
+        "",
+        "| object | episodes | successes | rate |",
+        "| ------ | -------- | --------- | ---- |",
+    ]
+    for stat in by_object:
+        lines.append(
+            f"| {stat.object} | {stat.episodes} | {stat.successes} | {stat.success_rate:.1%} |"
+        )
+
+    lines += [
+        "",
+        "## By episode",
+        "",
+        "| house | episode | object | steps | outcome | instruction | video | telemetry |",
+        "| ----- | ------- | ------ | ----- | ------- | ----------- | ----- | --------- |",
     ]
     for report in reports:
         lines.append(
-            f"| {report.house} | {report.episode} | {report.steps} "
+            f"| {report.house} | {report.episode} | {object_label(report.object_name)} "
+            f"| {report.steps} "
             f"| {'success' if report.success else 'failure'} | {report.instruction} "
             f"| [{report.video}]({report.video}) | [{report.telemetry}]({report.telemetry}) |"
         )
