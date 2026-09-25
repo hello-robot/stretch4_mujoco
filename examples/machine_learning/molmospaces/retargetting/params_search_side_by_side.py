@@ -62,6 +62,18 @@ count in place of an outcome it does not have. Seconds rather than an hour, and
 no checkpoint or GPU, which makes it the loop to change a retargeting parameter
 in. See `replay_pair` and `retargetting/replay.py`.
 
+A replay is open-loop, so the first thing it checks is that it *began* where
+the recording did: `StartAlignment` measures the opening grasp centre, the
+direction the hand points and the roll about that direction against the
+recording's own, writes `start_alignment.csv`, and says so in red if any episode
+is out. An episode that starts somewhere else is not a replay of that episode
+and nothing downstream of it means anything. Note what passing does not include:
+a half turn of the hand about its approach is a *pass*, because a parallel jaw
+grasps the same object the same way either way round -- it is reported as the
+roll it is, and it is what `--map_franka_wrist_to_flipped_stretch4_wrist` asks
+for. Pair that flag with `--change_franka_start_pose_flip_wrist` on the run that
+*records* the Franka half if the two hands should also look alike.
+
 It also writes what the video cannot be read off: `grasp_alignment.csv` and
 `grasp_alignment.png`, holding for every replayed step how far the grasp centre
 sat from the object being grasped and the three angles it was off by -- aimed at
@@ -1159,6 +1171,18 @@ RESIDUAL_FIELDS = (
     "franka_gap_mm",
 )
 
+START_CSV_NAME = "start_alignment.csv"
+
+START_FIELDS = (
+    "episode",
+    "instruction",
+    "aligned",
+    "position_gap_mm",
+    "approach_deg",
+    "roll_deg",
+    "roll_equivalent_deg",
+)
+
 RESIDUAL_ANGLE_COLOR = "#eb6834"
 """Categorical slot 2, as in the alignment plot: the angle, against slot 1's distance."""
 
@@ -1418,6 +1442,36 @@ def write_residual_outputs(results: list[Any], destination: Path) -> None:
         click.secho(f"Wrote {plot_path}", fg="green")
 
 
+def write_start_outputs(results: list[Any], destination: Path) -> None:
+    """One row per episode: whether the replay began where the recording did.
+
+    No plot. This is one reading per episode rather than a series, and four
+    numbers per episode is a table -- drawing it would be a chart of eight
+    points that a reader has to decode back into the table it came from.
+    """
+    rows = [
+        {
+            "episode": result.episode.panel_key,
+            "instruction": result.episode.instruction,
+            "aligned": result.start.aligned,
+            "position_gap_mm": round(result.start.position_gap_m * 1000.0, 4),
+            "approach_deg": round(result.start.approach_deg, 4),
+            "roll_deg": round(result.start.roll_deg, 4),
+            "roll_equivalent_deg": round(result.start.roll_equivalent_deg, 4),
+        }
+        for result in results
+        if result.start is not None and math.isfinite(result.start.position_gap_m)
+    ]
+    if not rows:
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    with (destination / START_CSV_NAME).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(START_FIELDS))
+        writer.writeheader()
+        writer.writerows(rows)
+    click.secho(f"Wrote {destination / START_CSV_NAME} ({len(rows)} episodes)", fg="green")
+
+
 def write_alignment_outputs(results: list[Any], destination: Path) -> None:
     """Write the replay's alignment CSV and plot, and say where they went.
 
@@ -1654,9 +1708,11 @@ def _apply_params(
     "seeing what it does to actions that are known to work. Writes the same split screen a "
     "run does -- the recorded Franka on the left, the replayed Stretch and its cameras on "
     "the right, captioned as a replay -- under <output-dir>/replay_as_stretch4/<pair>. Also "
-    "writes grasp_alignment.csv and grasp_alignment.png there: per step, how far the grasp "
-    "centre was from the object being grasped and the three angles it was off by. See "
-    "retargetting/replay.py and `write_alignment_outputs`.",
+    "writes three measurements there: start_alignment.csv, whether each episode began where "
+    "the recording did -- which an open-loop replay stands or falls on; grasp_alignment.csv "
+    "and .png, per step, how far the grasp centre was from the object being grasped and the "
+    "three angles it was off by; and retarget_residual.csv and .png, what the mapping asked "
+    "for against what Stretch could hold. See retargetting/replay.py.",
 )
 @click.option(
     "--replay-z-offset",
@@ -1869,6 +1925,7 @@ def main(
             replay_mod.report(results, destination, rendered=False)
             write_alignment_outputs(results, destination)
             write_residual_outputs(results, destination)
+            write_start_outputs(results, destination)
             return
 
         written: list[Path] = []
@@ -1899,6 +1956,7 @@ def main(
         replay_mod.report(results, destination, rendered=False)
         write_alignment_outputs(results, destination)
         write_residual_outputs(results, destination)
+        write_start_outputs(results, destination)
         return
 
     setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
