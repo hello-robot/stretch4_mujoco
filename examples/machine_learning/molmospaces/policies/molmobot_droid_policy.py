@@ -654,19 +654,35 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         the camera 180 degrees about its own optical axis. Measured on the
         compiled model at four tool poses: 180.000 degrees, with the axis of that
         rotation 0.003 degrees off the camera's own -z. The viewpoint moves about
-        110mm, which is the camera crossing to the other side of the hand and is
-        the *reason* to want the flipped branch -- Stretch's gripper camera has a
-        better view of the grasp from there.
+        110mm with it, the camera crossing to the other side of the approach
+        axis.
+
+        It does *not* buy a better view of the grasp, which an earlier version of
+        this note claimed. The flip is a symmetry of a parallel jaw, so the hand's
+        own appearance is invariant under it: projected into the wrist frame, both
+        fingertips and the grasp centre land in the same place on either branch
+        (v = -0.265 and -0.243). What changes is which side of the world the
+        camera sees past the hand.
 
         What is not wanted is the roll. The DROID checkpoint reads the wrist view
         more closely than any other channel (see `cameras.RetargetParams.
         wrist_fov_deg`), and it was trained on a Franka whose hand is not turned
         over: hand it an upside-down frame and its corrections come back
         inverted, which looks exactly like an arm driving away from the object it
-        is reaching for. Undoing the roll in image space keeps the better
-        viewpoint and returns the orientation the checkpoint expects -- the same
-        trick `ExoCameraParams.quarter_turns` plays for the head camera, which is
-        bolted on sideways for reasons equally uninteresting to a policy.
+        is reaching for. Undoing the roll in image space returns the orientation
+        the checkpoint expects -- the same trick `ExoCameraParams.quarter_turns`
+        plays for the head camera, which is bolted on sideways for reasons
+        equally uninteresting to a policy.
+
+        **And it costs the near field.** Because the flip moves the camera across
+        the axis as well as rolling it, turning the image back lands the gripper
+        at the *top* of the frame (v = +0.265) where the Franka's sits at the
+        bottom (v = -0.19), and puts the grasp centre above the optical centre
+        rather than below it. The turn is therefore right for the scene and wrong
+        for the hand, and which matters more to this checkpoint is a rollout
+        question rather than an argument.
+        `PoseConventions.keep_flipped_wrist_camera_frame` carries the full
+        measurement and is the flag that runs the other half of it.
 
         Keyed on `jaw_flipped` rather than on the pose convention because that
         flag is the physical truth: under `jaw_mode="auto"` the branch can change
@@ -681,6 +697,13 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         """
         frame = StretchMolmoBotDroidPolicy._camera(obs, name)
         if not proxy.jaw_flipped:
+            return frame
+        if proxy.pose_conventions.keep_flipped_wrist_camera_frame:
+            # Asked for the frame as the camera produced it. The turn below fixes
+            # the roll and breaks where the gripper sits in the frame, and which
+            # of the two a checkpoint prefers is a rollout question; see
+            # `PoseConventions.keep_flipped_wrist_camera_frame` for the
+            # projections.
             return frame
         # `ascontiguousarray` again, for `_camera`'s reason: `rot90` returns a
         # view with negative strides and `torch.from_numpy` refuses those.

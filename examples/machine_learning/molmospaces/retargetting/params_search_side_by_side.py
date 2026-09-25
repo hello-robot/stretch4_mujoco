@@ -1816,6 +1816,17 @@ def _apply_params(
     "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
 @click.option(
+    "--keep_flipped_wrist_camera_frame",
+    "keep_flipped_wrist_camera_frame",
+    is_flag=True,
+    help="Feed the policy the flipped wrist frame as the camera produced it, instead of "
+    "turning it half round to undo the roll JAW_FLIP puts on it. The turn fixes the roll "
+    "and lands the gripper at the top of a frame the checkpoint has it entering from the "
+    "bottom, because the flip carries the camera across the approach axis as well as "
+    "rolling it. Only does anything with --map_franka_wrist_to_flipped_stretch4_wrist. "
+    "See `franka_retarget.PoseConventions`.",
+)
+@click.option(
     "--use_left_gripper_camera",
     "use_left_gripper_camera",
     is_flag=True,
@@ -1853,6 +1864,7 @@ def main(
     change_franka_start_pose_flip_wrist: bool,
     change_franka_start_pose_limit_height: bool,
     change_stretch_start_pose_flip_wrist: bool,
+    keep_flipped_wrist_camera_frame: bool,
     map_franka_wrist_to_flipped_stretch4_wrist: bool,
     match_stretch_spawn_pose_to_franka: bool,
     use_left_gripper_camera: bool,
@@ -1865,6 +1877,7 @@ def main(
         change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
         change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
+        keep_flipped_wrist_camera_frame=keep_flipped_wrist_camera_frame,
         map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
         match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,
     )

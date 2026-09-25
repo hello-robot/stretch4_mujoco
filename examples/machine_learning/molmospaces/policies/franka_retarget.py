@@ -429,6 +429,7 @@ POSE_CONVENTION_ENV_VARS = {
     "change_franka_start_pose_flip_wrist": "STRETCH4_CHANGE_FRANKA_START_POSE_FLIP_WRIST",
     "change_franka_start_pose_limit_height": "STRETCH4_CHANGE_FRANKA_START_POSE_LIMIT_HEIGHT",
     "change_stretch_start_pose_flip_wrist": "STRETCH4_CHANGE_STRETCH_START_POSE_FLIP_WRIST",
+    "keep_flipped_wrist_camera_frame": "STRETCH4_KEEP_FLIPPED_WRIST_CAMERA_FRAME",
     "map_franka_wrist_to_flipped_stretch4_wrist": "STRETCH4_MAP_FRANKA_WRIST_TO_FLIPPED_STRETCH4_WRIST",
     "match_stretch_spawn_pose_to_franka": "STRETCH4_MATCH_STRETCH_SPAWN_POSE_TO_FRANKA",
 }
@@ -490,6 +491,51 @@ class PoseConventions:
     -- the first `get_action` writes the arm and wrist to whatever matches the
     Franka's start tool pose, so this decides the spawn and the first observation
     and is then overwritten. Turn the snap off to hold it for the episode.
+    """
+
+    keep_flipped_wrist_camera_frame: bool = False
+    """Hand the policy the flipped wrist frame as the camera produced it, unrotated.
+
+    `StretchMolmoBotDroidPolicy._wrist_camera` turns the wrist frame half a turn
+    whenever the jaw is held flipped, on the argument that `JAW_FLIP` rolls the
+    camera 180 degrees about its own optical axis and the checkpoint was trained
+    on a hand that is not turned over. The roll is real -- measured against the
+    virtual Franka's `gripper/wrist_camera` at the same tool pose, image-up is
+    160.5 degrees out on the flipped branch and 19.5 degrees out once the turn is
+    undone, which is the two lenses' fixed tilt and is what the unflipped branch
+    carries too.
+
+    What the turn does not undo is the *viewpoint*. `JAW_FLIP` rolls the camera
+    and carries it across the hand together: in the Franka tool frame the
+    Robotiq's wrist camera sits at x = -74mm, Stretch's at -57mm unflipped and
+    **+57mm flipped**, so the half turn puts it on the other side of the approach
+    axis. For the hand itself those two changes cancel exactly, because the flip
+    is a symmetry of a parallel jaw -- it maps one finger onto where the other
+    was. Projecting the fingertips into the frame the policy reads:
+
+        franka pads                      v = -0.19   fingers at the bottom
+        stretch, unflipped               v = -0.265  bottom
+        stretch, flipped, unrotated      v = -0.265  bottom
+        stretch, flipped, turned back    v = +0.265  **top**
+
+    and the grasp centre with them, -0.243 against the turned frame's +0.243.
+    So the turn fixes the far scene and breaks the near field: it lands the
+    gripper at the top of a frame that every DROID wrist view has it entering
+    from the bottom, and the vertical axis of that view is the channel a
+    wrist-camera policy reads for height and pitch. The symptom is an approach
+    that tracks well until the wrist view starts to dominate and then pitches the
+    wrong way a few centimetres out.
+
+    On, this skips the turn. Off -- the default -- is the behaviour every
+    measurement taken before this flag was added ran under, so a result can still
+    be compared against them. Pair it with
+    `map_franka_wrist_to_flipped_stretch4_wrist`, which is the only convention
+    under which it does anything at all: with the jaw upright there is no turn to
+    skip and this is inert.
+
+    The reproduction is a projection, not a rollout, and it assumes the compiled
+    models' nominal camera mounts. Which of the two framings the checkpoint
+    actually prefers is a rollout question, which is what the flag is for.
     """
 
     map_franka_wrist_to_flipped_stretch4_wrist: bool = False
