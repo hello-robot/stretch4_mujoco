@@ -39,6 +39,32 @@ pair *is* the controlled comparison, and `MATCHED_PAIRS` just names them.
     # one scene and one object, to check the plumbing before committing an hour
     python -m ...params_search_side_by_side --scenes 1 --episode-steps 40
 
+    # the released pick benchmark instead of the four-object mini one, capped so
+    # both halves of the pair get a turn
+    python -m ...params_search_side_by_side --benchmark pick --episodes 40
+
+Stopping early
+--------------
+Ctrl+C winds the run up rather than killing it: the first press stops after the
+episode in flight, and what has run is still composed into videos and written to
+`report.md`, which says in a section of its own that it is a slice rather than a
+score. A second press abandons the rollout, and the episodes the probe has
+already written are reported instead. That is what makes `--benchmark` usable
+without a cap -- start the suite, watch it, stop it when it has said enough.
+
+Run the same command again and it picks the stopped run back up rather than
+starting it over: a setup that finished is kept as it is, and one that was cut
+off runs only the houses it never got through, keeping the panels and the scores
+of the ones it did. Nothing has to be passed for that -- the flags name the run,
+so the same flags find it, on whatever day it was started. `--restart` is there
+for when what is wanted is the run again from the beginning. See `Progress` and
+`find_resumable`.
+
+    python -m ...params_search_side_by_side --benchmark pick --episodes 200
+    ^C
+    python -m ...params_search_side_by_side --benchmark pick --episodes 200
+    Carrying on eval_output/side_by_side_20260925_all_bench-pick
+
 What it costs
 -------------
 Two evaluations rather than one, run *sequentially* -- which is not a detail to
@@ -96,9 +122,11 @@ import logging
 import math
 import os
 import sys
+import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import date
+from dataclasses import asdict, dataclass, field, fields
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +144,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np  # noqa: E402
 
+from examples.machine_learning.molmospaces.benchmarks import (  # noqa: E402
+    BENCHMARKS,
+    resolve_benchmark_dir,
+)
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting import mini_benchmark  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting.cameras import (  # noqa: E402
@@ -123,6 +155,7 @@ from examples.machine_learning.molmospaces.retargetting.cameras import (  # noqa
 )
 from examples.machine_learning.molmospaces.retargetting.params_search import (  # noqa: E402
     DIMENSIONS,
+    SECONDS_PER_ROLLOUT,
     _label_episodes,
     affordable_workers,
     preserve_previous_run,
@@ -146,6 +179,10 @@ from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa:
     publish_params,
     publish_stretch_camera_choices,
     qualified_config_name,
+)
+from examples.machine_learning.molmospaces.run_benchmarks import (  # noqa: E402
+    InterruptState,
+    install_interrupt_handler,
 )
 from examples.machine_learning.molmospaces.visualize import (  # noqa: E402
     SCENE_PANEL_SIZE,
@@ -271,6 +308,101 @@ why each panel says so.
 """
 
 
+# =============================================================================
+# Which episodes a pair is run over
+# =============================================================================
+
+BENCHMARK_KEYS = tuple(
+    key for key, benchmark in BENCHMARKS.items() if benchmark.task_cls.endswith(".PickTask")
+)
+"""
+The released benchmarks `--benchmark` offers, which are the pick ones.
+
+Not every benchmark in the registry, because `scoring.GraspProbe` is what turns a
+rollout into a row here: it latches `task_config.pickup_obj_name` at reset and
+measures how close the gripper came to it, whether it was touched and how far it
+was lifted. That is a pick. An opening or navigation task has no pickup object to
+read, so every one of those measurements would come back NaN and the score would
+be a column of zeroes that looks like a result. Those keys are not offered rather
+than accepted and silently scored as nothing.
+"""
+
+UNCAPPED_WORK_UNITS = 1024
+"""
+Stand-in for "more houses than a GPU will ever afford workers for".
+
+`affordable_workers` takes the number of work items and caps the worker count at
+it, because a worker with no house left to take just idles. The mini benchmark's
+item count is its scene count; a released benchmark's is in the hundreds, which
+is past the point where anything but VRAM binds. Counting them exactly would mean
+parsing a 20 MB `benchmark.json` to pick a number that is already decided.
+"""
+
+CONSOLE_TARGET_COLUMNS = 12
+"""
+How many object columns the end-of-run console table shows.
+
+The mini benchmark has four objects and the table is the right shape for it. A
+released benchmark has whatever its episodes were about -- dozens -- and a column
+each makes a table wider than any terminal, so the console gets the
+most-attempted and says how many it left out. `report.md` gets all of them; it is
+read in something that scrolls.
+"""
+
+
+def instruction_target(instruction: str) -> str:
+    """The object key behind one benchmark episode's instruction.
+
+    The mini benchmark knows its four objects by name and `params_search.
+    _label_episodes` looks them up. A released benchmark has hundreds, listed
+    nowhere this script can reach: the episode spec names a body in the scene
+    (`pickup/0_0/Bowl_3`) but the probe records the instruction, so the words the
+    task used are what there is to group by. "Pick up the salt shaker" becomes
+    `salt_shaker`, and two salt shakers in different houses land in one column.
+    """
+    text = instruction.strip()
+    prefix = "pick up the "
+    if text.lower().startswith(prefix):
+        text = text[len(prefix) :]
+    return _slug(text) if text else "?"
+
+
+def label_benchmark_episodes(episodes: list[EpisodeScore], setup_key: str) -> list[EpisodeScore]:
+    """Say which object each released-benchmark episode was about.
+
+    The counterpart of `params_search._label_episodes`, which cannot be used
+    here: it matches the mini benchmark's four instructions and falls back to
+    *position* among them, so the first four episodes of a Pick-v2 run would come
+    back labelled bowl, potato, salt shaker and knife whatever they were actually
+    about. Here the instruction is the only thing that knows, and an episode whose
+    instruction says nothing is labelled "?" rather than guessed at.
+    """
+    for episode in episodes:
+        episode.setup = setup_key
+        episode.target = instruction_target(episode.instruction)
+    return episodes
+
+
+def target_columns(runs: list[RunResult]) -> tuple[str, ...]:
+    """The object columns the table and the report break a run down by.
+
+    The mini benchmark's four are fixed and in a deliberate order, so they are
+    used as they are -- an object no episode reached is still worth a column
+    there, because its absence is the finding. A released benchmark has whatever
+    objects its episodes happened to be about, so the columns are read off the
+    runs, most-attempted first: a column holding two episodes says much less than
+    one holding twenty, and on a suite stopped early that difference is the whole
+    caveat.
+    """
+    if not any(run.benchmark for run in runs):
+        return mini_benchmark.TARGET_KEYS
+    counts: dict[str, int] = {}
+    for run in runs:
+        for episode in run.labelled():
+            counts[episode.target] = counts.get(episode.target, 0) + 1
+    return tuple(sorted(counts, key=lambda key: (-counts[key], key)))
+
+
 class SplitPanelRecorder(EpisodeVideoRecorder):
     """Records each episode as two MP4s -- the scene, and the policy's cameras.
 
@@ -324,6 +456,7 @@ class SplitPanelRecorder(EpisodeVideoRecorder):
         panel_dir: Path,
         marker_color: tuple | None = None,
         in_stretch_convention: bool | None = None,
+        keep: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Point the recorder at a new run's directory, and start its numbering afresh.
 
@@ -334,10 +467,18 @@ class SplitPanelRecorder(EpisodeVideoRecorder):
         `house_0_ep0004..0007`, no key appears in both, and `compose_pair`
         silently finds nothing to pair. That is precisely what the first smoke
         run of this script did.
+
+        `keep` is a resumed run's earlier episodes, which have to be seeded here
+        rather than merged later: `_write_index` rewrites `episodes.json` from
+        this dictionary after every episode, so anything missing from it is
+        dropped from the index the moment the first new episode finishes -- and
+        the index is what `compose_pair` pairs on. The counter stays cleared even
+        then, because a resumed attempt only runs houses that the earlier one did
+        not, so nothing it writes can collide with what `keep` names.
         """
         self.panel_dir = Path(panel_dir)
         self._output_dir = Path(panel_dir)
-        self.episodes = {}
+        self.episodes = dict(keep or {})
         self._episodes_per_house = {}
         if marker_color is not None:
             self.marker_color = marker_color
@@ -594,6 +735,30 @@ class RunResult:
     output_dir: str = ""
     """Where `run_evaluation` wrote, for the report's per-trial link."""
 
+    benchmark: str = ""
+    """Which released benchmark this ran, or "" for the mini one. See `--benchmark`."""
+
+    interrupted: bool = False
+    """Whether Ctrl+C cut this run short, so its episodes are a slice of the benchmark."""
+
+    seconds: float = 0.0
+    """Wall clock this attempt took, which is what the next estimate is made from."""
+
+    ran: int = 0
+    """Episodes *this* attempt ran. On a resumed setup that is fewer than it holds,
+    and it is the one that pairs with `seconds` to give a rate."""
+
+    def labelled(self) -> list[EpisodeScore]:
+        """This run's episodes, each told which object it was about.
+
+        Two labellers, because there are two benchmarks and only one of them has
+        a fixed object list. See `label_benchmark_episodes` for why the mini
+        benchmark's cannot be used on a released one.
+        """
+        if self.benchmark:
+            return label_benchmark_episodes(self.episodes, self.setup)
+        return _label_episodes(self.episodes, self.setup)
+
     def as_trial(self) -> TrialResult:
         """This run as a `scoring.TrialResult`, which is what the report is built from.
 
@@ -608,7 +773,7 @@ class RunResult:
             setup=self.setup,
             params_description=params.describe(),
             params_json=params_to_json(self.setup, params),
-            episodes=_label_episodes(self.episodes, self.setup),
+            episodes=self.labelled(),
             output_dir=self.output_dir,
             error=self.error or "",
         )
@@ -641,8 +806,18 @@ def run_setup(
     checkpoint: str | None,
     episode_steps: int | None,
     num_workers: int,
+    max_episodes: int | None = None,
+    benchmark: str = "",
+    interrupts: InterruptState | None = None,
+    resume: bool = False,
+    pace: Pace | None = None,
 ) -> RunResult:
-    """Evaluate one setup, recording each episode's two panels."""
+    """Evaluate one setup, recording each episode's two panels.
+
+    A Ctrl+C is caught rather than raised, for the reason a failure is: the
+    probe has already written one line per finished episode, so a run cut short
+    still has a report in it. See `install_interrupt_handler`.
+    """
     import shutil
 
     from molmo_spaces.evaluation import run_evaluation
@@ -650,18 +825,44 @@ def run_setup(
     setup = SETUPS[setup_key]
     run_dir = output_root / "runs" / setup_key
     panel_dir = run_dir / "panels"
-    if panel_dir.is_dir():
-        shutil.rmtree(panel_dir, ignore_errors=True)
+    sink = run_dir / "probe"
     is_franka = setup.robot == "franka"
+
+    kept_panels: dict[str, dict[str, Any]] = {}
+    if resume:
+        # Keep everything the earlier attempt finished, drop everything it was in
+        # the middle of, and run exactly what is left -- so what is on disk and
+        # what is about to run cannot overlap. See `_finished_houses`.
+        finished = _finished_houses(run_dir)
+        done = _prune_probe_records(sink, finished)
+        kept_panels = _prune_panel_index(panel_dir, finished)
+        benchmark_dir, remaining = _unfinished_benchmark(
+            benchmark_dir, finished, max_episodes, run_dir / "benchmark"
+        )
+        # The trimmed benchmark *is* the remainder, so the cap is already spent.
+        max_episodes = None
+        log.info(
+            f"[resume] {setup_key}: {done} episode(s) kept from {len(finished)} finished "
+            f"house(s), {remaining} episode(s) still to run"
+        )
+        if not remaining:
+            result = RunResult(
+                setup=setup_key, panel_dir=panel_dir, params=params, benchmark=benchmark
+            )
+            result.episodes = collect_probe_records(sink)
+            return result
+    else:
+        if panel_dir.is_dir():
+            shutil.rmtree(panel_dir, ignore_errors=True)
+        if sink.is_dir():
+            shutil.rmtree(sink, ignore_errors=True)
+
     recorder.set_panel_dir(
         panel_dir,
         marker_color=fr.FRANKA_TOOL_COLOR if is_franka else fr.STRETCH_TOOL_COLOR,
         in_stretch_convention=is_franka,
+        keep=kept_panels,
     )
-
-    sink = run_dir / "probe"
-    if sink.is_dir():
-        shutil.rmtree(sink, ignore_errors=True)
     os.environ[PROBE_SINK_ENV_VAR] = str(sink)
 
     # Before the config class is resolved, exactly as in `params_search`: the
@@ -672,20 +873,47 @@ def run_setup(
     probe.sink = sink
     probe.episodes.clear()
 
-    result = RunResult(setup=setup_key, panel_dir=panel_dir, params=params)
+    interrupts = interrupts if interrupts is not None else InterruptState()
+    pace = pace if pace is not None else Pace(workers=num_workers)
+    result = RunResult(setup=setup_key, panel_dir=panel_dir, params=params, benchmark=benchmark)
     log.info(f"[side-by-side] {setup_key}: {params.describe()}")
+    expected = _planned_episodes(benchmark_dir, max_episodes)
+    log.info(
+        f"[eta] {setup_key}: {expected} episode(s) at {pace.describe()}, "
+        f"about {_duration(pace.remaining(expected))}"
+    )
     try:
-        evaluation = run_evaluation(
-            eval_config_cls=qualified_config_name(setup.eval_config),
-            benchmark_dir=benchmark_dir,
-            checkpoint_path=checkpoint,
-            output_dir=run_dir,
-            max_episodes=None,
-            num_workers=num_workers,
-            task_horizon_steps=episode_steps,
-            use_wandb=False,
-        )
+        interrupts.in_evaluation = True
+        try:
+            with EpisodeProgress(sink, setup_key, expected, pace) as progress:
+                evaluation = run_evaluation(
+                    eval_config_cls=qualified_config_name(setup.eval_config),
+                    benchmark_dir=benchmark_dir,
+                    checkpoint_path=checkpoint,
+                    output_dir=run_dir,
+                    max_episodes=max_episodes,
+                    num_workers=num_workers,
+                    task_horizon_steps=episode_steps,
+                    use_wandb=False,
+                )
+            result.seconds = progress.elapsed()
+            result.ran = progress.done
+            # The rate this run is going at, for whatever is estimated next. Only
+            # from a setup that finished: a stopped one stopped mid-episode, so
+            # its elapsed time counts an episode that did not happen.
+            if not interrupts.requested:
+                pace.observe(progress.done, progress.elapsed())
+        finally:
+            interrupts.in_evaluation = False
         result.output_dir = str(evaluation.output_dir)
+        # A graceful stop returns like any other run, having run fewer episodes.
+        result.interrupted = interrupts.requested
+    except KeyboardInterrupt:
+        # Forced: `run_evaluation` never returned, so there is no output directory
+        # to record -- but the panels and the probe's records are written as each
+        # episode finishes, which is what is collected below.
+        result.interrupted = True
+        log.warning(f"[side-by-side] {setup_key} abandoned; reporting the episodes on disk")
     # One half failing must still leave the other watchable.
     except Exception as error:  # noqa: BLE001
         result.error = f"{type(error).__name__}: {error}"
@@ -1506,7 +1734,7 @@ def write_alignment_outputs(results: list[Any], destination: Path) -> None:
 # =============================================================================
 
 
-def write_outputs(runs: list[RunResult], output_dir: Path) -> Path:
+def write_outputs(runs: list[RunResult], output_dir: Path, targets: tuple[str, ...]) -> Path:
     """Write the same report, CSVs and JSONL `params_search` writes.
 
     Deliberately the *same* files with the same columns, produced by the same
@@ -1525,7 +1753,7 @@ def write_outputs(runs: list[RunResult], output_dir: Path) -> Path:
             for t in trials
         )
     )
-    return write_report(trials, mini_benchmark.TARGET_KEYS, output_dir)
+    return write_report(trials, targets, output_dir)
 
 
 def own_records(episodes: list[EpisodeScore], setup: str) -> list[EpisodeScore]:
@@ -1558,7 +1786,10 @@ def own_records(episodes: list[EpisodeScore], setup: str) -> list[EpisodeScore]:
 
 
 def runs_from_disk(
-    output_dir: Path, setup_keys: list[str], param_specs: tuple[str, ...]
+    output_dir: Path,
+    setup_keys: list[str],
+    param_specs: tuple[str, ...],
+    benchmark: str = "",
 ) -> list[RunResult]:
     """Rebuild each setup's `RunResult` from what a finished run left on disk.
 
@@ -1580,9 +1811,386 @@ def runs_from_disk(
                 panel_dir=output_dir / "runs" / key / "panels",
                 episodes=episodes,
                 params=_apply_params(SETUPS[key].params, param_specs, key),
+                # Which benchmark it was decides how its episodes are labelled, and
+                # nothing on disk records that -- so re-reporting a released-benchmark
+                # run has to be asked for with --benchmark, the way it has to be asked
+                # for with the same --param flags.
+                benchmark=benchmark,
             )
         )
     return runs
+
+
+# =============================================================================
+# How long it is going to take
+# =============================================================================
+
+PROGRESS_INTERVAL_SEC = 60.0
+"""How often a running setup says where it has got to.
+
+A minute: long enough that an overnight log is readable in the morning, short
+enough that a run wedged on its first episode is visible before the second one
+would have finished.
+"""
+
+
+def _duration(seconds: float) -> str:
+    """A wall-clock duration in the largest two units that say anything."""
+    whole = max(0, int(seconds))
+    hours, rest = divmod(whole, 3600)
+    minutes, remainder = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {remainder:02d}s"
+    return f"{remainder}s"
+
+
+def _finishing(seconds: float) -> str:
+    """The clock time something `seconds` from now would finish at.
+
+    The day is printed as well when it is not today, because the answer to "how
+    long will this take" on a benchmark run is routinely "tomorrow", and 03:20 on
+    its own does not say which 03:20.
+    """
+    end = datetime.now() + timedelta(seconds=max(0.0, seconds))
+    return end.strftime("%H:%M" if end.date() == date.today() else "%a %H:%M")
+
+
+@dataclass
+class Pace:
+    """How long an episode is taking, and so how long what is left will take.
+
+    Starts at `params_search.SECONDS_PER_ROLLOUT`, which is an order of magnitude
+    rather than a measurement, and replaces it with this run's own rate the
+    moment there is one. An episode's cost depends on the horizon, the policy,
+    the card and what else is on it, so the only source worth trusting for it is
+    the run in front of you -- and the first setup of a pair measures the rate
+    the second one is estimated with.
+
+    The rate is wall clock per episode as the run is actually going, workers and
+    all, rather than per rollout: it is divided by the worker count once, on the
+    way in from the prior, and never again.
+    """
+
+    workers: int = 1
+    seconds_each: float = 0.0
+    measured: bool = False
+
+    def __post_init__(self) -> None:
+        # A rate handed in is a rate somebody measured -- the previous attempt at
+        # this very run, by way of `_recorded_pace` -- so it is not the prior and
+        # should not be labelled as one.
+        if self.seconds_each:
+            self.measured = True
+        else:
+            self.seconds_each = SECONDS_PER_ROLLOUT / max(1, self.workers)
+
+    def observe(self, episodes: int, seconds: float) -> None:
+        """Take this run's own rate from a setup that has just finished."""
+        if episodes > 0 and seconds > 0:
+            self.seconds_each = seconds / episodes
+            self.measured = True
+
+    def remaining(self, episodes: int) -> float:
+        return max(0, episodes) * self.seconds_each
+
+    def describe(self) -> str:
+        return f"~{_duration(self.seconds_each)} an episode" + (
+            "" if self.measured else " (a rough prior -- nothing has been timed yet)"
+        )
+
+
+class EpisodeProgress:
+    """Says where a running setup has got to, and what is left, while it runs.
+
+    The evaluation is one call that returns when it is done, so the only view
+    into it from out here is what the probe leaves on disk: one line per finished
+    episode, which is exactly a progress counter. Watched from a thread because
+    "how long is this going to take" is a question asked while it is running, not
+    afterwards -- and answered from the rate this setup is actually going at,
+    which is the only one that accounts for the scene it is in.
+
+    Counting lines rather than parsing them: a record half-written when the
+    counter reads it is a record that will be counted a second later.
+    """
+
+    def __init__(self, sink: Path, label: str, expected: int, pace: Pace) -> None:
+        self.sink = sink
+        self.label = label
+        self.expected = expected
+        self.pace = pace
+        self.baseline = self._count()
+        self.started = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _count(self) -> int:
+        total = 0
+        for path in self.sink.glob("*.jsonl"):
+            try:
+                total += sum(1 for line in path.read_text().splitlines() if line.strip())
+            except OSError:
+                continue
+        return total
+
+    @property
+    def done(self) -> int:
+        """Episodes this attempt has finished, not counting what it inherited."""
+        return max(0, self._count() - self.baseline)
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def _report(self) -> None:
+        done = self.done
+        elapsed = self.elapsed()
+        if not done:
+            log.info(
+                f"[eta] {self.label}: 0/{self.expected} episodes after {_duration(elapsed)}"
+            )
+            return
+        each = elapsed / done
+        left = (self.expected - done) * each
+        log.info(
+            f"[eta] {self.label}: {done}/{self.expected} episodes, {_duration(each)} each, "
+            f"{_duration(left)} left (about {_finishing(left)})"
+        )
+
+    def _watch(self) -> None:
+        while not self._stop.wait(PROGRESS_INTERVAL_SEC):
+            self._report()
+
+    def __enter__(self) -> "EpisodeProgress":
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
+# =============================================================================
+# Picking a stopped run back up
+# =============================================================================
+
+PROGRESS_FILE = "progress.json"
+"""What a run is and how far it got, written into the run directory."""
+
+STATUS_COMPLETED = "completed"
+STATUS_INTERRUPTED = "interrupted"
+STATUS_FAILED = "failed"
+
+
+@dataclass
+class Progress:
+    """A run's identity and how far through its setups it is. See `find_resumable`.
+
+    Written after every setup rather than at the end, because the thing it exists
+    to survive is a run not reaching the end. A setup killed outright leaves no
+    entry at all, which reads as "never started" -- and that is the right answer,
+    because what it actually finished is written in its trajectories either way.
+
+    `run` and `date` together are the experiment's identity. `run_directory_name`
+    is a pure function of the flags that decide what is being measured, so
+    recomputing it from the resuming invocation and comparing is a complete check
+    that the two agree -- complete without a field here per flag, which would be a
+    list that drifts behind the flags themselves. `scenes` and `max_episodes` are
+    carried separately because they are the two the name deliberately leaves out.
+    """
+
+    run: str
+    date: str
+    scenes: int
+    benchmark: str
+    max_episodes: int | None
+    command: str
+    """The command line that started the run, quoted back when a resume disagrees."""
+
+    setups: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Setup key -> status, episode count and output directory, for the ones that ran."""
+
+    @classmethod
+    def read(cls, run_dir: Path) -> "Progress | None":
+        """This run's progress, or None where no run has been started."""
+        path = run_dir / PROGRESS_FILE
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text())
+        except ValueError as error:
+            raise click.UsageError(f"{path} is not readable: {error}") from error
+        known = {f.name for f in fields(cls)}
+        return cls(**{key: value for key, value in payload.items() if key in known})
+
+    def write(self, run_dir: Path) -> None:
+        (run_dir / PROGRESS_FILE).write_text(json.dumps(asdict(self), indent=2))
+
+    def completed(self) -> set[str]:
+        """The setups that ran to the end, which a resume keeps rather than repeats."""
+        return {
+            key
+            for key, record in self.setups.items()
+            if record.get("status") == STATUS_COMPLETED
+        }
+
+    def unfinished(self, setup_keys: list[str]) -> list[str]:
+        """The setups of this pair still to run: never started, stopped, or failed.
+
+        A failed setup counts as unfinished rather than done. The usual failure
+        is the VLA running out of memory because something else was holding the
+        card, which says nothing about the setup and everything about the
+        moment -- so running it again is the right default, and it is the only
+        one that leaves a pair with two halves.
+        """
+        done = self.completed()
+        return [key for key in setup_keys if key not in done]
+
+
+def _episode_count(benchmark_dir: Path) -> int:
+    """How many episodes a benchmark directory holds.
+
+    From the metadata where there is any, because a released benchmark's
+    `benchmark.json` is 20 MB and this is only ever used to say how long
+    something will take. A resumed setup's trimmed benchmark has no metadata, by
+    the design of `_unfinished_benchmark`, and is counted directly -- it is the
+    remainder, which is the number wanted.
+    """
+    metadata = benchmark_dir / "benchmark_metadata.json"
+    if metadata.is_file():
+        try:
+            count = json.loads(metadata.read_text()).get("num_episodes")
+            if isinstance(count, int):
+                return count
+        except (OSError, ValueError):
+            pass
+    try:
+        return len(json.loads((benchmark_dir / "benchmark.json").read_text()))
+    except (OSError, ValueError):
+        return 0
+
+
+def _planned_episodes(benchmark_dir: Path, max_episodes: int | None) -> int:
+    """How many episodes a run over this benchmark will actually get through.
+
+    The cap and the benchmark are both upper bounds and the smaller wins, so a
+    `--episodes 200` over a benchmark holding 12 is estimated as 12 rather than
+    as most of an hour that never happens.
+    """
+    available = _episode_count(benchmark_dir)
+    if max_episodes is None:
+        return available
+    return min(available, max_episodes) if available else max_episodes
+
+
+def _finished_houses(run_dir: Path) -> set[int]:
+    """The houses an earlier attempt at this setup got all the way through.
+
+    A house's trajectories are written when it finishes and not at all otherwise
+    -- the rollout pipeline skips the save outright when it is shutting down -- so
+    the file is the honest record of what completed, and the house is the finest
+    unit a resume can be honest about. On the released pick benchmark that is
+    nearly per-episode: 938 of its 969 houses hold a single episode.
+
+    Every attempt is looked at rather than the last, because `run_evaluation`
+    timestamps a fresh output directory per call, so a run resumed twice has its
+    finished houses spread across two of them.
+    """
+    houses = set()
+    for path in run_dir.glob("*/*/house_*/trajectories*.h5"):
+        digits = path.parent.name.rsplit("_", 1)[-1]
+        if digits.isdigit():
+            houses.add(int(digits))
+    return houses
+
+
+def _prune_probe_records(sink: Path, houses: set[int]) -> int:
+    """Drop the scores of houses that did not finish, and count what is left.
+
+    A house with no trajectories is a house that will run again, and its records
+    from the attempt that was cut off would otherwise be counted a second time --
+    in a report whose episode counts nobody re-derives. The probe writes the house
+    index as `scene`, which is what `EpisodeScore.scene` holds and what the
+    trajectory directories are named after, so the two can be matched directly.
+    """
+    kept_total = 0
+    for path in sorted(sink.glob("*.jsonl")):
+        kept = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                log.warning(f"[resume] dropping a malformed record in {path}")
+                continue
+            if record.get("scene") in houses:
+                kept.append(line)
+        path.write_text("".join(f"{line}\n" for line in kept))
+        kept_total += len(kept)
+    return kept_total
+
+
+def _prune_panel_index(panel_dir: Path, houses: set[int]) -> dict[str, dict[str, Any]]:
+    """The panel records of the houses that finished, keyed as the recorder keys them.
+
+    The counterpart of `_prune_probe_records` for the footage: an unfinished
+    house's panels are about to be written again, so its entries are dropped and
+    the rest are handed back to seed the recorder. The MP4s themselves are left
+    where they are -- they are overwritten by the attempt that reruns them, and an
+    entry that no longer names them is enough to keep them out of a video.
+    """
+    index = _panel_index(panel_dir)
+    kept = {key: meta for key, meta in index.items() if _scene_of(meta) in houses}
+    if len(kept) != len(index):
+        (panel_dir / "episodes.json").write_text(json.dumps(list(kept.values()), indent=2))
+    return kept
+
+
+def _unfinished_benchmark(
+    benchmark_dir: Path, houses: set[int], max_episodes: int | None, destination: Path
+) -> tuple[Path, int]:
+    """A benchmark of just the episodes still to run, and how many that is.
+
+    There is no way to ask `run_evaluation` to start at the nth episode -- it
+    takes a cap and a single index and nothing in between -- so the way to run a
+    remainder is to hand it a benchmark that *is* the remainder. The episodes are
+    cut to the cap first and filtered afterwards, in that order, so the window is
+    the same window the first attempt ran: cutting after the filter would pull
+    episodes in from beyond it, one per house already done.
+
+    Only `benchmark.json` is written. `benchmark_metadata.json` is optional to
+    every reader of a benchmark directory, and a copy of it here would describe
+    the whole suite while sitting beside a slice of it.
+    """
+    episodes = json.loads((benchmark_dir / "benchmark.json").read_text())
+    if max_episodes is not None:
+        episodes = episodes[:max_episodes]
+    remaining = [episode for episode in episodes if episode.get("house_index") not in houses]
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "benchmark.json").write_text(json.dumps(remaining))
+    return destination, len(remaining)
+
+
+def _resumed_run(
+    output_dir: Path,
+    setup_key: str,
+    param_specs: tuple[str, ...],
+    benchmark: str,
+    record: dict[str, Any],
+) -> RunResult:
+    """A setup that finished in an earlier attempt, read back rather than run again.
+
+    `runs_from_disk` rebuilds everything the report needs except where the
+    evaluation wrote, which nothing on disk connects back to the setup -- so that
+    one field comes from the progress record instead, and the report's per-trial
+    link survives a resume.
+    """
+    run = runs_from_disk(output_dir, [setup_key], param_specs, benchmark)[0]
+    run.output_dir = str(record.get("output_dir") or "")
+    return run
 
 
 # =============================================================================
@@ -1642,6 +2250,7 @@ def run_directory_name(
     camera_choices: StretchCameraChoices,
     param_specs: tuple[str, ...] = (),
     grasp_offset: float | None = None,
+    benchmark: str | None = None,
     today: date | None = None,
 ) -> str:
     """The directory one run of this script writes to, named after what it is.
@@ -1653,13 +2262,13 @@ def run_directory_name(
     and hand-naming is exactly where a name drifts from the flags it claims to
     describe.
 
-    What goes in: the date, the pair, every convention and camera choice that is
-    on, the Stretch grasp offset when one was typed, and every `--param`
-    override. What stays out is everything operational -- the worker count, the
-    checkpoint path, `--rebuild-benchmark`, `--scenes` -- which changes how a run
-    is produced rather than what it measures. `--scenes` is the arguable one: two
-    scene counts land in the same directory, and the second run's `trials.csv`
-    replaces the first's.
+    What goes in: the date, the pair, the benchmark when it is not the mini one,
+    every convention and camera choice that is on, the Stretch grasp offset when
+    one was typed, and every `--param` override. What stays out is everything
+    operational -- the worker count, the checkpoint path, `--rebuild-benchmark`,
+    `--scenes` -- which changes how a run is produced rather than what it
+    measures. `--scenes` is the arguable one: two scene counts land in the same
+    directory, and the second run's `trials.csv` replaces the first's.
 
     Deterministic, and sorted where the flags themselves are unordered, so the
     same command on the same day always resolves to the same directory: a rerun
@@ -1667,6 +2276,10 @@ def run_directory_name(
     """
     stamp = (today or date.today()).strftime("%Y%m%d")
     segments = [RUN_NAME_PREFIX, stamp, pair]
+    if benchmark:
+        # What was measured rather than how: the same pair over the released pick
+        # suite is a different experiment from the same pair over the mini one.
+        segments.append(f"bench-{benchmark}")
     for name in fr.POSE_CONVENTION_ENV_VARS:
         value = getattr(conventions, name)
         if not value:
@@ -1688,8 +2301,66 @@ def run_directory_name(
     return "_".join(segments)
 
 
+def describes(progress: Progress, name_at: Callable[[date], str], **shape: Any) -> bool:
+    """Whether a recorded run is the one this invocation is asking for.
+
+    The test is the directory name recomputed at the date the run was started:
+    `run_directory_name` is a pure function of everything that decides what is
+    being measured, so two invocations agreeing on it agree on the experiment --
+    and agreeing without a field here per flag, which would be a list that drifts
+    behind the flags themselves. `--scenes` and `--episodes` are checked
+    separately because they are the two the name deliberately leaves out, and
+    they decide which episodes run.
+    """
+    try:
+        expected = name_at(date.fromisoformat(progress.date))
+    except ValueError:
+        log.warning(f"[resume] ignoring a run recorded with an unreadable date: {progress.date!r}")
+        return False
+    return expected == progress.run and all(
+        getattr(progress, field) == value for field, value in shape.items()
+    )
+
+
+def find_resumable(
+    output_root: Path, setup_keys: list[str], name_at: Callable[[date], str], **shape: Any
+) -> tuple[Path, Progress] | None:
+    """The stopped run this invocation is a continuation of, if there is one.
+
+    Looked up rather than asked for. The flags already name the run -- that is
+    what `run_directory_name` is for -- so the same command finds its own stopped
+    run without being told where it is, which is the whole point: the way anyone
+    resumes is to press up-arrow and enter.
+
+    Every recorded run under `--output-dir` is considered rather than only
+    today's, because a run started at midnight and stopped at two is resumed on a
+    day whose name would not match; the one that matches and is furthest on is
+    taken. A run with nothing left to do is not a candidate, so repeating the
+    command after a finished run starts it again, as it always has.
+    """
+    best: tuple[str, Path, Progress] | None = None
+    for path in sorted(output_root.glob(f"{RUN_NAME_PREFIX}_*/{PROGRESS_FILE}")):
+        try:
+            progress = Progress.read(path.parent)
+        except click.UsageError as error:
+            log.warning(f"[resume] ignoring {path}: {error}")
+            continue
+        if progress is None or not progress.unfinished(setup_keys):
+            continue
+        if not describes(progress, name_at, **shape):
+            continue
+        if best is None or progress.date > best[0]:
+            best = (progress.date, path.parent, progress)
+    return (best[1], best[2]) if best is not None else None
+
+
 def _benchmark_for_run(
-    output_root: Path, output_dir: Path, *, force: bool, scene_count: int
+    output_root: Path,
+    output_dir: Path,
+    *,
+    force: bool,
+    scene_count: int,
+    benchmark: str | None = None,
 ) -> Path:
     """Build the benchmark once per --output-dir, and leave a copy in the run.
 
@@ -1707,9 +2378,24 @@ def _benchmark_for_run(
     the root's, which also keeps a run directory self-contained if it is moved or
     archived away from its siblings. The files are tens of kilobytes.
 
+    A released `--benchmark` is not built and not shared through the root -- it is
+    already on disk wherever `benchmarks.resolve_benchmark_dir` found it -- but it
+    is copied into the run for the same reason: so the run says which episodes it
+    was, and so a replay of it can still read what each one was about. That copy
+    is 20 MB rather than tens of kilobytes.
+
     Returns the directory the evaluation should run from, which is the run's own.
     """
     import shutil
+
+    if benchmark:
+        destination = output_dir / "benchmark"
+        # A resumed run already has its copy, and it is the copy a resume trims
+        # its remainder out of -- so it is left alone unless a rebuild is asked
+        # for, which also saves re-copying 20 MB on every rerun into a directory.
+        if force or not (destination / "benchmark.json").is_file():
+            shutil.copytree(resolve_benchmark_dir(benchmark), destination, dirs_exist_ok=True)
+        return destination
 
     built = mini_benchmark.build(output_root / "benchmark", force=force, scene_count=scene_count)
     benchmark_dir = output_dir / "benchmark"
@@ -1799,6 +2485,26 @@ def _apply_params(
     help="How many scenes to run. Each contributes one episode per object.",
 )
 @click.option(
+    "--benchmark",
+    type=click.Choice(BENCHMARK_KEYS),
+    default=None,
+    help="Run a released benchmark instead of the four-object mini one: 'pick' is "
+    "MolmoSpaces' own Pick-v2 suite, a thousand episodes across hundreds of houses. Worth "
+    "pairing with --episodes, because both halves of a pair have to run before anything "
+    "can be composed and an uncapped suite never reaches the second half -- or stop it with "
+    "Ctrl+C, which reports what has run. Only the pick benchmarks are offered; see "
+    "BENCHMARK_KEYS.",
+)
+@click.option(
+    "--episodes",
+    "max_episodes",
+    type=int,
+    default=None,
+    help="Cap the episodes each setup runs, taken from the front of the benchmark so both "
+    "halves of a pair get the same ones. Only with --benchmark; the mini benchmark is "
+    "sized by --scenes.",
+)
+@click.option(
     "--episode-steps",
     type=int,
     default=None,
@@ -1829,6 +2535,14 @@ def _apply_params(
     "printed when the run starts. --compose-only, --report-only and --replay-as-stretch4 "
     "read a finished run instead of making one, so for those pass the run's own directory "
     "and it is used exactly as typed. See `run_directory_name`.",
+)
+@click.option(
+    "--restart",
+    is_flag=True,
+    help="Run from the beginning rather than carrying on. These flags name their own run, "
+    "so repeating a command that was stopped picks it up where it left off -- setups that "
+    "finished kept, the one that was cut off running only the houses it missed. This throws "
+    "that away and does it again. See `find_resumable`.",
 )
 @click.option(
     "--rebuild-benchmark", is_flag=True, help="Rebuild the benchmark even if it is there."
@@ -2002,10 +2716,13 @@ def main(
     pair: str,
     param_specs: tuple[str, ...],
     scene_count: int,
+    benchmark: str | None,
+    max_episodes: int | None,
     episode_steps: int | None,
     checkpoint: str | None,
     num_workers: int | None,
     output_dir: Path,
+    restart: bool,
     rebuild_benchmark: bool,
     compose_only: bool,
     report_only: bool,
@@ -2027,6 +2744,28 @@ def main(
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    if max_episodes is not None and benchmark is None:
+        raise click.UsageError(
+            "--episodes caps a --benchmark run. The mini benchmark is sized by --scenes, "
+            "which is one episode per object per scene."
+        )
+    if restart and (compose_only or report_only or replay_as_stretch4):
+        raise click.UsageError(
+            "--restart runs an experiment again; --compose-only, --report-only and "
+            "--replay-as-stretch4 read one that has already been run."
+        )
+    if benchmark and replay_as_stretch4:
+        raise click.UsageError(
+            "--benchmark has nothing to say to --replay-as-stretch4, which replays the "
+            "Franka trajectories a run already recorded. Pass it to the run that records "
+            "them, and replay that run's directory."
+        )
+    if benchmark and _typed("scene_count"):
+        raise click.UsageError(
+            "--scenes builds the mini benchmark, which --benchmark replaces. Cap a "
+            "released benchmark with --episodes instead."
+        )
 
     conventions = fr.PoseConventions(
         change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
@@ -2057,6 +2796,7 @@ def main(
         log.info(f"[camera] Stretch reads: {camera_choices.describe()}")
 
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
+    setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
 
     # What --output-dir was typed as, before the run's own directory is appended
     # to it. The benchmark lives here rather than in the run: its episode specs
@@ -2065,19 +2805,50 @@ def main(
     # on every run. See `run_directory_name`.
     output_root = output_dir
     consuming_a_finished_run = compose_only or report_only or replay_as_stretch4
+    progress: Progress | None = None
     if not consuming_a_finished_run:
         # Only a new evaluation names its own directory. The three modes above
         # read a run that already exists, and deriving a name for them would make
         # re-reporting mean retyping the exact flags that produced it -- and put
         # a run from any other day out of reach entirely.
-        output_dir = output_dir / run_directory_name(
-            pair,
-            conventions,
-            camera_choices,
-            param_specs=param_specs,
-            grasp_offset=stretch4_grasp_offset if _typed("stretch4_grasp_offset") else None,
+        def name_at(day: date) -> str:
+            return run_directory_name(
+                pair,
+                conventions,
+                camera_choices,
+                param_specs=param_specs,
+                grasp_offset=(
+                    stretch4_grasp_offset if _typed("stretch4_grasp_offset") else None
+                ),
+                benchmark=benchmark,
+                today=day,
+            )
+
+        found = (
+            None
+            if restart
+            else find_resumable(
+                output_root,
+                setup_keys,
+                name_at,
+                scenes=scene_count,
+                benchmark=benchmark or "",
+                max_episodes=max_episodes,
+            )
         )
-        click.secho(f"Writing this run to {output_dir}", fg="cyan")
+        if found is not None:
+            # The run this command already started once. Its directory is used as
+            # it stands rather than derived again, because the name carries the
+            # day it began and today may not be that day.
+            output_dir, progress = found
+            click.secho(
+                f"Carrying on {output_dir}: "
+                f"{len(progress.completed())} of {len(setup_keys)} setup(s) already done",
+                fg="cyan",
+            )
+        else:
+            output_dir = output_dir / name_at(date.today())
+            click.secho(f"Writing this run to {output_dir}", fg="cyan")
     output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = output_dir / "videos"
 
@@ -2149,12 +2920,13 @@ def main(
         write_start_outputs(results, destination)
         return
 
-    setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
-
     if report_only:
-        runs = runs_from_disk(output_dir, setup_keys, param_specs)
-        report = write_outputs(runs, output_dir)
-        table = format_trial_table([r.as_trial() for r in runs], mini_benchmark.TARGET_KEYS)
+        runs = runs_from_disk(output_dir, setup_keys, param_specs, benchmark or "")
+        columns = target_columns(runs)
+        report = write_outputs(runs, output_dir, columns)
+        table = format_trial_table(
+            [r.as_trial() for r in runs], columns[:CONSOLE_TARGET_COLUMNS]
+        )
         click.echo("\n" + table)
         click.secho(f"\nWrote {report}", fg="green")
         return
@@ -2173,7 +2945,8 @@ def main(
                     result.episodes = collect_probe_records(probe)
             written += compose_pair(*halves, videos_dir / name)
         _report(written, videos_dir)
-        report = write_outputs(runs_from_disk(output_dir, setup_keys, param_specs), output_dir)
+        runs = runs_from_disk(output_dir, setup_keys, param_specs, benchmark or "")
+        report = write_outputs(runs, output_dir, target_columns(runs))
         click.secho(f"Wrote {report}", fg="green")
         return
 
@@ -2195,9 +2968,18 @@ def main(
     if missing:
         raise click.UsageError(inference_requirements_message(missing))
 
-    workers = num_workers if num_workers is not None else affordable_workers(scene_count)
+    # `affordable_workers` caps at the number of work items, since a worker with no
+    # house left to take only idles. For the mini benchmark that is the scene count;
+    # a released benchmark has far more houses than VRAM affords workers, so what
+    # caps it there is --episodes, or nothing.
+    work_units = scene_count if benchmark is None else (max_episodes or UNCAPPED_WORK_UNITS)
+    workers = num_workers if num_workers is not None else affordable_workers(work_units)
     benchmark_dir = _benchmark_for_run(
-        output_root, output_dir, force=rebuild_benchmark, scene_count=scene_count
+        output_root,
+        output_dir,
+        force=rebuild_benchmark,
+        scene_count=scene_count,
+        benchmark=benchmark,
     )
 
     # One recorder, re-pointed per run; `set_panel_dir` is what keeps each run's
@@ -2205,11 +2987,45 @@ def main(
     recorder = SplitPanelRecorder(output_dir / "runs")
     _install(recorder)
 
-    setups_to_run = setup_keys
-    episodes = scene_count * len(mini_benchmark.TARGETS)
+    # Which setups have something on disk to keep: the ones a stopped run got
+    # partway through. A fresh run has none, and wipes as it always did.
+    already_ran_partly = set(progress.setups) if progress is not None else set()
+    already_run = progress.completed() if progress is not None else set()
+    setups_to_run = [key for key in setup_keys if key not in already_run]
+    if progress is None:
+        # Not resuming, but the directory may still hold a stopped run: one whose
+        # name matches and whose episode counts do not, since --scenes and
+        # --episodes are deliberately left out of the name. Its results are about
+        # to be replaced, which is worth saying rather than doing quietly.
+        stopped = Progress.read(output_dir)
+        if stopped is not None and stopped.unfinished(setup_keys) and not restart:
+            click.secho(
+                f"{output_dir} holds a stopped run of --scenes {stopped.scenes} "
+                f"--episodes {stopped.max_episodes}, which is not what this is; "
+                "starting again and replacing it.",
+                fg="yellow",
+            )
+        progress = Progress(
+            run=output_dir.name,
+            date=date.today().isoformat(),
+            scenes=scene_count,
+            benchmark=benchmark or "",
+            max_episodes=max_episodes,
+            command=" ".join(sys.argv),
+        )
+    if benchmark is None:
+        episodes = scene_count * len(mini_benchmark.TARGETS)
+        scope = (
+            f"{scene_count} scene(s) x {len(mini_benchmark.TARGETS)} objects = "
+            f"{episodes} episodes each"
+        )
+    else:
+        scope = (
+            f"{BENCHMARKS[benchmark].display_name}, "
+            f"{max_episodes if max_episodes is not None else 'all'} episodes each"
+        )
     click.secho(
-        f"Running {len(setups_to_run)} setup(s) over {scene_count} scene(s) x "
-        f"{len(mini_benchmark.TARGETS)} objects = {episodes} episodes each, "
+        f"Running {len(setups_to_run)} setup(s) over {scope}, "
         f"{workers} worker(s). Sequentially, because two policies do not fit on one card. "
         f"Output: {len(pair_names)} split-screen video(s) per episode.",
         bold=True,
@@ -2217,11 +3033,40 @@ def main(
     for name in pair_names:
         click.echo(f"  {name:11s} {' vs '.join(MATCHED_PAIRS[name])}")
 
+    pace = Pace(workers=workers, seconds_each=_recorded_pace(progress))
+    planned = _planned_episodes(benchmark_dir, max_episodes)
+    _announce_eta(pace, planned, setup_keys, already_run, progress)
+
+    if benchmark is not None and max_episodes is None:
+        click.secho(
+            "Uncapped: the first setup will run the whole suite, so the second half of its "
+            "pair never starts. Stop it with Ctrl+C when it has said enough, or pass "
+            "--episodes.",
+            fg="yellow",
+        )
+
     # Every setup first, then the tiling: a pair cannot be composed until both
     # its halves have run, and running them pair by pair would reload the
     # checkpoint for each half anyway.
+    interrupts = InterruptState()
+    install_interrupt_handler(interrupts)
+    # Written before the first rollout, so a run killed outright rather than
+    # interrupted still says what experiment it was and can be resumed.
+    progress.write(output_dir)
+
     runs: dict[str, RunResult] = {}
-    for setup_key in setups_to_run:
+    for setup_key in setup_keys:
+        if setup_key in already_run:
+            runs[setup_key] = _resumed_run(
+                output_dir, setup_key, param_specs, benchmark or "", progress.setups[setup_key]
+            )
+            click.secho(
+                f"{setup_key}: finished already, keeping its "
+                f"{len(runs[setup_key].episodes)} episode(s)",
+                fg="cyan",
+            )
+            continue
+
         base = SETUPS[setup_key].params
         params = _apply_params(base, param_specs, setup_key)
         runs[setup_key] = run_setup(
@@ -2233,22 +3078,98 @@ def main(
             checkpoint=checkpoint,
             episode_steps=episode_steps,
             num_workers=workers,
+            max_episodes=max_episodes,
+            benchmark=benchmark or "",
+            interrupts=interrupts,
+            resume=setup_key in already_ran_partly,
+            pace=pace,
         )
-        if runs[setup_key].error:
-            click.secho(f"{setup_key} failed: {runs[setup_key].error}", fg="red")
+        result = runs[setup_key]
+        progress.setups[setup_key] = {
+            "status": (
+                STATUS_FAILED
+                if result.error
+                else STATUS_INTERRUPTED
+                if result.interrupted
+                else STATUS_COMPLETED
+            ),
+            "episodes": len(result.episodes),
+            "ran": result.ran,
+            "seconds": round(result.seconds, 1),
+            "output_dir": result.output_dir,
+        }
+        progress.write(output_dir)
+        if result.seconds:
+            # The setups still to come, and what this one's measured rate says
+            # they will cost -- which is the number worth having after the first
+            # half of a pair, because the second half is the same episodes again.
+            left = [key for key in setup_keys if key not in progress.setups]
+            to_go = sum(pace.remaining(planned - _already(progress, key)) for key in left)
+            click.secho(
+                f"{setup_key}: {result.ran} episode(s) in {_duration(result.seconds)}"
+                + (
+                    f", {len(result.episodes)} in total"
+                    if result.ran != len(result.episodes)
+                    else ""
+                )
+                + (
+                    f". {len(left)} setup(s) left, about {_duration(to_go)} "
+                    f"(finishing about {_finishing(to_go)})"
+                    if left and not interrupts.requested
+                    else "."
+                ),
+                fg="cyan",
+            )
+        if result.error:
+            click.secho(f"{setup_key} failed: {result.error}", fg="red")
+        if interrupts.requested:
+            click.secho(
+                f"Stopped during {setup_key}; composing and reporting what has run.",
+                fg="yellow",
+            )
+            break
+
+    # Read before the composition, which can be interrupted in its own right and
+    # must not be able to make a finished run look like a curtailed one.
+    run_interrupted = interrupts.requested
 
     written = []
-    for name in pair_names:
-        franka_key, stretch_key = MATCHED_PAIRS[name]
-        # A pair whose halves both failed has nothing to tile; one that lost a
-        # half still writes what it has, held against the surviving side.
-        written += compose_pair(runs[franka_key], runs[stretch_key], videos_dir / name)
+    try:
+        for name in pair_names:
+            franka_key, stretch_key = MATCHED_PAIRS[name]
+            halves = [runs.get(franka_key), runs.get(stretch_key)]
+            if any(half is None for half in halves):
+                # A pair is two runs, and a sweep stopped early can leave one of
+                # them never started. There is nothing to tile a run against a run
+                # that did not happen, and the half that did run keeps its panels.
+                log.info(f"[side-by-side] {name}: only one half ran, nothing to compose")
+                continue
+            # A pair whose halves both failed has nothing to tile; one that lost a
+            # half still writes what it has, held against the surviving side.
+            written += compose_pair(*halves, videos_dir / name)
+    except KeyboardInterrupt:
+        # The panels are on disk and the report is still to be written, so a Ctrl+C
+        # here is asking to skip the tiling rather than to lose the run.
+        click.secho("Skipping the rest of the composition.", fg="yellow")
     _report(written, videos_dir)
 
-    ordered = [runs[key] for key in setups_to_run]
-    table = format_trial_table([r.as_trial() for r in ordered], mini_benchmark.TARGET_KEYS)
+    # Every setup of the pair, not just the ones this invocation ran: a resumed
+    # run's earlier halves are in `runs` too, and a report missing them would say
+    # the run scored nothing.
+    ordered = [runs[key] for key in setup_keys if key in runs]
+    columns = target_columns(ordered)
+    shown = columns[:CONSOLE_TARGET_COLUMNS]
+    table = format_trial_table([r.as_trial() for r in ordered], shown)
     click.echo("\n" + table)
-    report = write_outputs(ordered, output_dir)
+    if len(shown) < len(columns):
+        click.secho(
+            f"Showing the {len(shown)} most-attempted of {len(columns)} objects; "
+            f"report.md has them all.",
+            fg="yellow",
+        )
+    report = write_outputs(ordered, output_dir, columns)
+    if run_interrupted:
+        _note_interrupted(report, ordered, setups_to_run)
     click.secho(f"\nWrote {report}", fg="green")
 
 
@@ -2263,6 +3184,101 @@ def _install(recorder: SplitPanelRecorder) -> None:
 
     visualize._EVAL_OBSERVERS.clear()
     visualize._install_eval_rollout_hook(recorder)
+
+
+def _recorded_pace(progress: Progress) -> float:
+    """Seconds an episode took last time, from the most recent setup that ran any.
+
+    A resumed run should not fall back to the 45-second prior when it has its own
+    measurement from an hour ago. The last recorded setup wins rather than an
+    average of them: the machine it is on now is more like the machine it was on
+    most recently. A setup that was interrupted counts too -- its elapsed time
+    includes the episode that was cut off, which makes the rate slightly
+    pessimistic, and an estimate that runs long is the harmless direction.
+    """
+    for record in reversed(list(progress.setups.values())):
+        ran, seconds = record.get("ran") or 0, record.get("seconds") or 0.0
+        if ran and seconds:
+            return seconds / ran
+    return 0.0
+
+
+def _already(progress: Progress, setup_key: str) -> int:
+    """Episodes a stopped attempt at this setup left behind.
+
+    Overstates by at most the house it was in the middle of, whose episodes run
+    again -- close enough for an estimate, and never more than the setup holds.
+    """
+    return int(progress.setups.get(setup_key, {}).get("episodes") or 0)
+
+
+def _announce_eta(
+    pace: Pace,
+    planned: int,
+    setup_keys: list[str],
+    already_run: set[str],
+    progress: Progress,
+) -> None:
+    """Say how long each setup and the run as a whole should take, before it starts.
+
+    Per setup rather than one number for the run, because the setups are run one
+    after another and a pair is only comparable once both halves are done -- so
+    "when is the first half finished" is the question that decides whether to
+    wait up, and a total on its own does not answer it.
+
+    Every number here is the prior until a rollout has been timed, and the prior
+    is an order of magnitude. It is printed anyway: "about six hours" is what
+    decides whether a run is started before bed, and "unknown" decides nothing.
+    """
+    lines = []
+    total = 0.0
+    for key in setup_keys:
+        if key in already_run:
+            lines.append(f"  {key:20s} done")
+            continue
+        done = _already(progress, key)
+        remaining = max(0, planned - done)
+        total += pace.remaining(remaining)
+        note = f" ({done} already done)" if done else ""
+        lines.append(
+            f"  {key:20s} {remaining:4d} episode(s)  ~{_duration(pace.remaining(remaining))}{note}"
+        )
+    click.secho(f"At {pace.describe()}:", bold=True)
+    for line in lines:
+        click.echo(line)
+    click.secho(
+        f"  {'total':20s}               ~{_duration(total)}, finishing about {_finishing(total)}",
+        fg="cyan",
+    )
+
+
+def _note_interrupted(report: Path, runs: list[RunResult], setup_keys: list[str]) -> None:
+    """Say in `report.md` that the run was cut short, and how far it got.
+
+    Appended to the report rather than only printed to the console, because the
+    report is what gets read a week later: a partial run that does not say so
+    reads as a finished one with a surprising score, and a score over the first
+    nine episodes of a thousand-episode suite is not a score on that suite. The
+    per-setup episode counts are the evidence, and a setup that never started
+    says so rather than showing a zero that could be read as a failure.
+    """
+    lines = [
+        "",
+        "## Stopped early",
+        "",
+        "Interrupted with Ctrl+C. Every trial below is a slice of the benchmark taken "
+        "from the front of it, not a score on the whole thing, and a pair missing a half "
+        "has no video.",
+        "",
+        "| setup | episodes |",
+        "| ----- | -------- |",
+    ]
+    by_setup = {run.setup: run for run in runs}
+    for key in setup_keys:
+        run = by_setup.get(key)
+        lines.append(f"| {key} | {len(run.episodes) if run is not None else 'not run'} |")
+    with report.open("a") as handle:
+        handle.write("\n".join(lines) + "\n")
 
 
 def _report(written: list[Path], videos_dir: Path) -> None:
