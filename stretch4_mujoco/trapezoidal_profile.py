@@ -1,3 +1,11 @@
+"""Trapezoidal motion profiles, ported from the Stretch stepper firmware.
+
+A sim move should take as long as the same move on hardware and follow the same
+velocity curve while it does, so rather than approximate the shape,
+`TrapezoidalProfile` is a transcription of the two generators that actually run
+on the robot's stepper boards.
+"""
+
 import math
 import time
 
@@ -5,46 +13,128 @@ import numpy as np
 
 
 class TrapezoidalProfile:
-    """
-    Generates a trapezoidal velocity profile for a single joint.
-    Mimics the behavior of a stepper motor driver.
+    """Generates a trapezoidal velocity profile for a single joint.
 
     Two modes, both bounded by the same `max_vel`/`max_accel`:
 
     * velocity: `set_target_velocity()`, the position is whatever integrating
       the ramped velocity produces. Used for the wheels and for jogging.
-    * position: `set_target_position()`, the profile accelerates towards the
-      goal and decelerates into it. Used to shape the position actuators'
-      setpoints, which MuJoCo would otherwise step to instantly.
+    * position: `set_target_position()`, the profile plans a full
+      brake/accelerate/cruise/decelerate move and evaluates it in closed form.
+      Used to shape the position actuators' setpoints, which MuJoCo would
+      otherwise step to instantly.
+
+    The plan is recomputed whenever the goal moves, from wherever the profile
+    has got to, exactly as the firmware does on a new `x_des` -- so a stream of
+    setpoints is followed as well as a single discrete goal.
     """
 
     VELOCITY = "velocity"
     POSITION = "position"
 
     def __init__(self, max_vel: float = 10.0, max_accel: float = 10.0, dt: float = 0.002):
-        self.max_vel = max_vel
-        self.max_accel = max_accel
+        self._max_vel = abs(max_vel)
+        self._max_accel = abs(max_accel)
         self.dt = dt
 
+        # MotionGenerator state. `current_pos`/`current_vel`/`current_accel` are
+        # the firmware's pos/vel/acc, kept under the names the sim already uses.
         self.current_pos = 0.0
         self.current_vel = 0.0
-        self.target_vel = 0.0
+        self.current_accel = 0.0
+        self.old_pos = 0.0
+        self.old_pos_ref = 0.0
+        self.old_vel = 0.0
+
+        self.d_brk = 0.0
+        self.d_acc = 0.0
+        self.d_vel = 0.0
+        self.d_dec = 0.0
+        self.d_tot = 0.0
+
+        self.t_brk = 0.0
+        self.t_acc = 0.0
+        self.t_vel = 0.0
+        self.t_dec = 0.0
+
+        self.t = 0.0
+        self.vel_st = 0.0
+        self.sign_m = 1  # 1 = positive change, -1 = negative change
+        self.sign_m_acc = 1
+        self.shape = True  # True = trapezoidal, False = triangular
+        self.is_finished = False
+        self.force_recalc = False
+
         self.target_pos = 0.0
+        self.target_vel = 0.0
         self.mode = self.VELOCITY
         self.last_update_time = time.perf_counter()
+
+    # -- MotionGenerator::setMaxVelocity / setMaxAcceleration ----------------
+
+    @property
+    def max_vel(self) -> float:
+        return self._max_vel
+
+    @max_vel.setter
+    def max_vel(self, value: float) -> None:
+        value = abs(value)
+        if value != self._max_vel:
+            self._max_vel = value
+            self.force_recalc = True
+
+    @property
+    def max_accel(self) -> float:
+        return self._max_accel
+
+    @max_accel.setter
+    def max_accel(self, value: float) -> None:
+        value = abs(value)
+        if value != self._max_accel:
+            self._max_accel = value
+            self.force_recalc = True
+
+    @staticmethod
+    def _sign(value: float) -> int:
+        """`MotionGenerator::sign` -- note it returns 0 for 0, not 1."""
+        if value < 0:
+            return -1
+        if value > 0:
+            return 1
+        return 0
+
+    def _safe_switch_on(self, pos: float, vel: float) -> None:
+        """`MotionGenerator::safe_switch_on` -- adopt a state and replan onto it.
+
+        The firmware calls this on every mode change so the new generator picks up
+        the joint's measured position and velocity instead of resuming a plan made
+        before the switch.
+        """
+        self.current_pos = pos
+        self.current_vel = vel
+        self.current_accel = 0.0
+        self.force_recalc = True
 
     def set_target_velocity(self, target_vel: float):
         """
         Sets the target velocity for the profile.
         """
-        self.mode = self.VELOCITY
+        if self.mode != self.VELOCITY:
+            self.mode = self.VELOCITY
+            # `vg.safe_switch_on(ywd, v_pll)` on the mode change: carry the
+            # position and velocity across so a jog out of a move is continuous.
+            self._safe_switch_on(self.current_pos, self.current_vel)
         self.target_vel = max(-self.max_vel, min(self.max_vel, target_vel))
 
     def set_target_position(self, target_pos: float):
         """
         Sets the position the profile should drive to, and switches to position mode.
         """
-        self.mode = self.POSITION
+        if self.mode != self.POSITION:
+            self.mode = self.POSITION
+            # `mg.safe_switch_on(yw, v_pll)` on the mode change.
+            self._safe_switch_on(self.current_pos, self.current_vel)
+            self.is_finished = False
         self.target_pos = target_pos
 
     def update(self, dt: float | None = None) -> float:
@@ -58,63 +148,171 @@ class TrapezoidalProfile:
             self.last_update_time = now
 
         if self.mode == self.POSITION:
-            self._update_position_target()
+            return self._update_position(dt)
+        return self._update_velocity(dt)
 
-        # Calculate velocity error
-        vel_error = self.target_vel - self.current_vel
+    def _update_velocity(self, dt: float) -> float:
+        """`VelocityGenerator::update_relative` -- ramp to `target_vel`, integrate.
 
-        # Determine acceleration to apply
-        if abs(vel_error) < 1e-6:
-            accel = 0.0
-        else:
-            # Ramp velocity towards target
-            accel_direction = 1.0 if vel_error > 0 else -1.0
-            accel = accel_direction * self.max_accel
+        The min/max land exactly on the target rather than dithering around it,
+        so no epsilon snapping is needed to bring the joint to a true stop.
+        """
+        if self.current_vel < self.target_vel:  # accel up to desired vel
+            self.current_vel = min(self.target_vel, self.current_vel + self.max_accel * dt)
+        elif self.current_vel > self.target_vel:  # decel down to desired vel
+            self.current_vel = max(self.target_vel, self.current_vel - self.max_accel * dt)
 
-            # Don't overshoot target velocity in this step
-            if abs(accel * dt) > abs(vel_error):
-                accel = vel_error / dt
-
-        # Update velocity
-        self.current_vel += accel * dt
-
-        # Clamp velocity (safety)
-        self.current_vel = max(-self.max_vel, min(self.max_vel, self.current_vel))
-
-        # Snap to zero if target is zero and we are close (prevents drift)
-        if self.target_vel == 0.0 and abs(self.current_vel) < 1e-4:
-            self.current_vel = 0.0
-
-        # Update position
-        previous_pos = self.current_pos
+        self.current_accel = 0.0 if self.current_vel == self.target_vel else self.max_accel
         self.current_pos += self.current_vel * dt
+        return self.current_pos
 
-        if self.mode == self.POSITION:
-            # Land exactly on the goal rather than dithering around it: with a
-            # discrete step the deceleration ramp below can only get within
-            # O(max_accel * dt^2) of it on its own.
-            crossed = (self.target_pos - previous_pos) * (self.target_pos - self.current_pos) < 0
-            if crossed or abs(self.target_pos - self.current_pos) < 1e-9:
-                self.current_pos = self.target_pos
-                self.current_vel = 0.0
+    def _update_position(self, dt: float) -> float:
+        """`MotionGenerator::update` -- replan on a new goal, then evaluate at `t`.
+
+        The whole move is laid out up front (how long to brake, accelerate,
+        cruise and decelerate, and how far each phase covers) and then sampled in
+        closed form. That is what makes the deceleration land exactly on the goal
+        at exactly the planned time; a feedback shaper that picks
+        `sqrt(2 * a * distance)` every step only approaches it asymptotically and
+        drifts from hardware's timing.
+        """
+        pos_ref = self.target_pos
+
+        if self.old_pos_ref != pos_ref or self.force_recalc:  # reference changed
+            self.is_finished = False
+            self.force_recalc = False
+
+            # Shift state variables
+            self.old_pos_ref = pos_ref
+            self.old_pos = self.current_pos
+            self.old_vel = self.current_vel
+            self.t = 0.0
+
+            # Calculate braking time and distance (in case is needed)
+            self.t_brk = abs(self.old_vel) / self.max_accel
+            self.d_brk = self.t_brk * abs(self.old_vel) / 2
+
+            # Calculate sign of motion
+            self.sign_m = self._sign(
+                pos_ref - (self.old_pos + self._sign(self.old_vel) * self.d_brk)
+            )
+            self.sign_m_acc = self.sign_m
+
+            if self.sign_m != self._sign(self.old_vel):  # means brake is needed
+                self.t_acc = self.max_vel / self.max_accel
+                self.d_acc = self.t_acc * (self.max_vel / 2)
+            else:
+                self.t_brk = 0.0
+                self.d_brk = 0.0
+                self.t_acc = abs(self.max_vel - abs(self.old_vel)) / self.max_accel
+                self.d_acc = self.t_acc * (self.max_vel + abs(self.old_vel)) / 2
+                if self.max_vel < abs(self.old_vel):  # need to decel in accel phase
+                    self.sign_m_acc = self.sign_m_acc * -1
+
+            # Calculate total distance to go after braking
+            self.d_tot = abs(pos_ref - self.old_pos + self.sign_m * self.d_brk)
+
+            self.t_dec = self.max_vel / self.max_accel
+            self.d_dec = self.t_dec * self.max_vel / 2
+            self.d_vel = self.d_tot - (self.d_acc + self.d_dec)
+            self.t_vel = self.d_vel / self.max_vel
+
+            if self.t_vel > 0:  # trapezoidal shape
+                self.shape = True
+            else:  # triangular shape
+                self.shape = False
+                # Recalculate distances and periods
+                if self.sign_m != self._sign(self.old_vel):  # means brake is needed
+                    self.vel_st = math.sqrt(self.max_accel * self.d_tot)
+                    self.t_acc = self.vel_st / self.max_accel
+                    self.d_acc = self.t_acc * (self.vel_st / 2)
+                else:
+                    self.t_brk = 0.0
+                    self.d_brk = 0.0
+                    self.d_tot = abs(pos_ref - self.old_pos)  # recalculate total distance
+                    self.vel_st = math.sqrt(
+                        (self.old_vel * self.old_vel) / 2 + self.max_accel * self.d_tot
+                    )
+                    self.t_acc = (self.vel_st - abs(self.old_vel)) / self.max_accel
+                    self.d_acc = self.t_acc * (self.vel_st + abs(self.old_vel)) / 2
+                self.t_dec = self.vel_st / self.max_accel
+                self.d_dec = self.t_dec * self.vel_st / 2
+
+        self.t = self.t + dt
+        self._calculate_trapezoidal_profile(pos_ref)
 
         return self.current_pos
 
-    def _update_position_target(self) -> None:
-        """Pick the velocity that heads for `target_pos` and still stops on it.
+    def _calculate_trapezoidal_profile(self, pos_ref: float) -> None:
+        """`MotionGenerator::calculateTrapezoidalProfile` -- sample the plan at `t`."""
+        t = self.t
+        max_vel = self.max_vel
+        max_accel = self.max_accel
+        t_brk, t_acc, t_vel, t_dec = self.t_brk, self.t_acc, self.t_vel, self.t_dec
 
-        `sqrt(2 * a * distance)` is the fastest we can be going and still bleed
-        off all of it within the distance left, so taking the smaller of that and
-        `max_vel` gives the cruise-then-brake shape of a trapezoid without having
-        to plan the whole move up front -- which matters because the goal can be
-        moved on any step.
-        """
-        error = self.target_pos - self.current_pos
-        if self.max_accel <= 0.0:
-            braking_vel = self.max_vel
-        else:
-            braking_vel = math.sqrt(2.0 * self.max_accel * abs(error))
-        self.target_vel = math.copysign(min(self.max_vel, braking_vel), error)
+        if self.shape:  # trapezoidal shape
+            if t <= (t_brk + t_acc):
+                self.current_pos = (
+                    self.old_pos + self.old_vel * t + self.sign_m_acc * (max_accel / 2) * t * t
+                )
+                self.current_vel = self.old_vel + self.sign_m_acc * max_accel * t
+                self.current_accel = self.sign_m_acc * max_accel
+            elif t > (t_brk + t_acc) and t < (t_brk + t_acc + t_vel):
+                self.current_pos = self.old_pos + self.sign_m * (
+                    -self.d_brk + self.d_acc + max_vel * (t - t_brk - t_acc)
+                )
+                self.current_vel = self.sign_m * max_vel
+                self.current_accel = 0.0
+            elif t >= (t_brk + t_acc + t_vel) and t < (t_brk + t_acc + t_vel + t_dec):
+                dt_dec = t - t_brk - t_acc - t_vel
+                self.current_pos = self.old_pos + self.sign_m * (
+                    -self.d_brk
+                    + self.d_acc
+                    + self.d_vel
+                    + max_vel * dt_dec
+                    - (max_accel / 2) * dt_dec * dt_dec
+                )
+                self.current_vel = self.sign_m * (max_vel - max_accel * dt_dec)
+                self.current_accel = -self.sign_m * max_accel
+            else:
+                self.current_pos = pos_ref
+                self.current_vel = 0.0
+                self.current_accel = 0.0
+                self.is_finished = True
+        else:  # triangular shape
+            if t <= (t_brk + t_acc):
+                # NB: the firmware uses sign_m here where the trapezoidal branch
+                # above uses sign_m_acc. Kept as-is so the two match.
+                self.current_pos = (
+                    self.old_pos + self.old_vel * t + self.sign_m * (max_accel / 2) * t * t
+                )
+                self.current_vel = self.old_vel + self.sign_m * max_accel * t
+                self.current_accel = self.sign_m * max_accel
+            elif t > (t_brk + t_acc) and t < (t_brk + t_acc + t_dec):
+                dt_dec = t - t_brk - t_acc
+                self.current_pos = self.old_pos + self.sign_m * (
+                    -self.d_brk
+                    + self.d_acc
+                    + self.vel_st * dt_dec
+                    - (max_accel / 2) * dt_dec * dt_dec
+                )
+                self.current_vel = self.sign_m * (self.vel_st - max_accel * dt_dec)
+                self.current_accel = -self.sign_m * max_accel
+            else:
+                self.current_pos = pos_ref
+                self.current_vel = 0.0
+                self.current_accel = 0.0
+                self.is_finished = True
+
+    def is_accelerating(self) -> bool:
+        """`MotionGenerator::isAccelerating` / `VelocityGenerator::isAccelerating`."""
+        if self.mode == self.POSITION:
+            return self.current_accel != 0
+        return self.current_vel != self.target_vel
+
+    def is_moving(self) -> bool:
+        """`isMoving` in both generators."""
+        return self.current_vel != 0
 
     @property
     def is_settled(self) -> bool:
@@ -125,17 +323,31 @@ class TrapezoidalProfile:
         first tick of a move the position barely changes. Callers that decide
         "motion is over" from position stability need this, or they conclude a
         move is done before it has begun.
+
+        The goal-reached test is exact because the firmware's final branch
+        assigns `pos = posRef` outright rather than integrating into it.
         """
         if self.mode == self.POSITION:
-            return self.current_vel == 0.0 and self.current_pos == self.target_pos
+            return (
+                self.is_finished
+                and self.current_vel == 0.0
+                and self.current_pos == self.target_pos
+            )
         return self.current_vel == 0.0 and self.target_vel == 0.0
 
     def set_position(self, pos: float):
+        """Hard reset of the position (e.g. for initialization).
+
+        `MotionGenerator::safe_switch_on(pos, 0)` plus a goal of `pos`, so the
+        profile lands stopped and finished exactly here with nothing pending.
         """
-        Hard reset of the position (e.g. for initialization).
-        """
-        self.current_pos = pos
+        self._safe_switch_on(pos, 0.0)
+        self.old_pos = pos
+        self.old_pos_ref = pos
+        self.old_vel = 0.0
+        self.t = 0.0
         self.target_pos = pos
+        self.is_finished = True
 
 
 class TrapezoidalSetpointLimiter:

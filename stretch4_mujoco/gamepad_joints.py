@@ -24,10 +24,10 @@ Differences from the robot-side file:
 
 * `RobotParams()` is not available in sim, so the SE4 motion profiles are baked
   into `ROBOT_PARAMS` below, copied verbatim from `robot_params_SE4.py`.
-* The robot's per-tick `move_by(dx_deg)` jogs become `set_velocity()` here, at
-  the speed that step implies over the robot's control period. The sim joints
-  run trapezoidal profiles of their own, so a stream of position deltas would
-  fight them -- see `CommandFeetechJoint`.
+* The gripper's per-tick step becomes a `set_velocity()` jog, because a stalled
+  finger stops advancing the measured position that `move_by` chains off, and
+  with it the position error that grip force is built from. The Feetech wrists
+  issue the same per-tick `move_by(dx_deg)` the robot does.
 * The gripper is commanded in aperture radians instead of the robot's percent.
 """
 
@@ -254,18 +254,7 @@ class CommandArm:
 
 
 class CommandFeetechJoint:
-    """Abstract motion command class for Feetech joints.
-
-    Jogs are issued as a velocity, not as a position delta per tick. Re-issuing
-    `move_by(dx)` every tick -- which is what this used to do, back when the sim
-    had no velocity profiles -- chains each delta off the *commanded* position, so
-    the goal runs away from the joint at the full jog rate while the profile can
-    only close on it at `sqrt(2 * accel * error)`. The two balance at a permanent
-    lag of `rate**2 / (2 * accel)`, which for the wrists' 3.93 rad/s and
-    7 rad/s**2 is 1.1 rad: the wrist trails the stick by 63 degrees and, because
-    that travel is already committed to the goal, keeps going for another 1.1 rad
-    after the stick is released.
-    """
+    """Abstract motion command class for Feetech joints."""
 
     def __init__(self, name, dx_deg, vel_type, acc_type):
         self.params = ROBOT_PARAMS[name]
@@ -281,17 +270,18 @@ class CommandFeetechJoint:
 
     def _move(self, dx_deg, robot: "StretchMujocoSimulator", velocity: float | None = None):
         scale = 1.0 - (0.95 * self.precision_mode)
+        dx_deg = dx_deg * scale
 
-        # `dx_deg` is a per-tick step sized for the robot's control period. Held
-        # down it means a continuous jog, so turn it into the speed it implies
-        # rather than re-issuing it as a position delta every tick -- see the
-        # class docstring for why that distinction matters so much here.
-        v_rad = deg_to_rad(dx_deg) * scale / DEFAULT_STEP_SLEEP
+        capped_velocity = min(self.max_vel, velocity) if velocity is not None else self.max_vel
 
-        cap = min(self.max_vel, velocity) if velocity is not None else self.max_vel
-        v_rad = max(-cap, min(cap, v_rad))
+        dx_rad = deg_to_rad(dx_deg)
+        # `FeetechSMHello.move_by` drops steps this small rather than letting a
+        # resting stick walk the joint, and a zero step is how `stop_motion()`
+        # says "no new goal".
+        if abs(dx_rad) <= 2e-5:
+            return
 
-        self._get_subsystem(robot).set_velocity(v_rad, self.acc)
+        self._get_subsystem(robot).move_by(dx_rad, capped_velocity, self.acc)
 
     def command_button_to_motion(self, direction, robot: "StretchMujocoSimulator"):
         """Make servo move based on a button state.
@@ -316,13 +306,11 @@ class CommandFeetechJoint:
         """Stop the joint motion. To be used whenever the controller is idle/no-inputs
         to stop unnecessary robot motion.
 
-        Braking at the `max` acceleration rather than the jog's own, which is what
-        the robot does for every other joint: letting go of the stick should stop
-        the wrist, not coast it to a halt.
+        `robot.end_of_arm.move_by(name, 0)` on the robot, which the device layer
+        drops as a zero step -- so stopping means "issue no further goal" and the
+        wrist decelerates into the last one it was given, at most a step away.
         """
-        self._get_subsystem(robot).set_velocity(
-            0.0, self.params["motion"]["max"]["accel"]
-        )
+        self._move(0.0, robot)
 
 
 class CommandWristYaw(CommandFeetechJoint):
