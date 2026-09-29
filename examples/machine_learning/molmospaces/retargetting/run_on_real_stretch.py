@@ -191,15 +191,8 @@ DEFAULT_JOINTS_PORT = 4409
 without the gripper repository on the path. `--port` overrides it, and the real
 value is read from `gripper_networking` when that package *is* importable."""
 
-CONTROL_HZ = 25.0
-"""The rate every other MolmoBot-DROID rollout in this repository runs at.
-
-The action *scale* is tied to it -- the checkpoint was cloned from an expert
-stepping at 66ms -- so running the robot faster does not make it quicker, it
-makes each commanded step a larger fraction of a motion the model metered out.
-The loop below holds the rate when it can and falls behind on the steps where
-the model is queried, which is safe here because every target is absolute.
-"""
+CONTROL_HZ = 15.0
+"""The rate every other MolmoBot-DROID rollout in this repository runs at."""
 
 WRIST_CAMERA_FOV_DEG = float(
     StretchCameras.cam_gripper_se4_right_rgb.initial_camera_settings
@@ -1890,9 +1883,12 @@ class CommandedPose:
 
 
 def tool_errors(
-    measured: np.ndarray, commanded: np.ndarray | None, target: np.ndarray | None
+    measured: np.ndarray,
+    commanded: np.ndarray | None,
+    target: np.ndarray | None,
+    reported: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """The three distances between the poses in `CommandedPose`'s docstring.
+    """The distances between the poses in `CommandedPose`'s docstring.
 
     `target` is where the policy pointed, `commanded` is what the robot was told
     after the IK approximated it and the step clamp trimmed it, and `measured` is
@@ -1901,8 +1897,19 @@ def tool_errors(
     actually closing its loop on -- which is the one that decides whether a grasp
     lands, and is not the sum of the other two, the three poses not being
     collinear.
+
+    `reported` is the fourth: the Franka tool pose the policy was *told* the arm
+    is at, i.e. FK of `franka_joint_pos()`. That state comes out of a second IK,
+    Franka-side, and every `joint_pos_rel` action is a delta on top of it -- so
+    `reported_state` is an offset that lands in every target and reads as the
+    retargeting missing, when it is the observation that is wrong. It should be
+    near zero whenever the Franka IK converged, moving or not.
     """
     errors: dict[str, float] = {}
+    if reported is not None:
+        errors["reported_state_position_m"] = float(
+            np.linalg.norm(reported[:3, 3] - measured[:3, 3])
+        )
     if commanded is not None:
         errors["tracking_position_m"] = float(np.linalg.norm(commanded[:3, 3] - measured[:3, 3]))
     if target is not None:
@@ -2178,6 +2185,10 @@ class RealStretchRunner:
             DROID_WRIST_CAMERA_KEY: wrist,
         }
 
+        # Copied before the policy sees it: this is the state its `joint_pos_rel`
+        # deltas are added to, and `_log` checks it against the measured gripper.
+        reported_arm = np.array(policy_observation["qpos"]["arm"], dtype=float)
+
         started = time.perf_counter()
         action = self.policy.get_action(policy_observation)
         timing = self._timing(time.perf_counter() - started)
@@ -2190,7 +2201,7 @@ class RealStretchRunner:
         if self.commander is not None and self.running:
             commanded = self.commander.send(targets, measured)
 
-        self._log(observation, head, wrist, measured, commanded, action, timing)
+        self._log(observation, head, wrist, measured, commanded, action, timing, reported_arm)
 
     def _timing(self, inference_s: float) -> TimingNote:
         """How long `get_action` took, and whether that was the model or a list index.
@@ -2292,6 +2303,7 @@ class RealStretchRunner:
         commanded: dict[str, float],
         action: dict[str, Any] | None,
         timing: TimingNote | None = None,
+        reported_arm: np.ndarray | None = None,
     ) -> None:
         """One row of telemetry, whether or not the policy was asked for an action.
 
@@ -2330,7 +2342,14 @@ class RealStretchRunner:
             commanded_pose = (
                 None if self._commanded is None else self._commanded.tool_pose(commanded)
             )
-            errors.update(tool_errors(scene.stretch_tool, commanded_pose, scene.franka_tool))
+            reported_pose = (
+                None
+                if reported_arm is None
+                else self.proxy.franka_tool_pose_to_world(self.proxy.franka.fk(reported_arm))
+            )
+            errors.update(
+                tool_errors(scene.stretch_tool, commanded_pose, scene.franka_tool, reported_pose)
+            )
         self.telemetry.log_step(
             step=self.step_count,
             images={"head": head, "wrist": wrist},
