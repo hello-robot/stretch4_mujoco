@@ -65,7 +65,6 @@ import numpy as np
 
 from stretch4_mujoco.config import robot_settings_se4
 from stretch4_mujoco.enums.actuators import Actuators
-from stretch4_mujoco.gamepad_joints import WRIST_ROLL_SIM_SIGN
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
 # =============================================================================
@@ -175,10 +174,11 @@ GRIPPER = "gripper"
 
 @dataclass(frozen=True)
 class MirroredJoint:
-    """A joint the sim and the robot command in the same units, up to `sign`.
+    """A joint the sim and the robot command in the same units and sign.
 
-    `sign` accounts for axes the URDF mirrors relative to the robot's servo
-    convention (see `WRIST_ROLL_SIM_SIGN`): `sim_value = sign * robot_value`.
+    The wrist roll included: `RobotClient` reports it in the URDF's own
+    convention, which is what stretch4_body's self-collision and IK feed the
+    URDF, so a sim roll *is* the robot's roll.
     """
 
     name: str
@@ -190,7 +190,6 @@ class MirroredJoint:
     deadband: float
     """How far the robot may differ from the sim before the sim is corrected.
     Keeps sensor noise from turning into a stream of sim commands."""
-    sign: float = 1.0
 
 
 MIRRORED_JOINTS = (
@@ -204,7 +203,6 @@ MIRRORED_JOINTS = (
         "wrist",
         "end_of_arm",
         deadband=0.01,
-        sign=WRIST_ROLL_SIM_SIGN,
     ),
 )
 
@@ -503,7 +501,7 @@ class DigitalTwin:
         for joint in self.joints:
             if not self._sim_is_leading(joint.name, now):
                 continue
-            target = joint.sign * joint.actuator.get_position(sim_status)
+            target = joint.actuator.get_position(sim_status)
             velocity, acceleration = self._motion_limits[joint.name]
             if joint.subsystem == "end_of_arm":
                 accepted = self.robot.end_of_arm.move_to(
@@ -612,7 +610,7 @@ class DigitalTwin:
             robot_value = self._robot_position(joint)
             if robot_value is None:
                 continue
-            target = joint.sign * robot_value
+            target = robot_value
             current = joint.actuator.get_position(sim_status)
             if self._sim_leads(joint.name, current, target, joint.deadband, now):
                 continue
@@ -706,7 +704,7 @@ class DigitalTwin:
         for joint in self.joints:
             robot_value = self._robot_position(joint)
             if robot_value is not None:
-                self._sim_move_to(joint.actuator, joint.sign * robot_value)
+                self._sim_move_to(joint.actuator, robot_value)
         if self.gripper is not None:
             robot_value = self.gripper.robot_position()
             if robot_value is not None:
@@ -1216,13 +1214,9 @@ def stretch_urdf_configuration(
     }
     configuration["lift_joint"] = float(status["lift"]["pos"])
     end_of_arm = status.get("end_of_arm", {})
-    for joint, sign in (
-        ("wrist_yaw", 1.0),
-        ("wrist_pitch", 1.0),
-        ("wrist_roll", WRIST_ROLL_SIM_SIGN),
-    ):
+    for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
         if joint in end_of_arm:
-            configuration[f"{joint}_joint"] = sign * float(end_of_arm[joint].get("pos", 0.0))
+            configuration[f"{joint}_joint"] = float(end_of_arm[joint].get("pos", 0.0))
 
     if gripper_joint is None:
         gripper_joint = next((j for j in TOOL_FOR_GRIPPER_JOINT if j in end_of_arm), None)
@@ -1456,9 +1450,8 @@ class DigitalTwinView:
         """One tick of the view: both robots, both tool centres, and the errors.
 
         The channels are the mirror's own `MirroredJoint` entries, taken at
-        construction, so the plots carry the same `sign` convention the mirror
-        does -- a view that disagreed with it about which way a wrist rolls would
-        be reporting the twin broken when it was not.
+        construction, so the plots show exactly the joints the mirror keeps in
+        step.
         """
         rr = self._rr
         self.tick += 1
@@ -1507,7 +1500,6 @@ class DigitalTwinView:
             measured = self._robot_position(joint, status)
             if measured is None:
                 continue
-            measured = joint.sign * measured
             rr.log(f"joint/{joint.name}/robot", rr.Scalars(float(measured)))
             rr.log(f"error/{joint.name}", rr.Scalars(abs(float(measured - simulated))))
 
