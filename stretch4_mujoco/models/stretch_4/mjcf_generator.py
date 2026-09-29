@@ -294,34 +294,21 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             if geom.get("class") != "visualgeom":
                 geom.set("class", "rubber")
 
-    # Add compliant passive joints to fingertips to allow surface alignment
+    # Add compliant passive joints to fingertips to allow surface alignment.
+    # A hinge per bending axis, and none about the pad's own long axis (body z),
+    # which is bonded to the finger and does not twist. How much they give is the
+    # 'fingertip_compliance' class in defaults.xml.
     for body in worldbody.findall(".//body"):
         name = body.get("name", "")
         if name in ["gripper_fingertip_right_link", "gripper_fingertip_left_link"]:
-            ET.SubElement(
-                body,
-                "joint",
-                name=f"{name}_compliant_x",
-                type="hinge",
-                axis="1 0 0",
-                stiffness="0.1",
-                damping="0.002",
-                springref="0",
-                limited="true",
-                range="-0.15 0.15",
-            )
-            ET.SubElement(
-                body,
-                "joint",
-                name=f"{name}_compliant_y",
-                type="hinge",
-                axis="0 1 0",
-                stiffness="0.1",
-                damping="0.002",
-                springref="0",
-                limited="true",
-                range="-0.15 0.15",
-            )
+            for axis_name, axis in (("x", "1 0 0"), ("y", "0 1 0")):
+                ET.SubElement(
+                    body,
+                    "joint",
+                    name=f"{name}_compliant_{axis_name}",
+                    axis=axis,
+                    **{"class": "fingertip_compliance"},
+                )
 
     # 12. Update Joint Classes
     for j in worldbody.findall(".//joint"):
@@ -350,7 +337,20 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     tree = ET.ElementTree(new_root)
     tree.write(out_mjcf_path, encoding="unicode", xml_declaration=True)
 
-    # Inject ctrlrange into actuator_sensor.xml based on the extracted joint ranges
+    # Inject ctrlrange into actuator_sensor.xml based on the extracted joint ranges.
+    #
+    # Position limits are the only part of the joints' dynamic envelope that MJCF
+    # can hold. There is deliberately no velocity or acceleration limit written
+    # here because MuJoCo has nowhere to put one: a <joint> takes `range` and
+    # `actuatorfrcrange` but nothing bounding qvel, and an <actuator> takes
+    # `ctrlrange` and `forcerange` but nothing bounding how fast it may chase its
+    # setpoint. `damping`/`armature`/`forcerange` only shape the response, they do
+    # not cap it.
+    #
+    # So the per-joint velocity and acceleration limits from stretch_body's
+    # robot_params_SE4.py live in `stretch4_mujoco/config.py` instead.
+    # Anything that writes `mjdata.ctrl` without going through one of those gets
+    # a step input, and the joint will move as fast as the physics allows.
     try:
         import os
 
