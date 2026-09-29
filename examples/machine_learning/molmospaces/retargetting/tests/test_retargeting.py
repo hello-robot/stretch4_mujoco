@@ -181,42 +181,44 @@ back on purpose**, and this tolerance is deliberately *not* loosened to
 accommodate it. The flip closes the gap by substituting a grasp-equivalent pose,
 and that equivalence does not extend to the wrist camera riding on the same
 wrist -- so the substitution is not available to a study whose start pose is
-chosen for where that camera points. The number this test now reports at `yaw_in`
-is the honest cost of forbidding it, and it is the same 0.43 rad the paragraph
-above records from before `JAW_FLIP` existed. Restoring `jaw_mode="auto"` on the
-rig is the one-line way back.
+chosen for where that camera points. The number this test now reports at
+`yaw_out` is the honest cost of forbidding it. It was `yaw_in` until
+`mjcf_generator.FLIP_WRIST_ROLL_RANGE` mirrored the model's roll limits onto the
+servo's, which moved the end of the roll's travel -- and with it the stall -- to
+the other side. Restoring `jaw_mode="auto"` on the rig is the one-line way back.
 """
 
 
-UPRIGHT_WALKED_SHORTFALL_RAD = {"yaw_in": 0.4289}
+UPRIGHT_WALKED_SHORTFALL_RAD = {"yaw_out": 0.4277}
 """
 What `jaw_mode="upright"` costs in orientation at each waypoint it cannot walk onto.
 
-**Not that the pose is unreachable -- that the path to it is.** Measured three
-ways at `yaw_in`, which is the distinction worth keeping straight:
+Measured at both yawed waypoints, with the roll's range the servo's (about
+[-1.14, +4.28] rad; see `mjcf_generator.FLIP_WRIST_ROLL_RANGE`):
 
-    solved fresh from the snap, upright     0.0001 rad
-    walked continuously, upright            0.4289 rad
-    walked continuously, auto               0.0014 rad, on the flipped branch
+                                            yaw_in        yaw_out
+    solved fresh from the snap, upright     0.4333 rad    0.4277 rad
+    walked continuously, upright            0.0000 rad    0.4277 rad
+    walked continuously, auto               0.0000 rad    0.0004 rad, on the flipped branch
 
-So the upright branch holds this pose perfectly well when it is solved for
-directly, and gets trapped on the way there: `StretchArmIK` seeds each solve
-from where the arm already is, and walking onto a large tool yaw winds
-Stretch's `wrist_roll_joint` (about [-4.28, +1.14] rad) up against its end. The
-half-turned branch is in open range throughout, which is what `auto` takes and
-what this rig forbids -- because a flip mirrors the wrist camera as well as the
-jaw. See `RetargetRig` on why it forbids it, and `walked` on why the checks
-measure the path rather than fresh solves.
+Walked -- which is what these checks measure, see `walked` -- the upright branch
+arrives at `yaw_in` and is trapped short of `yaw_out`: `StretchArmIK` seeds each
+solve from where the arm already is, and walking onto that tool yaw winds
+Stretch's `wrist_roll_joint` up against its end. The half-turned branch is in
+open range throughout, which is what `auto` takes and what this rig forbids --
+because a flip mirrors the wrist camera as well as the jaw. See `RetargetRig` on
+why it forbids it.
 
 Pinned rather than asserted away, which is the same thing
 `test_above_the_lift_ceiling_the_error_is_the_lift_shortfall` does to the lift's
 travel and for the same reason: a limitation that is merely tolerated goes quiet
-when it changes. `test_the_flip_is_what_buys_the_yawed_in_waypoint` holds the
+when it changes. `test_the_flip_is_what_buys_the_yawed_out_waypoint` holds the
 other end of it -- that `auto` recovers this by flipping -- so if the flip ever
 stops being the mechanism, that fails too.
 
-`yaw_out` is *not* here. The prose used to say the mode cost both; measured,
-upright walks onto `yaw_out` at 0.0004 rad and only `yaw_in` falls out.
+`yaw_in` is *not* here. It was, at 0.4289 rad, while the model's roll limits
+were the URDF's mirrored ones, [-4.28, +1.14] rad; with the servo's it walks on
+at 0.0000 rad and only `yaw_out` falls out.
 """
 
 UPRIGHT_WALKED_SHORTFALL_TOLERANCE_RAD = 0.01
@@ -630,7 +632,7 @@ class RetargetRig:
 
     The cost is stated rather than hidden: `"upright"` cannot hold `yaw_in` and
     `yaw_out` from a rolled start, where Stretch's asymmetric `wrist_roll_joint`
-    (about [-4.28, +1.14] rad) leaves it 0.43 rad short -- see `JAW_FLIP`. Those
+    (about [-1.14, +4.28] rad) leaves it 0.43 rad short -- see `JAW_FLIP`. Those
     are poses this robot reaches only by flipping, and refusing to flip means
     admitting it cannot reach them, which is the more useful thing for a
     cross-embodiment study to report.
@@ -1237,7 +1239,7 @@ def test_stretch_reaches_the_commanded_pose(
         f"{rig.proxy.jaw_mode!r}). About 1.57 rad here is `FRANKA_TO_STRETCH_TOOL` applied on "
         f"the wrong side or about the wrong axis; about 0.43 rad at a large tool yaw is "
         f"Stretch's `wrist_roll_joint` hitting the end of its asymmetric range (about "
-        f"[-4.28, +1.14] rad) -- see `franka_retarget.JAW_FLIP`. Under `jaw_mode=\"upright\"` "
+        f"[-1.14, +4.28] rad) -- see `franka_retarget.JAW_FLIP`. Under `jaw_mode=\"upright\"` "
         f"that is simply a pose this arm cannot hold: the half-turned wrist reaches it and is "
         f"not allowed to be substituted, because a flip mirrors the wrist camera as well as "
         f"the jaw. `yaw_in` and `yaw_out` are the two waypoints this costs."
@@ -1907,10 +1909,10 @@ def test_the_grippers_stay_together_along_a_continuous_path(rig: RetargetRig) ->
         )
 
 
-def test_the_flip_is_what_buys_the_yawed_in_waypoint() -> None:
+def test_the_flip_is_what_buys_the_yawed_out_waypoint() -> None:
     """The other end of `UPRIGHT_WALKED_SHORTFALL_RAD`: `auto` recovers what `upright` cannot.
 
-    The pinned shortfall says the upright branch walks onto `yaw_in` 0.43 rad
+    The pinned shortfall says the upright branch walks onto `yaw_out` 0.43 rad
     short. On its own that is just a number, and it would keep passing if the
     cause moved -- if the waypoint drifted out of the workspace, say, or the IK
     started giving up for an unrelated reason. This holds the claim that the
@@ -1922,7 +1924,7 @@ def test_the_flip_is_what_buys_the_yawed_in_waypoint() -> None:
     rather than snapping because the shortfall is a property of the path -- see
     `walked` and `UPRIGHT_WALKED_SHORTFALL_RAD`.
     """
-    label = "yaw_in"
+    label = "yaw_out"
     rig = RetargetRig(jaw_mode="auto")
     rig.restore()
     commands = [rig.franka_command_for(rig.waypoint_pose(w)) for w in WAYPOINTS]

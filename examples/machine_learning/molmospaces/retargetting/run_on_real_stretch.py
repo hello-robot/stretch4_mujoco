@@ -170,7 +170,6 @@ from examples.machine_learning.molmospaces.stretch.robot_view import (  # noqa: 
 )
 from stretch4_mujoco.config import robot_settings_se4  # noqa: E402
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras  # noqa: E402
-from stretch4_mujoco.gamepad_joints import WRIST_ROLL_SIM_SIGN  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -775,11 +774,11 @@ class RobotMirror:
     it is the robot's measured state expressed as an `MjData`, which is the form
     the retargeting needs it in.
 
-    The wrist roll is the one axis whose sign differs between the two: the URDF
-    turns it the opposite way from the robot's servo convention, which
-    `WRIST_ROLL_SIM_SIGN` records and `digital_twin.py` applies in the same
-    place. Getting it wrong is not subtle -- the hand rolls the wrong way -- but
-    it is invisible until something moves.
+    Every joint, the wrist roll included, is written as the robot reports it:
+    `RobotClient` reports roll in the URDF's own sign, which is what
+    stretch4_body's self-collision and IK feed the URDF. The URDF's roll *limits*
+    are the servo's mirrored, which `mjcf_generator.FLIP_WRIST_ROLL_RANGE`
+    corrects in the model this clips to.
     """
 
     def __init__(self, view: Stretch4RobotView, gripper: GripperUnits) -> None:
@@ -815,7 +814,7 @@ class RobotMirror:
             "wrist": [
                 self._clip("wrist", 0, yaw),
                 self._clip("wrist", 1, pitch),
-                self._clip("wrist", 2, WRIST_ROLL_SIM_SIGN * roll),
+                self._clip("wrist", 2, roll),
             ],
             "gripper": [self._clip("gripper", 0, finger), self._clip("gripper", 1, finger)],
         }
@@ -947,12 +946,8 @@ class RobotCommander:
 
         if "wrist" in targets:
             wrist = np.ravel(np.asarray(targets["wrist"], dtype=float))
-            # Back through the sign the mirror applied on the way in, so the
-            # robot is told to roll the way the model is holding the hand.
-            for index, (name, sign) in enumerate(
-                (("wrist_yaw", 1.0), ("wrist_pitch", 1.0), ("wrist_roll", WRIST_ROLL_SIM_SIGN))
-            ):
-                value = self._clamp("wrist", sign * float(wrist[index]), measured[name])
+            for index, name in enumerate(("wrist_yaw", "wrist_pitch", "wrist_roll")):
+                value = self._clamp("wrist", float(wrist[index]), measured[name])
                 self._check(
                     name,
                     self.robot.end_of_arm.move_to(name, value, eoa_velocity, eoa_acceleration),
@@ -1863,15 +1858,10 @@ class CommandedPose:
     there is no base *pose* on the wire to do kinematics with.
     """
 
-    WRIST = (("wrist_yaw", 1.0), ("wrist_pitch", 1.0), ("wrist_roll", WRIST_ROLL_SIM_SIGN))
-    """The commanded wrist, and the sign that takes each axis back to the model's.
-
-    `RobotCommander.send` applies `WRIST_ROLL_SIM_SIGN` on the way out, because
-    the URDF turns that joint the opposite way from the robot's servo -- so a
-    command read back off the wire has to be turned around again before it means
-    anything to a model. The same pairing, in the same order, as the loop in
-    `send` that produced it.
-    """
+    WRIST = ("wrist_yaw", "wrist_pitch", "wrist_roll")
+    """The commanded wrist, in the model's order -- the same order as the loop in
+    `RobotCommander.send` that produced it. A command read back off the wire is
+    already in the model's units and sign."""
 
     def __init__(self, mirror: RobotMirror, namespace: str) -> None:
         self._live = mirror.data
@@ -1885,14 +1875,14 @@ class CommandedPose:
         and there is no commanded pose to be short of -- which is a gap in the
         plot rather than a zero, zero being a claim that the robot arrived.
         """
-        if not all(name in commanded for name in ("lift", "arm", *(n for n, _ in self.WRIST))):
+        if not all(name in commanded for name in ("lift", "arm", *self.WRIST)):
             return None
         self._data.qpos[:] = self._live.qpos
         self._view.set_qpos_dict(
             {
                 "lift": [commanded["lift"]],
                 "arm": [commanded["arm"]],
-                "wrist": [sign * commanded[name] for name, sign in self.WRIST],
+                "wrist": [commanded[name] for name in self.WRIST],
             }
         )
         mujoco.mj_kinematics(self._data.model, self._data)
@@ -2118,10 +2108,8 @@ class RealStretchRunner:
             "arm": abs(float(np.ravel(targets["arm"])[0]) - measured["arm"]) < 0.01,
         }
         wrist = np.ravel(targets["wrist"])
-        for index, (name, sign) in enumerate(
-            (("wrist_yaw", 1.0), ("wrist_pitch", 1.0), ("wrist_roll", WRIST_ROLL_SIM_SIGN))
-        ):
-            reached[name] = abs(sign * float(wrist[index]) - measured[name]) < 0.05
+        for index, name in enumerate(("wrist_yaw", "wrist_pitch", "wrist_roll")):
+            reached[name] = abs(float(wrist[index]) - measured[name]) < 0.05
         return all(reached.values())
 
     # -- one step ----------------------------------------------------------
