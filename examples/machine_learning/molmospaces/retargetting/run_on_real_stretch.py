@@ -12,11 +12,10 @@ two cameras and its joint states over ZMQ, and the joint targets go back over
         --wrist-camera right --head-camera right
 
     # on the workstation, with the flags the study's best side-by-side run used
-    python -m examples.machine_learning.molmospaces.retargetting.run_on_real_stretch \\
-        --robot-ip 100.71.110.52 \\
-        --map_franka_wrist_to_flipped_stretch4_wrist \\
-        --change_franka_start_pose_limit_height \\
-        --grasp-offset-m -0.009 --target-z-offset-m 0.035
+    python -m examples.machine_learning.molmospaces.retargetting.run_on_real_stretch \
+        --robot-ip 100.71.110.52 \
+        --change_franka_start_pose_limit_height \
+        --grasp-offset-m -0.009
 
     > Pick up the cup          # the instruction, handed to the policy verbatim
     >                          # space or enter: stop the arm where it is, now
@@ -77,6 +76,32 @@ What is different from a sim rollout, and worth knowing before the first run
   `--use_left_fisheye_camera`; the side the robot chose is printed at startup and
   used to stand the head frames up the right way.
 
+What the viewer shows
+---------------------
+Two tabs (`RerunTelemetry`). **run**, the one that opens, is for watching a
+rollout: the two frames as the policy receives them, a text log of how long each
+model query took, and one 3D view holding *three* robots at once --
+
+* Stretch, in its own colours, drawn from the MuJoCo mirror, which is the robot
+  as the retargeting believes it to be;
+* the virtual Franka it is imitating, a green ghost standing on its imaginary
+  pedestal at the commanded joint angles (`RerunRobotScene`), with the tail of
+  the policy's action chunk drawn ahead of its hand;
+* this robot's own URDF, violet, posed from `RobotClient`'s status rather than
+  from the camera stream (`RerunUrdfOverlay`).
+
+The two tool centres are balled and labelled with the gap between them, and the
+plot beside it separates that gap into what the retargeting costs, what the robot
+has not tracked yet, and what the policy is actually closing its loop on -- see
+`tool_errors`. The third robot is there to answer a question the other two
+cannot: it is the same machine as the MuJoCo Stretch from a different joint
+source, so the distance between *their* grippers is stream latency and
+calibration rather than anything the policy did.
+
+**diagnostics** is the layout this module had before: processed frames beside the
+raw ones, measured against commanded per joint, and the retargeting residual.
+`--no-rerun-3d` drops the 3D view and `--no-rerun-urdf` just the third robot.
+
 Requires `stretch4_body` (`uv pip install -e ".[digital-twin]"`), `pyzmq`,
 `rerun-sdk`, and MolmoBot on the path -- see `policies/molmobot_droid_policy.py`
 for the last one. `stretch4_body` also wants a *fleet directory*, which a
@@ -98,6 +123,7 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -114,7 +140,14 @@ import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
 from mujoco import MjData, MjSpec  # noqa: E402
 
-from examples.digital_twin import ensure_fleet_directory  # noqa: E402
+from examples.digital_twin import (  # noqa: E402
+    REAL_ROBOT_COLOR,
+    RerunMujocoRobot,
+    RerunUrdfRobot,
+    ensure_fleet_directory,
+    load_stretch_urdf,
+    rgba8,
+)
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (  # noqa: E402
     DROID_EXO_CAMERA_KEY,
@@ -213,11 +246,11 @@ would throttle every step rather than only the bad ones. `--step-limit-scale`
 tightens all four together.
 """
 
-SLOW_SPEED_SCALE = 0.4
+SLOW_SPEED_SCALE = 0.2
 """What `--slow` multiplies every commanded velocity and acceleration by.
 
-60% slower than the profile the joint would otherwise run, which is its `max`.
-Both numbers, not just the velocity: scaling the speed alone leaves every motion
+A fifth of the profile the joint would otherwise run, which is its `max`. Both
+numbers, not just the velocity: scaling the speed alone leaves every motion
 starting and stopping as sharply as it did, and the abruptness is most of what
 makes a robot driven by a policy feel fast in a room with people in it.
 
@@ -230,13 +263,21 @@ rehearsal, not as a measurement.
 
 MAX_BASE_SPEED_MPS = 0.25
 MAX_BASE_TURN_RADPS = 0.5
-"""Caps on what one step may ask the base for, under `--include-base`.
+"""Caps on what one step may ask the base for, under `--include-base`, at full speed.
 
 Half of what `live_policy.py` allows itself in simulation. A base command here
 moves a 25kg robot across a room it shares with whoever is running it, and the
 policy's base output is an IK by-product -- the solver drives the base only
 because the arm could not reach -- so it is worth being slower than the arm
 rather than faster.
+
+`--slow` scales these too, in `RobotCommander._send_base` rather than here: the
+arm's limits are scaled per-commander by `speed_scale`, and a base whose cap was
+scaled at module level would be slow on a full-speed run as well, which is the
+one thing `--slow` is supposed to be the switch for. Clipping here also costs
+nothing in accuracy -- the IK hands back an absolute base *pose* and the loop
+re-solves from the measured one every step, so a clipped base closes the same gap
+over more steps rather than aiming somewhere else.
 """
 
 
@@ -945,7 +986,9 @@ class RobotCommander:
         The IK hands back an absolute pose and this base steers three omniwheels,
         so there is nothing absolute to command: the same conversion
         `live_policy.apply_action` makes, rotated into the base's own frame,
-        capped at `MAX_BASE_SPEED_MPS` / `MAX_BASE_TURN_RADPS`.
+        capped at `MAX_BASE_SPEED_MPS` / `MAX_BASE_TURN_RADPS` -- at
+        `speed_scale`, so that `--slow` slows the base as well as the arm. See
+        `MAX_BASE_SPEED_MPS` for why the scaling is here and not in the constant.
         """
         yaw = measured["base_theta"]
         delta = goal[:2] - np.array([measured["base_x"], measured["base_y"]])
@@ -954,9 +997,11 @@ class RobotCommander:
         left = (-sin_yaw * delta[0] + cos_yaw * delta[1]) / self.control_period_s
         turn = math.atan2(math.sin(goal[2] - yaw), math.cos(goal[2] - yaw)) / self.control_period_s
 
-        forward = float(np.clip(forward, -MAX_BASE_SPEED_MPS, MAX_BASE_SPEED_MPS))
-        left = float(np.clip(left, -MAX_BASE_SPEED_MPS, MAX_BASE_SPEED_MPS))
-        turn = float(np.clip(turn, -MAX_BASE_TURN_RADPS, MAX_BASE_TURN_RADPS))
+        speed = MAX_BASE_SPEED_MPS * self.speed_scale
+        rate = MAX_BASE_TURN_RADPS * self.speed_scale
+        forward = float(np.clip(forward, -speed, speed))
+        left = float(np.clip(left, -speed, speed))
+        turn = float(np.clip(turn, -rate, rate))
         self.robot.omnibase.set_velocity(forward, left, turn)
         return {"base_forward": forward, "base_left": left, "base_turn": turn}
 
@@ -1023,78 +1068,6 @@ class RobotCommander:
             )
 
 
-FLEET_HELP = """stretch4_body could not read the robot's parameters.
-
-`RobotClient` builds them locally even when it is talking to a robot over the
-network -- `RobotParams` reads the *fleet directory* at import time -- so a
-workstation needs a copy of that robot's fleet directory and the two environment
-variables that name it. On the robot they are already in the shell; here they are
-not, which is what this failure is.
-
-    # on the robot, to find out what they are
-    echo $HELLO_FLEET_PATH $HELLO_FLEET_ID
-    # e.g. /home/hello-robot/stretch_user stretch-se4-3001
-
-    # on this workstation, once
-    scp -r 'hello-robot@{robot}:$HELLO_FLEET_PATH/$HELLO_FLEET_ID' ~/stretch_user/
-    export HELLO_FLEET_PATH=~/stretch_user
-    export HELLO_FLEET_ID=<the fleet id>
-
-(the quotes matter: those two variables are the robot's, and an unquoted remote
-path is expanded by this shell, which does not have them.)
-
-`--fleet-path ~/stretch_user --fleet-id <the fleet id>` sets the same two for one
-run. `--dry-run` needs none of it: it runs the cameras, the mirror and the
-retargeting, and moves nothing."""
-
-
-def prepare_fleet_environment(fleet_path: str | None, fleet_id: str | None) -> None:
-    """Name the robot's fleet directory, before anything imports `stretch4_body`.
-
-    The variables have to be in the environment by the time
-    `stretch4_body.core.robot_params` is imported, because it reads them at class
-    definition time -- so this is a `os.environ` write rather than an argument,
-    and it has to happen before `connect_robot`.
-
-    With a path and no id, the id is inferred when exactly one directory under it
-    looks like a fleet directory. One candidate is an answer; several is a choice
-    this cannot make for you.
-    """
-    if not fleet_path and not fleet_id:
-        return
-    if fleet_path:
-        os.environ["HELLO_FLEET_PATH"] = str(Path(fleet_path).expanduser())
-    if fleet_id:
-        os.environ["HELLO_FLEET_ID"] = fleet_id
-        click.echo(f"  fleet      : {os.environ['HELLO_FLEET_PATH']}/{fleet_id}")
-        return
-
-    # A path and no id. The id is *always* inferred from that path rather than
-    # left at whatever is in the environment, because by the time this runs
-    # `ensure_fleet_directory` has put its stand-in there -- and a run that names
-    # a real fleet directory and silently keeps the stand-in's id would read the
-    # stand-in.
-    root = Path(os.environ["HELLO_FLEET_PATH"])
-    candidates = [
-        child.name
-        for child in sorted(root.glob("*"))
-        if child.is_dir() and (child / "stretch_configuration_params.yaml").exists()
-    ]
-    if len(candidates) == 1:
-        os.environ["HELLO_FLEET_ID"] = candidates[0]
-        click.echo(f"  fleet      : {root}/{candidates[0]}")
-    elif candidates:
-        raise SystemExit(
-            f"{root} holds several fleet directories ({', '.join(candidates)}). "
-            "Name the one this robot is with --fleet-id."
-        )
-    else:
-        raise SystemExit(
-            f"{root} holds no fleet directory -- nothing under it has a "
-            "stretch_configuration_params.yaml. Check --fleet-path."
-        )
-
-
 def connect_robot(robot_ip: str | None) -> Any:
     """Start a `RobotClient`, and refuse to go on with a robot that is not homed.
 
@@ -1103,22 +1076,7 @@ def connect_robot(robot_ip: str | None) -> Any:
     the loop carries on computing actions, and the robot stands still while the
     terminal fills with a policy running normally.
     """
-    try:
-        from stretch4_body.robot.robot_client import RobotClient
-    except ImportError as error:
-        raise SystemExit(
-            f"stretch4_body is required to command the robot ({error}).\n"
-            'Install it with: uv pip install -e ".[digital-twin]", or pass --dry-run '
-            "to run everything except the motion."
-        )
-    except KeyError as error:
-        # Not an ImportError: `stretch4_body` is installed and reads the fleet
-        # environment while it is being imported, so a workstation without it
-        # fails here with a bare `KeyError: 'HELLO_FLEET_PATH'` from four frames
-        # inside somebody else's module.
-        if str(error).strip("\"'") not in ("HELLO_FLEET_PATH", "HELLO_FLEET_ID"):
-            raise
-        raise SystemExit(FLEET_HELP.format(robot=robot_ip or "<robot>"))
+    from stretch4_body.robot.robot_client import RobotClient
 
     where = f"tcp://{robot_ip}" if robot_ip else "the local robot"
     click.echo(f"Connecting to {where}...")
@@ -1150,23 +1108,334 @@ def connect_robot(robot_ip: str | None) -> Any:
 # =============================================================================
 
 
+PLANNED_TOOL_COLOR = (0.25, 0.65, 1.00, 1.0)
+"""What the policy's unexecuted action chunk is drawn in. See `RerunRobotScene.log_plan`."""
+
+STRETCH_ROOT_BODY = "base"
+"""The body Stretch hangs off in the mirror, under the robot's namespace.
+
+`build_mirror` adds the robot with `Stretch4RobotConfig.robot_namespace`, so the
+body is `robot_0/base` -- the holonomic base wrapper, above `base_link`. Named
+because `digital_twin.visual_geoms` takes a subtree rather than a name prefix:
+the mirror's model is a robot on a floor today, and a scene with furniture in it
+would otherwise put the furniture in the view.
+"""
+
+FRANKA_ROOT_BODY = "fr3_link0"
+"""The virtual Franka's base link, and the root of everything drawn of it.
+
+The standalone `franka_droid/model.xml` hangs the whole arm off this, welded to
+an unnamed wrapper body at the origin -- which is why the root named here is the
+link and not the wrapper. `VirtualFranka.fk` asserts that same body sits at the
+origin, so the two agree about where this robot begins.
+"""
+
+
+class RerunRobotScene:
+    """Both robots in one Rerun 3D view: Stretch solid, the Franka a ghost inside it.
+
+    The same picture `test_retargeting.OverlayScene` renders for the sim study,
+    built the way Rerun wants it instead of the way MuJoCo's renderer does. There
+    is no third scene here: the two models this run already drives are drawn into
+    one entity tree by `digital_twin.RerunMujocoRobot`, Stretch's geoms in world
+    coordinates and the Franka's under a `world/franka` transform that stands it
+    on its virtual pedestal. So the overlay cannot flatter the comparison -- a
+    mistake in this class puts a robot in the wrong place, it cannot change a
+    number.
+
+    What the picture is for is the pair of tool centres. Stretch's is where its
+    gripper actually is; the Franka's is the pose the retargeting asked it to
+    reach, which is the ghost's own hand (see `log_robots` on the height offset).
+    The line drawn between them, labelled in millimetres, is the whole answer.
+    """
+
+    ROOT = "world"
+    STRETCH = "world/stretch"
+    FRANKA = "world/franka"
+
+    def __init__(
+        self,
+        rr: Any,
+        stretch_model: Any,
+        stretch_namespace: str,
+        franka_model: Any,
+    ) -> None:
+        self._rr = rr
+        self.stretch = RerunMujocoRobot(
+            rr, stretch_model, f"{stretch_namespace}{STRETCH_ROOT_BODY}", self.STRETCH
+        )
+        # Painted its own marker colour rather than left grey and translucent.
+        # Both robots are grey plastic and white metal and they stand inside one
+        # another, so the first version of this view was one in which it was
+        # genuinely hard to say which limb belonged to which -- a failure of the
+        # only thing an overlay is for. The tint matches the ball below, which
+        # says whose hand that is in the language the view already speaks.
+        self.franka = RerunMujocoRobot(
+            rr,
+            franka_model,
+            FRANKA_ROOT_BODY,
+            self.FRANKA,
+            tint=fr.FRANKA_TOOL_COLOR[:3],
+        )
+
+        rr.log(self.ROOT, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+        for path, color in (
+            ("world/tool/stretch", fr.STRETCH_TOOL_COLOR),
+            ("world/tool/franka", fr.FRANKA_TOOL_COLOR),
+        ):
+            rr.log(f"{path}/frame", rr.TransformAxes3D(axis_length=0.08), static=True)
+            rr.log(
+                path,
+                rr.Points3D(positions=[[0.0, 0.0, 0.0]], radii=[0.012], colors=[rgba8(color)]),
+                static=True,
+            )
+
+    # -- where everything is, logged per step -------------------------------
+
+    def log_robots(self, stretch_data: Any, franka_data: Any | None, ghost_pose: Any) -> None:
+        """Stretch where it is, and the Franka where the retargeting imagines it.
+
+        `ghost_pose` is the virtual Franka's mount pose *with `target_z_offset`
+        added to its height*, not the bare `franka_mount_pose`. The offset is
+        defined as "stand the virtual Franka this much higher" -- that is exactly
+        what `franka_tool_pose_to_world` does to every target -- so raising the
+        ghost by it is what keeps the ghost's hand and the target tool centre the
+        same point. Drawn at the bare mount pose the ghost's hand would sit
+        `target_z_offset` below the pose Stretch is actually reaching for, and
+        the gap the view exists to show would read that much too large.
+
+        `franka_data` is `None` on a step the policy was not queried on -- the
+        ghost then keeps the pose it was last commanded to, which is where the
+        robot was last told to go and is the honest thing for it to be showing.
+        """
+        self.stretch.log(stretch_data)
+        if franka_data is None:
+            return
+        ghost_pose = np.asarray(ghost_pose, dtype=float)
+        self._rr.log(
+            self.FRANKA,
+            self._rr.Transform3D(translation=ghost_pose[:3, 3], mat3x3=ghost_pose[:3, :3]),
+        )
+        self.franka.log(franka_data)
+
+    def log_tool_frames(self, stretch_pose: Any, franka_pose: Any | None) -> None:
+        """The two tool centres, and the gap between them labelled in millimetres.
+
+        The one number this whole view is for. Both poses are in the world, both
+        are 4x4, and the label is the euclidean distance between their origins --
+        which is the retargeting residual plus whatever the robot has not yet
+        tracked, i.e. how far the real gripper is from the Franka gripper the
+        policy thinks it is driving.
+        """
+        rr = self._rr
+        self._log_tool("world/tool/stretch", stretch_pose)
+        self._log_tool("world/tool/franka", franka_pose)
+        if franka_pose is None:
+            return
+        stretch_point = np.asarray(stretch_pose, dtype=float)[:3, 3]
+        franka_point = np.asarray(franka_pose, dtype=float)[:3, 3]
+        gap = float(np.linalg.norm(franka_point - stretch_point))
+        rr.log(
+            "world/tool/gap",
+            rr.LineStrips3D(
+                [[stretch_point, franka_point]],
+                radii=[0.003],
+                colors=[[255, 255, 255, 255]],
+                labels=[f"{gap * 1000:.0f} mm"],
+            ),
+        )
+
+    def _log_tool(self, path: str, pose: Any | None) -> None:
+        if pose is None:
+            return
+        pose = np.asarray(pose, dtype=float)
+        self._rr.log(path, self._rr.Transform3D(translation=pose[:3, 3], mat3x3=pose[:3, :3]))
+
+    def log_plan(self, points: Any) -> None:
+        """Where the policy is intending to take the tool, as a polyline.
+
+        The unexecuted tail of the action chunk, put through the virtual Franka's
+        forward kinematics. See `RealStretchRunner._planned_tool_path` for what
+        the approximation in it is -- this only draws what it is handed, and
+        draws nothing when it is handed nothing.
+        """
+        rr = self._rr
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if len(points) < 1:
+            rr.log("world/plan", rr.Clear(recursive=True))
+            return
+        color = rgba8(PLANNED_TOOL_COLOR)
+        rr.log("world/plan/points", rr.Points3D(positions=points, radii=0.006, colors=[color]))
+        if len(points) >= 2:
+            rr.log("world/plan/path", rr.LineStrips3D([points], radii=[0.002], colors=[color]))
+
+
+class RerunUrdfOverlay:
+    """The robot's *own* URDF, posed from `RobotClient`, as a third robot in the view.
+
+    `digital_twin.RerunUrdfRobot` with this run's wiring around it: the same
+    drawing the digital twin example puts beside its simulated robot, here put
+    beside the MuJoCo mirror and the virtual Franka. What it adds is a robot
+    neither of the others is -- the mirror is a model of this robot driven by the
+    *camera stream's* `closest_joint_state`, and the virtual Franka is not this
+    robot at all. This one is `stretch4_urdf`'s description of the machine on the
+    bench, with that machine's batch and tool, posed from the status
+    `RobotClient` reads over its own connection.
+
+    So two disagreements become visible that nothing else here can show:
+
+    * **Between this and the MJCF Stretch**, a disagreement about *time*. Both
+      are the same robot; they are fed from two different links with two
+      different latencies, so the gap between their grippers is how far behind
+      the stream the policy's view of the arm is running.
+    * **Between this and the geometry the MJCF was built from**, a disagreement
+      about *the robot*. A steady offset is a calibration or batch difference the
+      retargeting is carrying silently.
+
+    It is drawn under the mirror's `base_link`, not at its own `base_footprint`,
+    so the two Stretches are pinned together at the base by construction and
+    every millimetre between their hands is joint angles rather than odometry.
+    """
+
+    ROOT = "world/urdf"
+    TOOL = "world/tool/urdf"
+    BASE_LINK = "base_link"
+    """The frame every link pose is reported in. See the class docstring."""
+
+    def __init__(self, rr: Any, robot: Any) -> None:
+        self._rr = rr
+        self._robot = robot
+        urdf, self.description = load_stretch_urdf(robot)
+        self.drawing = RerunUrdfRobot(rr, urdf, self.ROOT, base_link=self.BASE_LINK)
+        rr.log(f"{self.TOOL}/frame", rr.TransformAxes3D(axis_length=0.08), static=True)
+        rr.log(
+            self.TOOL,
+            rr.Points3D(
+                positions=[[0.0, 0.0, 0.0]], radii=[0.012], colors=[rgba8(REAL_ROBOT_COLOR)]
+            ),
+            static=True,
+        )
+        click.echo(
+            f"  urdf       : {'/'.join(self.description)}, {len(self.drawing.links)} links, "
+            f"{self.drawing.vertices} vertices"
+        )
+
+    def log(self, base_pose: np.ndarray) -> np.ndarray | None:
+        """Pose the overlay under `base_pose`, and return its tool pose in the world.
+
+        `base_pose` is the *mirror's* `base_link` in the world, which is what pins
+        this robot to the other two -- see the class docstring.
+
+        `pull_status` is non-blocking. The control loop is holding the arm with a
+        stream of targets and must not stop to wait for a status message; a step
+        where none had arrived keeps the joints it had, which is a viewer one
+        frame stale rather than a robot one frame late. The transforms are
+        re-logged either way, because the base may have moved even if the arm has
+        not.
+        """
+        if self._robot is not None and self._robot.pull_status(blocking=False):
+            self.drawing.pose_from_status(self._robot.status)
+        tool = self.drawing.log(base_pose)
+        if tool is not None:
+            self._rr.log(
+                self.TOOL,
+                self._rr.Transform3D(translation=tool[:3, 3], mat3x3=tool[:3, :3]),
+            )
+        return tool
+
+
+def urdf_overlay_builder(robot: Any) -> "Callable[[Any], RerunUrdfOverlay] | None":
+    """A factory for `RerunUrdfOverlay`, or `None` and a reason why not.
+
+    Deferred rather than built outright because the overlay logs its meshes the
+    moment it exists and nothing may be logged before `rr.init`, which happens
+    inside `RerunTelemetry`. What *is* settled here is the part worth answering
+    before a viewer is up: whether there is a robot to read a status from, and
+    whether the two packages that describe it are installed. Both are ordinary
+    absences rather than faults -- `--dry-run` has no robot by definition -- so
+    each is a line on the way past and the run carries on with two robots in the
+    view instead of three.
+    """
+    if robot is None:
+        click.echo("  urdf       : skipped -- --dry-run has no robot to read a status from.")
+        return None
+    try:
+        import stretch4_urdf  # noqa: F401
+        import yourdfpy  # noqa: F401
+    except ImportError as error:
+        click.secho(
+            f"  urdf       : skipped ({error}). Install it with "
+            "`uv pip install yourdfpy stretch4-urdf`, or pass --no-rerun-urdf.",
+            fg="yellow",
+        )
+        return None
+    return lambda rr: RerunUrdfOverlay(rr, robot)
+
+
+@dataclass
+class SceneSnapshot:
+    """One step's worth of 3D: where each robot is, and where the tool centres are.
+
+    Assembled by `RealStretchRunner._scene`, which is the only place that has
+    both models and the retargeting, and handed to the telemetry as a unit so
+    that `log_step` stays one call per step. Every field may be absent except
+    `stretch_data` and `stretch_tool`: a held robot still has a pose, and nothing
+    else on this list means anything when the policy has not been asked.
+    """
+
+    stretch_data: Any
+    stretch_tool: np.ndarray
+    base_pose: np.ndarray | None = None
+    """The mirror's `base_link` in the world, which the URDF overlay hangs off."""
+    franka_data: Any | None = None
+    ghost_pose: np.ndarray | None = None
+    franka_tool: np.ndarray | None = None
+    plan: np.ndarray | None = None
+
+
+@dataclass
+class TimingNote:
+    """How long the policy took this step, and whether the model was actually run.
+
+    The distinction is the whole point of logging this. `RealRobotVLAPolicy`
+    predicts `action_horizon` actions and hands back `execute_horizon` of them
+    before querying again, so most steps are a list index and one in eight is a
+    forward pass through a VLM -- and an average over all of them describes
+    neither. `queried` separates the two, and `pending` says how many actions are
+    left before the next one.
+    """
+
+    inference_s: float
+    queried: bool
+    pending: int
+
+
 class RerunTelemetry:
     """Streams the run to a Rerun viewer, and optionally to an `.rrd` file.
 
-    Three things, laid out so a failure is readable without scrolling: what the
-    policy is looking at (the processed frames, which is not what the cameras
-    produced), what the robot is doing (measured against commanded, per joint),
-    and how well the retargeting is coping (the residual, and how far behind the
-    stream the loop is running).
+    Two tabs, because there are two questions and they want different pictures.
 
-    The raw camera frames are logged too, beside the processed ones. Most of what
-    goes wrong on a first real run is in the gap between those two rows -- a
-    frame turned the wrong way, a channel swap, a crop that cut the workspace out
-    -- and side by side it is one glance.
+    **run**, the one that opens, is for watching a rollout: what the policy is
+    being shown, how long it is taking to answer, where the two tool centres are
+    relative to each other in 3D, and the errors between them. Everything on it
+    is on the `policy_step` timeline, so scrubbing moves the frames, the robot
+    and the plots together.
+
+    **diagnostics** is the layout this module had before, kept whole: the
+    processed frames beside the *raw* ones, and measured against commanded per
+    joint. Most of what goes wrong on a first real run is in the gap between
+    those two image rows -- a frame turned the wrong way, a channel swap, a crop
+    that cut the workspace out -- and that is a different glance from watching a
+    reach, so it is a different tab rather than a busier one.
     """
 
     def __init__(
-        self, save_path: Path | None = None, spawn: bool = True, jpeg_quality: int = 75
+        self,
+        save_path: Path | None = None,
+        spawn: bool = True,
+        jpeg_quality: int = 75,
+        scene: "Callable[[Any], RerunRobotScene] | None" = None,
+        urdf: "Callable[[Any], RerunUrdfOverlay] | None" = None,
     ) -> None:
         import rerun as rr
         import rerun.blueprint as rrb
@@ -1177,29 +1446,84 @@ class RerunTelemetry:
         if save_path is not None:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             rr.save(str(save_path))
+
+        # Built here, from factories, rather than handed in ready-made: both log
+        # their geometry the moment they exist -- a few megabytes of mesh, once --
+        # and nothing may be logged before `rr.init` has decided where it is
+        # going. The blueprint below then reads `self.scene` to know whether
+        # there is a 3D view to lay out.
+        self.scene = None if scene is None else scene(rr)
+        self.urdf = None
+        if urdf is not None:
+            try:
+                self.urdf = urdf(rr)
+            except Exception as error:  # noqa: BLE001 - a third robot is not the run
+                # Loudly, and not fatally. Everything this can fail on is about
+                # *describing* the robot -- a fleet directory that resolves to
+                # nominal geometry has no meshes to load -- and none of it stops
+                # the robot being driven or the other two robots being drawn.
+                click.secho(f"  urdf       : skipped ({error}).", fg="yellow")
+
         rr.send_blueprint(
-            rrb.Horizontal(
-                rrb.Vertical(
-                    rrb.Horizontal(
-                        rrb.Spatial2DView(origin="policy/head", name="head (to the policy)"),
-                        rrb.Spatial2DView(origin="policy/wrist", name="wrist (to the policy)"),
-                    ),
-                    rrb.Horizontal(
-                        rrb.Spatial2DView(origin="camera/head", name="head (raw)"),
-                        rrb.Spatial2DView(origin="camera/wrist", name="wrist (raw)"),
-                    ),
-                    rrb.TextDocumentView(origin="run/task", name="instruction"),
-                    row_shares=[2, 2, 1],
-                ),
-                rrb.Vertical(
-                    rrb.TimeSeriesView(origin="robot/measured", name="where the robot is"),
-                    rrb.TimeSeriesView(origin="robot/commanded", name="what it was told"),
-                    rrb.TimeSeriesView(origin="retarget", name="retargeting and timing"),
-                ),
-                column_shares=[3, 2],
+            rrb.Blueprint(
+                rrb.Tabs(
+                    self._run_tab(rrb),
+                    self._diagnostics_tab(rrb),
+                    active_tab=0,
+                )
             )
         )
         self._task: str | None = None
+        self._queries: list[float] = []
+        """Every model query's wall time this run, for the rolling mean in the log."""
+
+    def _run_tab(self, rrb: Any) -> Any:
+        """The default tab: the plan, the frames behind it, and the errors."""
+        left: list[Any] = []
+        if self.scene is not None:
+            left.append(
+                rrb.Spatial3DView(
+                    origin=RerunRobotScene.ROOT,
+                    name="Stretch, with the Franka it is imitating",
+                )
+            )
+        left.append(rrb.TimeSeriesView(origin="error", name="tool-centre errors"))
+        return rrb.Horizontal(
+            rrb.Vertical(*left, row_shares=[3, 2][: len(left)]),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin="policy/head", name="head -> the policy"),
+                rrb.Spatial2DView(origin="policy/wrist", name="wrist -> the policy"),
+                rrb.TextLogView(origin="log", name="inference"),
+                row_shares=[2, 2, 1],
+            ),
+            column_shares=[3, 2],
+            name="run",
+        )
+
+    @staticmethod
+    def _diagnostics_tab(rrb: Any) -> Any:
+        """The layout this module shipped with, unchanged. See the class docstring."""
+        return rrb.Horizontal(
+            rrb.Vertical(
+                rrb.Horizontal(
+                    rrb.Spatial2DView(origin="policy/head", name="head (to the policy)"),
+                    rrb.Spatial2DView(origin="policy/wrist", name="wrist (to the policy)"),
+                ),
+                rrb.Horizontal(
+                    rrb.Spatial2DView(origin="camera/head", name="head (raw)"),
+                    rrb.Spatial2DView(origin="camera/wrist", name="wrist (raw)"),
+                ),
+                rrb.TextDocumentView(origin="run/task", name="instruction"),
+                row_shares=[2, 2, 1],
+            ),
+            rrb.Vertical(
+                rrb.TimeSeriesView(origin="robot/measured", name="where the robot is"),
+                rrb.TimeSeriesView(origin="robot/commanded", name="what it was told"),
+                rrb.TimeSeriesView(origin="retarget", name="retargeting and timing"),
+            ),
+            column_shares=[3, 2],
+            name="diagnostics",
+        )
 
     def _image(self, frame: np.ndarray) -> Any:
         """One frame, JPEG-encoded unless asked for raw.
@@ -1223,6 +1547,9 @@ class RerunTelemetry:
         commanded: dict[str, float],
         diagnostics: dict[str, float],
         task: str,
+        errors: dict[str, float] | None = None,
+        scene: SceneSnapshot | None = None,
+        timing: TimingNote | None = None,
     ) -> None:
         rr = self._rr
         rr.set_time("policy_step", sequence=step)
@@ -1240,10 +1567,59 @@ class RerunTelemetry:
             rr.log(f"robot/commanded/{key}", rr.Scalars(float(value)))
         for key, value in diagnostics.items():
             rr.log(f"retarget/{key}", rr.Scalars(float(value)))
+        for key, value in (errors or {}).items():
+            rr.log(f"error/{key}", rr.Scalars(float(value)))
+
+        if scene is not None and self.scene is not None:
+            self.scene.log_robots(scene.stretch_data, scene.franka_data, scene.ghost_pose)
+            self.scene.log_tool_frames(scene.stretch_tool, scene.franka_tool)
+            self.scene.log_plan(scene.plan if scene.plan is not None else ())
+        if scene is not None and self.urdf is not None and scene.base_pose is not None:
+            # The one error that is about the *robot* rather than the policy: the
+            # same machine drawn from two joint sources, so the gap between the
+            # two grippers is stream latency and calibration, not retargeting.
+            tool = self.urdf.log(scene.base_pose)
+            if tool is not None:
+                rr.log(
+                    "error/urdf_vs_mirror_m",
+                    rr.Scalars(float(np.linalg.norm(tool[:3, 3] - scene.stretch_tool[:3, 3]))),
+                )
+
+        if timing is not None:
+            self._log_timing(step, timing)
 
         if task != self._task:
             self._task = task
             rr.log("run/task", rr.TextDocument(task))
+
+    def _log_timing(self, step: int, timing: TimingNote) -> None:
+        """One line per step about how long the policy took, plus the same as scalars.
+
+        The text is what you read while the robot is moving and the scalars are
+        what you scrub afterwards, so both are logged. Only the model queries go
+        into the mean -- see `TimingNote`.
+        """
+        rr = self._rr
+        rr.log("timing/policy_s", rr.Scalars(timing.inference_s))
+        rr.log("timing/model_query", rr.Scalars(float(timing.queried)))
+        rr.log("timing/actions_pending", rr.Scalars(float(timing.pending)))
+        if timing.queried:
+            self._queries.append(timing.inference_s)
+            rr.log("timing/inference_s", rr.Scalars(timing.inference_s))
+
+        if timing.queried:
+            mean = sum(self._queries) / len(self._queries)
+            text = (
+                f"step {step}: model query took {timing.inference_s * 1000:.0f}ms "
+                f"({1.0 / timing.inference_s:.1f}Hz) -- mean {mean * 1000:.0f}ms over "
+                f"{len(self._queries)} queries. {timing.pending} actions buffered."
+            )
+        else:
+            text = (
+                f"step {step}: from the buffer in {timing.inference_s * 1000:.1f}ms, "
+                f"{timing.pending} actions left before the next query."
+            )
+        rr.log("log/inference", rr.TextLog(text, level="INFO" if timing.queried else "DEBUG"))
 
 
 # =============================================================================
@@ -1443,6 +1819,111 @@ class RunSettings:
     wrist_fov_deg: float = 0.0
 
 
+def pose_virtual_franka(franka: fr.VirtualFranka, data: MjData, joint_pos) -> None:
+    """Put a *second* `MjData` for the virtual Franka at `joint_pos`, in place.
+
+    `VirtualFranka.fk` already does these kinematics, but it does them in the
+    arm's own `MjData` -- the one the retargeting solves in and overwrites on the
+    next call -- and what the viewer needs is a pose that survives long enough to
+    be drawn, and that drawing a planned trajectory afterwards cannot disturb.
+
+    The joints are addressed by name, the way `VirtualFranka` addresses its own,
+    so this cannot silently drift onto the wrong `qpos` slots if the model gains
+    a body. Only the arm is posed: the hand is left at the model's default
+    aperture, because the ghost is in the picture for where its tool centre is
+    and the Robotiq command is already a plot of its own.
+    """
+    joint_pos = np.asarray(joint_pos, dtype=float).reshape(-1)[: fr.VirtualFranka.N_JOINTS]
+    model = franka.model
+    for index, value in enumerate(np.clip(joint_pos, *franka.joint_limits.T)):
+        data.qpos[model.jnt_qposadr[model.joint(f"fr3_joint{index + 1}").id]] = value
+    mujoco.mj_kinematics(model, data)
+
+
+class CommandedPose:
+    """Where the joint targets that were actually sent would put the tool.
+
+    The third pose in a picture that otherwise has two. The retargeting reports
+    how far its solution fell short of the Franka's tool pose
+    (`last_position_error`), and the mirror says where the gripper is -- but the
+    gap between those two is a sum of two unrelated things: a five-DOF arm
+    approximating a six-DOF pose, and a robot that has not finished moving. This
+    separates them, by running forward kinematics on the targets
+    `RobotCommander.send` actually put on the wire.
+
+    Which is not the same vector the IK produced: every target is clamped to
+    `MAX_TARGET_STEP` of where the joint is, so on a large reach the robot is
+    chasing a nearer pose than the one the policy asked for, and a tracking error
+    measured against the unclamped target would read that clamp as lag.
+
+    On scratch data, for the same reason `StretchArmIK` is: writing joint
+    positions into the live mirror would move the robot the retargeting is about
+    to be solved against. The base is copied from the live model rather than
+    commanded -- under `--include-base` the commander sends wheel velocities, and
+    there is no base *pose* on the wire to do kinematics with.
+    """
+
+    WRIST = (("wrist_yaw", 1.0), ("wrist_pitch", 1.0), ("wrist_roll", WRIST_ROLL_SIM_SIGN))
+    """The commanded wrist, and the sign that takes each axis back to the model's.
+
+    `RobotCommander.send` applies `WRIST_ROLL_SIM_SIGN` on the way out, because
+    the URDF turns that joint the opposite way from the robot's servo -- so a
+    command read back off the wire has to be turned around again before it means
+    anything to a model. The same pairing, in the same order, as the loop in
+    `send` that produced it.
+    """
+
+    def __init__(self, mirror: RobotMirror, namespace: str) -> None:
+        self._live = mirror.data
+        self._data = MjData(mirror.model)
+        self._view = Stretch4RobotView(self._data, namespace)
+
+    def tool_pose(self, commanded: dict[str, float]) -> np.ndarray | None:
+        """The tool pose for one step's commands, or None if the arm was not commanded.
+
+        `None` covers both a held robot and `--dry-run`, where nothing was sent
+        and there is no commanded pose to be short of -- which is a gap in the
+        plot rather than a zero, zero being a claim that the robot arrived.
+        """
+        if not all(name in commanded for name in ("lift", "arm", *(n for n, _ in self.WRIST))):
+            return None
+        self._data.qpos[:] = self._live.qpos
+        self._view.set_qpos_dict(
+            {
+                "lift": [commanded["lift"]],
+                "arm": [commanded["arm"]],
+                "wrist": [sign * commanded[name] for name, sign in self.WRIST],
+            }
+        )
+        mujoco.mj_kinematics(self._data.model, self._data)
+        return self._view.get_move_group("wrist").leaf_frame_to_world
+
+
+def tool_errors(
+    measured: np.ndarray, commanded: np.ndarray | None, target: np.ndarray | None
+) -> dict[str, float]:
+    """The three distances between the poses in `CommandedPose`'s docstring.
+
+    `target` is where the policy pointed, `commanded` is what the robot was told
+    after the IK approximated it and the step clamp trimmed it, and `measured` is
+    where the gripper is. So `retarget` is what the retargeting costs, `tracking`
+    is what the robot has not done yet, and `total` is what the policy is
+    actually closing its loop on -- which is the one that decides whether a grasp
+    lands, and is not the sum of the other two, the three poses not being
+    collinear.
+    """
+    errors: dict[str, float] = {}
+    if commanded is not None:
+        errors["tracking_position_m"] = float(np.linalg.norm(commanded[:3, 3] - measured[:3, 3]))
+    if target is not None:
+        errors["total_position_m"] = float(np.linalg.norm(target[:3, 3] - measured[:3, 3]))
+        if commanded is not None:
+            errors["commanded_vs_target_m"] = float(
+                np.linalg.norm(target[:3, 3] - commanded[:3, 3])
+            )
+    return errors
+
+
 class RealStretchRunner:
     """One control loop: stream in, retargeted targets out.
 
@@ -1479,6 +1960,16 @@ class RealStretchRunner:
         stop holds the arm at. See `RobotCommander.hold`."""
 
         self._warned: set[str] = set()
+
+        # Both exist only to be looked at, so neither is built when nothing is
+        # looking: an `MjData` per model is a few megabytes and the kinematics
+        # they run are per step.
+        self._commanded = None if telemetry is None else CommandedPose(mirror, proxy.namespace)
+        self._ghost = None if telemetry is None else MjData(proxy.franka.model)
+        """The virtual Franka's pose as *drawn*, separate from the one it solves in.
+        See `pose_virtual_franka`."""
+        self._base_body = mirror.model.body(f"{proxy.namespace}{RerunUrdfOverlay.BASE_LINK}").id
+        """What the URDF overlay is pinned to. See `RerunUrdfOverlay`."""
 
     # -- episodes ----------------------------------------------------------
 
@@ -1701,7 +2192,7 @@ class RealStretchRunner:
 
         started = time.perf_counter()
         action = self.policy.get_action(policy_observation)
-        inference_s = time.perf_counter() - started
+        timing = self._timing(time.perf_counter() - started)
 
         targets = self.proxy.retarget_franka_joint_pos(action["arm"])
         targets["gripper"] = self.proxy.retarget_robotiq_ctrl(action["gripper"])
@@ -1711,7 +2202,98 @@ class RealStretchRunner:
         if self.commander is not None and self.running:
             commanded = self.commander.send(targets, measured)
 
-        self._log(observation, head, wrist, measured, commanded, action, inference_s)
+        self._log(observation, head, wrist, measured, commanded, action, timing)
+
+    def _timing(self, inference_s: float) -> TimingNote:
+        """How long `get_action` took, and whether that was the model or a list index.
+
+        `RealRobotVLAPolicy` predicts a chunk and hands it out one action at a
+        time, re-querying once `execute_horizon` of them have gone -- which it
+        signals by resetting `buffer_index`, so an index of 1 on the way out is
+        exactly a step the model ran on. Read rather than timed, because the
+        threshold between "a forward pass through a VLM" and "a list index" is
+        three orders of magnitude on a good day and not a number worth guessing
+        on a bad one.
+
+        Everything here is read defensively: this module drives MolmoBot's class
+        directly (see `demo_droid_on_stretch.load_droid_policy`) and its buffer
+        is an implementation detail of somebody else's policy. Without it the
+        timing still logs, as a query every step, which is what a policy with no
+        chunk would actually be doing.
+        """
+        index = int(getattr(self.policy, "buffer_index", 1))
+        horizon = int(getattr(self.policy, "execute_horizon", 1))
+        return TimingNote(
+            inference_s=inference_s,
+            queried=index <= 1,
+            pending=max(0, horizon - index),
+        )
+
+    def _planned_tool_path(self, action: dict[str, Any]) -> np.ndarray | None:
+        """Where the rest of this chunk would put the tool, as world points.
+
+        The steps between now and the next forward pass are already decided, so
+        they can be drawn. Only those: the chunk is `action_horizon` long and
+        only `execute_horizon` of it is ever executed, and drawing the tail would
+        be drawing a plan that is about to be thrown away.
+
+        **It is a heading, not a trajectory.** The actions are `joint_pos_rel` --
+        each is a delta against the arm state at the step it is executed at, and
+        those states do not exist yet -- so the current one stands in for all of
+        them. What the line shows is where the chunk points from here, which is
+        the question worth asking of it while the robot is moving: whether the
+        policy is reaching for the object or for somewhere else.
+        """
+        buffer = getattr(self.policy, "action_buffer", None)
+        if not buffer:
+            return None
+        index = int(getattr(self.policy, "buffer_index", 0))
+        horizon = int(getattr(self.policy, "execute_horizon", len(buffer)))
+        pending = list(buffer[index : min(horizon, len(buffer))])
+
+        here = np.asarray(self.proxy.get_move_group("arm").joint_pos, dtype=float)
+        relative = getattr(self.policy, "action_type", "") == "joint_pos_rel"
+        joints = [np.asarray(action["arm"], dtype=float).reshape(-1)]
+        for future in pending:
+            step = np.asarray(future["arm"], dtype=float).reshape(-1)
+            joints.append(step[:7] + here if relative else step[:7])
+        return np.array(
+            [
+                self.proxy.franka_tool_pose_to_world(self.proxy.franka.fk(each))[:3, 3]
+                for each in joints
+            ]
+        )
+
+    def _scene(self, action: dict[str, Any] | None) -> SceneSnapshot:
+        """This step's 3D: Stretch where it is, and the Franka it is imitating.
+
+        The ghost stands at the mount pose raised by `target_z_offset`, which is
+        what that offset *is* -- `franka_tool_pose_to_world` adds it to every
+        target, so the Franka the retargeting is chasing is one standing that
+        much higher. Drawn at the bare mount pose the ghost's hand would sit the
+        offset below the pose Stretch is actually reaching for, and the gap the
+        view exists to show would read that much too large.
+        """
+        base_pose = np.eye(4)
+        base_pose[:3, :3] = self.mirror.data.xmat[self._base_body].reshape(3, 3)
+        base_pose[:3, 3] = self.mirror.data.xpos[self._base_body]
+        scene = SceneSnapshot(
+            stretch_data=self.mirror.data,
+            stretch_tool=self.proxy.arm_ik.tool_pose(),
+            base_pose=base_pose,
+        )
+        if action is None or self._ghost is None:
+            return scene
+        pose_virtual_franka(self.proxy.franka, self._ghost, action["arm"])
+        ghost = np.array(self.proxy.franka_mount_pose, dtype=float)
+        ghost[2, 3] += self.proxy.target_z_offset
+        scene.franka_data = self._ghost
+        scene.ghost_pose = ghost
+        scene.franka_tool = self.proxy.franka_tool_pose_to_world(
+            self.proxy.franka.fk(np.asarray(action["arm"], dtype=float).reshape(-1))
+        )
+        scene.plan = self._planned_tool_path(action)
+        return scene
 
     def _log(
         self,
@@ -1721,15 +2303,16 @@ class RealStretchRunner:
         measured: dict[str, float],
         commanded: dict[str, float],
         action: dict[str, Any] | None,
-        inference_s: float = 0.0,
+        timing: TimingNote | None = None,
     ) -> None:
         """One row of telemetry, whether or not the policy was asked for an action.
 
-        A held robot still logs: the frames, where it is, and how far behind the
-        stream the loop is. What it does not log is a retargeting that did not
-        happen -- the residual and the gripper command are the previous step's
-        once the policy stops being queried, and a flat line in the viewer is
-        easier to read than a stale one.
+        A held robot still logs: the frames, where it is, how far behind the
+        stream the loop is, and where its own gripper is in 3D. What it does not
+        log is a retargeting that did not happen -- the residual, the gripper
+        command, the ghost Franka and the plan are the previous step's once the
+        policy stops being queried, and a gap in the viewer is easier to read
+        than a stale line.
         """
         self.step_count += 1
         if self.telemetry is None:
@@ -1739,6 +2322,8 @@ class RealStretchRunner:
             "head_sync_offset_ms": observation.head_sync_offset_ms,
             "running": float(self.running),
         }
+        errors: dict[str, float] = {}
+        scene = self._scene(action)
         if action is not None:
             diagnostics.update(
                 {
@@ -1746,10 +2331,18 @@ class RealStretchRunner:
                     "orientation_error_rad": self.proxy.last_orientation_error,
                     "jaw_flipped": float(self.proxy.jaw_flipped),
                     "unreachable_steps": float(self.proxy.unreachable_steps),
-                    "inference_s": inference_s,
+                    "inference_s": timing.inference_s if timing else 0.0,
                     "robotiq_ctrl": float(np.ravel(action["gripper"])[0]),
                 }
             )
+            errors = {
+                "retarget_position_m": self.proxy.last_position_error,
+                "retarget_orientation_rad": self.proxy.last_orientation_error,
+            }
+            commanded_pose = (
+                None if self._commanded is None else self._commanded.tool_pose(commanded)
+            )
+            errors.update(tool_errors(scene.stretch_tool, commanded_pose, scene.franka_tool))
         self.telemetry.log_step(
             step=self.step_count,
             images={"head": head, "wrist": wrist},
@@ -1758,6 +2351,9 @@ class RealStretchRunner:
             commanded=commanded,
             diagnostics=diagnostics,
             task=self.task,
+            errors=errors,
+            scene=scene,
+            timing=timing,
         )
 
     def _warn_once(self, key: str, message: str) -> None:
@@ -1832,20 +2428,6 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "use gripper_networking's configured IP for the stream and a local RobotClient.",
 )
 @click.option("--port", type=int, default=None, help="The stream's port. Defaults to 4409.")
-@click.option(
-    "--fleet-path",
-    type=str,
-    default=None,
-    help="Directory holding the robot's fleet directory, for this run. A workstation "
-    "needs a copy of it even to drive a robot over the network; see FLEET_HELP.",
-)
-@click.option(
-    "--fleet-id",
-    type=str,
-    default=None,
-    help="Which fleet directory under --fleet-path, e.g. stretch-se4-3001. Inferred when "
-    "there is only one.",
-)
 @click.option(
     "--task",
     type=str,
@@ -1987,9 +2569,10 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
 @click.option(
     "--slow",
     is_flag=True,
-    help="Move at 40% of the robot's max profile -- 60% slower, in both velocity and "
-    "acceleration. The targets are unchanged, so the robot lags a 15Hz stream further; "
-    "read a slow rollout as a rehearsal rather than a measurement.",
+    help=f"Move at {SLOW_SPEED_SCALE:.0%} of the robot's max profile, in velocity and "
+    "acceleration alike, and cap the base at the same fraction. The targets are "
+    "unchanged, so the robot lags the stream further; read a slow rollout as a "
+    "rehearsal rather than a measurement.",
 )
 @click.option(
     "--step-limit-scale",
@@ -2006,6 +2589,22 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     help="Stop sending when the newest frame is older than this, in seconds.",
 )
 @click.option("--rerun/--no-rerun", default=True, show_default=True, help="Stream to Rerun.")
+@click.option(
+    "--rerun-3d/--no-rerun-3d",
+    default=True,
+    show_default=True,
+    help="Draw Stretch and the virtual Franka it is imitating in one 3D view. Costs a "
+    "transform per visual geom per step; turn it off on a machine the policy is "
+    "already saturating.",
+)
+@click.option(
+    "--rerun-urdf/--no-rerun-urdf",
+    default=True,
+    show_default=True,
+    help="Add a third robot to that view: this robot's own URDF, posed from "
+    "RobotClient's status rather than from the camera stream. Needs stretch4_urdf and "
+    "yourdfpy, and a robot -- it is skipped under --dry-run.",
+)
 @click.option(
     "--rerun-jpeg-quality",
     type=int,
@@ -2030,8 +2629,6 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
 def main(
     robot_ip: str | None,
     port: int | None,
-    fleet_path: str | None,
-    fleet_id: str | None,
     task: str,
     checkpoint: str | None,
     control_hz: float,
@@ -2056,6 +2653,8 @@ def main(
     step_limit_scale: float,
     max_obs_age: float,
     rerun: bool,
+    rerun_3d: bool,
+    rerun_urdf: bool,
     rerun_jpeg_quality: int,
     rrd: Path | None,
     dry_run: bool,
@@ -2129,8 +2728,6 @@ def main(
             "state it can read."
         )
 
-    if not dry_run:
-        prepare_fleet_environment(fleet_path, fleet_id)
     robot = None if dry_run else connect_robot(robot_ip)
     gripper_units = GripperUnits.nominal() if robot is None else GripperUnits.from_robot(robot)
     click.echo(
@@ -2168,11 +2765,18 @@ def main(
 
     policy = load_droid_policy(checkpoint)
 
-    telemetry = (
-        RerunTelemetry(save_path=rrd, jpeg_quality=rerun_jpeg_quality)
-        if (rerun or rrd is not None)
-        else None
-    )
+    telemetry = None
+    if rerun or rrd is not None:
+        telemetry = RerunTelemetry(
+            save_path=rrd,
+            jpeg_quality=rerun_jpeg_quality,
+            scene=(
+                (lambda rr: RerunRobotScene(rr, mirror.model, namespace, proxy.franka.model))
+                if rerun_3d
+                else None
+            ),
+            urdf=urdf_overlay_builder(robot) if (rerun_3d and rerun_urdf) else None,
+        )
     commander = (
         None
         if robot is None
