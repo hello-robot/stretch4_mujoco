@@ -159,7 +159,7 @@ DEFAULT_JOINTS_PORT = 4409
 without the gripper repository on the path. `--port` overrides it, and the real
 value is read from `gripper_networking` when that package *is* importable."""
 
-CONTROL_HZ = 15.0
+CONTROL_HZ = 25.0
 """The rate every other MolmoBot-DROID rollout in this repository runs at.
 
 The action *scale* is tied to it -- the checkpoint was cloned from an expert
@@ -211,6 +211,21 @@ well above what the robot can do in a control period -- the robot lags a streame
 target by construction (see `digital_twin.py`), so a clamp near its actual speed
 would throttle every step rather than only the bad ones. `--step-limit-scale`
 tightens all four together.
+"""
+
+SLOW_SPEED_SCALE = 0.4
+"""What `--slow` multiplies every commanded velocity and acceleration by.
+
+60% slower than the profile the joint would otherwise run, which is its `max`.
+Both numbers, not just the velocity: scaling the speed alone leaves every motion
+starting and stopping as sharply as it did, and the abruptness is most of what
+makes a robot driven by a policy feel fast in a room with people in it.
+
+It changes how the robot *follows*, not what it is asked for. The targets are the
+same targets -- so a slower robot lags further behind a stream that is still
+running at 15Hz, and the policy sees a gripper that has not arrived yet, which is
+a real difference in what it is closing its loop on. Read a slow rollout as a
+rehearsal, not as a measurement.
 """
 
 MAX_BASE_SPEED_MPS = 0.25
@@ -814,11 +829,15 @@ class RobotCommander:
         step_limit_scale: float = 1.0,
         include_base: bool = False,
         control_period_s: float = 1.0 / CONTROL_HZ,
+        speed_scale: float = 1.0,
     ) -> None:
+        from examples.digital_twin import EOA_ACCELERATION_R, EOA_VELOCITY_R
+
         self.robot = robot
         self.gripper = gripper
         self.include_base = include_base
         self.control_period_s = control_period_s
+        self.speed_scale = float(speed_scale)
         self.step_limits = {
             group: value * step_limit_scale for group, value in MAX_TARGET_STEP.items()
         }
@@ -826,12 +845,24 @@ class RobotCommander:
         self.last_sent: dict[str, float] = {}
 
         # Read once. They come out of the robot's own parameters, which do not
-        # change while it is up, and the reads walk a nested dict per joint.
-        self._lift_limits = self._motion_limits("lift")
-        self._arm_limits = self._motion_limits("arm")
+        # change while it is up, and the reads walk a nested dict per joint. Kept
+        # at full rate as well as scaled, because a stop is not a motion to make
+        # gently -- see `hold`.
+        self._lift_max = self._motion_limits("lift")
+        self._arm_max = self._motion_limits("arm")
+        self._eoa_max = (EOA_VELOCITY_R, EOA_ACCELERATION_R)
+        self._lift_limits = self._scaled(self._lift_max)
+        self._arm_limits = self._scaled(self._arm_max)
+        self._eoa_limits = self._scaled(self._eoa_max)
+
+    def _scaled(
+        self, limits: tuple[float | None, float | None]
+    ) -> tuple[float | None, float | None]:
+        """`limits` at `speed_scale`. A `None` stays `None` -- see `_motion_limits`."""
+        return tuple(None if value is None else value * self.speed_scale for value in limits)
 
     def _motion_limits(self, subsystem: str) -> tuple[float | None, float | None]:
-        """`(velocity, acceleration)` from the joint's `max` profile.
+        """`(velocity, acceleration)` from the joint's `max` profile, unscaled.
 
         `digital_twin.DigitalTwin._joint_motion_limits`, including the lift's
         backed-off acceleration -- the puppet teleop does not run the lift at its
@@ -841,6 +872,14 @@ class RobotCommander:
 
         params = getattr(getattr(self.robot, subsystem, None), "params", None)
         if not isinstance(params, dict):
+            # `None` is not zero: `move_to` reads it as "no limit given" and uses
+            # the joint's own default profile, which is what this had before it
+            # could find the parameters. `--slow` cannot scale a number that was
+            # never read, and says so rather than multiplying `None`.
+            log.warning(
+                f"[robot] no motion parameters for {subsystem}; it will move at its "
+                "default profile, and --slow will not apply to it."
+            )
             return None, None
         motion = params.get("motion", {}).get(MOTION_PROFILE, {})
         velocity, acceleration = motion.get("vel_m"), motion.get("accel_m")
@@ -850,8 +889,7 @@ class RobotCommander:
 
     def send(self, targets: dict[str, np.ndarray], measured: dict[str, float]) -> dict[str, float]:
         """One step's targets. Returns what was actually commanded, in robot units."""
-        from examples.digital_twin import EOA_ACCELERATION_R, EOA_VELOCITY_R
-
+        eoa_velocity, eoa_acceleration = self._eoa_limits
         commanded: dict[str, float] = {}
 
         if "lift" in targets:
@@ -876,9 +914,7 @@ class RobotCommander:
                 value = self._clamp("wrist", sign * float(wrist[index]), measured[name])
                 self._check(
                     name,
-                    self.robot.end_of_arm.move_to(
-                        name, value, EOA_VELOCITY_R, EOA_ACCELERATION_R
-                    ),
+                    self.robot.end_of_arm.move_to(name, value, eoa_velocity, eoa_acceleration),
                 )
                 commanded[name] = value
 
@@ -890,7 +926,7 @@ class RobotCommander:
             self._check(
                 GRIPPER_JOINT,
                 self.robot.end_of_arm.move_to(
-                    GRIPPER_JOINT, value, EOA_VELOCITY_R, EOA_ACCELERATION_R
+                    GRIPPER_JOINT, value, eoa_velocity, eoa_acceleration
                 ),
             )
             commanded["gripper_pct"] = value
@@ -941,18 +977,24 @@ class RobotCommander:
 
         `measured` comes from the mirror's last sync; without one (a stop before
         any frame arrived) there is nothing to hold at and only the base is told.
+
+        **At full rate, whatever `--slow` says.** `--slow` is about how briskly
+        the robot goes about the task; a stop is not part of the task, and a
+        deceleration scaled down by the same factor is a stop that takes two and a
+        half times as long to arrive. The targets here are where the joints
+        already are, so the full profile is a deceleration and not a lurch.
         """
         try:
-            from examples.digital_twin import EOA_ACCELERATION_R, EOA_VELOCITY_R
+            eoa_velocity, eoa_acceleration = self._eoa_max
 
             if measured is not None:
-                velocity, acceleration = self._lift_limits
+                velocity, acceleration = self._lift_max
                 self.robot.lift.move_to(measured["lift"], v_m=velocity, a_m=acceleration)
-                velocity, acceleration = self._arm_limits
+                velocity, acceleration = self._arm_max
                 self.robot.arm.move_to(measured["arm"], v_m=velocity, a_m=acceleration)
                 for name in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
                     self.robot.end_of_arm.move_to(
-                        name, measured[name], EOA_VELOCITY_R, EOA_ACCELERATION_R
+                        name, measured[name], eoa_velocity, eoa_acceleration
                     )
             if self.include_base:
                 self.robot.omnibase.set_velocity(0.0, 0.0, 0.0)
@@ -1507,10 +1549,17 @@ class RealStretchRunner:
             group: np.asarray(self.mirror.view.get_move_group(group).joint_pos, dtype=float)
             for group in ("lift", "arm", "wrist", "gripper")
         }
+        # Which branch the wrist settled in, because the difference is a hand
+        # turned most of the way over and it is the first thing about the home
+        # pose anyone notices. Under `jaw_mode="auto"` it is the solver's choice
+        # rather than anything asked for at the command line -- see `--jaw-mode`.
+        branch = "flipped" if self.proxy.jaw_flipped else "upright"
         click.echo(
-            f"Moving to the Franka home pose. Residual (dx dy dz | drx dry drz): "
+            f"Moving to the Franka home pose. Jaw: {branch} "
+            f"({self.proxy.jaw_mode}). Residual (dx dy dz | drx dry drz): "
             f"{np.round(residual, 4).tolist()}"
         )
+        self._report_start_pose()
         click.echo(f"  targets: {({k: np.round(v, 3).tolist() for k, v in targets.items()})}")
 
         # Streamed at the control rate rather than sent once, for the reason
@@ -1537,6 +1586,40 @@ class RealStretchRunner:
             self.last_measured = self.mirror.sync(observation)
         self.proxy.reset()
         self.pause("at the home pose")
+
+    def _report_start_pose(self) -> None:
+        """Say how far the start pose is from the Franka's home, in the policy's own units.
+
+        The residual above is a *tool pose* error, and it is not what the
+        checkpoint reads. What it reads is seven Franka joint angles out of
+        `franka_joint_pos()`, and the question that decides whether an episode
+        begins where the policy expects is how far those are from the home
+        configuration it was trained to start from -- measured against
+        `relative_max_joint_delta`, the per-joint bound its own action scaling
+        applies, because a joint further out than that is one the first chunk
+        spends steps walking back rather than reaching with.
+
+        Expect one joint to be out and the rest to be close. Stretch's wrist roll
+        runs into its stop holding the Franka's home orientation, and the shortfall
+        lands almost entirely in the Franka's last joint -- a roll about the
+        approach axis, which is the axis a parallel jaw cares least about.
+        """
+        reported = np.asarray(self.proxy.get_move_group("arm").joint_pos, dtype=float)
+        home = np.asarray(self.proxy.franka.init_qpos, dtype=float)
+        delta = np.abs(reported - home)
+        clamp = np.asarray(
+            getattr(self.policy, "relative_max_joint_delta", 0.2), dtype=float
+        ).reshape(-1)
+        clamp = float(clamp[0]) if clamp.size else 0.2
+        worst = int(np.argmax(delta))
+        over = int(np.sum(delta > clamp))
+        click.secho(
+            f"  the policy reads the arm {delta.max():.3f} rad from the Franka's home at "
+            f"its worst joint (fr3_joint{worst + 1}); {over} of 7 are beyond its "
+            f"{clamp:.2f} rad per-step clamp.",
+            fg="yellow" if over > 1 else "green",
+        )
+        click.echo(f"  per joint: {np.round(delta, 3).tolist()}")
 
     def _at_targets(self, targets: dict[str, np.ndarray], measured: dict[str, float]) -> bool:
         reached = {
@@ -1847,7 +1930,11 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     type=click.Choice(list(fr.JAW_MODES)),
     default="auto",
     show_default=True,
-    help="Which way round the jaw is held. See franka_retarget.JAW_MODES.",
+    help="Which way round the jaw is held. 'auto' lets the IK pick the branch that "
+    "reaches each target best, which is usually the half-turned one -- so the hand "
+    "coming out rolled over is this, not a pose convention -- and it may change branch "
+    "mid-run, which on hardware is a sudden large roll of the wrist and its cameras. "
+    "'flipped' and 'upright' pin it. See franka_retarget.JAW_MODES.",
 )
 @click.option(
     "--snap-to-franka-home/--no-snap-to-franka-home",
@@ -1856,11 +1943,39 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     help="Move the arm to the Franka's home pose before the first instruction. This is a "
     "real motion of the real robot, and it is the first thing to watch.",
 )
-@click.option("--change_franka_start_pose_flip_wrist", is_flag=True)
-@click.option("--change_franka_start_pose_limit_height", is_flag=True)
-@click.option("--change_stretch_start_pose_flip_wrist", is_flag=True)
-@click.option("--change_stretch_start_pose_pitch_deg", type=float, default=0.0)
-@click.option("--keep_flipped_wrist_camera_frame", is_flag=True)
+@click.option(
+    "--change_franka_start_pose_flip_wrist",
+    is_flag=True,
+    help="Roll the Franka's start pose half a turn about its approach axis, which moves "
+    "where `home` puts the arm.",
+)
+@click.option(
+    "--change_franka_start_pose_limit_height",
+    is_flag=True,
+    help="Cap the Franka's start tool height at Stretch's own reach ceiling "
+    "(1.0824 m). `home` then leaves the lift at its stop by construction, so any action "
+    "asking for more height is unreachable and says so.",
+)
+@click.option(
+    "--change_stretch_start_pose_flip_wrist",
+    is_flag=True,
+    help="No effect here. It rolls the wrist of a Stretch *spawned in simulation*, and "
+    "on hardware there is no spawn -- the arm starts wherever it is, and `home` decides "
+    "the start pose. Accepted so a sim command line can be pasted unchanged.",
+)
+@click.option(
+    "--change_stretch_start_pose_pitch_deg",
+    type=float,
+    default=0.0,
+    help="Pitch the wrist by this many degrees about the jaw line at the start pose, "
+    "i.e. at `home`. Does not change the frame actions are interpreted in.",
+)
+@click.option(
+    "--keep_flipped_wrist_camera_frame",
+    is_flag=True,
+    help="Feed the policy the wrist frame as the camera produced it while the jaw is "
+    "half-turned, instead of turning it back upright.",
+)
 @click.option(
     "--map_franka_wrist_to_flipped_stretch4_wrist",
     is_flag=True,
@@ -1868,6 +1983,13 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "The conventions above are franka_retarget.PoseConventions, spelled as "
     "params_search_side_by_side.py spells them, so a run here can be given the same "
     "ones a sim comparison was run with.",
+)
+@click.option(
+    "--slow",
+    is_flag=True,
+    help="Move at 40% of the robot's max profile -- 60% slower, in both velocity and "
+    "acceleration. The targets are unchanged, so the robot lags a 15Hz stream further; "
+    "read a slow rollout as a rehearsal rather than a measurement.",
 )
 @click.option(
     "--step-limit-scale",
@@ -1930,6 +2052,7 @@ def main(
     change_stretch_start_pose_pitch_deg: float,
     keep_flipped_wrist_camera_frame: bool,
     map_franka_wrist_to_flipped_stretch4_wrist: bool,
+    slow: bool,
     step_limit_scale: float,
     max_obs_age: float,
     rerun: bool,
@@ -1954,6 +2077,11 @@ def main(
     click.echo(f"  robot      : {where}")
     click.echo(f"  head       : {head_mode}, crop {crop_to or 'none'}")
     click.echo(f"  rate       : {control_hz} Hz")
+    click.echo(
+        f"  speed      : {SLOW_SPEED_SCALE * 100:.0f}% of the max profile (--slow)"
+        if slow
+        else "  speed      : the robot's max profile"
+    )
     click.echo(f"  python     : {sys.executable}")
     conventions = _publish_conventions(
         change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
@@ -2054,6 +2182,7 @@ def main(
             step_limit_scale=step_limit_scale,
             include_base=include_base,
             control_period_s=1.0 / control_hz,
+            speed_scale=SLOW_SPEED_SCALE if slow else 1.0,
         )
     )
 
