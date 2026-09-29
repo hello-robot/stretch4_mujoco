@@ -633,6 +633,7 @@ class MujocoServer:
         profiles: dict[str, TrapezoidalProfile] = {}
         self.joint_profile_defaults: dict[str, tuple[float, float]] = {}
         self.joint_profile_ceilings: dict[str, tuple[float, float]] = {}
+        self.joint_profile_travel: dict[str, tuple[float, float]] = {}
         for i in range(self.mjmodel.nu):
             name = mujoco._functions.mj_id2name(
                 self.mjmodel, mujoco._enums.mjtObj.mjOBJ_ACTUATOR, i
@@ -654,7 +655,23 @@ class MujocoServer:
                 name, profile="max", settings=self.robot_settings
             )
             self.joint_profile_ceilings[name] = ceiling if ceiling else (max_vel, max_accel)
+            # How far the setpoint may travel. Every joint on the robot bounds its
+            # own setpoint -- `FeetechSMHello.move_to` clips `x_des` to the servo's
+            # soft motion limits, and the stepper firmware clips `cmd.x_des` to
+            # `motion_limits` before handing it to the motion generator -- so a
+            # held jog parks at the limit instead of winding past it.
+            if self.mjmodel.actuator_ctrllimited[i]:
+                low, high = self.mjmodel.actuator_ctrlrange[i]
+                self.joint_profile_travel[name] = (float(low), float(high))
         return profiles
+
+    def _clamp_to_travel(self, actuator_name: str, pos: float) -> float:
+        """Clip a setpoint to the actuator's range, as the robot clips to its limits."""
+        travel = self.joint_profile_travel.get(actuator_name)
+        if travel is None:
+            return pos
+        low, high = travel
+        return min(max(pos, low), high)
 
     def _apply_profile_limits(
         self, actuator_name: str, profile: TrapezoidalProfile, vel, accel
@@ -740,7 +757,7 @@ class MujocoServer:
             self.mjdata.actuator(actuator_name).ctrl = pos
         else:
             self._apply_profile_limits(actuator_name, profile, max_vel, max_accel)
-            profile.set_target_position(pos)
+            profile.set_target_position(self._clamp_to_travel(actuator_name, pos))
 
     def _set_actuator_velocity(
         self,
@@ -764,9 +781,32 @@ class MujocoServer:
             profile.set_target_velocity(vel)
 
     def _update_joint_profiles(self, dt: float) -> None:
-        """Advance every profile one control interval and write out the setpoints."""
+        """Advance every profile one control interval and write out the setpoints.
+
+        A jog integrates its own position, so unlike a position goal it can walk
+        the setpoint past the end of the joint's travel and keep going -- holding
+        the gripper button drove `ctrl` to 2.11 on an actuator whose `ctrlrange`
+        stops at 0.5. MuJoCo clamps what it actuates, so the joint stayed put, but
+        the setpoint did not: reversing then had to unwind all of that before the
+        joint moved, and grip force grew without bound while it was held.
+
+        The robot stops at the limit instead, and keeps no wind-up to unwind:
+        `PrismaticJoint._step_vel_braking` brakes a velocity command as the joint
+        approaches its soft limit. This is that without the taper -- the setpoint
+        stops dead at the limit rather than easing into it.
+        """
         for name, profile in self.joint_profiles.items():
-            self.mjdata.actuator(name).ctrl = profile.update(dt)
+            pos = profile.update(dt)
+            if profile.mode == profile.VELOCITY:
+                # Position goals are already clipped in `_set_actuator_position`;
+                # only an integrating jog can run off the end. `set_position()`
+                # parks the setpoint on the limit and zeroes the velocity, so
+                # there is nothing to unwind when the jog reverses.
+                clamped = self._clamp_to_travel(name, pos)
+                if clamped != pos:
+                    profile.set_position(clamped)
+                    pos = clamped
+            self.mjdata.actuator(name).ctrl = pos
 
     def update_joint_limits(self):
         limits = {}

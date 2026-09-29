@@ -379,9 +379,6 @@ class CommandStretchGripperPosition:
 
     def _move(self, dx_rad, robot: "StretchMujocoSimulator"):
         scale = 1.0 - 0.75 * self.precision_mode
-        # Same per-tick-step -> jog-speed conversion as CommandFeetechJoint, and
-        # for the same reason: chained move_by deltas leave the fingers trailing
-        # the button and still closing after it is let go.
         v_rad = dx_rad * scale / DEFAULT_STEP_SLEEP
         v_rad = max(-self.gripper_vel, min(self.gripper_vel, v_rad))
         self._get_subsystem(robot).set_velocity(v_rad, self.gripper_accel)
@@ -394,12 +391,7 @@ class CommandStretchGripperPosition:
         self._move(-self.gripper_step_rad, robot)
 
     def stop_gripper(self, robot: "StretchMujocoSimulator"):
-        """The robot quick-stops the servo here.
-
-        A zero jog holds the commanded aperture where it is, so a grasp keeps its
-        squeeze: the profile stops advancing the setpoint but does not give any of
-        it back, which is what keeps position error -- and grip force -- built up.
-        """
+        """The robot quick-stops the servo here."""
         if self.stop_reqd:
             self._get_subsystem(robot).set_velocity(0.0, self.gripper_accel)
             self.stop_reqd = False
