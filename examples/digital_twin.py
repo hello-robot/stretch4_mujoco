@@ -1,6 +1,8 @@
 """
 Digital twin: keep a real Stretch 4 and the MuJoCo sim in sync.
 
+Requires the `digital-twin` extra: `uv pip install -e ".[digital-twin]"`.
+
 The bridge runs in two independent directions, selected with `--controller`:
 
 sim -> robot (`--controller sim`)
@@ -44,7 +46,6 @@ The mechanism follows `stretch4_body/tools/stretch_puppet_teleop.py`: connect a
 positions with generous velocity and acceleration limits, and `push_command()`
 once per control cycle.
 
-Requires the `digital-twin` extra: `uv pip install -e ".[digital-twin]"`.
 """
 
 from __future__ import annotations
@@ -59,6 +60,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
+import mujoco
+import numpy as np
 
 from stretch4_mujoco.config import robot_settings_se4
 from stretch4_mujoco.enums.actuators import Actuators
@@ -794,6 +797,753 @@ class DigitalTwin:
             click.secho(f"Could not stop the robot's base: {exception}", fg="red")
 
 
+# =============================================================================
+# Drawing robots in Rerun
+# =============================================================================
+
+GHOST_ALPHA = 0.35
+"""How opaque an overlaid robot is drawn, where 1.0 is the model's own colours.
+
+Two robots standing inside one another are only readable if the one in front can
+be seen through. At full opacity the overlay covers exactly the part of the other
+robot the picture exists to compare it with, and the render is of one robot with
+another known to be somewhere behind it.
+"""
+
+OVERLAY_ALPHA = 0.6
+"""The same, for a robot that is *coincident* with the one underneath rather than near it.
+
+A digital twin that is working draws its two robots in the same place to within a
+millimetre, which is the one case the ghost alpha above is wrong for: two
+surfaces at the same depth, and the translucent one reads as a faint sheen on
+the solid one rather than as a robot. Solid enough to be the thing you are
+looking at, sheer enough to see the other through -- and the moment the two do
+separate, which is what the view is for, it is unmistakable.
+"""
+
+REAL_ROBOT_COLOR = (0.62, 0.42, 0.98)
+"""What the real robot's URDF is drawn in, against the simulated robot's own colours.
+
+Translucency alone is not enough to tell two Stretches apart: they are the same
+grey plastic and white metal in the same pose, and at a camera distance that
+frames the gripper there is not much of either in shot. So the real robot is
+painted one colour outright, and its tool ball is painted the same -- which says
+which robot that ball belongs to without a legend. The simulated one keeps its
+real colours, being the one whose model is under question.
+"""
+
+SIM_TOOL_COLOR = (1.00, 0.35, 0.10)
+"""The simulated robot's tool centre."""
+
+
+def visual_geoms(model, root_body: str) -> list[int]:
+    root = model.body(root_body).id
+    inside = [False] * model.nbody
+    # MuJoCo orders bodies parents-first, so one pass settles every descendant.
+    for body in range(model.nbody):
+        inside[body] = body == root or (body > 0 and inside[model.body_parentid[body]])
+
+    solid = [
+        geom
+        for geom in range(model.ngeom)
+        if inside[model.geom_bodyid[geom]]
+        and int(model.geom_type[geom])
+        not in (mujoco.mjtGeom.mjGEOM_PLANE, mujoco.mjtGeom.mjGEOM_HFIELD)
+    ]
+    visual = [
+        geom for geom in solid if not (model.geom_contype[geom] or model.geom_conaffinity[geom])
+    ]
+    return visual or solid
+
+
+def geom_color(model, geom: int) -> np.ndarray:
+    """A geom's RGBA, taking the material's where it has one.
+
+    A geom with a material carries `rgba` values the renderer ignores, so reading
+    `geom_rgba` alone paints most of an arm the MJCF's default off-white.
+    """
+    material = int(model.geom_matid[geom])
+    rgba = model.mat_rgba[material] if material >= 0 else model.geom_rgba[geom]
+    return np.asarray(rgba, dtype=float)
+
+
+def rgba8(color) -> list[int]:
+    """A float RGB or RGBA sequence as the 0-255 integers Rerun wants."""
+    return [int(round(float(channel) * 255)) for channel in color]
+
+
+class RerunMujocoRobot:
+
+    def __init__(
+        self,
+        rr,
+        model,
+        root_body: str,
+        path: str,
+        tint=None,
+        alpha: float = GHOST_ALPHA,
+    ) -> None:
+        """`tint` repaints every geom one colour, at `alpha`. None keeps the model's own."""
+        self._rr = rr
+        self.model = model
+        self.path = path
+        self.geoms = visual_geoms(model, root_body)
+        self._paths: dict[int, str] = {}
+        for geom in self.geoms:
+            name = model.geom(geom).name or f"geom_{geom}"
+            self._paths[geom] = f"{path}/{name.replace('/', '_')}"
+            color = geom_color(model, geom) if tint is None else np.array([*tint[:3], alpha], float)
+            self._log_shape(self._paths[geom], geom, rgba8(color))
+
+    def _log_shape(self, path: str, geom: int, color: list[int]) -> None:
+        """One geom's shape, in its own frame, logged `static`.
+
+        MuJoCo's primitives are all centred on the geom frame and aligned with
+        its z -- except Rerun's capsule, which grows from the origin along +z,
+        hence the half-length shifted back. Anything else is skipped rather than
+        approximated: a shape drawn as the wrong shape is worse in a comparison
+        view than a shape that is not drawn.
+        """
+        rr, model = self._rr, self.model
+        kind = mujoco.mjtGeom(int(model.geom_type[geom]))
+        size = np.asarray(model.geom_size[geom], dtype=float)
+        if kind == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh = int(model.geom_dataid[geom])
+            vertex = int(model.mesh_vertadr[mesh])
+            vertices = int(model.mesh_vertnum[mesh])
+            face = int(model.mesh_faceadr[mesh])
+            faces = int(model.mesh_facenum[mesh])
+            rr.log(
+                path,
+                rr.Mesh3D(
+                    vertex_positions=model.mesh_vert[vertex : vertex + vertices],
+                    triangle_indices=model.mesh_face[face : face + faces],
+                    albedo_factor=color,
+                ),
+                static=True,
+            )
+        elif kind == mujoco.mjtGeom.mjGEOM_BOX:
+            rr.log(
+                path, rr.Boxes3D(half_sizes=[size], colors=[color], fill_mode="solid"), static=True
+            )
+        elif kind == mujoco.mjtGeom.mjGEOM_SPHERE:
+            rr.log(
+                path,
+                rr.Ellipsoids3D(half_sizes=[[size[0]] * 3], colors=[color], fill_mode="solid"),
+                static=True,
+            )
+        elif kind == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+            rr.log(
+                path,
+                rr.Ellipsoids3D(half_sizes=[size], colors=[color], fill_mode="solid"),
+                static=True,
+            )
+        elif kind == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            rr.log(
+                path,
+                rr.Cylinders3D(
+                    lengths=[2.0 * size[1]], radii=[size[0]], colors=[color], fill_mode="solid"
+                ),
+                static=True,
+            )
+        elif kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            rr.log(
+                path,
+                rr.Capsules3D(
+                    lengths=[2.0 * size[1]],
+                    radii=[size[0]],
+                    translations=[[0.0, 0.0, -size[1]]],
+                    colors=[color],
+                    fill_mode="solid",
+                ),
+                static=True,
+            )
+
+    def log(self, data) -> None:
+        """Where every drawn geom is now, from an `MjData` already forwarded."""
+        rr = self._rr
+        for geom, path in self._paths.items():
+            rr.log(
+                path,
+                rr.Transform3D(
+                    translation=data.geom_xpos[geom],
+                    mat3x3=data.geom_xmat[geom].reshape(3, 3),
+                ),
+            )
+
+    def body_pose(self, data, body: str) -> np.ndarray:
+        """One body's 4x4 pose in the model's world frame."""
+        index = self.model.body(body).id
+        pose = np.eye(4)
+        pose[:3, :3] = data.xmat[index].reshape(3, 3)
+        pose[:3, 3] = data.xpos[index]
+        return pose
+
+
+class RerunUrdfRobot:
+    """One `yourdfpy` URDF, drawn into a Rerun entity tree.
+
+    `stretch4_body/tools/stretch_joint_viz.py` in reusable form, and the same
+    static-geometry / per-tick-transform split as `RerunMujocoRobot`. What it
+    adds over drawing the MJCF twice is that this is the robot's *own*
+    description -- its batch, its tool, its meshes -- so a steady offset between
+    this and a MuJoCo model of the same robot is a real difference between the
+    model and the machine rather than a difference in joint angles.
+
+    Link poses are reported relative to `base_link` rather than the URDF's own
+    root, so that a caller can hang this off whatever it is comparing against and
+    have the two pinned together at the base by construction. Every millimetre
+    between the hands is then joint angles, and not an argument about odometry.
+    """
+
+    def __init__(
+        self,
+        rr,
+        urdf,
+        path: str,
+        tool_link: str = "grasp_center_link",
+        base_link: str = "base_link",
+        color=REAL_ROBOT_COLOR,
+        alpha: float = OVERLAY_ALPHA,
+    ) -> None:
+        self._rr = rr
+        self.urdf = urdf
+        self.path = path
+        self.tool_link = tool_link
+        self.base_link = base_link
+        self.links: list[str] = []
+        self.vertices = 0
+        """How much geometry actually reached the viewer. See `_log_meshes`."""
+        self._log_meshes(rgba8((*color[:3], alpha)))
+
+    def _log_meshes(self, color: list[int]) -> None:
+        """Every visual mesh, once, in its link's frame. Fills `links` and `vertices`.
+
+        Logged as `Mesh3D` from vertices `yourdfpy` has already loaded, rather
+        than as `Asset3D` pointing at the STL on disk. Three reasons, and the
+        first is the one that matters: this is the same archetype the MuJoCo half
+        of the view uses, so the two robots cannot end up rendering differently
+        for reasons to do with file formats. The mesh bytes are also already in
+        memory -- `URDF.load` parses them to build its scene -- so re-reading
+        them through a second loader buys nothing. And a vertex count is
+        something this class can report, where "the viewer was handed a path"
+        is not: a silently empty robot is exactly the failure that is hard to
+        see, because what it looks like is a view with one robot in it.
+
+        Links with no mesh are dropped rather than posed as empty entities: a
+        Stretch URDF carries a dozen millimetre placeholder boxes for camera
+        optical frames, and a view with those in it is a view with a dozen
+        unlabelled specks floating in it.
+        """
+        import trimesh
+
+        rr = self._rr
+        for name, link in self.urdf.link_map.items():
+            meshes = [
+                visual
+                for visual in link.visuals
+                if visual.geometry is not None
+                and visual.geometry.mesh is not None
+                and visual.geometry.mesh.filename
+            ]
+            if not meshes or name not in self.urdf.scene.graph.nodes:
+                continue
+            self.links.append(name)
+            for index, visual in enumerate(meshes):
+                path = f"{self.path}/{name}/mesh_{index}"
+                if visual.origin is not None:
+                    origin = np.asarray(visual.origin, dtype=float)
+                    rr.log(
+                        path,
+                        rr.Transform3D(translation=origin[:3, 3], mat3x3=origin[:3, :3]),
+                        static=True,
+                    )
+                try:
+                    # `force="mesh"` because an STL with several solids in it
+                    # loads as a `Scene`, which has no `.vertices` -- and a link
+                    # that came back as one would otherwise raise here and be
+                    # dropped from a robot that is only missing a part.
+                    mesh = trimesh.load(visual.geometry.mesh.filename, force="mesh")
+                    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+                    if visual.geometry.mesh.scale is not None:
+                        vertices = vertices * np.asarray(
+                            visual.geometry.mesh.scale, dtype=np.float32
+                        ).reshape(-1)
+                    rr.log(
+                        path,
+                        rr.Mesh3D(
+                            vertex_positions=vertices,
+                            triangle_indices=np.asarray(mesh.faces, dtype=np.uint32),
+                            vertex_normals=np.asarray(mesh.vertex_normals, dtype=np.float32),
+                            albedo_factor=color,
+                        ),
+                        static=True,
+                    )
+                    self.vertices += len(vertices)
+                except Exception as error:  # noqa: BLE001 - one missing mesh is not a run
+                    click.secho(
+                        f"Could not load {visual.geometry.mesh.filename}: {error}", fg="yellow"
+                    )
+
+    def pose_from_status(self, status: dict) -> None:
+        """Move onto the pose `RobotClient.status` describes.
+
+        The status-to-URDF conversion needs one thing only this object has: the
+        travel of the PG4's slide joint, which is a property of the description
+        being drawn rather than a constant. See `_parallel_gripper_fingers`.
+        """
+        self.pose(stretch_urdf_configuration(status, finger_limits=self.finger_limits))
+
+    @property
+    def finger_limits(self) -> tuple[float, float] | None:
+        """The PG4 slide joint's travel, or None on a URDF whose hand is not one."""
+        joint = self.urdf.joint_map.get("finger_left_joint")
+        if joint is None or joint.limit is None:
+            return None
+        return float(joint.limit.lower), float(joint.limit.upper)
+
+    def pose(self, configuration: dict[str, float]) -> None:
+        """Move the URDF's kinematics onto `configuration`, tolerating a bad name."""
+        try:
+            self.urdf.update_cfg(configuration)
+        except Exception as error:  # noqa: BLE001 - a bad joint name is not a run
+            click.secho(f"urdf.update_cfg refused {configuration}: {error}", fg="yellow")
+
+    def log(self, base_pose) -> np.ndarray | None:
+        """Draw the robot under `base_pose`, and return its tool pose in the world.
+
+        Re-logged every tick even when the joints have not moved, because the
+        parent may have: `base_pose` is where this robot's `base_link` is, and it
+        moves whenever the robot it is being compared against drives.
+        """
+        rr = self._rr
+        base_pose = np.asarray(base_pose, dtype=float)
+        rr.log(self.path, rr.Transform3D(translation=base_pose[:3, 3], mat3x3=base_pose[:3, :3]))
+        for link in self.links:
+            pose = self.relative(link)
+            if pose is not None:
+                rr.log(
+                    f"{self.path}/{link}",
+                    rr.Transform3D(translation=pose[:3, 3], mat3x3=pose[:3, :3]),
+                )
+        tool = self.relative(self.tool_link)
+        return None if tool is None else base_pose @ tool
+
+    def relative(self, link: str) -> np.ndarray | None:
+        """One link's pose in `base_link`, or None if it is not in the scene graph."""
+        try:
+            matrix, _ = self.urdf.scene.graph.get(link, self.base_link)
+        except Exception:  # noqa: BLE001 - a link off the graph is one not drawn
+            return None
+        return np.asarray(matrix, dtype=float)
+
+
+TOOL_FOR_GRIPPER_JOINT = {
+    "stretch_gripper": "eoa_wrist_dw4_tool_sg4",
+    "parallel_gripper": "eoa_wrist_dw4_tool_pg4",
+}
+
+
+def robot_gripper_joint(robot) -> str | None:
+    """Which gripper the robot's *server* says it has, or None if it has not said."""
+    status = getattr(robot, "status", None) or {}
+    end_of_arm = status.get("end_of_arm") or {}
+    for joint in TOOL_FOR_GRIPPER_JOINT:
+        if joint in end_of_arm:
+            return joint
+    return None
+
+
+def load_stretch_urdf(robot=None) -> tuple[object, tuple[str, str, str]]:
+    """This robot's own URDF, by the model, batch and tool its fleet directory names."""
+    import io
+
+    import stretch4_urdf
+    import yourdfpy
+    from stretch4_body.core.robot_params import RobotParams
+
+    _, params = RobotParams.get_params()
+    model, batch, tool = (
+        params["robot"]["model_name"],
+        params["robot"]["batch_name"],
+        params["robot"]["tool"],
+    )
+    tool = _tool_matching_robot(tool, robot)
+    default_batch = Stretch4MujocoSimulator.get_default_model_batch_tool_names()[1]
+    try:
+        contents = stretch4_urdf.get_urdf(
+            model, batch, tool, do_add_file_prefix_to_absolute_paths=False
+        )
+    except FileNotFoundError:
+        if batch == default_batch:
+            raise
+        click.secho(
+            f"               {model}/{batch} has no URDF description shipped, so the "
+            f"overlay is drawn from {model}/{default_batch} instead. Point "
+            "HELLO_FLEET_PATH at the robot's own fleet directory to draw its batch.",
+            fg="yellow",
+        )
+        batch = default_batch
+        contents = stretch4_urdf.get_urdf(
+            model, batch, tool, do_add_file_prefix_to_absolute_paths=False
+        )
+    return yourdfpy.URDF.load(io.StringIO(contents)), (model, batch, tool)
+
+
+def _tool_matching_robot(tool: str, robot) -> str:
+    reported = robot_gripper_joint(robot)
+    if reported is None:
+        return tool
+    wanted = TOOL_FOR_GRIPPER_JOINT[reported]
+    if tool.endswith(wanted.rsplit("_", 1)[-1]):
+        return tool
+    click.secho(
+        f"               the fleet directory says the tool is {tool}, but the robot is "
+        f"reporting a {reported}. Drawing {wanted} to match the robot -- check "
+        "HELLO_FLEET_PATH, or whether this robot's tool has been configured.",
+        fg="yellow",
+    )
+    return wanted
+
+
+def stretch_urdf_configuration(
+    status: dict,
+    gripper_joint: str | None = None,
+    finger_limits: tuple[float, float] | None = None,
+) -> dict[str, float]:
+    configuration = {
+        f"arm_l{segment}_joint": float(status["arm"]["pos"]) / 4.0 for segment in (1, 2, 3, 4)
+    }
+    configuration["lift_joint"] = float(status["lift"]["pos"])
+    end_of_arm = status.get("end_of_arm", {})
+    for joint, sign in (
+        ("wrist_yaw", 1.0),
+        ("wrist_pitch", 1.0),
+        ("wrist_roll", WRIST_ROLL_SIM_SIGN),
+    ):
+        if joint in end_of_arm:
+            configuration[f"{joint}_joint"] = sign * float(end_of_arm[joint].get("pos", 0.0))
+
+    if gripper_joint is None:
+        gripper_joint = next((j for j in TOOL_FOR_GRIPPER_JOINT if j in end_of_arm), None)
+    hand = end_of_arm.get(gripper_joint) or {}
+    if gripper_joint == "parallel_gripper":
+        configuration.update(_parallel_gripper_fingers(hand, finger_limits))
+    else:
+        # `gripper_conversion` is published beside the SG4's raw servo angle
+        # precisely so that nothing downstream has to redo the chord-over-radius
+        # that turns one into the other. `finger_rad` is the URDF's own units.
+        conversion = hand.get("gripper_conversion") or {}
+        if conversion.get("finger_rad") is not None:
+            finger = float(conversion["finger_rad"])
+            configuration["gripper_finger_left_joint"] = finger
+            configuration["gripper_finger_right_joint"] = finger
+    return configuration
+
+
+def _parallel_gripper_fingers(hand: dict, limits: tuple[float, float] | None) -> dict[str, float]:
+    pos_mm = hand.get("pos_mm")
+    if pos_mm is None or limits is None:
+        return {}
+    from stretch4_body.core.robot_params import RobotParams
+
+    _, params = RobotParams.get_params()
+    range_mm = float(params.get("parallel_gripper", {}).get("range_mm", 80.0)) or 80.0
+    lower, upper = limits
+    value = upper + (float(pos_mm) / range_mm) * (lower - upper)
+    return {"finger_left_joint": value, "finger_right_joint": value}
+
+
+SIM_ROOT_BODY = "stretch4"
+"""The body the simulated robot hangs off in `scene_stretch4.xml`."""
+
+SIM_ARM_SEGMENTS = 4
+"""How many telescoping segments carry the arm's extension in the MJCF.
+"""
+
+
+class DigitalTwinView:
+    """The twin in 3D: the simulated robot, and the real one drawn inside it."""
+
+    SIM = "world/sim"
+    REAL = "world/real"
+    BASE_LINK = "base_link"
+
+    def __init__(
+        self,
+        sim: Stretch4MujocoSimulator,
+        robot,
+        joints: tuple[MirroredJoint, ...] = MIRRORED_JOINTS,
+        gripper: "GripperMirror | None" = None,
+        scene_xml_path: str | None = None,
+        root_body: str = SIM_ROOT_BODY,
+        spawn: bool = True,
+        save_path: Path | None = None,
+    ) -> None:
+        """`joints` and `gripper` are the mirror's own, not this view's idea of them."""
+        import rerun as rr
+        import rerun.blueprint as rrb
+
+        self._rr = rr
+        self.sim = sim
+        self.robot = robot
+        self.joints = tuple(joints)
+        self.gripper = gripper
+        self.tick = 0
+
+        # A second copy of the scene, compiled here. The simulator runs MuJoCo in
+        # its own process and hands back a status dataclass, not an `MjData`, so
+        # there is no live model on this side to read geom poses out of -- this
+        # one is posed from that status and never stepped, exactly as
+        # `run_on_real_stretch.build_mirror` does for the real robot.
+        self.model = mujoco.MjModel.from_xml_path(
+            scene_xml_path or sim.scene_xml_path or Stretch4MujocoSimulator.get_scene_xml_path()
+        )
+        self.data = mujoco.MjData(self.model)
+        self.root_body = root_body
+        self._joints = self._joint_addresses()
+
+        rr.init("Stretch 4 digital twin", spawn=spawn and save_path is None)
+        if save_path is not None:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            rr.save(str(save_path))
+        rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+
+        self.sim_robot = RerunMujocoRobot(rr, self.model, root_body, self.SIM)
+        self.real_robot = self._load_real_robot(rr)
+        for path, color in (
+            ("world/tool/sim", SIM_TOOL_COLOR),
+            ("world/tool/real", REAL_ROBOT_COLOR),
+        ):
+            rr.log(f"{path}/frame", rr.TransformAxes3D(axis_length=0.08), static=True)
+            rr.log(
+                path,
+                rr.Points3D(positions=[[0.0, 0.0, 0.0]], radii=[0.012], colors=[rgba8(color)]),
+                static=True,
+            )
+        rr.send_blueprint(
+            rrb.Blueprint(
+                rrb.Horizontal(
+                    rrb.Spatial3DView(
+                        origin="world", name="sim (solid) and the real robot (violet)"
+                    ),
+                    rrb.Vertical(
+                        rrb.TimeSeriesView(
+                            origin="error", name="how far the robot is from the sim"
+                        ),
+                        self._joint_grid(rrb),
+                        row_shares=[1, 2],
+                    ),
+                    column_shares=[3, 2],
+                )
+            )
+        )
+
+    def _joint_grid(self, rrb):
+        """One plot per mirrored channel, tiled.
+
+        A single plot over `joint/` puts every channel on one pair of axes, which
+        is unreadable twice over: eleven lines in a space that has room for three,
+        and metres and radians sharing a y axis, so the lift's half-metre of
+        travel flattens a wrist's whole range into the baseline. Per channel,
+        each plot holds exactly the two lines that belong together -- where the
+        sim is and where the robot is -- on an axis scaled to that joint, which
+        is the comparison the view is named for.
+        """
+        plots = [
+            rrb.TimeSeriesView(origin=f"joint/{joint.name}", name=joint.name)
+            for joint in self.joints
+        ]
+        if self.gripper is not None:
+            plots.append(rrb.TimeSeriesView(origin=f"joint/{GRIPPER}", name=GRIPPER))
+        return rrb.Grid(
+            *plots,
+            # Two, so a tile stays wide enough to read a time axis on in the
+            # right-hand column of the window. Six channels is the usual case and
+            # lands as three rows of two.
+            grid_columns=min(2, len(plots)) or 1,
+            name="sim against robot, per joint",
+        )
+
+    def _load_real_robot(self, rr):
+        """The real robot's URDF drawing, or `None` and a reason why not.
+
+        An absent overlay is an ordinary outcome rather than a fault: a
+        workstation without `yourdfpy`, or a stand-in fleet directory naming
+        batch `nominal`, which ships no meshes. Either way the sim robot is still
+        worth watching, so this reports and returns.
+        """
+        try:
+            urdf, description = load_stretch_urdf(self.robot)
+        except Exception as error:  # noqa: BLE001 - one robot in the view is still a view
+            click.secho(f"  rerun      : no URDF overlay ({error}).", fg="yellow")
+            return None
+        drawing = RerunUrdfRobot(rr, urdf, self.REAL, base_link=self.BASE_LINK)
+        click.echo(
+            f"  rerun      : real robot {'/'.join(description)}, "
+            f"{len(drawing.links)} links, {drawing.vertices} vertices"
+        )
+        if not drawing.vertices:
+            # A URDF that parsed and drew nothing is the failure that looks like
+            # success: the view comes up, one robot is in it, and nothing says
+            # the other one is missing rather than hidden behind it.
+            click.secho(
+                "               none of its meshes loaded, so the overlay will be empty.",
+                fg="yellow",
+            )
+        return drawing
+
+    def _joint_addresses(self) -> dict[str, int]:
+        """`qpos` address for every model joint this view writes, by name.
+
+        Looked up once. A joint the model does not have is simply absent, and
+        `_pose_sim` skips it -- a scene built with the parallel gripper has no
+        `gripper_finger_*_joint`, and that is a hand this cannot draw open rather
+        than a run it should end.
+        """
+        wanted = [
+            "lift_joint",
+            *(f"arm_l{segment}_joint" for segment in range(1, SIM_ARM_SEGMENTS + 1)),
+            "wrist_yaw_joint",
+            "wrist_pitch_joint",
+            "wrist_roll_joint",
+            "gripper_finger_left_joint",
+            "gripper_finger_right_joint",
+        ]
+        addresses = {}
+        for name in wanted:
+            try:
+                addresses[name] = int(self.model.joint(name).qposadr[0])
+            except KeyError:
+                continue
+        return addresses
+
+    # -- one tick -----------------------------------------------------------
+
+    def _pose_sim(self, status) -> None:
+        """Write the simulator's reported joints into the local model and forward it.
+
+        `mj_forward` rather than `mj_step`: this model exists to be photographed
+        at the configuration the simulator is *in*, not to settle at one of its
+        own. The base goes in through the free joint rather than through an
+        entity transform so that the model's own `base_link` -- which is what the
+        real robot is hung off -- is in the same world as everything else here.
+        """
+        values = {
+            "lift_joint": status.lift.pos,
+            "wrist_yaw_joint": status.wrist_yaw.pos,
+            "wrist_pitch_joint": status.wrist_pitch.pos,
+            "wrist_roll_joint": status.wrist_roll.pos,
+            "gripper_finger_left_joint": status.gripper_left_finger.pos,
+            "gripper_finger_right_joint": status.gripper_right_finger.pos,
+        }
+        for segment in range(1, SIM_ARM_SEGMENTS + 1):
+            values[f"arm_l{segment}_joint"] = status.arm.pos / SIM_ARM_SEGMENTS
+        for name, value in values.items():
+            if name in self._joints:
+                self.data.qpos[self._joints[name]] = float(value)
+
+        free = self.model.body(self.root_body).jntadr[0]
+        if free >= 0 and self.model.jnt_type[free] == mujoco.mjtJoint.mjJNT_FREE:
+            address = int(self.model.jnt_qposadr[free])
+            half = status.base.theta / 2.0
+            self.data.qpos[address : address + 2] = (status.base.x, status.base.y)
+            self.data.qpos[address + 2] = self.model.qpos0[address + 2]
+            self.data.qpos[address + 3 : address + 7] = (math.cos(half), 0.0, 0.0, math.sin(half))
+        mujoco.mj_forward(self.model, self.data)
+
+    def log(self, sim_status) -> None:
+        """One tick of the view: both robots, both tool centres, and the errors.
+
+        The channels are the mirror's own `MirroredJoint` entries, taken at
+        construction, so the plots carry the same `sign` convention the mirror
+        does -- a view that disagreed with it about which way a wrist rolls would
+        be reporting the twin broken when it was not.
+        """
+        rr = self._rr
+        self.tick += 1
+        rr.set_time("tick", sequence=self.tick)
+        rr.set_time("wall_time", timestamp=time.time())
+
+        self._pose_sim(sim_status)
+        self.sim_robot.log(self.data)
+        sim_tool = self.sim_robot.body_pose(self.data, "grasp_center_link")
+        self._log_tool("world/tool/sim", sim_tool)
+
+        status = getattr(self.robot, "status", None)
+        real_tool = None
+        if self.real_robot is not None and status:
+            self.real_robot.pose_from_status(status)
+            real_tool = self.real_robot.log(self.sim_robot.body_pose(self.data, self.BASE_LINK))
+            self._log_tool("world/tool/real", real_tool)
+
+        if real_tool is not None:
+            gap = float(np.linalg.norm(real_tool[:3, 3] - sim_tool[:3, 3]))
+            rr.log("error/tool_gap_m", rr.Scalars(gap))
+            rr.log(
+                "world/tool/gap",
+                rr.LineStrips3D(
+                    [[sim_tool[:3, 3], real_tool[:3, 3]]],
+                    radii=[0.003],
+                    colors=[[255, 255, 255, 255]],
+                    labels=[f"{gap * 1000:.0f} mm"],
+                ),
+            )
+
+        self._log_joints(sim_status, status)
+
+    def _log_joints(self, sim_status, status) -> None:
+        """Both sides of every mirrored joint, and the difference, as scalars.
+
+        The `_report` table this example already prints at 2Hz, plotted instead:
+        the same three numbers per joint, on a timeline, where a channel that
+        stops tracking is a line that separates rather than a row that has to be
+        noticed going past.
+        """
+        rr = self._rr
+        for joint in self.joints:
+            simulated = joint.actuator.get_position(sim_status)
+            rr.log(f"joint/{joint.name}/sim", rr.Scalars(float(simulated)))
+            measured = self._robot_position(joint, status)
+            if measured is None:
+                continue
+            measured = joint.sign * measured
+            rr.log(f"joint/{joint.name}/robot", rr.Scalars(float(measured)))
+            rr.log(f"error/{joint.name}", rr.Scalars(abs(float(measured - simulated))))
+
+        if self.gripper is not None:
+            simulated = Actuators.gripper.get_position(sim_status)
+            rr.log(f"joint/{GRIPPER}/sim", rr.Scalars(float(simulated)))
+            measured = self.gripper.robot_position()
+            if measured is not None:
+                measured = self.gripper.to_sim(measured)
+                rr.log(f"joint/{GRIPPER}/robot", rr.Scalars(float(measured)))
+                rr.log(f"error/{GRIPPER}", rr.Scalars(abs(float(measured - simulated))))
+
+    @staticmethod
+    def _robot_position(joint: MirroredJoint, status) -> float | None:
+        """`joint`'s position out of `RobotClient.status`, in robot units.
+
+        The same lookup `DigitalTwin._robot_position` makes, off the status dict
+        rather than off the client, so this view can be given a status it has
+        already pulled instead of pulling one of its own inside a control loop.
+        """
+        if not status:
+            return None
+        try:
+            if joint.subsystem == "end_of_arm":
+                return status["end_of_arm"][joint.name]["pos"]
+            return status[joint.subsystem]["pos"]
+        except (KeyError, TypeError):
+            return None
+
+    def _log_tool(self, path: str, pose) -> None:
+        if pose is None:
+            return
+        pose = np.asarray(pose, dtype=float)
+        self._rr.log(path, self._rr.Transform3D(translation=pose[:3, 3], mat3x3=pose[:3, :3]))
+
+
 def _add(a, b):
     """Accumulate two relative motions, scalar or (dx, dy)."""
     if isinstance(a, tuple):
@@ -860,7 +1610,29 @@ def _connect(robot_ip: str | None):
     help="How to drive the sim. Use 'none' to drive it from your own script instead.",
 )
 @click.option("--scene-xml-path", type=str, default=None, help="Path to the scene xml file")
-@click.option("--headless", is_flag=True, help="Run the sim without a viewer")
+@click.option(
+    "--rerun/--no-rerun",
+    default=True,
+    show_default=True,
+    help="Open a Rerun window showing the simulated robot with the real robot's own URDF "
+    "drawn inside it, and the per-joint gap between them. Needs rerun-sdk, and yourdfpy "
+    "for the overlay.",
+)
+@click.option(
+    "--rrd",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write the Rerun stream to this .rrd file instead of opening a window. Implies "
+    "--rerun.",
+)
+@click.option(
+    "--headless/--viewer",
+    default=True,
+    show_default=True,
+    help="Run the sim without MuJoCo's own viewer. On by default because --rerun is: the "
+    "Rerun window shows the simulated robot and the real one together, which is what the "
+    "MuJoCo viewer cannot do. --viewer brings it back alongside.",
+)
 @click.option("--rate_hz", type=float, default=30.0, help="Control rate of the bridge")
 @click.option("--no_prompt", is_flag=True, help="Skip the confirmation before the robot may move")
 @click.option(
@@ -875,6 +1647,8 @@ def main(
     joints: str,
     teleop: str,
     scene_xml_path: str | None,
+    rerun: bool,
+    rrd: Path | None,
     headless: bool,
     rate_hz: float,
     no_prompt: bool,
@@ -906,6 +1680,7 @@ def main(
 
     sim = Stretch4MujocoSimulator(scene_xml_path=scene_xml_path)
     twin = None
+    view = None
     teleop_controller = None
     try:
         sim.start(headless=headless)
@@ -915,6 +1690,21 @@ def main(
             raise SystemExit("The MuJoCo simulator did not start. Nothing to mirror.")
 
         twin = DigitalTwin(sim, robot, controller=controller, groups=groups, debug=debug)
+
+        if rerun or rrd is not None:
+            # After the twin, because the view is laid out around the channels
+            # the twin is actually mirroring and reads the real hand through the
+            # `GripperMirror` it built; and before the sync, so the view's first
+            # tick is the two robots as they were when the run started rather
+            # than after one of them has jumped.
+            view = DigitalTwinView(
+                sim,
+                robot,
+                joints=twin.joints,
+                gripper=twin.gripper,
+                scene_xml_path=scene_xml_path,
+                save_path=rrd,
+            )
 
         click.echo("Synchronizing the sim to the robot...")
         twin.sync_sim_to_robot()
@@ -948,6 +1738,12 @@ def main(
         while sim.is_running():
             start = time.perf_counter()
             twin.step()
+            if view is not None:
+                # Off the status both sides have just pulled in `twin.step()`,
+                # rather than pulling again: a second `pull_status` here would
+                # cost a round trip per tick and would draw a robot at a
+                # different instant from the one the twin just acted on.
+                view.log(sim.pull_status())
             elapsed = time.perf_counter() - start
             if elapsed < period:
                 time.sleep(period - elapsed)
