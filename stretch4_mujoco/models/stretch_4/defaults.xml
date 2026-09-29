@@ -16,17 +16,6 @@
         <velocity kv="1" gear="6" forcerange="-100 100" />
         <position kp="1" gear="6" forcerange="-100 100"/>
       </default>
-      <!-- Actuator gains are tuned so each joint tracks its commanded setpoint
-           promptly, because since the trapezoidal profiles landed the setpoint is
-           what carries the intended motion: a joint that trails it by 100ms makes
-           every command feel 100ms late no matter what the profile does.
-
-           For a position actuator the lag in following a ramp is (kv + joint
-           damping) / kp, and the damping ratio is (kv + damping) / (2*sqrt(kp*M)).
-           kv is picked per joint for a damping ratio near 1 against that joint's
-           own inertia (M, from the compiled model), so the joints track closely
-           without ringing -- the wrists have no gravity compensation and will
-           swing through a target if left underdamped. -->
       <default class="lift">
         <joint damping="20" stiffness="0.03" armature="0.01" frictionloss="1.5" />
         <general forcerange="-200 200" />
@@ -89,39 +78,10 @@
             <position ctrlrange="0.0 0.5" kp="500" kv="20" forcerange="-30 30"/>
           </default>
         </default>
-        <!-- The SG4's rubber fingertips hang off the fingers on a pair of passive
-             hinges (one per bending axis) so the pad can align itself with whatever
-             it is pressed against. The pad weighs 15 g and its inertia about those
-             hinges is only ~1e-6 kg m^2, which is light enough that a grasp or a
-             bump throws it around unless the joint is conditioned for it:
-
-               armature    raises the inertia the solver sees on the DOF. A few
-                           newtons of contact acting on a 1e-6 kg m^2 DOF is a
-                           numerically stiff problem at a 2 ms timestep, and what
-                           comes out is the pad whipping about. 2e-5 is roughly the
-                           pad's own mass at its own radius, so the pad still gives
-                           readily, it just stops being near-massless.
-               stiffness   returns the pad to straight. At 1 N m/rad a typical
-                           ~0.1 N m grasp load sits near 6 deg, inside the travel,
-                           rather than parked against the stop as it did at 0.1.
-               damping     is ~critical for that stiffness and inertia, so the pad
-                           settles rather than ringing.
-               sol*limit   make +-0.15 rad an actual stop. Inheriting the global
-                           0.02 s default left it soft enough that a wrist pitch
-                           swung the pad 42 deg, five times past its limit.
-
-             Bending only: there is deliberately no hinge about the pad's long axis,
-             because a pad bonded to the finger does not twist off it. -->
         <default class="fingertip_compliance">
           <joint type="hinge" limited="true" range="-0.15 0.15" springref="0"
                  stiffness="1.0" damping="0.01" armature="2e-5"
                  solreflimit="0.005 1" solimplimit="0.95 0.999 0.001" />
-        </default>
-        <!-- The parallel gripper (PG4) fingers are prismatic, 0 closed to -0.04 open.
-             Their joint axis comes from the URDF, so it is not set here. -->
-        <default class="parallel_gripper_finger">
-          <joint range="-0.04 0" damping="10" armature="0.1" frictionloss=".1" />
-          <position ctrlrange="-0.04 0" kp="1000" kv="20" forcerange="-30 30"/>
         </default>
       </default>
 
@@ -131,22 +91,6 @@
 
       <default class="collision">
         <geom group="3" type="mesh" />
-        <!-- The gripper's rubber fingers and pads. priority="1" means these numbers
-             win outright over whatever the pad touches, so the pad defines its own
-             contact against tables, walls and grasped objects alike.
-
-             friction is (slide, torsion, roll). Only the first is a coefficient; the
-             other two are in metres, and MuJoCo's defaults for them are 0.005 and
-             0.0001. Torsion and roll used to sit at 0.5 here, which resists twisting
-             with 0.5 N m per newton pressed -- several N m in an ordinary grasp, more
-             than the wrist can produce. That is what glued the pads to tables and
-             stalled the wrist rolling against one. 0.01 is about a 5 mm contact patch
-             at this slide friction, which is what a pad this size actually has.
-
-             solref/solimp keep the contact soft enough to read as rubber while
-             bounding how far the pad sinks in: impedance now ramps from 0.95 to
-             0.999 over 5 mm of penetration, so light touches stay squishy and a real
-             press firms up instead of sinking at constant softness. -->
         <default class="rubber">
           <geom  condim="6" friction="1.8 0.01 0.001" priority="1" solref="0.01 1" solimp="0.95 0.999 0.005" conaffinity="1" contype="1" />
         </default>

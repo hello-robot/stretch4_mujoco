@@ -17,27 +17,14 @@ robot_settings_se4 = {
         'urdf_closed_rad': 0,# From URDF, note: this is offset by 0.5, because the URDF maps 0 for open and -0.5 for closed, but that messes up the math
         'urdf_offset': 0.5  # This is offset is subtracted from the final mapping
     },
-    # Per-joint trapezoidal motion profiles, mirrored from stretch4_body's
-    # `robot/robot_params_SE4.py`. Keys and units are kept identical to the
-    # source so the two can be diffed by eye:
-    #   prismatic joints use `vel_m`/`accel_m` (m/s, m/s^2)
-    #   revolute joints use `vel`/`accel`     (rad/s, rad/s^2)
-    # Everything here is in the *joint* frame, not the motor frame -- stretch_body
-    # multiplies by `gr` on its way to servo ticks (see
-    # `FeetechSMHello.world_rad_to_ticks_per_sec`), so no gear ratio is applied.
-    #
-    # MuJoCo has no notion of a joint velocity or acceleration limit, so these are
-    # enforced by shaping the actuator setpoint before it is written to `ctrl`:
-    # `MujocoServer._update_joint_profiles()` for the standalone simulator, and
-    # `examples/.../molmospaces/stretch/motion_limits.py` for MolmoSpaces.
+    # Per-joint motion profiles, mirrored from stretch4_body's
+    # `robot/robot_params_SE4.py`.
     'lift': {
         'motion': {
             'default': {'accel_m': 0.3, 'vel_m': 0.3},
             'fast': {'accel_m': 0.5, 'vel_m': 0.4},
             'max': {'accel_m': 1.0, 'vel_m': 0.5},
             'slow': {'accel_m': 0.2, 'vel_m': 0.15}}},
-    # The arm's numbers are for the *total* telescoping extension, which is what
-    # both the real joint and the MJCF's "extend" tendon are measured in.
     'arm': {
         'motion': {
             'default': {'accel_m': 0.4, 'vel_m': 0.4},
@@ -62,10 +49,6 @@ robot_settings_se4 = {
             'fast': {'accel': 9.0, 'vel': 9.0},
             'max': {'accel': 12.0, 'vel': 12.0},
             'slow': {'accel': 4.0, 'vel': 4.0}}},
-    # Gripper limits are in the *servo* frame, over the servo's `range_deg`
-    # sweep. `gripper_servo_range_deg` records that sweep so the limits can be
-    # rescaled into the aperture and URDF finger frames MuJoCo is commanded in;
-    # see `get_actuator_motion_limits()`.
     'stretch_gripper': {
         'gripper_servo_range_deg': (-100.0, 300.0),
         'motion': {
@@ -128,8 +111,6 @@ DEFAULT_MOTION_PROFILE = "default"
 """
 
 # MJCF actuator name -> the `robot_settings_se4` key holding its motion profiles.
-# Wheels are absent on purpose: the base runs on its own trapezoidal profiles out
-# of `robot_settings_se4['omnibase']['motion']`, see `BaseController`.
 _ACTUATOR_MOTION_KEYS = {
     "lift": "lift",
     "arm": "arm",

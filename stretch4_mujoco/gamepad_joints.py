@@ -275,9 +275,7 @@ class CommandFeetechJoint:
         capped_velocity = min(self.max_vel, velocity) if velocity is not None else self.max_vel
 
         dx_rad = deg_to_rad(dx_deg)
-        # `FeetechSMHello.move_by` drops steps this small rather than letting a
-        # resting stick walk the joint, and a zero step is how `stop_motion()`
-        # says "no new goal".
+        
         if abs(dx_rad) <= 2e-5:
             return
 
