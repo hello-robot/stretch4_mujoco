@@ -704,17 +704,28 @@ class MujocoServer:
                 self._apply_profile_limits(actuator_name, profile, None, None)
                 profile.set_target_position(float(ctrl[i]))
 
-    def _commanded_position(self, actuator_name: str) -> float:
-        """Where the actuator has been *told* to go, profile ramp included.
+    def _measured_position(self, actuator_name: str) -> float:
+        """Where the actuator actually *is*, which is what `move_by` chains off.
 
-        Relative commands chain off this rather than off the measured position so
-        that a burst of `move_by`s covers the distance asked for: measured
-        position lags the setpoint by design once the setpoint is rate limited.
+        Both joint families on the robot resolve an incremental move against the
+        measured position, not the commanded one:
+
+        * Feetech wrists -- `FeetechSMHello.move_by` reads `status['pos_ticks']`
+          and issues `move_to(ticks_to_world_rad(x) + x_des)`.
+        * steppers -- `MODE_POS_TRAJ_INCR` computes `x_des_incr = ywd + x_des`,
+          `ywd` being the encoder angle. The firmware even carries a commented-out
+          variant using the commanded `xdes` "so we don't add in steady state
+          error", so chaining off measured is the deliberate choice, not an
+          oversight.
+
+        Chaining off the setpoint instead is what made held jogs feel laggy: the
+        goal advances a full step every tick regardless of whether the joint has
+        got there, so it runs ahead of the joint and a stick reversal has to
+        unwind all of that before the joint turns around. Against the measured
+        position the goal is only ever one step ahead, so a reversal puts it on
+        the other side of the joint immediately.
         """
-        profile = self.joint_profiles.get(actuator_name)
-        if profile is not None:
-            return profile.target_pos
-        return float(self.mjdata.actuator(actuator_name).ctrl[0])
+        return float(self.mjdata.actuator(actuator_name).length[0])
 
     def _set_actuator_position(
         self,
@@ -1150,7 +1161,7 @@ class MujocoServer:
                             current_value + pos
                         )
                     else:
-                        current_ctrl_left = self._commanded_position(
+                        current_ctrl_left = self._measured_position(
                             Actuators.gripper_left_finger.name
                         )
                         current_aperture = self.urdf_angle_radians_to_aperture_angle_radians(current_ctrl_left)
@@ -1159,8 +1170,10 @@ class MujocoServer:
                         self._set_actuator_position(Actuators.gripper_left_finger.name, finger_pos)
                         self._set_actuator_position(Actuators.gripper_right_finger.name, finger_pos)
                 else:
-                    current_value = self._commanded_position(actuator_name)
-                    self._set_actuator_position(actuator_name, current_value + pos)
+                    current_value = self._measured_position(actuator_name)
+                    self._set_actuator_position(
+                        actuator_name, current_value + pos, command.vel, command.accel
+                    )
 
         # move_to
         for _, command in command_status.move_to.items():
