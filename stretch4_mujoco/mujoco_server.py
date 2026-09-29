@@ -612,24 +612,6 @@ class MujocoServer:
         return config.robot_settings_se4
 
     def _build_joint_profiles(self) -> dict[str, TrapezoidalProfile]:
-        """One trapezoidal profile per position actuator with recorded limits.
-
-        MuJoCo has no joint velocity or acceleration limit -- a position actuator
-        chases whatever `ctrl` says as hard as its gains and `forcerange` allow --
-        so a `move_to` written straight into `ctrl` is a step input, and the joint
-        crosses its whole range as fast as the physics will let it. Shaping the
-        setpoint here is what makes a sim move take as long as the same move on
-        hardware; the limits themselves come from `config.robot_settings_se4`,
-        mirrored from stretch_body's `robot_params_SE4.py`.
-
-        Note that the profile ramps the *commanded* position, not the measured
-        one. That matters for the gripper: when the fingers stall on an object
-        the setpoint keeps advancing to the commanded target, so position error
-        -- and with it grip force -- still builds exactly as before.
-
-        Actuators without recorded limits (the wheels, and everything on Stretch
-        3) get no profile and are written through untouched.
-        """
         profiles: dict[str, TrapezoidalProfile] = {}
         self.joint_profile_defaults: dict[str, tuple[float, float]] = {}
         self.joint_profile_ceilings: dict[str, tuple[float, float]] = {}
@@ -676,14 +658,7 @@ class MujocoServer:
     def _apply_profile_limits(
         self, actuator_name: str, profile: TrapezoidalProfile, vel, accel
     ) -> None:
-        """Retune one profile to a command's `v_m`/`a_m`, clamped to the joint's ceiling.
-
-        Without this the sim answers every command with
-        `config.DEFAULT_MOTION_PROFILE`: gamepad teleop's speed cycling does nothing
-        to the arm and lift, and its deliberately brisk stop (`stop_motion()` asks
-        for the `max` acceleration) decelerates as lazily as the jog did, so a
-        released d-pad coasts out the whole ramp.
-        """
+        """Retune one profile to a command's `v_m`/`a_m`, clamped to the joint's ceiling. """
         default_vel, default_accel = self.joint_profile_defaults.get(
             actuator_name, (profile.max_vel, profile.max_accel)
         )
@@ -697,15 +672,7 @@ class MujocoServer:
         profile.max_accel = min(abs(accel), ceiling_accel) if accel else default_accel
 
     def _apply_keyframe(self, name: str) -> None:
-        """Pose the robot at a keyframe, rate limited like any other move.
-
-        Writing `mjdata.ctrl` wholesale -- which is what this used to do -- is a
-        step input, exactly the thing the joint profiles exist to prevent: `stow()`
-        crossed the arm and lift over their whole travel within a single control
-        step. Profiled actuators take the keyframe value as a position goal and
-        trapezoid into it; the wheels, which have no profile, are still written
-        straight through.
-        """
+        """Pose the robot at a keyframe, rate limited like any other move.     """
         ctrl = self.mjmodel.keyframe(name).ctrl
         for i in range(self.mjmodel.nu):
             actuator_name = mujoco._functions.mj_id2name(
@@ -722,26 +689,6 @@ class MujocoServer:
                 profile.set_target_position(float(ctrl[i]))
 
     def _measured_position(self, actuator_name: str) -> float:
-        """Where the actuator actually *is*, which is what `move_by` chains off.
-
-        Both joint families on the robot resolve an incremental move against the
-        measured position, not the commanded one:
-
-        * Feetech wrists -- `FeetechSMHello.move_by` reads `status['pos_ticks']`
-          and issues `move_to(ticks_to_world_rad(x) + x_des)`.
-        * steppers -- `MODE_POS_TRAJ_INCR` computes `x_des_incr = ywd + x_des`,
-          `ywd` being the encoder angle. The firmware even carries a commented-out
-          variant using the commanded `xdes` "so we don't add in steady state
-          error", so chaining off measured is the deliberate choice, not an
-          oversight.
-
-        Chaining off the setpoint instead is what made held jogs feel laggy: the
-        goal advances a full step every tick regardless of whether the joint has
-        got there, so it runs ahead of the joint and a stick reversal has to
-        unwind all of that before the joint turns around. Against the measured
-        position the goal is only ever one step ahead, so a reversal puts it on
-        the other side of the joint immediately.
-        """
         return float(self.mjdata.actuator(actuator_name).length[0])
 
     def _set_actuator_position(
@@ -766,12 +713,7 @@ class MujocoServer:
         dt: float,
         max_accel: float | None = None,
     ) -> None:
-        """Jog an actuator, rate limited if the actuator has limits.
-
-        The requested speed doubles as the profile's cap: a jog is "go this fast",
-        so clamping it to whatever tier the profile happened to be built with would
-        silently ignore a caller asking for a faster one.
-        """
+        """Jog an actuator, rate limited if the actuator has limits."""
         profile = self.joint_profiles.get(actuator_name)
         if profile is None:
             current = float(self.mjdata.actuator(actuator_name).ctrl[0])
@@ -781,20 +723,7 @@ class MujocoServer:
             profile.set_target_velocity(vel)
 
     def _update_joint_profiles(self, dt: float) -> None:
-        """Advance every profile one control interval and write out the setpoints.
-
-        A jog integrates its own position, so unlike a position goal it can walk
-        the setpoint past the end of the joint's travel and keep going -- holding
-        the gripper button drove `ctrl` to 2.11 on an actuator whose `ctrlrange`
-        stops at 0.5. MuJoCo clamps what it actuates, so the joint stayed put, but
-        the setpoint did not: reversing then had to unwind all of that before the
-        joint moved, and grip force grew without bound while it was held.
-
-        The robot stops at the limit instead, and keeps no wind-up to unwind:
-        `PrismaticJoint._step_vel_braking` brakes a velocity command as the joint
-        approaches its soft limit. This is that without the taper -- the setpoint
-        stops dead at the limit rather than easing into it.
-        """
+        """Advance every profile one control interval and write out the setpoints."""
         for name, profile in self.joint_profiles.items():
             pos = profile.update(dt)
             if profile.mode == profile.VELOCITY:

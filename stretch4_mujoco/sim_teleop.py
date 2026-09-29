@@ -55,13 +55,6 @@ from stretch4_mujoco.gamepad_enums import (
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 
-# Header constants, mirroring stretch4_body/core/gamepad_teleop.py
-#
-# The robot polls at 15Hz, which is as fast as its servo bus is worth reading. In
-# sim there is no bus -- the server runs at 100Hz -- and 15Hz costs up to 67ms
-# between a d-pad going down and anything being commanded, on top of the joint's
-# own acceleration ramp. Per-step deltas are all derived from this, so raising it
-# changes when commands are issued, not how fast the joints then move.
 STEP_SLEEP = 1 / 50
 
 # Button Hold Durations

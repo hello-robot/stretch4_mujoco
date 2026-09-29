@@ -352,26 +352,6 @@ class TrapezoidalProfile:
 
 class TrapezoidalSetpointLimiter:
     """Shapes a *stream* of position setpoints so they respect vel/accel limits.
-
-    A vector wrapper over `TrapezoidalProfile` in position mode, for callers that
-    reissue an absolute target every control step -- MolmoSpaces' controllers --
-    rather than handing over one discrete goal at a time.
-
-    It decelerates into the goal, and that matters more than it sounds. The
-    obvious cheaper shaper -- cap the speed, cap how fast it may speed up, let it
-    stop dead on arrival -- is wrong here, because Stretch's wrist actuators are
-    `gainprm=[20, 0, 0] biasprm=[0, -20, 0]`: kp only, *no velocity feedback*. The
-    only thing damping the joint is `damping="2"` on the joint itself, so a
-    setpoint that stops dead leaves the wrist to carry its own momentum through
-    the target. Measured on the compiled model, driving wrist yaw 1.5 rad:
-
-        step ctrl (unshaped)   peak 11.9 rad/s, no overshoot,      settles 0.50s
-        stop-dead rate limit   peak  3.9 rad/s, 0.99 rad (57deg!), settles 2.99s
-        this, decelerating     peak  2.8 rad/s, no overshoot,      settles 1.13s
-
-    The middle row is a joint visibly swinging past where it was sent and ringing
-    back -- slower than before by the numbers, and much worse to watch.
-
     Args:
         max_vel: per-joint velocity limit.
         max_accel: per-joint acceleration limit.

@@ -23,13 +23,7 @@ class CommandMove:
 
 @dataclass
 class CommandJointVelocity:
-    """A continuous jog, with the acceleration to ramp it at.
-
-    `accel` matters as much as `vel` here: gamepad teleop jogs at the profile's
-    acceleration but *stops* at the `max` profile's, so that releasing a d-pad
-    brakes rather than coasting out the rest of the ramp.
-    """
-
+    """A continuous jog, with the acceleration to ramp it at."""
     vel: float
     accel: float | None = None
 
@@ -87,15 +81,7 @@ class StatusCommand:
         self.move_by.pop(actuator_name, None)
 
     def set_keyframe(self, command: CommandKeyframe):
-        """Sends a keyframe and drops every per-joint command it supersedes.
-
-        A keyframe poses the whole robot, so anything still queued for an
-        individual joint is stale. Jogs especially: `joint_velocities` entries are
-        re-applied on every control step, so a leftover one would drag its joint
-        straight back out of the pose -- and a leftover *zero* would pin it where
-        it stands, which is how a stow ends up moving everything but the joint you
-        last jogged.
-        """
+        """Sends a keyframe and drops every per-joint command it supersedes."""
         self.keyframe = command
         self.move_to.clear()
         self.move_by.clear()
