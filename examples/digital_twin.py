@@ -50,10 +50,13 @@ Requires the `digital-twin` extra: `uv pip install -e ".[digital-twin]"`.
 from __future__ import annotations
 
 import math
+import os
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import click
 
@@ -61,6 +64,103 @@ from stretch4_mujoco.config import robot_settings_se4
 from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.gamepad_joints import WRIST_ROLL_SIM_SIGN
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+# =============================================================================
+# The fleet directory stretch4_body reads before it will import
+# =============================================================================
+
+NOMINAL_FLEET_PATH = Path(tempfile.gettempdir()) / "stretch4_mujoco_fleet"
+NOMINAL_FLEET_ID = "stretch-se4-nominal"
+"""Where `ensure_fleet_directory` puts the stand-in, and what it calls it.
+
+Named rather than random so a run reuses the previous run's directory instead of
+leaving one behind per launch, and "nominal" rather than a plausible serial
+number because anything that prints the fleet id should say what this is.
+"""
+
+
+def ensure_fleet_directory(tool_name: str | None = None) -> Path:
+    """Give `stretch4_body` a fleet directory to read, inventing one if there is none.
+
+    `RobotParams` reads `$HELLO_FLEET_PATH/$HELLO_FLEET_ID/` **while it is being
+    imported** -- the two YAMLs are read in the class body -- and calls
+    `sys.exit(1)` when they are not there. That is fine on a robot, where the
+    variables are in the shell, and it is why importing `RobotClient` on a
+    workstation dies with `KeyError: 'HELLO_FLEET_PATH'` before any of this
+    repository's code gets to run. This writes the smallest directory that
+    satisfies it, under the system temporary directory, and exports the two
+    variables.
+
+    What it costs, and it is worth knowing before trusting a number: the
+    parameters `stretch4_body` then builds are the **nominal** ones for this model
+    and tool, not the ones calibrated for the robot being driven. For commanding
+    a robot over the network that is mostly harmless -- the joint targets are in
+    SI units and the robot's own server applies its calibration to them -- but
+    anything read back from `robot.robot_params` here is a catalogue value.
+    `GripperMirror`'s `range_deg` is the one this repository actually reads.
+    Copy the robot's own fleet directory over and set the variables yourself when
+    that matters; this never overwrites an environment that already names one.
+
+    `tool_name` is the end of arm to declare, and it has to be the tool that is
+    physically on the robot or the client builds the wrong end of arm -- a
+    `stretch_gripper` where there is a `parallel_gripper`. It defaults to the
+    same tool the simulator builds its own model with, so the two halves of a
+    twin describe one robot.
+
+    Returns the fleet directory in use, spoofed or not.
+    """
+    fleet_path, fleet_id = os.environ.get("HELLO_FLEET_PATH"), os.environ.get("HELLO_FLEET_ID")
+    if fleet_path and fleet_id:
+        return Path(fleet_path) / fleet_id
+
+    model_name, _, default_tool = Stretch4MujocoSimulator.get_default_model_batch_tool_names()
+    tool_name = tool_name or default_tool
+    directory = NOMINAL_FLEET_PATH / NOMINAL_FLEET_ID
+    directory.mkdir(parents=True, exist_ok=True)
+    # `nominal_system_params` builds a rotating log file handler at
+    # `$HELLO_FLEET_PATH/log/stretch_body_logger/` -- beside the fleet directory,
+    # not inside it -- and a handler whose directory does not exist raises the
+    # moment anything configures logging.
+    (NOMINAL_FLEET_PATH / "log" / "stretch_body_logger").mkdir(parents=True, exist_ok=True)
+
+    # Only `robot.model_name` and `robot.tool` are load-bearing: the first picks
+    # the `robot_params_<model>` module the nominal parameters come from, the
+    # second the end of arm expanded out of it. Everything else in a real
+    # configuration file is this robot's calibration, which is exactly what a
+    # stand-in cannot invent.
+    (directory / "stretch_configuration_params.yaml").write_text(
+        "# Written by examples/digital_twin.py: ensure_fleet_directory().\n"
+        "# A stand-in for a real robot's fleet directory: nominal parameters for\n"
+        "# this model and tool, and no calibration. Delete it to have it rebuilt.\n"
+        "robot:\n"
+        f"  model_name: {model_name}\n"
+        f"  tool: {tool_name}\n"
+        "  batch_name: nominal\n"
+        "  serial_no: nominal\n"
+    )
+    # Read second and overlaid on the above, so the user half of the parameters
+    # is deliberately empty: there is no user to have tuned anything here.
+    (directory / "stretch_user_params.yaml").write_text(
+        "# Written by examples/digital_twin.py: ensure_fleet_directory().\n"
+        "{}\n"
+    )
+
+    os.environ["HELLO_FLEET_PATH"] = str(NOMINAL_FLEET_PATH)
+    os.environ["HELLO_FLEET_ID"] = NOMINAL_FLEET_ID
+    click.secho(
+        f"HELLO_FLEET_PATH was not set, so stretch4_body is reading {directory} instead: "
+        f"nominal {model_name} parameters with {tool_name}, and none of this robot's "
+        "calibration. Set HELLO_FLEET_PATH and HELLO_FLEET_ID to a copy of the robot's "
+        "own fleet directory to use its.",
+        fg="yellow",
+    )
+    return directory
+
+
+# Before anything imports `stretch4_body`, which this module does lazily in
+# `_connect` -- and which is far enough down that the import would otherwise be
+# the first thing on this machine to discover the variables are missing.
+ensure_fleet_directory()
 
 # Base channels are mirrored as relative motions / velocities rather than
 # positions, so they get their own names in the pending-command table.
@@ -714,7 +814,18 @@ def _connect(robot_ip: str | None):
     where = f"tcp://{robot_ip}" if robot_ip else "the local robot"
     click.echo(f"Connecting to {where}...")
     robot = RobotClient(ip_address=robot_ip)
-    if not robot.startup():
+    # Over the network, `allow_different_user_connection` is not optional. The
+    # check it skips asks whether the *local* server socket belongs to this user
+    # -- `is_server_owned_by_current_user` stats `/tmp/stretch_zmq/port_admin`,
+    # an ipc path that only exists on the robot -- so on a workstation it does
+    # not return False, it raises `FileNotFoundError` from four frames inside
+    # `pathlib`. The connection itself has already been made and verified by the
+    # time it runs. Left on for a local robot, where it is a real check against
+    # taking a session another user on that machine is holding.
+    started = (
+        robot.startup(allow_different_user_connection=True) if robot_ip else robot.startup()
+    )
+    if not started:
         raise SystemExit(
             f"Failed to start the RobotClient. Is the Stretch Body Server running on {where}?"
         )
