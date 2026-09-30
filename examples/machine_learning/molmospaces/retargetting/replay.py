@@ -681,8 +681,7 @@ def build_stretch_in_scene(
     view = Stretch4RobotView(data, namespace)
     # The study's spawn pose, not `Stretch4RobotConfig`'s: an episode puts
     # Stretch at `setups.stretch_spawn_init_qpos()`, which telescopes the arm out
-    # to `STRETCH_SPAWN_ARM_M` and rolls the wrist when
-    # `--change_stretch_start_pose_flip_wrist` asks. The config's own pose stows
+    # to `STRETCH_SPAWN_ARM_M`. The config's own pose stows
     # the arm at 0, which is the bottom of its travel and the seed the opening
     # `snap_to_franka_joint_pos` would then solve the whole episode from -- so a
     # replay spawned from it is being asked a question no rollout was asked.
@@ -997,27 +996,12 @@ def _frame_angle_deg(reached: np.ndarray, wanted: np.ndarray) -> float:
     return float(np.degrees(R.from_matrix(np.asarray(reached).T @ np.asarray(wanted)).magnitude()))
 
 
-def _grasp_equivalent_angle_deg(reached: np.ndarray, target: np.ndarray) -> float:
-    """`_frame_angle_deg`, taking the nearer of the two branches that grasp alike.
-
-    A parallel jaw held half a turn over about its approach axis grasps the
-    identical object the identical way -- that is what `fr.JAW_FLIP` is and why
-    `_solve_either_jaw` is allowed to pick a branch. Measuring the raw angle
-    would therefore report a wrist that flipped mid-episode as 180 degrees out
-    when nothing about the grasp changed, which is a step in the trace that
-    looks like the retargeting falling over and is not.
-    """
-    upright = _frame_angle_deg(reached[:3, :3], target[:3, :3])
-    flipped = _frame_angle_deg(reached[:3, :3], (target @ fr.JAW_FLIP)[:3, :3])
-    return min(upright, flipped)
-
-
 STRETCH_APPROACH_COLUMN = 0
 """Which column of Stretch's grasp frame points out of the hand: +x.
 
 The Robotiq reaches along its own +z and the tool transform lines the two up;
 see `grasp_center_alignment`, which measures both hands' surfaces along this
-same axis, and `fr.JAW_FLIP`, which is the half turn about it.
+same axis.
 """
 
 FRANKA_APPROACH_COLUMN = 2
@@ -1045,18 +1029,12 @@ class StartAlignment:
       decides whether the same action means the same reach; a hand pointing 20
       degrees off will drive into the counter following a trajectory that
       cleared it.
-    * `roll_deg` -- how far the hand is turned about that pointing axis. A
-      parallel jaw grasps the same object the same way half a turn over (see
-      `fr.JAW_FLIP`), so `roll_equivalent_deg` folds the two branches together:
-      it is 180 degrees of `roll_deg` that costs the *grasp* nothing and moves
-      the wrist cameras to the other side of the hand.
+    * `roll_deg` -- how far the hand is turned about that pointing axis.
     """
 
     position_gap_m: float = float("nan")
     approach_deg: float = float("nan")
     roll_deg: float = float("nan")
-    roll_equivalent_deg: float = float("nan")
-    """`roll_deg` folded onto the nearer of the two jaw branches, in [0, 90]."""
 
     @property
     def aligned(self) -> bool:
@@ -1064,18 +1042,17 @@ class StartAlignment:
         return (
             self.position_gap_m < START_POSITION_TOLERANCE_M
             and self.approach_deg < START_ANGLE_TOLERANCE_DEG
-            and self.roll_equivalent_deg < START_ANGLE_TOLERANCE_DEG
+            and abs(self.roll_deg) < START_ANGLE_TOLERANCE_DEG
         )
 
     def summary(self) -> str:
         if not np.isfinite(self.position_gap_m):
             return "start: not measured (the recording carries no tool pose)"
-        flipped = " (jaw half a turn over)" if abs(self.roll_deg) > 90.0 else ""
         return (
             f"start {'OK  ' if self.aligned else 'OFF '} "
             f"{self.position_gap_m * 1000:6.1f}mm  "
             f"approach {self.approach_deg:5.1f}deg  "
-            f"roll {self.roll_deg:+6.1f}deg{flipped}"
+            f"roll {self.roll_deg:+6.1f}deg"
         )
 
 
@@ -1134,7 +1111,6 @@ def measure_start_alignment(
         position_gap_m=float(np.linalg.norm(stretch[:3, 3] - episode.tcp_world[0])),
         approach_deg=_angle_between_deg(recorded_rot[:, FRANKA_APPROACH_COLUMN], approach),
         roll_deg=roll,
-        roll_equivalent_deg=min(abs(roll), abs(abs(roll) - 180.0)),
     )
 
 
@@ -1195,8 +1171,7 @@ class GraspAlignment:
     part of the misalignment that is the arm's five DOFs rather than the policy's
     aim. Held against the object's distance on the same axis because that is the
     trade: the orientation Stretch gives up is usually bought somewhere near the
-    object. Jaw-flip equivalent branches are folded together; see
-    `_grasp_equivalent_angle_deg`.
+    object.
     """
 
     def summary(self) -> str:
@@ -1254,7 +1229,7 @@ class _AlignmentWatch:
         self.object_frame.append(
             _frame_angle_deg(grasp[:3, :3], np.asarray(self.data.xmat[self.body]).reshape(3, 3))
         )
-        self.retarget.append(_grasp_equivalent_angle_deg(grasp, target_pose))
+        self.retarget.append(_frame_angle_deg(grasp[:3, :3], target_pose[:3, :3]))
 
     def result(self) -> "GraspAlignment | None":
         """What was measured, or `None` when there was no object to measure against."""
@@ -1893,17 +1868,10 @@ def report(results: list[ReplayResult], output_dir: Path, rendered: bool) -> Non
     ]
     off = [s for s in starts if not s.aligned]
     if starts and not off:
-        flipped = sum(1 for s in starts if abs(s.roll_deg) > 90.0)
-        note = (
-            f" {flipped} of them with the jaw held half a turn over, which grasps the same "
-            f"object the same way -- see fr.JAW_FLIP."
-            if flipped
-            else ""
-        )
         click.secho(
             f"\nEvery episode began where the recording did: "
             f"at most {max(s.position_gap_m for s in starts) * 1000:.2f}mm and "
-            f"{max(s.approach_deg for s in starts):.2f}deg of approach apart.{note}",
+            f"{max(s.approach_deg for s in starts):.2f}deg of approach apart.",
             fg="green",
         )
     elif off:

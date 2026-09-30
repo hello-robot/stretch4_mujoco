@@ -93,12 +93,7 @@ the recording did: `StartAlignment` measures the opening grasp centre, the
 direction the hand points and the roll about that direction against the
 recording's own, writes `start_alignment.csv`, and says so in red if any episode
 is out. An episode that starts somewhere else is not a replay of that episode
-and nothing downstream of it means anything. Note what passing does not include:
-a half turn of the hand about its approach is a *pass*, because a parallel jaw
-grasps the same object the same way either way round -- it is reported as the
-roll it is, and it is what `--map_franka_wrist_to_flipped_stretch4_wrist` asks
-for. Pair that flag with `--change_franka_start_pose_flip_wrist` on the run that
-*records* the Franka half if the two hands should also look alike.
+and nothing downstream of it means anything.
 
 It also writes what the video cannot be read off: `grasp_alignment.csv` and
 `grasp_alignment.png`, holding for every replayed step how far the grasp centre
@@ -1420,7 +1415,6 @@ START_FIELDS = (
     "position_gap_mm",
     "approach_deg",
     "roll_deg",
-    "roll_equivalent_deg",
 )
 
 RESIDUAL_ANGLE_COLOR = "#eb6834"
@@ -1697,7 +1691,6 @@ def write_start_outputs(results: list[Any], destination: Path) -> None:
             "position_gap_mm": round(result.start.position_gap_m * 1000.0, 4),
             "approach_deg": round(result.start.approach_deg, 4),
             "roll_deg": round(result.start.roll_deg, 4),
-            "roll_equivalent_deg": round(result.start.roll_equivalent_deg, 4),
         }
         for result in results
         if result.start is not None and math.isfinite(result.start.position_gap_m)
@@ -2212,12 +2205,8 @@ RUN_NAME_PREFIX = "side_by_side"
 """What every auto-named run directory starts with, before the date and the flags."""
 
 RUN_NAME_ABBREVIATIONS = {
-    "change_franka_start_pose_flip_wrist": "franka-start-flipped",
     "change_franka_start_pose_limit_height": "limit-height",
-    "change_stretch_start_pose_flip_wrist": "stretch-start-flipped",
     "change_stretch_start_pose_pitch_deg": "start-pitch",
-    "keep_flipped_wrist_camera_frame": "unrotated-wrist-cam",
-    "map_franka_wrist_to_flipped_stretch4_wrist": "flipped-wrist",
     "match_stretch_spawn_pose_to_franka": "matched-spawn",
     "use_left_gripper_camera": "left-gripper-cam",
     "use_left_fisheye_camera": "left-fisheye-cam",
@@ -2549,7 +2538,7 @@ def _apply_params(
     default=Path("eval_output"),
     show_default=True,
     help="Where runs are kept. A new run makes itself a directory in here named after "
-    "the date and the flags it was given -- side_by_side_20260925_baseline_flipped-wrist_"
+    "the date and the flags it was given -- side_by_side_20260925_baseline_limit-height_"
     "grasp-offset-0.009 and so on -- so runs accumulate side by side instead of "
     "overwriting each other, and the benchmark is built once here and shared. The path is "
     "printed when the run starts. --compose-only, --report-only and --replay-as-stretch4 "
@@ -2645,28 +2634,12 @@ def _apply_params(
     "changing the layout without paying for the rollouts again.",
 )
 @click.option(
-    "--change_franka_start_pose_flip_wrist",
-    "change_franka_start_pose_flip_wrist",
-    is_flag=True,
-    help="Start the Franka rolled half a turn about its approach axis. The grasp is "
-    "identical either way round; what swings round is the hand, and the wrist camera "
-    "bolted off to one side of it. See `franka_retarget.PoseConventions`.",
-)
-@click.option(
     "--change_franka_start_pose_limit_height",
     "change_franka_start_pose_limit_height",
     is_flag=True,
     help="Cap the Franka's start tool height at Stretch's own reach ceiling, so the "
     "Stretch condition does not begin every episode with its lift already at its stop. "
     "See `franka_retarget.PoseConventions`.",
-)
-@click.option(
-    "--change_stretch_start_pose_flip_wrist",
-    "change_stretch_start_pose_flip_wrist",
-    is_flag=True,
-    help="Spawn Stretch with its own wrist rolled half a turn, the counterpart of "
-    "--change_franka_start_pose_flip_wrist. Overwritten by the snap to the Franka's home "
-    "unless snap_to_franka_home is off. See `franka_retarget.PoseConventions`.",
 )
 @click.option(
     "--match_stretch_spawn_pose_to_franka",
@@ -2676,14 +2649,6 @@ def _apply_params(
     "cancelling the retreat in the virtual Franka's mount so the frame is unchanged. "
     "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
     "it -- see `fr.stretch_spawn_base_offset_xy` for both numbers.",
-)
-@click.option(
-    "--map_franka_wrist_to_flipped_stretch4_wrist",
-    "map_franka_wrist_to_flipped_stretch4_wrist",
-    is_flag=True,
-    help="Retarget every pose onto the half-turned branch of Stretch's wrist, by folding "
-    "the turn into the tool transform itself -- so it holds for the whole episode and both "
-    "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
 @click.option(
     "--change_stretch_start_pose_pitch_deg",
@@ -2698,17 +2663,6 @@ def _apply_params(
     "horizontal. Every step after the snap is retargeted untouched and the pitched arm is "
     "reported honestly, so the policy commands the pitch away rather than fighting a "
     "hidden offset -- unlike --param wrist_tilt_deg, which it cannot see. Stretch only. "
-    "See `franka_retarget.PoseConventions`.",
-)
-@click.option(
-    "--keep_flipped_wrist_camera_frame",
-    "keep_flipped_wrist_camera_frame",
-    is_flag=True,
-    help="Feed the policy the flipped wrist frame as the camera produced it, instead of "
-    "turning it half round to undo the roll JAW_FLIP puts on it. The turn fixes the roll "
-    "and lands the gripper at the top of a frame the checkpoint has it entering from the "
-    "bottom, because the flip carries the camera across the approach axis as well as "
-    "rolling it. Only does anything with --map_franka_wrist_to_flipped_stretch4_wrist. "
     "See `franka_retarget.PoseConventions`.",
 )
 @click.option(
@@ -2763,12 +2717,8 @@ def main(
     replay_limit: int | None,
     replay_no_video: bool,
     replay_kinematic: bool,
-    change_franka_start_pose_flip_wrist: bool,
     change_franka_start_pose_limit_height: bool,
-    change_stretch_start_pose_flip_wrist: bool,
     change_stretch_start_pose_pitch_deg: float,
-    keep_flipped_wrist_camera_frame: bool,
-    map_franka_wrist_to_flipped_stretch4_wrist: bool,
     match_stretch_spawn_pose_to_franka: bool,
     use_left_gripper_camera: bool,
     use_left_fisheye_camera: bool,
@@ -2800,12 +2750,8 @@ def main(
         )
 
     conventions = fr.PoseConventions(
-        change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
-        change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
         change_stretch_start_pose_pitch_deg=change_stretch_start_pose_pitch_deg,
-        keep_flipped_wrist_camera_frame=keep_flipped_wrist_camera_frame,
-        map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
         match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,
     )
     # Before anything runs, and every variable written in both directions: the

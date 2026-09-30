@@ -92,7 +92,6 @@ retargeting residual.
 python -m examples.machine_learning.molmospaces.retargetting.params_search_side_by_side \
     --pair baseline --scenes 2 \
     --output-dir eval_output \
-    --map_franka_wrist_to_flipped_stretch4_wrist \
     --change_franka_start_pose_limit_height \
     --stretch4_grasp_offset -0.009 \
     --param target_z_offset_m=0.035 \
@@ -106,7 +105,7 @@ names its own directory from the date and the flags it was given and prints the
 path before anything expensive starts:
 
 ```
-eval_output/side_by_side_20260925_baseline_limit-height_flipped-wrist_left-gripper-cam_grasp-offset-0.009_target-z-offset-m+0.035/
+eval_output/side_by_side_20260925_baseline_limit-height_left-gripper-cam_grasp-offset-0.009_target-z-offset-m+0.035/
     benchmark/      the episode specs this run was generated from
     runs/           per-setup panels and probe records
     videos/         one tiled MP4 per episode
@@ -146,12 +145,8 @@ halves rather than hard-coded. All default off; `PoseConventions` and
 
 | flag | what it changes |
 |---|---|
-| `--change_franka_start_pose_flip_wrist` | Start the Franka rolled half a turn about the Robotiq's approach axis. Same grasp; the hand and the camera bolted to it swing round. |
 | `--change_franka_start_pose_limit_height` | Cap the Franka's start tool height at Stretch's reach ceiling, so the Stretch half does not begin every episode with its lift already at its stop. |
-| `--change_stretch_start_pose_flip_wrist` | Spawn Stretch with its own wrist rolled half a turn. Overwritten by the snap to the Franka's home unless `snap_to_franka_home` is off. |
-| `--map_franka_wrist_to_flipped_stretch4_wrist` | Pin Stretch to the half-turned branch of its wrist, which reaches poses the upright branch cannot, and report the pose back unflipped. |
 | `--change_stretch_start_pose_pitch_deg N` | Pitch Stretch's wrist N degrees about the jaw line at the opening snap, and only there. Positive aims it out across the counter. Stretch only. |
-| `--keep_flipped_wrist_camera_frame` | Skip the half turn the policy's wrist frame is otherwise given on that branch. A control; see below. |
 | `--match_stretch_spawn_pose_to_franka` | Stand Stretch back far enough that its spawn gripper pose is the Franka's. Costs most of the arm's remaining reach. |
 | `--use_left_gripper_camera` | Read the wrist channel from Stretch's left gripper camera. The pair is 20mm apart on the same side of the hand, so this is a parallax check. |
 | `--use_left_fisheye_camera` | On `stretchcam`/`fisheye`/`rectified`, move the exo mount to Stretch's **left** head camera (y +0.075 against −0.075) — on both robots, camera under test unchanged. On `baseline`, substitute Stretch's real left fisheye instead, which leaves every camera parameter inert. |
@@ -169,37 +164,6 @@ half and the run still asks "the same view, two robots", 150mm across the head
 from where it asked before. Only on `baseline`, which mounts the DROID shoulder
 camera in the room rather than on Stretch's head, does it substitute Stretch's
 own fisheye and leave the camera parameters inert.
-
-### The wrist camera on the flipped branch
-
-Worth knowing before running a pair with `--map_franka_wrist_to_flipped_stretch4_wrist`,
-because it is the one convention whose cost is invisible in the tiled video.
-
-`JAW_FLIP` is a half turn about the tool's approach axis, and Stretch's gripper
-camera looks down that axis — so the flipped branch rolls the camera 180 degrees
-about its own optical axis *and* carries it across to the other side of the axis.
-Measured against the virtual Franka's own wrist camera at the same tool pose:
-
-| | optical axis off by | image-up off by | camera across the axis |
-|---|---:|---:|---:|
-| upright branch | 19.5° | 19.5° | 17mm |
-| flipped, frame unrotated | 19.5° | 160.5° | 131mm |
-| flipped, frame turned back | 19.5° | 19.5° | 131mm |
-
-`StretchMolmoBotDroidPolicy._wrist_camera` turns the frame back, which fixes the
-roll and cannot fix the viewpoint. **Both halves of that matter, and they were
-measured separately.** Skipping the turn (`--keep_flipped_wrist_camera_frame`) is
-much worse than taking it: an unrotated frame has the whole scene 180 degrees
-out, so the policy reads every lateral correction backwards and the arm drives
-away from the object or stalls rather than arriving. Taking the turn leaves a
-static framing error instead — the gripper lands at the top of a frame every
-DROID wrist view has it entering from the bottom — and the arm tracks the object
-to within a few centimetres and then pitches the wrong way.
-
-So the turn is necessary and not sufficient, and what remains is parallax that no
-operation on an image can undo. The open question is whether the close-range
-failure is that 131mm; the way to ask it is to drop the flipped branch, where the
-camera sits 17mm from the Robotiq's instead.
 
 ### Letting the first frames see the workspace
 

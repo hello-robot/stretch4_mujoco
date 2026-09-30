@@ -11,7 +11,6 @@ Stretch anyway:
       -> VirtualFranka.fk           -> tool pose in the Franka's base frame
       -> franka_mount_pose          -> tool pose in the world
       -> FRANKA_TO_STRETCH_TOOL     -> Stretch's tool convention
-      -> JAW_FLIP (maybe)           -> the grasp-equivalent branch the wrist can hold
       -> StretchArmIK.solve         -> base / lift / arm extension / wrist targets
       -> Stretch's own move groups
 
@@ -81,39 +80,6 @@ log = logging.getLogger(__name__)
 # edge-on.
 FRANKA_TO_STRETCH_TOOL = R.from_euler("y", -90, degrees=True).as_matrix()
 
-# A half turn about Stretch's tool +x -- its approach axis. A parallel jaw grasps
-# identically either way round: the rotation maps one finger onto where the other
-# was and leaves the jaw line and the approach direction unchanged, so both poses
-# close on the same object the same way. Only the labels "left finger" and "right
-# finger" swap, and nothing downstream depends on which is which.
-#
-# It is worth a second solve because Stretch's wrist roll has an asymmetric range
-# (`wrist_roll_joint`, about [-4.28, +1.14] rad): a commanded twist can pin both
-# `wrist_yaw` and `wrist_roll` against their upper limits with the orientation
-# still a quarter turn out, while the same grasp expressed half a turn round sits
-# in open range. Measured, on the waypoints in
-# `retargetting/tests/test_retargeting.py`: one of fifteen stalls at 0.43 rad of
-# orientation error that no number of iterations recovers (80, 240, 800 and 3000
-# all settle at 0.433), and the flipped branch reaches it to 0.001 rad with no
-# change in position error. See `FrankaOnStretchView._solve_either_jaw`.
-JAW_FLIP = np.eye(4)
-JAW_FLIP[:3, :3] = R.from_euler("x", 180, degrees=True).as_matrix()
-
-ROBOTIQ_ROLL_180 = np.eye(4)
-ROBOTIQ_ROLL_180[:3, :3] = R.from_euler("z", 180, degrees=True).as_matrix()
-"""
-A half turn about the *Robotiq's* approach axis -- the Franka-convention twin of `JAW_FLIP`.
-
-`JAW_FLIP` is the same physical rotation written in Stretch's tool frame, where
-the approach is +x; the Robotiq reaches along +z, so here it is a turn about z.
-Both leave a parallel jaw grasping the identical object the identical way (see
-`JAW_FLIP`) -- what changes is which way round the hand, and therefore the wrist
-camera bolted to it, is facing.
-
-That is the whole point of `--change_franka_start_pose_flip_wrist`: the grasp is unaffected
-and the picture is not.
-"""
-
 STRETCH_MAX_GRASP_HEIGHT_M = 1.0824
 """
 The highest `grasp_center_link` gets, in world metres, at the Franka's home tool pose.
@@ -131,65 +97,6 @@ episode overrides, which run before there is a Stretch to measure -- and because
 it is a property of the arm, not of the scene. It is the ceiling for *this* tool
 orientation; a pose reaching further out tops out lower, so treat it as the best
 case rather than as a bound.
-"""
-
-JAW_MODES = ("auto", "flipped", "upright")
-"""
-How `FrankaOnStretchView` chooses which way round to hold the jaw.
-
-* `"auto"` -- the default. Try the branch already in use and switch only on a
-  clear orientation win. Two IK solves per step, and the only mode that gives up
-  nothing: measured across `tests/test_retargeting.py`'s waypoints it holds every
-  one to 0.0006 rad.
-* `"flipped"` -- always the half-turned branch. One solve per step, no branch
-  that can change mid-reach, and *better position everywhere* -- worst 0.39mm
-  against auto's 1.87mm across those waypoints, with 0.0000 rad of orientation at
-  fourteen of sixteen. The catch is the other two: at large tool yaws (`yaw_in`
-  at +45 degrees, `yaw_out` at -30) the flipped branch runs the wrist into a roll
-  limit and settles **0.43 rad** short.
-* `"upright"` -- never flip. The behaviour before jaw symmetry existed, kept so a
-  result can be compared against runs that predate it. Measures the same as
-  "auto" on those waypoints, because solved fresh from the snap the upright
-  branch suffices; the two diverge along a continuous path.
-
-The 0.43 rad is why "flipped" is not the default despite winning on position. It
-is not a symmetry to be forgiven: a jaw rotated that far about its approach axis
-closes along a different line, so it would take a knife across rather than along
--- and `test_both_grippers_end_up_pointing_the_same_way`, which reads the finger
-bodies rather than any tool frame, fails at those two waypoints under "flipped".
-The tests are left tight on purpose, so selecting a worse mode makes the suite
-name the poses it costs.
-
-All three grasp the same object the same way where they agree; see `JAW_FLIP`.
-What differs is which poses Stretch's wrist can hold, and that is not a strict
-ordering -- a fixed branch that is right for most of the workspace is wrong at
-its edges.
-"""
-
-JAW_FLIP_GAIN_RAD = 0.10
-"""
-How much orientation the other jaw branch has to win before the wrist rolls over
-to it.
-
-This is hysteresis, not a tolerance. Both branches are legitimate solutions, so
-without a deadband the choice would follow whichever residual happened to be
-smaller and the wrist would spin half a turn between steps that command almost
-the same pose -- real motion, at the moment a grasp is closing. Requiring a clear
-win against the branch already in use means the arm changes its mind only when
-there is something to gain: over the 180 commands of the test's continuous path,
-twice, both times mid-reorientation rather than mid-grasp.
-"""
-
-JAW_FLIP_POSITION_SLACK_M = 0.001
-"""
-How much position the other jaw branch may cost while still being preferred.
-
-Position outranks orientation everywhere else in this module
-(`_task_priority_step` solves for it outright and gives orientation the leftovers),
-so it would be incoherent for a jaw flip to buy an angle at the price of a
-millimetre of reach. The slack is there only so that two solves which reach the
-same point to within solver noise are judged on their orientation rather than on
-which one happened to round down.
 """
 
 # Per-iteration caps on the pose error an IK step is allowed to chase, and on the
@@ -514,12 +421,8 @@ def pose_matrix(pos, quat_wxyz) -> np.ndarray:
 
 
 POSE_CONVENTION_ENV_VARS = {
-    "change_franka_start_pose_flip_wrist": "STRETCH4_CHANGE_FRANKA_START_POSE_FLIP_WRIST",
     "change_franka_start_pose_limit_height": "STRETCH4_CHANGE_FRANKA_START_POSE_LIMIT_HEIGHT",
-    "change_stretch_start_pose_flip_wrist": "STRETCH4_CHANGE_STRETCH_START_POSE_FLIP_WRIST",
     "change_stretch_start_pose_pitch_deg": "STRETCH4_CHANGE_STRETCH_START_POSE_PITCH_DEG",
-    "keep_flipped_wrist_camera_frame": "STRETCH4_KEEP_FLIPPED_WRIST_CAMERA_FRAME",
-    "map_franka_wrist_to_flipped_stretch4_wrist": "STRETCH4_MAP_FRANKA_WRIST_TO_FLIPPED_STRETCH4_WRIST",
     "match_stretch_spawn_pose_to_franka": "STRETCH4_MATCH_STRETCH_SPAWN_POSE_TO_FRANKA",
 }
 """
@@ -547,18 +450,9 @@ class PoseConventions:
     every measurement in this package was taken under unless it says otherwise.
 
     These are conventions rather than parameters: none of them changes what a
-    grasp *is*, only which way round a wrist is held and where an episode begins.
+    grasp *is*, only where an episode begins and how the wrist is posed at the start.
     That is exactly why they need naming and publishing rather than hard-coding --
     a comparison whose two halves disagree about a convention is not a comparison.
-    """
-
-    change_franka_start_pose_flip_wrist: bool = False
-    """Roll the Franka's start pose half a turn about the Robotiq's approach axis.
-
-    The grasp is unaffected -- see `JAW_FLIP` -- and what swings round is the
-    hand, and the wrist camera bolted off to one side of it. Applied to the real
-    Franka's episode `init_qpos` and to the virtual one the retargeting snaps
-    Stretch to, from the same flag, so the two cannot disagree.
     """
 
     change_franka_start_pose_limit_height: bool = False
@@ -569,17 +463,6 @@ class PoseConventions:
     put its own with the tool pointing down, so the arm sits at its stop reaching
     for a pose it cannot hold and reports proprioception from a configuration it
     never reached.
-    """
-
-    change_stretch_start_pose_flip_wrist: bool = False
-    """Spawn Stretch with its own wrist rolled half a turn.
-
-    The Stretch-side counterpart of `change_franka_start_pose_flip_wrist`, and it
-    moves Stretch's wrist cameras to the other side of the hand in the same way.
-    Note what it does *not* survive: with `snap_to_franka_home` on -- the default
-    -- the first `get_action` writes the arm and wrist to whatever matches the
-    Franka's start tool pose, so this decides the spawn and the first observation
-    and is then overwritten. Turn the snap off to hold it for the episode.
     """
 
     change_stretch_start_pose_pitch_deg: float = 0.0
@@ -613,8 +496,6 @@ class PoseConventions:
     moves the start and says so.
 
     Stretch only, and it does not need `snap_to_franka_home` -- it *is* the snap.
-    `change_stretch_start_pose_flip_wrist`, which rolls the spawn instead, is the
-    one that the snap overwrites.
 
     **Tried, and it costs grasps where the policy was working.** Eight episodes
     per cell, everything else held:
@@ -647,94 +528,6 @@ class PoseConventions:
     configuration that works, which is a fact about where to spend effort.
     """
 
-    keep_flipped_wrist_camera_frame: bool = False
-    """Hand the policy the flipped wrist frame as the camera produced it, unrotated.
-
-    `StretchMolmoBotDroidPolicy._wrist_camera` turns the wrist frame half a turn
-    whenever the jaw is held flipped, on the argument that `JAW_FLIP` rolls the
-    camera 180 degrees about its own optical axis and the checkpoint was trained
-    on a hand that is not turned over. The roll is real -- measured against the
-    virtual Franka's `gripper/wrist_camera` at the same tool pose, image-up is
-    160.5 degrees out on the flipped branch and 19.5 degrees out once the turn is
-    undone, which is the two lenses' fixed tilt and is what the unflipped branch
-    carries too.
-
-    What the turn does not undo is the *viewpoint*. `JAW_FLIP` rolls the camera
-    and carries it across the hand together: in the Franka tool frame the
-    Robotiq's wrist camera sits at x = -74mm, Stretch's at -57mm unflipped and
-    **+57mm flipped**, so the half turn puts it on the other side of the approach
-    axis. For the hand itself those two changes cancel exactly, because the flip
-    is a symmetry of a parallel jaw -- it maps one finger onto where the other
-    was. Projecting the fingertips into the frame the policy reads:
-
-        franka pads                      v = -0.19   fingers at the bottom
-        stretch, unflipped               v = -0.265  bottom
-        stretch, flipped, unrotated      v = -0.265  bottom
-        stretch, flipped, turned back    v = +0.265  **top**
-
-    and the grasp centre with them, -0.243 against the turned frame's +0.243. So
-    the turn fixes the far scene and costs the near field: it lands the gripper at
-    the top of a frame that every DROID wrist view has it entering from the
-    bottom.
-
-    **Tried, and it is much worse.** `stretch_baseline` on the flipped branch,
-    the same episodes, differing in nothing but this flag: with the turn the arm
-    tracks the object to within a few centimetres and then pitches the wrong way;
-    without it the arm does not arrive at all, driving away from the object or
-    stalling. So the two errors are not comparable in size, and the reason is
-    that only one of them is a *sign*. The unrotated frame has the whole scene
-    180 degrees out -- the 179.89 degree figure above -- and a policy closing a
-    visual loop through it reads every lateral correction backwards, which is an
-    inverted controller rather than a biased one. The turn's own cost is a static
-    framing offset: the loop keeps its sign and the alignment it converges to is
-    wrong. A biased controller reaches the object and misses it; an inverted one
-    never arrives.
-
-    Which leaves the turn as necessary and not sufficient, and moves the
-    remaining close-range failure onto the one term neither branch can rotate
-    away -- the viewpoint. Stretch's camera sits 131mm across the approach axis
-    from the Robotiq's and 101mm further back from the grasp, and no operation on
-    the image fixes parallax. The experiment that isolates it is to drop the
-    flipped branch entirely: with the jaw upright the camera is 17mm from the
-    Robotiq's rather than 131mm, so if the close-range pitch failure is the
-    viewpoint it should ease there, and `map_franka_wrist_to_flipped_stretch4_wrist`
-    is then buying wrist reach at the cost of the wrist view.
-
-    Kept, off by default, as the control that establishes the above: without it
-    "the turn is needed" is an argument rather than a measurement. Off is also
-    what every result taken before this flag existed ran under. Pair it with
-    `map_franka_wrist_to_flipped_stretch4_wrist`, the only convention under which
-    it does anything -- with the jaw upright there is no turn to skip.
-
-    The projections are of the compiled models' nominal camera mounts, not of a
-    rollout; the rollout is the paragraph above.
-    """
-
-    map_franka_wrist_to_flipped_stretch4_wrist: bool = False
-    """Retarget every pose onto the half-turned branch of Stretch's wrist.
-
-    Implemented as `jaw_mode="flipped"`, which `FrankaOnStretchView.__init__`
-    upgrades to when this is set: the half-turned branch is pinned for the
-    episode and the pose is *reported back unflipped*, so the policy still
-    commands and reads the Franka's own grasp orientation rather than the
-    Franka's rolled half a turn. The turn is deliberately *not* folded into
-    `_tool_correction` -- that would make the retargeting's own frame the
-    half-turned one, and `setups.apply_tool_correction` would compose a second
-    turn on top of it and the two would cancel.
-
-    A pin rather than a per-step preference because the branch is the whole
-    point of the convention: under `jaw_mode="auto"` the wrist leaves the
-    half-turned branch at the first tool yaw that runs it into
-    `wrist_roll_joint`'s limit and never comes back, which is this convention
-    quietly expiring mid-episode with the cameras swinging round as it goes.
-    What the pin costs is reach at large yaws -- see `JAW_MODES`, which measures
-    it at 0.43 rad of orientation.
-
-    The grasp is identical either way (see `JAW_FLIP`). The reason to want it is
-    the wrist camera: pair it with `change_franka_start_pose_flip_wrist` to put
-    both robots' wrist cameras on the same side of their respective hands.
-    """
-
     match_stretch_spawn_pose_to_franka: bool = False
     """Stand Stretch back far enough that its spawn gripper pose is the Franka's.
 
@@ -758,7 +551,7 @@ class PoseConventions:
 
     @property
     def changes_franka_start_pose(self) -> bool:
-        return self.change_franka_start_pose_flip_wrist or self.change_franka_start_pose_limit_height
+        return self.change_franka_start_pose_limit_height
 
     def describe(self) -> str:
         asked = [
@@ -766,7 +559,7 @@ class PoseConventions:
             for name in POSE_CONVENTION_ENV_VARS
             if getattr(self, name)
         ]
-        return ", ".join(asked) if asked else "none (DROID home, unflipped)"
+        return ", ".join(asked) if asked else "none (DROID home)"
 
 
 def _env_flag(name: str) -> bool:
@@ -827,41 +620,20 @@ def stretch_startable_arm_qpos(
     franka: "VirtualFranka",
     mount_height_m: float = FRANKA_PEDESTAL_HEIGHT,
     *,
-    roll_180: bool = True,
     max_height_m: float | None = STRETCH_MAX_GRASP_HEIGHT_M,
     iterations: int = 300,
 ) -> np.ndarray:
-    """The Franka's home arm configuration, adjusted so Stretch can start there too.
+    """The Franka's home arm configuration, lowered so Stretch can start there too.
 
-    Two changes to the home tool pose, independent of each other and each asked
-    for by its own flag (`StartPoseChanges`), both of which exist because the two
-    robots do not start an episode in the same place and the study needs them to.
-    `roll_180=False` skips the first, `max_height_m=None` skips the second, and
-    with both off this returns `franka.init_qpos` unchanged -- which is what
-    makes "neither flag was passed" cost nothing rather than round-trip the home
-    pose through an IK solve.
-
-    * **The wrist rolled** as near half a turn as `fr3_joint7` goes -- see
-      `roll_franka_wrist`, which turns that one joint and leaves the grasp site
-      exactly where it was. A parallel jaw grasps identically either way round, so
-      this costs the grasp nothing; what swings round is the hand, and the wrist
-      camera bolted off to one side of it.
-
-      Worth knowing what it does to that camera, since it is the reason to want
-      it. `gripper/wrist_camera` -- the one the DROID checkpoint reads -- sits
-      7.4cm behind the grasp site at the Franka's home, with a view direction of
-      x=+0.333 in the arm's base frame. After the roll it is 7.0cm the other side,
-      at x=-0.332. That mirroring is not a choice this function makes: with the
-      approach pointing straight down, a half turn about it takes anything offset
-      to one side over to the other, and the camera is offset. Render the camera
-      and look before concluding it is the view you wanted.
-    * **Lowered to `max_height_m`**, Stretch's own ceiling. The Franka's home puts
-      its grasp site at 1.185m and Stretch's lift tops out 10.3cm below that
-      (`STRETCH_MAX_GRASP_HEIGHT_M`), so unretargeted the Stretch condition begins
-      every episode already saturated, reaching for a pose it cannot hold and
-      reporting proprioception from a configuration it never actually reached.
-      Capping the Franka's start is what makes "both robots start in the same
-      place" true rather than aspirational.
+    The Franka's home puts its grasp site at 1.185m and Stretch's lift tops out
+    10.3cm below that (`STRETCH_MAX_GRASP_HEIGHT_M`), so unretargeted the Stretch
+    condition begins every episode already saturated, reaching for a pose it
+    cannot hold and reporting proprioception from a configuration it never
+    actually reached. Capping the Franka's start at `max_height_m` is what makes
+    "both robots start in the same place" true rather than aspirational.
+    `max_height_m=None` returns `franka.init_qpos` unchanged, which is what makes
+    "the flag was not passed" cost nothing rather than round-trip the home pose
+    through an IK solve.
 
     The clamp is applied to the tool's z *in the arm's own base frame*, offset by
     `mount_height_m`, which is the same number as world z only because every mount
@@ -871,27 +643,13 @@ def stretch_startable_arm_qpos(
     Returns seven joint angles, IK'd from the home configuration so the result is
     the nearest way to hold that pose rather than an unrelated branch. The height
     is a *cap*, not a move: a home pose already below the ceiling is left at its
-    own height and only rolled.
+    own height.
     """
-    if not roll_180 and max_height_m is None:
+    if max_height_m is None:
         return np.asarray(franka.init_qpos, dtype=float).copy()
     pose = franka.fk(franka.init_qpos)
-    if max_height_m is not None:
-        pose[2, 3] = min(float(pose[2, 3]), float(max_height_m) - float(mount_height_m))
-    qpos = franka.ik(pose, franka.init_qpos, iterations=iterations)
-    if roll_180:
-        # The wrist joint first, then a solve for the exact half turn seeded from
-        # it. `fr3_joint7` gets 172.8 of the 180 degrees on its own and the solve
-        # finds the remaining 7.2 in the joints behind it -- seeded from the
-        # rolled wrist, so it converges on the configuration *next to* this one
-        # rather than on some other arm shape that also happens to hold the pose.
-        # See `roll_franka_wrist` for what the seed is worth.
-        qpos = franka.ik(
-            pose @ ROBOTIQ_ROLL_180,
-            roll_franka_wrist(franka, qpos),
-            iterations=iterations,
-        )
-    return qpos
+    pose[2, 3] = min(float(pose[2, 3]), float(max_height_m) - float(mount_height_m))
+    return franka.ik(pose, franka.init_qpos, iterations=iterations)
 
 
 def franka_start_arm_qpos(
@@ -901,61 +659,19 @@ def franka_start_arm_qpos(
 ) -> np.ndarray:
     """`stretch_startable_arm_qpos` driven by a `PoseConventions`.
 
-    The one place the two Franka start-pose flags are turned into the two
-    arguments, so the Franka half of the change (`setups.franka_episode_override`)
-    and the Stretch half (`FrankaOnStretchView`) cannot disagree about what a
-    flag means.
+    The one place the Franka start-pose flag is turned into an argument, so the
+    Franka half of the change (`setups.franka_episode_override`) and the Stretch
+    half (`FrankaOnStretchView`) cannot disagree about what the flag means.
     """
     return stretch_startable_arm_qpos(
         franka,
         mount_height_m,
-        roll_180=conventions.change_franka_start_pose_flip_wrist,
         max_height_m=(
             stretch_tool_geometry().max_grasp_height_m
             if conventions.change_franka_start_pose_limit_height
             else None
         ),
     )
-
-
-def roll_franka_wrist(franka: "VirtualFranka", joint_pos: np.ndarray) -> np.ndarray:
-    """`joint_pos` with the last wrist joint turned as close to half a turn as it goes.
-
-    `fr3_joint7` *is* the roll about the Robotiq's approach axis, so turning it is
-    the whole operation: the grasp site sits on that axis and does not move, the
-    other six joints keep their angles, and what swings round is the hand -- the
-    jaw line, and the wrist camera bolted off to one side of it.
-
-    Done by turning the joint rather than by IK'ing `pose @ ROBOTIQ_ROLL_180`,
-    which is what this used to do and is not the same operation at all: a fresh
-    solve is free to reach the rolled pose from any configuration, and from the
-    Franka's home it picked one with *every* joint moved --
-    `[-0.81, -1.02, 0.60, -2.60, 0.50, 1.66, 2.63]` against a home of
-    `[0, -0.79, 0, -2.36, 0, 1.57, 0]`. That is re-posing the arm, not rolling the
-    wrist, and it moved the elbow and shoulder into a configuration whose
-    consequences (a different jaw branch at large tool yaws) had nothing to do
-    with the roll that was asked for.
-
-    **The joint cannot quite manage a half turn on its own.** `fr3_joint7` runs to
-    +-3.0159 rad and home is 0, so it stops 0.126 rad -- 7.2 degrees -- short
-    either way. That is a property of the arm, not a choice here. Which is why
-    this is a *seed* rather than the answer: `stretch_startable_arm_qpos` turns
-    this joint as far as it goes and then solves for the exact half turn starting
-    from here, so the last 7.2 degrees come out of the joints behind the wrist and
-    the solution stays the one next to this configuration.
-
-    The direction is whichever has more headroom, which from a home of 0 is a
-    tie broken towards positive.
-    """
-    qpos = np.asarray(joint_pos, dtype=float).copy()
-    low, high = franka.joint_limits[6]
-    forward, backward = qpos[6] + math.pi, qpos[6] - math.pi
-    # Whichever half turn the joint can follow furthest before its limit stops it.
-    if min(high, forward) - qpos[6] >= qpos[6] - max(low, backward):
-        qpos[6] = min(high, forward)
-    else:
-        qpos[6] = max(low, backward)
-    return qpos
 
 
 def franka_mount_pose_from_base(
@@ -1503,12 +1219,7 @@ class FrankaOnStretchView:
       not reached -- `last_residual` reports by how much, and
       `last_position_error` is the part of it you can see. The holonomic base
       joins the solve when `include_base` is set, which buys most of the reach
-      back; see `StretchArmIK`. What is left of the orientation shortfall is
-      partly bought back by holding the jaw half a turn over where that is the
-      branch the wrist can reach, which grasps the same object the same way;
-      see `JAW_FLIP` and `_solve_either_jaw`. `jaw_flipped` says which branch the
-      arm is currently in, and `franka_joint_pos` reports the arm state back in
-      the orientation the policy commanded either way.
+      back; see `StretchArmIK`.
     * The policy is looking through Stretch's camera at a Stretch arm, which is
       not what it was trained on. Retargeting fixes the action interface, not
       the visual domain gap.
@@ -1541,13 +1252,9 @@ class FrankaOnStretchView:
         include_base: bool = True,
         target_z_offset: float = 0.0,
         match_robotiq_aperture: bool = True,
-        jaw_mode: str = "auto",
         pose_conventions: PoseConventions | None = None,
         robotiq_aperture_m: float | None = None,
     ) -> None:
-        if jaw_mode not in JAW_MODES:
-            raise ValueError(f"jaw_mode must be one of {JAW_MODES}, not {jaw_mode!r}")
-        self.jaw_mode = jaw_mode
         self.stretch_view = stretch_view
         self.namespace = namespace
         self.target_z_offset = float(target_z_offset)
@@ -1561,20 +1268,6 @@ class FrankaOnStretchView:
         if pose_conventions is None:
             pose_conventions = pose_conventions_requested()
         self.pose_conventions = pose_conventions
-        # A pin, not a seed. `map_franka_wrist_to_flipped_stretch4_wrist` is
-        # wanted for the wrist cameras, which are bolted to the hand, so which
-        # branch the wrist holds is the one thing this convention controls that
-        # anything downstream can see. Left in "auto" it does not survive the
-        # episode: `JAW_FLIP_GAIN_RAD` is hysteresis about the branch *in use*,
-        # with no restoring force towards `jaw_natural_flipped`, so the first
-        # tool yaw that runs the half-turned branch into `wrist_roll_joint`'s
-        # limit evicts the wrist for good and the convention expires mid-reach.
-        # Only "auto" is upgraded, so a caller that asked for "upright" outright
-        # still gets the mode it named.
-        if self.pose_conventions.map_franka_wrist_to_flipped_stretch4_wrist and (
-            self.jaw_mode == "auto"
-        ):
-            self.jaw_mode = "flipped"
         if self.pose_conventions.changes_franka_start_pose:
             self.franka.init_qpos = franka_start_arm_qpos(
                 self.franka, self.pose_conventions, float(franka_mount_pose[2, 3])
@@ -1616,14 +1309,7 @@ class FrankaOnStretchView:
                 self.robotiq_aperture_m,
             )
 
-        # The bare axis correction, under every convention. The half turn that
-        # `map_franka_wrist_to_flipped_stretch4_wrist` asks for is *not* folded
-        # in here: folding it in would make the retargeting's own frame the
-        # half-turned one, so the grasp orientation this reports and accepts
-        # would be the Franka's rolled half a turn rather than the Franka's. The
-        # convention takes Stretch's flipped wrist as its natural state instead
-        # and maps the Franka's grasp orientation onto that -- which is a choice
-        # of *branch*, made below, not a change of frame.
+        # The bare axis correction, under every convention.
         self._tool_correction = np.eye(4)
         self._tool_correction[:3, :3] = FRANKA_TO_STRETCH_TOOL
         self._tool_correction_inverse = np.linalg.inv(self._tool_correction)
@@ -1633,32 +1319,6 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = self.franka.init_qpos.copy()
         self.last_gripper_ctrl = np.array([ROBOTIQ_CTRL_RANGE[0]])
         self.last_residual = np.zeros(6)
-        self.jaw_natural_flipped = self.jaw_mode == "flipped"
-        """Which branch this wrist rests in -- the state it starts and returns to.
-
-        `map_franka_wrist_to_flipped_stretch4_wrist` makes it the half-turned
-        one, by way of the `jaw_mode` upgrade above: Stretch's natural state is
-        the flipped wrist, and the Franka's grasp orientation is mapped onto it
-        from there. Derived from `self.jaw_mode` rather than from the convention
-        directly, so an explicit `jaw_mode="upright"` is not contradicted by a
-        natural branch claiming the opposite. That mapping is what
-        `_tool_correction` stays free of and what `franka_joint_pos` undoes when
-        reporting, so the orientation the policy commands and reads back is the
-        Franka's, not the Franka's rolled half a turn.
-
-        Under `jaw_mode="auto"` this is a default rather than a pin: the arm
-        sits here and `_solve_either_jaw` leaves it wherever the wrist cannot
-        hold this branch -- Stretch's `wrist_roll_joint` range is asymmetric, and
-        at large tool yaws the half-turned branch runs into its limit and settles
-        0.43 rad short (see `JAW_MODES`). Pinning it instead costs real reach:
-        measured on the recorded knife episode, a pinned branch takes the
-        retargeting residual from 4.0mm mean to 198.5mm. `jaw_mode="flipped"`
-        pins it, and `map_franka_wrist_to_flipped_stretch4_wrist` now selects
-        that mode -- a convention held for the wrist cameras has to outlast the
-        first reorientation to be worth anything.
-        """
-        self.jaw_flipped = self.jaw_natural_flipped
-        """Whether the arm is currently holding the half-turned jaw. See `JAW_FLIP`."""
         self.unreachable_steps = 0
         """Steps this episode whose target was out of reach with the lift saturated."""
         self.set_franka_mount_pose(franka_mount_pose)
@@ -1742,13 +1402,7 @@ class FrankaOnStretchView:
             log.info(
                 f"[retarget] snapping with the wrist pitched {pitch:+.1f} deg about the jaw line"
             )
-        # Through the same branch selection as a commanded step, so that the
-        # configuration the robot is written into and `jaw_flipped` cannot
-        # disagree -- the reported arm state is read back through that flag, and
-        # a snap that picked one branch while the flag said the other would
-        # report an arm half a turn from the one Stretch is holding.
-        self.jaw_flipped = self.jaw_natural_flipped
-        solution, residual, self.jaw_flipped = self._solve_either_jaw(target)
+        solution, residual = self.arm_ik.solve(target)
         for group, value in self.arm_ik.split(solution).items():
             move_group = self.stretch_view.get_move_group(group)
             move_group.joint_pos = value
@@ -1775,47 +1429,6 @@ class FrankaOnStretchView:
         return residual
 
     # -- the retargeting itself ----------------------------------------------
-
-    def _solve_either_jaw(self, target_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
-        """Solve for `target_pose`, allowing the gripper to be held half a turn over.
-
-        Returns the joint targets, the residual, and which branch they are. Both
-        branches grasp the commanded object identically (see `JAW_FLIP`), so this
-        is free reach rather than a compromise: the arm is allowed to pick the
-        one its wrist can actually hold.
-
-        Under `jaw_mode` "flipped" or "upright" the branch is fixed and this is a
-        single solve; only "auto" pays for two and chooses. See `JAW_MODES`.
-
-        In "auto", the branch in use is tried first and kept unless the other one
-        clearly wins, which is what stops the wrist rolling over on solver noise;
-        see `JAW_FLIP_GAIN_RAD`.
-        """
-        if self.jaw_mode != "auto":
-            fixed = self.jaw_mode == "flipped"
-            solution, residual = self.arm_ik.solve(
-                target_pose @ JAW_FLIP if fixed else target_pose
-            )
-            return solution, residual, fixed
-
-        current = target_pose @ JAW_FLIP if self.jaw_flipped else target_pose
-        current_solution, current_residual = self.arm_ik.solve(current)
-
-        other = target_pose if self.jaw_flipped else target_pose @ JAW_FLIP
-        other_solution, other_residual = self.arm_ik.solve(other)
-
-        def split(residual):
-            return float(np.linalg.norm(residual[:3])), float(np.linalg.norm(residual[3:]))
-
-        current_position, current_angle = split(current_residual)
-        other_position, other_angle = split(other_residual)
-        switch = (
-            other_position <= current_position + JAW_FLIP_POSITION_SLACK_M
-            and other_angle < current_angle - JAW_FLIP_GAIN_RAD
-        )
-        if switch:
-            return other_solution, other_residual, not self.jaw_flipped
-        return current_solution, current_residual, self.jaw_flipped
 
     def stretch_tool_pose_to_franka(self, tool_pose_world: np.ndarray) -> np.ndarray:
         """A Stretch tool pose in the world -> the Franka grasp site's pose in its base frame."""
@@ -1860,16 +1473,7 @@ class FrankaOnStretchView:
         Seeding from the previous answer instead lets a run of unreachable
         targets walk the reported arm somewhere the policy never sent it.
         """
-        tool_pose = self.arm_ik.tool_pose()
-        if self.jaw_flipped:
-            # Reported in the orientation the policy asked for, not the
-            # grasp-equivalent one the wrist adopted. The two describe the same
-            # grasp (see `JAW_FLIP`), but only one of them is in the frame the
-            # policy is closing its loop in: report the flipped pose and the
-            # checkpoint reads its own command as having been rolled half a turn
-            # and spends the next chunk undoing it.
-            tool_pose = tool_pose @ JAW_FLIP
-        target = self.stretch_tool_pose_to_franka(tool_pose)
+        target = self.stretch_tool_pose_to_franka(self.arm_ik.tool_pose())
         self._franka_seed = self.franka.ik(target, self.last_arm_ctrl)
         return self._franka_seed.copy()
 
@@ -1885,7 +1489,7 @@ class FrankaOnStretchView:
         self.last_arm_ctrl = joint_pos.copy()
 
         target = self.franka_tool_pose_to_world(self.franka.fk(joint_pos))
-        solution, self.last_residual, self.jaw_flipped = self._solve_either_jaw(target)
+        solution, self.last_residual = self.arm_ik.solve(target)
         targets = self.arm_ik.split(solution)
         self._warn_if_lift_saturated(targets, self.last_residual)
         return targets

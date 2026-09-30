@@ -287,18 +287,6 @@ class StretchMolmoBotDroidPolicyConfig(BasePolicyConfig):
     wants clearance, and see `FrankaOnStretchView` for what it does not fix.
     """
 
-    jaw_mode: str = "auto"
-    """
-    Which way round Stretch holds its jaw: "auto", "flipped" or "upright".
-
-    A parallel jaw grasps the same object the same way either way round, so this
-    is free reach rather than a trade in grasp quality -- what it changes is which
-    poses Stretch's wrist can hold. "auto" is the default and the only mode that
-    gives up nothing, at two IK solves per step; "flipped" is one solve and better
-    on position everywhere, at the price of 0.43 rad at large tool yaws. See
-    `franka_retarget.JAW_MODES`, which records the measurements.
-    """
-
     match_robotiq_aperture: bool = True
     """
     Open Stretch's jaw only as wide as the Robotiq's, rather than as wide as it goes.
@@ -586,7 +574,6 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
             franka_mount_pose_from_base(base_xytheta),
             include_base=policy_config.include_base,
             match_robotiq_aperture=policy_config.match_robotiq_aperture,
-            jaw_mode=policy_config.jaw_mode,
         )
 
         # Measured before the snap and from where the robot is standing, so it
@@ -617,7 +604,7 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         log.info(
             f"[droid] virtual Franka at {np.round(proxy.franka_mount_pose[:3, 3], 3).tolist()}, "
             f"target z offset {proxy.target_z_offset:+.4f}m, "
-            f"{proxy.gripper_kind.name} jaw {proxy.jaw_mode}, opens to "
+            f"{proxy.gripper_kind.name} jaw, opens to "
             f"{proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "
             f"base {'in' if policy_config.include_base else 'out of'} the IK"
         )
@@ -641,76 +628,8 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
                 "gripper": proxy.get_move_group("gripper").joint_pos,
             },
             DROID_EXO_CAMERA_KEY: self._camera(obs, policy_config.exo_camera),
-            DROID_WRIST_CAMERA_KEY: self._wrist_camera(
-                obs, policy_config.wrist_camera, proxy
-            ),
+            DROID_WRIST_CAMERA_KEY: self._camera(obs, policy_config.wrist_camera),
         }
-
-    @staticmethod
-    def _wrist_camera(obs: dict, name: str, proxy: FrankaOnStretchView) -> np.ndarray:
-        """The wrist frame, turned back upright when the wrist is held half over.
-
-        `JAW_FLIP` is a half turn about the tool's *approach* axis, and Stretch's
-        wrist camera looks along that axis -- so holding the flipped branch rolls
-        the camera 180 degrees about its own optical axis. Measured on the
-        compiled model at four tool poses: 180.000 degrees, with the axis of that
-        rotation 0.003 degrees off the camera's own -z. The viewpoint moves about
-        110mm with it, the camera crossing to the other side of the approach
-        axis.
-
-        It does *not* buy a better view of the grasp, which an earlier version of
-        this note claimed. The flip is a symmetry of a parallel jaw, so the hand's
-        own appearance is invariant under it: projected into the wrist frame, both
-        fingertips and the grasp centre land in the same place on either branch
-        (v = -0.265 and -0.243). What changes is which side of the world the
-        camera sees past the hand.
-
-        What is not wanted is the roll. The DROID checkpoint reads the wrist view
-        more closely than any other channel (see `cameras.RetargetParams.
-        wrist_fov_deg`), and it was trained on a Franka whose hand is not turned
-        over: hand it an upside-down frame and its corrections come back
-        inverted, which looks exactly like an arm driving away from the object it
-        is reaching for. Undoing the roll in image space returns the orientation
-        the checkpoint expects -- the same trick `ExoCameraParams.quarter_turns`
-        plays for the head camera, which is bolted on sideways for reasons
-        equally uninteresting to a policy.
-
-        **And it costs the near field.** Because the flip moves the camera across
-        the axis as well as rolling it, turning the image back lands the gripper
-        at the *top* of the frame (v = +0.265) where the Franka's sits at the
-        bottom (v = -0.19), and puts the grasp centre above the optical centre
-        rather than below it. So the turn is right for the scene and wrong for
-        the hand -- and the scene wins decisively. Measured, not argued:
-        `PoseConventions.keep_flipped_wrist_camera_frame` skips the turn and the
-        arm stops arriving at the object at all, because an unrotated frame
-        inverts the sign of every lateral correction while the turn only biases
-        where the loop settles. Read that flag for the measurement, and for what
-        the turn still leaves wrong.
-
-        Keyed on `jaw_flipped` rather than on the pose convention because that
-        flag is the physical truth: under `jaw_mode="auto"` the branch can change
-        mid-episode, and the compensation has to change with it.
-
-        Exact only where the branch is: at a tool yaw that runs the wrist into
-        its roll limit the arm settles short of the half turn (158.9 degrees at
-        one of the four poses measured; see `JAW_MODES`), and a full turn back
-        then over-corrects by the shortfall. Still much nearer upright than
-        leaving it, and `retarget_orientation_error_mean_rad` already reports
-        when the branch is not being held.
-        """
-        frame = StretchMolmoBotDroidPolicy._camera(obs, name)
-        if not proxy.jaw_flipped:
-            return frame
-        if proxy.pose_conventions.keep_flipped_wrist_camera_frame:
-            # Asked for the frame as the camera produced it. The turn below fixes
-            # the roll and breaks where the gripper sits in the frame, and which
-            # of the two a checkpoint prefers is a rollout question; see
-            # `PoseConventions.keep_flipped_wrist_camera_frame` for the
-            # projections.
-            return frame
-        # `ascontiguousarray` again, for `_camera`'s reason: `rot90` returns a
-        # view with negative strides and `torch.from_numpy` refuses those.
-        return np.ascontiguousarray(np.rot90(frame, 2))
 
     @staticmethod
     def _camera(obs: dict, name: str) -> np.ndarray:

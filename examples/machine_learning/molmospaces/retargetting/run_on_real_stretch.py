@@ -243,7 +243,7 @@ would throttle every step rather than only the bad ones. `--step-limit-scale`
 tightens all of them together.
 """
 
-SLOW_SPEED_SCALE = 0.4
+SLOW_SPEED_SCALE = 0.2
 """What `--slow` multiplies every commanded velocity and acceleration by.
 
 A fifth of the profile the joint would otherwise run, which is its `max`. Both
@@ -618,21 +618,15 @@ def head_frame_for_policy(
     return _centre_crop_resize(np.ascontiguousarray(frame), options.crop_to, shift)
 
 
-def wrist_frame_for_policy(
-    frame: np.ndarray, jaw_flipped: bool, keep_flipped_frame: bool, fov_deg: float = 0.0
-) -> np.ndarray:
-    """A raw wrist frame, oriented the way the checkpoint reads it.
+def wrist_frame_for_policy(frame: np.ndarray, fov_deg: float = 0.0) -> np.ndarray:
+    """A raw wrist frame, as the checkpoint reads it.
 
     The frame goes to the policy at the hardware's own 640x400, uncropped: it is
-    *not* reframed to the 656x368 a sim rollout renders. The one correction is
-    the half turn, which `StretchMolmoBotDroidPolicy` applies to a rendered frame
-    too: holding the jaw half over rolls the wrist camera 180 degrees about its
-    own axis, and the checkpoint was trained on a Franka whose hand is not turned
-    over -- hand it an upside-down frame and every lateral correction comes back
-    inverted. See `StretchMolmoBotDroidPolicy._wrist_camera` for the measurement,
-    and for what turning it back still leaves wrong.
+    *not* reframed to the 656x368 a sim rollout renders. It is never rotated,
+    whichever branch the wrist is held on: the policy sees the frame the way the
+    camera produced it.
 
-    `fov_deg` is the one crop left, and it is opt-in: it is `RetargetParams.wrist_fov_deg` as
+    `fov_deg` is the one crop, and it is opt-in: it is `RetargetParams.wrist_fov_deg` as
     it exists on hardware: Stretch's camera sits further back along a longer hand
     than the Robotiq's, so an object at the grasp point subtends 1.55x less of
     the frame, and cropping into the centre is how a real camera is narrowed.
@@ -648,9 +642,6 @@ def wrist_frame_for_policy(
         top = (height - crop_height) // 2
         left = (width - crop_width) // 2
         frame = frame[top : top + crop_height, left : left + crop_width]
-
-    if jaw_flipped and not keep_flipped_frame:
-        frame = np.rot90(frame, 2)
     return np.ascontiguousarray(frame)
 
 
@@ -2249,14 +2240,8 @@ class RealStretchRunner:
             group: np.asarray(self.mirror.view.get_move_group(group).joint_pos, dtype=float)
             for group in ("lift", "arm", "wrist", "gripper")
         }
-        # Which branch the wrist settled in, because the difference is a hand
-        # turned most of the way over and it is the first thing about the home
-        # pose anyone notices. Under `jaw_mode="auto"` it is the solver's choice
-        # rather than anything asked for at the command line -- see `--jaw-mode`.
-        branch = "flipped" if self.proxy.jaw_flipped else "upright"
         click.echo(
-            f"Moving to the Franka home pose. Jaw: {branch} "
-            f"({self.proxy.jaw_mode}). Residual (dx dy dz | drx dry drz): "
+            "Moving to the Franka home pose. Residual (dx dy dz | drx dry drz): "
             f"{np.round(residual, 4).tolist()}"
         )
         self._report_start_pose()
@@ -2365,12 +2350,7 @@ class RealStretchRunner:
             observation.head_camera_matrix,
             observation.head_distortion,
         )
-        wrist = wrist_frame_for_policy(
-            observation.wrist_rgb,
-            self.proxy.jaw_flipped,
-            self.proxy.pose_conventions.keep_flipped_wrist_camera_frame,
-            self.settings.wrist_fov_deg,
-        )
+        wrist = wrist_frame_for_policy(observation.wrist_rgb, self.settings.wrist_fov_deg)
 
         if not self.running:
             # Held: the cameras and the mirror keep running, the policy does not.
@@ -2541,7 +2521,6 @@ class RealStretchRunner:
                 {
                     "position_error_m": self.proxy.last_position_error,
                     "orientation_error_rad": self.proxy.last_orientation_error,
-                    "jaw_flipped": float(self.proxy.jaw_flipped),
                     "unreachable_steps": float(self.proxy.unreachable_steps),
                     "inference_s": timing.inference_s if timing else 0.0,
                     "robotiq_ctrl": float(np.ravel(action["gripper"])[0]),
@@ -2743,28 +2722,11 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "franka_retarget.ROBOTIQ_MAX_APERTURE_M.",
 )
 @click.option(
-    "--jaw-mode",
-    type=click.Choice(list(fr.JAW_MODES)),
-    default="auto",
-    show_default=True,
-    help="Which way round the jaw is held. 'auto' lets the IK pick the branch that "
-    "reaches each target best, which is usually the half-turned one -- so the hand "
-    "coming out rolled over is this, not a pose convention -- and it may change branch "
-    "mid-run, which on hardware is a sudden large roll of the wrist and its cameras. "
-    "'flipped' and 'upright' pin it. See franka_retarget.JAW_MODES.",
-)
-@click.option(
     "--snap-to-franka-home/--no-snap-to-franka-home",
     default=True,
     show_default=True,
     help="Move the arm to the Franka's home pose before the first instruction. This is a "
     "real motion of the real robot, and it is the first thing to watch.",
-)
-@click.option(
-    "--change_franka_start_pose_flip_wrist",
-    is_flag=True,
-    help="Roll the Franka's start pose half a turn about its approach axis, which moves "
-    "where `home` puts the arm.",
 )
 @click.option(
     "--change_franka_start_pose_limit_height",
@@ -2774,32 +2736,11 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "asking for more height is unreachable and says so.",
 )
 @click.option(
-    "--change_stretch_start_pose_flip_wrist",
-    is_flag=True,
-    help="No effect here. It rolls the wrist of a Stretch *spawned in simulation*, and "
-    "on hardware there is no spawn -- the arm starts wherever it is, and `home` decides "
-    "the start pose. Accepted so a sim command line can be pasted unchanged.",
-)
-@click.option(
     "--change_stretch_start_pose_pitch_deg",
     type=float,
     default=0.0,
     help="Pitch the wrist by this many degrees about the jaw line at the start pose, "
     "i.e. at `home`. Does not change the frame actions are interpreted in.",
-)
-@click.option(
-    "--keep_flipped_wrist_camera_frame",
-    is_flag=True,
-    help="Feed the policy the wrist frame as the camera produced it while the jaw is "
-    "half-turned, instead of turning it back upright.",
-)
-@click.option(
-    "--map_franka_wrist_to_flipped_stretch4_wrist",
-    is_flag=True,
-    help="Retarget onto the half-turned branch of Stretch's wrist and hold it there. "
-    "The conventions above are franka_retarget.PoseConventions, spelled as "
-    "params_search_side_by_side.py spells them, so a run here can be given the same "
-    "ones a sim comparison was run with.",
 )
 @click.option(
     "--slow",
@@ -2878,14 +2819,9 @@ def main(
     wrist_tilt_deg: float,
     target_z_offset_m: float,
     aperture_m: float,
-    jaw_mode: str,
     snap_to_franka_home: bool,
-    change_franka_start_pose_flip_wrist: bool,
     change_franka_start_pose_limit_height: bool,
-    change_stretch_start_pose_flip_wrist: bool,
     change_stretch_start_pose_pitch_deg: float,
-    keep_flipped_wrist_camera_frame: bool,
-    map_franka_wrist_to_flipped_stretch4_wrist: bool,
     slow: bool,
     step_limit_scale: float,
     max_obs_age: float,
@@ -2920,12 +2856,8 @@ def main(
     )
     click.echo(f"  python     : {sys.executable}")
     conventions = _publish_conventions(
-        change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
-        change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
         change_stretch_start_pose_pitch_deg=change_stretch_start_pose_pitch_deg,
-        keep_flipped_wrist_camera_frame=keep_flipped_wrist_camera_frame,
-        map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
         match_stretch_spawn_pose_to_franka=False,
     )
 
@@ -3007,7 +2939,6 @@ def main(
         fr.franka_mount_pose_from_base(view.get_move_group("base").joint_pos),
         include_base=include_base,
         target_z_offset=target_z_offset_m,
-        jaw_mode=jaw_mode,
         pose_conventions=conventions,
     )
     # The study's two tool parameters, applied the way `setups.py` applies them
@@ -3017,7 +2948,7 @@ def main(
     proxy.reset()
     click.echo(
         f"  retarget   : grasp offset {grasp_offset_m:+.4f}m, wrist tilt {wrist_tilt_deg:+.1f}deg, "
-        f"z offset {target_z_offset_m:+.4f}m, {proxy.gripper_kind.name} jaw {proxy.jaw_mode}, "
+        f"z offset {target_z_offset_m:+.4f}m, {proxy.gripper_kind.name} jaw, "
         f"opens to {proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "
         f"base {'in' if include_base else 'out of'} the IK"
     )

@@ -547,29 +547,12 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "trials.jsonl, or @path to a file holding either.",
 )
 @click.option(
-    "--change_franka_start_pose_flip_wrist",
-    "change_franka_start_pose_flip_wrist",
-    is_flag=True,
-    help="Start the Franka rolled half a turn about its approach axis. The grasp is "
-    "identical either way round; what swings round is the hand, and the wrist camera "
-    "bolted off to one side of it. Applies to the Franka condition and, through the "
-    "retargeting, to the Stretch one. See `franka_retarget.PoseConventions`.",
-)
-@click.option(
     "--change_franka_start_pose_limit_height",
     "change_franka_start_pose_limit_height",
     is_flag=True,
     help="Cap the Franka's start tool height at Stretch's own reach ceiling, so the "
     "Stretch condition does not begin every episode with its lift already at its stop. "
     "See `franka_retarget.PoseConventions`.",
-)
-@click.option(
-    "--change_stretch_start_pose_flip_wrist",
-    "change_stretch_start_pose_flip_wrist",
-    is_flag=True,
-    help="Spawn Stretch with its own wrist rolled half a turn, the counterpart of "
-    "--change_franka_start_pose_flip_wrist. Overwritten by the snap to the Franka's home "
-    "unless snap_to_franka_home is off. See `franka_retarget.PoseConventions`.",
 )
 @click.option(
     "--match_stretch_spawn_pose_to_franka",
@@ -579,14 +562,6 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "cancelling the retreat in the virtual Franka's mount so the frame is unchanged. "
     "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
     "it -- see `fr.stretch_spawn_base_offset_xy` for both numbers.",
-)
-@click.option(
-    "--map_franka_wrist_to_flipped_stretch4_wrist",
-    "map_franka_wrist_to_flipped_stretch4_wrist",
-    is_flag=True,
-    help="Retarget every pose onto the half-turned branch of Stretch's wrist, by folding "
-    "the turn into the tool transform itself -- so it holds for the whole episode and both "
-    "directions carry it, unlike jaw_mode. See `franka_retarget.PoseConventions`.",
 )
 @click.option("--list", "list_only", is_flag=True, help="List the benchmarks and exit.")
 def main(
@@ -606,10 +581,7 @@ def main(
     want_report: bool,
     retarget_setup: str,
     retarget_params: str | None,
-    change_franka_start_pose_flip_wrist: bool,
     change_franka_start_pose_limit_height: bool,
-    change_stretch_start_pose_flip_wrist: bool,
-    map_franka_wrist_to_flipped_stretch4_wrist: bool,
     match_stretch_spawn_pose_to_franka: bool,
     list_only: bool,
 ) -> None:
@@ -665,10 +637,7 @@ def main(
     # this process and its children agree on where an episode starts. Every
     # variable written in both directions -- see `publish_pose_conventions`.
     conventions = PoseConventions(
-        change_franka_start_pose_flip_wrist=change_franka_start_pose_flip_wrist,
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
-        change_stretch_start_pose_flip_wrist=change_stretch_start_pose_flip_wrist,
-        map_franka_wrist_to_flipped_stretch4_wrist=map_franka_wrist_to_flipped_stretch4_wrist,
         match_stretch_spawn_pose_to_franka=match_stretch_spawn_pose_to_franka,
     )
     publish_pose_conventions(conventions)

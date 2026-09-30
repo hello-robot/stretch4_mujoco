@@ -927,11 +927,7 @@ class StretchCameraChoices:
     and that is the point of having it: a grasp that succeeds through one and
     fails through the other is 10mm of parallax and a different finger doing the
     occluding, which is the scale of difference worth ruling out before looking
-    for larger explanations. It composes with the half-turned wrist --
-    `map_franka_wrist_to_flipped_stretch4_wrist` rolls the whole hand, so
-    whichever camera is selected is rolled with it and
-    `StretchMolmoBotDroidPolicy._wrist_camera` turns its frame back upright
-    either way.
+    for larger explanations.
     """
 
     use_left_fisheye_camera: bool = False
@@ -1327,20 +1323,10 @@ def stretch_spawn_base_pose(base_xy, yaw: float) -> tuple[float, float]:
 def stretch_spawn_init_qpos() -> dict[str, list[float]]:
     """Stretch's per-move-group spawn pose for this study.
 
-    `stretch_home_init_qpos()` with the arm out at `STRETCH_SPAWN_ARM_M`, and the
-    wrist rolled half a turn when `--change_stretch_start_pose_flip_wrist` asks
-    for it -- a roll about the approach axis, so the grasp centre does not move
-    and what swings round is the hand and the two cameras on it.
-
-    The roll goes *negative*: `wrist_roll_joint` runs about [-4.276, +1.135] rad,
-    so +pi is outside its travel and -pi is not. Measured, not assumed, and the
-    grasp centre comes out in the same place to the micrometre either way.
+    `stretch_home_init_qpos()` with the arm out at `STRETCH_SPAWN_ARM_M`.
     """
     init_qpos = stretch_home_init_qpos()
     init_qpos["arm"] = [float(STRETCH_SPAWN_ARM_M)]
-    if pose_conventions_requested().change_stretch_start_pose_flip_wrist:
-        yaw, pitch, _ = init_qpos.get("wrist", [0.0, 0.0, 0.0])
-        init_qpos["wrist"] = [float(yaw), float(pitch), -float(np.pi)]
     return init_qpos
 
 
@@ -1495,12 +1481,6 @@ def apply_tool_correction(proxy: Any, wrist_tilt_deg: float, grasp_offset_m: flo
     ).as_matrix()
     # +x is Stretch's approach axis; see `franka_retarget.FRANKA_TO_STRETCH_TOOL`.
     correction[:3, 3] = correction[:3, :3] @ np.array([grasp_offset_m, 0.0, 0.0])
-    # No half turn here, under any convention.
-    # `map_franka_wrist_to_flipped_stretch4_wrist` is a choice of *branch* --
-    # `FrankaOnStretchView` holds the half-turned wrist for the episode -- not a
-    # rotation of the frame the retargeting is defined in. Re-applying one here
-    # would compose with that branch and the two would cancel, which is exactly
-    # what this used to do.
 
     proxy._tool_correction = correction
     proxy._tool_correction_inverse = np.linalg.inv(correction)
