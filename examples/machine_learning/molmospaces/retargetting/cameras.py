@@ -376,6 +376,10 @@ class RetargetParams:
         PG4 `gripper_camera_right_rgb`   -166.3    -10.0   +57.0   straight down the approach
         PG4 `gripper_camera_left_rgb`    -166.3    +10.0   +57.0   straight down the approach
 
+    Re-measure, and get these as flags for both scripts, with
+
+        python -m examples.machine_learning.molmospaces.retargetting.wrist_camera_offset [--parallel_gripper]
+
     So the Franka camera minus Stretch's is +101.4mm in x on the SG4 and +33.3mm
     on the PG4, and +41mm (right camera) or +21mm (left) in y. Setting the
     offsets to exactly those numbers puts Stretch's wrist camera where the
