@@ -1313,7 +1313,7 @@ def replay_episode(
     scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT,
     exo: ExoCameraParams | None = None,
     stage: dict[str, Any] | None = None,
-    tool_correction: tuple[float, float] | None = None,
+    tool_correction: tuple[float, ...] | None = None,
     frame_sink: Any = None,
     physics: bool = False,
     policy_dt_ms: float = 66.0,
@@ -1328,8 +1328,9 @@ def replay_episode(
     every step -- which is how a caller renders a video without this function
     knowing anything about rendering.
 
-    `tool_correction` is `(wrist_tilt_deg, grasp_offset_m)`, the two terms a
-    setup adds to the fixed Franka-to-Stretch tool transform. Passed by a caller
+    `tool_correction` is `(wrist_tilt_deg, grasp_offset_m[, tool_offset_x_m,
+    tool_offset_y_m])`, the terms a setup adds to the fixed Franka-to-Stretch
+    tool transform, in `apply_tool_correction`'s order. Passed by a caller
     replaying *against a setup* -- without it the replay measures the bare
     retargeting, which is a different question from the one a side-by-side
     against `stretch_baseline` asks. See `setups.apply_tool_correction`.
@@ -1400,9 +1401,7 @@ def replay_episode(
             apply_tool_correction,
         )
 
-        apply_tool_correction(
-            proxy, wrist_tilt_deg=tool_correction[0], grasp_offset_m=tool_correction[1]
-        )
+        apply_tool_correction(proxy, *tool_correction)
     # The rollout's own opening move, for the reason `RetargetRig.restore`
     # gives: `StretchArmIK` converges on a target near the configuration it is
     # seeded from, and Stretch's stowed pose is nowhere near the first command.

@@ -354,6 +354,45 @@ class RetargetParams:
     the head camera's version of that knob; the wrist has no equivalent.
     """
 
+    tool_offset_x_m: float = 0.0
+    """
+    Metres to move the commanded grasp centre along Stretch's approach axis (+x, forward).
+
+    The same axis as `grasp_offset_m`, and added to it. The two are separate
+    because they answer different questions: `grasp_offset_m` lines the two
+    hands' *fingers* up, and this and `tool_offset_y_m` are the knobs for the two
+    hands' *wrist cameras* not being in the same place. The policy aims through
+    the wrist view, so a camera that sits somewhere else relative to the fingers
+    shifts where the fingers end up by roughly the difference.
+
+    Measured on the compiled models with the retargeted tool frames coincident,
+    in Stretch's tool axes (x approach, y jaw line, z towards the camera's side
+    of the hand), from each hand's own grasp point:
+
+        camera                             x mm     y mm    z mm   looks
+        Franka `gripper/wrist_camera`    -133.0    +31.0   +74.0   19.5 deg in towards the jaw axis
+        SG4 `gripper_camera_right_rgb`   -234.4    -10.0   +57.0   straight down the approach
+        SG4 `gripper_camera_left_rgb`    -234.4    +10.0   +57.0   straight down the approach
+        PG4 `gripper_camera_right_rgb`   -166.3    -10.0   +57.0   straight down the approach
+        PG4 `gripper_camera_left_rgb`    -166.3    +10.0   +57.0   straight down the approach
+
+    So the Franka camera minus Stretch's is +101.4mm in x on the SG4 and +33.3mm
+    on the PG4, and +41mm (right camera) or +21mm (left) in y. Setting the
+    offsets to exactly those numbers puts Stretch's wrist camera where the
+    Franka's would be for the same command. Nothing sets that by default: the two
+    cameras are also *aimed* differently, and the policy re-closes its loop
+    through the view, so how much of the camera offset shows up as a grasp error
+    is something to measure rather than assume. Like `wrist_tilt_deg`, it is
+    subtracted again from the proprioception the policy reads.
+    """
+
+    tool_offset_y_m: float = 0.0
+    """
+    Metres to move the commanded grasp centre along Stretch's jaw line (+y).
+
+    See `tool_offset_x_m`, which carries the measurement both are set from.
+    """
+
     target_z_offset_m: float = 0.0
     """
     Metres to raise every commanded target by.
@@ -429,6 +468,10 @@ class RetargetParams:
     def describe(self) -> str:
         extra = "" if not self.wrist_fov_deg else f" wrist_fov={self.wrist_fov_deg:.1f}deg"
         extra += "" if not self.aperture_m else f" aperture={self.aperture_m * 1000:.0f}mm"
+        if self.tool_offset_x_m or self.tool_offset_y_m:
+            extra += (
+                f" tool_offset=({self.tool_offset_x_m:+.3f}, {self.tool_offset_y_m:+.3f})m"
+            )
         return (
             f"{self.exo.describe()} | grasp_offset={self.grasp_offset_m:+.3f}m "
             f"wrist_tilt={self.wrist_tilt_deg:+.1f}deg z_offset={self.target_z_offset_m:+.3f}m"

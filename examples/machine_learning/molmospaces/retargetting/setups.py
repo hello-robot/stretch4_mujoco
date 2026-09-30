@@ -1416,6 +1416,12 @@ class RetargetStretchMolmoBotDroidPolicyConfig(StretchMolmoBotDroidPolicyConfig)
     wrist_tilt_deg: float = 0.0
     """See `RetargetParams.wrist_tilt_deg`."""
 
+    tool_offset_x_m: float = 0.0
+    """See `RetargetParams.tool_offset_x_m`."""
+
+    tool_offset_y_m: float = 0.0
+    """See `RetargetParams.tool_offset_y_m`."""
+
     aperture_m: float = 0.0
     """See `RetargetParams.aperture_m`. 0 keeps `ROBOTIQ_MAX_APERTURE_M`."""
 
@@ -1438,8 +1444,8 @@ class RetargetStretchMolmoBotDroidPolicy(StretchMolmoBotDroidPolicy):
     the wrist than the Robotiq's do, so a tool pose that would close the Robotiq
     around an object closes Stretch's palm around the air behind it.
 
-    So the correction gains two terms -- a pitch and a translation along the
-    approach -- and the search decides them. Replacing the matrix after
+    So the correction gains two terms -- a pitch and a translation in the hand's own
+    axes -- and the search decides them. Replacing the matrix after
     construction rather than threading parameters through
     `FrankaOnStretchView.__init__` keeps this study out of the shared
     retargeting module; the transform is one attribute and its inverse, and both
@@ -1453,21 +1459,32 @@ class RetargetStretchMolmoBotDroidPolicy(StretchMolmoBotDroidPolicy):
             proxy,
             wrist_tilt_deg=float(getattr(policy_config, "wrist_tilt_deg", 0.0)),
             grasp_offset_m=float(getattr(policy_config, "grasp_offset_m", 0.0)),
+            tool_offset_x_m=float(getattr(policy_config, "tool_offset_x_m", 0.0)),
+            tool_offset_y_m=float(getattr(policy_config, "tool_offset_y_m", 0.0)),
         )
         apply_aperture(proxy, float(getattr(policy_config, "aperture_m", 0.0)))
         return proxy
 
 
-def apply_tool_correction(proxy: Any, wrist_tilt_deg: float, grasp_offset_m: float) -> None:
+def apply_tool_correction(
+    proxy: Any,
+    wrist_tilt_deg: float,
+    grasp_offset_m: float,
+    tool_offset_x_m: float = 0.0,
+    tool_offset_y_m: float = 0.0,
+) -> None:
     """Rewrite a `FrankaOnStretchView`'s tool transform in place.
 
     The composition is rotate-then-translate in the *Stretch* tool frame:
 
-        correction = FRANKA_TO_STRETCH_TOOL @ R_y(tilt) @ T(offset along +x)
+        correction = FRANKA_TO_STRETCH_TOOL @ R_y(tilt)
+                     @ T(grasp_offset + tool_offset_x along +x, tool_offset_y along +y)
 
-    so `grasp_offset_m` moves the commanded grasp centre along the approach
-    direction after the tilt has decided which way that is, which is the way
-    round that makes the two parameters independent.
+    so the translation moves the commanded grasp centre in the hand's own axes
+    after the tilt has decided which way those point, which is the way round that
+    makes the parameters independent. `tool_offset_x_m` shares `grasp_offset_m`'s
+    axis and simply adds to it; the two are kept apart because they correct
+    different things -- see `RetargetParams.tool_offset_x_m`.
     """
     from scipy.spatial.transform import Rotation as R
 
@@ -1480,7 +1497,10 @@ def apply_tool_correction(proxy: Any, wrist_tilt_deg: float, grasp_offset_m: flo
         "y", wrist_tilt_deg, degrees=True
     ).as_matrix()
     # +x is Stretch's approach axis; see `franka_retarget.FRANKA_TO_STRETCH_TOOL`.
-    correction[:3, 3] = correction[:3, :3] @ np.array([grasp_offset_m, 0.0, 0.0])
+    # +y is the jaw line.
+    correction[:3, 3] = correction[:3, :3] @ np.array(
+        [grasp_offset_m + tool_offset_x_m, tool_offset_y_m, 0.0]
+    )
 
     proxy._tool_correction = correction
     proxy._tool_correction_inverse = np.linalg.inv(correction)
@@ -1604,6 +1624,8 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
         if isinstance(self.policy_config, RetargetStretchMolmoBotDroidPolicyConfig):
             self.policy_config.grasp_offset_m = params.grasp_offset_m
             self.policy_config.wrist_tilt_deg = params.wrist_tilt_deg
+            self.policy_config.tool_offset_x_m = params.tool_offset_x_m
+            self.policy_config.tool_offset_y_m = params.tool_offset_y_m
             self.policy_config.target_z_offset = params.target_z_offset_m
             self.policy_config.aperture_m = params.aperture_m
 

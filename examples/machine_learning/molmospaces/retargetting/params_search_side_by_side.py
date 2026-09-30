@@ -1328,7 +1328,12 @@ def replay_pair(
                 ),
                 fps=fps,
                 target_z_offset=target_z_offset,
-                tool_correction=(params.wrist_tilt_deg, params.grasp_offset_m),
+                tool_correction=(
+                    params.wrist_tilt_deg,
+                    params.grasp_offset_m,
+                    params.tool_offset_x_m,
+                    params.tool_offset_y_m,
+                ),
                 aperture_m=params.aperture_m or None,
                 scene_count=scene_count,
                 physics=physics,
@@ -2253,6 +2258,8 @@ def run_directory_name(
     benchmark: str | None = None,
     today: date | None = None,
     parallel_gripper: bool = False,
+    tool_offset_x: float | None = None,
+    tool_offset_y: float | None = None,
 ) -> str:
     """The directory one run of this script writes to, named after what it is.
 
@@ -2264,8 +2271,8 @@ def run_directory_name(
     describe.
 
     What goes in: the date, the pair, the benchmark when it is not the mini one,
-    the tool when it is the PG4, every convention and camera choice that is on, the Stretch grasp offset when
-    one was typed, and every `--param` override. What stays out is everything
+    the tool when it is the PG4, every convention and camera choice that is on, the Stretch grasp
+    and tool offsets when they were typed, and every `--param` override. What stays out is everything
     operational -- the worker count, the checkpoint path, `--rebuild-benchmark`,
     `--scenes` -- which changes how a run is produced rather than what it
     measures. `--scenes` is the arguable one: two scene counts land in the same
@@ -2302,6 +2309,10 @@ def run_directory_name(
     ]
     if grasp_offset is not None:
         segments.append(f"grasp-offset{_run_name_value(grasp_offset)}")
+    if tool_offset_x is not None:
+        segments.append(f"tool-offset-x{_run_name_value(tool_offset_x)}")
+    if tool_offset_y is not None:
+        segments.append(f"tool-offset-y{_run_name_value(tool_offset_y)}")
     segments += sorted(_run_name_param(spec) for spec in param_specs)
     return "_".join(segments)
 
@@ -2424,6 +2435,14 @@ def _typed(name: str) -> bool:
     return source is not None and source.name != "DEFAULT"
 
 
+STRETCH_OFFSET_FLAGS = {
+    "stretch4_grasp_offset": "grasp_offset_m",
+    "stretch4_tool_offset_x": "tool_offset_x_m",
+    "stretch4_tool_offset_y": "tool_offset_y_m",
+}
+"""The Stretch-only offset flags, and the `RetargetParams` field each one writes."""
+
+
 def _apply_params(
     base: RetargetParams, specs: tuple[str, ...], setup_key: str
 ) -> RetargetParams:
@@ -2444,7 +2463,9 @@ def _apply_params(
     its own 0.
 
     Applied after `--param` so it wins over a `--param grasp_offset_m=` naming
-    the same number; the dedicated flag is the more specific statement. Note the
+    the same number; the dedicated flag is the more specific statement.
+    `--stretch4-tool-offset-x` / `-y` are handled exactly the same way, for
+    `tool_offset_x_m` / `tool_offset_y_m`; see `STRETCH_OFFSET_FLAGS`. Note the
     asymmetry that leaves: `--param` is applied to whichever setup it is handed,
     Franka included, which is what its own help means by "where it applies".
 
@@ -2462,9 +2483,11 @@ def _apply_params(
         if not value:
             raise click.UsageError(f"--param {spec!r} should be name=value.")
         params = DIMENSIONS[name].write(params, float(value))
-    if _typed("stretch4_grasp_offset") and SETUPS[setup_key].robot == "stretch":
-        offset = click.get_current_context().params["stretch4_grasp_offset"]
-        params = DIMENSIONS["grasp_offset_m"].write(params, float(offset))
+    if SETUPS[setup_key].robot == "stretch":
+        for flag, dimension in STRETCH_OFFSET_FLAGS.items():
+            if _typed(flag):
+                value = click.get_current_context().params[flag]
+                params = DIMENSIONS[dimension].write(params, float(value))
     return params
 
 
@@ -2597,6 +2620,33 @@ def _apply_params(
     "parameter a grasp is most sensitive to; see setups.apply_tool_correction.",
 )
 @click.option(
+    "--stretch4-tool-offset-x",
+    "--stretch4_tool_offset_x",
+    "stretch4_tool_offset_x",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="tool_offset_x_m for every Stretch setup this invocation touches, in metres: "
+    "moves the commanded grasp centre forward along Stretch's approach axis, on top of "
+    "the grasp offset. The knob for the two robots' wrist cameras sitting at different "
+    "depths behind their fingers -- +0.101 on the SG4 and +0.033 on the PG4 put Stretch's "
+    "camera where the Franka's is. Stretch only, overrides --param tool_offset_x_m. See "
+    "cameras.RetargetParams.tool_offset_x_m.",
+)
+@click.option(
+    "--stretch4-tool-offset-y",
+    "--stretch4_tool_offset_y",
+    "stretch4_tool_offset_y",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="tool_offset_y_m for every Stretch setup this invocation touches, in metres: "
+    "moves the commanded grasp centre along Stretch's jaw line. +0.041 (right gripper "
+    "camera) or +0.021 (left) puts Stretch's camera level with the Franka's across the "
+    "hand. Stretch only, overrides --param tool_offset_y_m. See "
+    "cameras.RetargetParams.tool_offset_x_m.",
+)
+@click.option(
     "--replay-kinematic",
     "replay_kinematic",
     is_flag=True,
@@ -2714,6 +2764,8 @@ def main(
     replay_as_stretch4: bool,
     replay_z_offset: float,
     stretch4_grasp_offset: float,
+    stretch4_tool_offset_x: float,
+    stretch4_tool_offset_y: float,
     replay_limit: int | None,
     replay_no_video: bool,
     replay_kinematic: bool,
@@ -2809,6 +2861,12 @@ def main(
                 benchmark=benchmark,
                 today=day,
                 parallel_gripper=parallel_gripper,
+                tool_offset_x=(
+                    stretch4_tool_offset_x if _typed("stretch4_tool_offset_x") else None
+                ),
+                tool_offset_y=(
+                    stretch4_tool_offset_y if _typed("stretch4_tool_offset_y") else None
+                ),
             )
 
         found = (
@@ -2863,7 +2921,12 @@ def main(
                 render=False,
                 limit=replay_limit,
                 target_z_offset=z_offset,
-                tool_correction=(params.wrist_tilt_deg, params.grasp_offset_m),
+                tool_correction=(
+                    params.wrist_tilt_deg,
+                    params.grasp_offset_m,
+                    params.tool_offset_x_m,
+                    params.tool_offset_y_m,
+                ),
                 aperture_m=params.aperture_m or None,
                 # The run's own --scenes, so `scene_for_house` searches a list
                 # that contains the houses the trajectories were recorded in.

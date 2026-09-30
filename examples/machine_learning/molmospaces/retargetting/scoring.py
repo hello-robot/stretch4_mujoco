@@ -576,11 +576,19 @@ PARAM_LABELS = {
     "crop_to": "crop",
     "grasp_offset_m": "grasp_off",
     "wrist_tilt_deg": "wrist_tilt",
+    "tool_offset_x_m": "tool_x",
+    "tool_offset_y_m": "tool_y",
     "target_z_offset_m": "z_offset",
 }
 """Column headings for the parameter fields, short enough to put in a table."""
 
-TOOL_FIELDS = ("grasp_offset_m", "wrist_tilt_deg", "target_z_offset_m")
+TOOL_FIELDS = (
+    "grasp_offset_m",
+    "wrist_tilt_deg",
+    "target_z_offset_m",
+    "tool_offset_x_m",
+    "tool_offset_y_m",
+)
 
 PARAM_EXPLANATIONS = {
     "pitch_deg": (
@@ -616,6 +624,17 @@ PARAM_EXPLANATIONS = {
         "about the tool y axis on top of the fixed -90 degree correction the retargeting "
         "already carries. 0 is the retargeting's own behaviour; positive tips the gripper "
         "further down than the policy asked for."
+    ),
+    "tool_offset_x_m": (
+        "Metres the commanded grasp centre is moved **along Stretch's approach axis**, on top "
+        "of `grasp_offset`. Where `grasp_offset` lines the two hands' fingers up, this is for "
+        "their wrist cameras: the Franka's sits 101mm further forward of Stretch's SG4 one "
+        "relative to the fingers (33mm on the PG4). See `RetargetParams.tool_offset_x_m`."
+    ),
+    "tool_offset_y_m": (
+        "Metres the commanded grasp centre is moved **along Stretch's jaw line**. The "
+        "Franka's wrist camera sits 41mm to one side of Stretch's right gripper camera "
+        "(21mm of its left). See `RetargetParams.tool_offset_x_m`."
     ),
     "target_z_offset_m": (
         "**Metres** to raise every commanded target by. Stretch's lift runs out of travel "

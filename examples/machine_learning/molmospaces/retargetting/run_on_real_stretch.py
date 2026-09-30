@@ -2701,6 +2701,25 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "setups.STRETCH_GRASP_OFFSET_M for the sim setups' default (-0.009 on the SG4) and why.",
 )
 @click.option(
+    "--tool-offset-x-m",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Move the commanded grasp centre forward along the approach, on top of "
+    "--grasp-offset-m: the knob for the Franka's wrist camera sitting nearer its fingers "
+    "than Stretch's does. +0.101 (SG4) or +0.033 (PG4) puts Stretch's gripper camera where "
+    "the Franka's is. See cameras.RetargetParams.tool_offset_x_m.",
+)
+@click.option(
+    "--tool-offset-y-m",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Move the commanded grasp centre along the jaw line. +0.041 (right gripper "
+    "camera) or +0.021 (left) puts Stretch's camera level with the Franka's across the "
+    "hand. See cameras.RetargetParams.tool_offset_x_m.",
+)
+@click.option(
     "--wrist-tilt-deg",
     type=float,
     default=0.0,
@@ -2816,6 +2835,8 @@ def main(
     head_virtual_pitch_deg: float | None,
     wrist_fov_deg: float,
     grasp_offset_m: float,
+    tool_offset_x_m: float,
+    tool_offset_y_m: float,
     wrist_tilt_deg: float,
     target_z_offset_m: float,
     aperture_m: float,
@@ -2941,13 +2962,21 @@ def main(
         target_z_offset=target_z_offset_m,
         pose_conventions=conventions,
     )
-    # The study's two tool parameters, applied the way `setups.py` applies them
-    # to a trial, so a run here is the same retargeting a sim trial measured.
-    apply_tool_correction(proxy, wrist_tilt_deg=wrist_tilt_deg, grasp_offset_m=grasp_offset_m)
+    # The study's tool parameters, applied the way `setups.py` applies them to a
+    # trial, so a run here is the same retargeting a sim trial measured.
+    apply_tool_correction(
+        proxy,
+        wrist_tilt_deg=wrist_tilt_deg,
+        grasp_offset_m=grasp_offset_m,
+        tool_offset_x_m=tool_offset_x_m,
+        tool_offset_y_m=tool_offset_y_m,
+    )
     apply_aperture(proxy, aperture_m)
     proxy.reset()
     click.echo(
-        f"  retarget   : grasp offset {grasp_offset_m:+.4f}m, wrist tilt {wrist_tilt_deg:+.1f}deg, "
+        f"  retarget   : grasp offset {grasp_offset_m:+.4f}m, "
+        f"tool offset ({tool_offset_x_m:+.4f}, {tool_offset_y_m:+.4f})m, "
+        f"wrist tilt {wrist_tilt_deg:+.1f}deg, "
         f"z offset {target_z_offset_m:+.4f}m, {proxy.gripper_kind.name} jaw, "
         f"opens to {proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "
         f"base {'in' if include_base else 'out of'} the IK"
