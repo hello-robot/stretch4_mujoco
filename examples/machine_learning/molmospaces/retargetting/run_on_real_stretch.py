@@ -282,6 +282,36 @@ BASE_DEADBAND_M = 0.005
 BASE_DEADBAND_RAD = 0.01
 """A base gap smaller than this is not sent. See `RobotCommander._send_base`."""
 
+ARRIVAL_TIMEOUT_S = 2.0
+"""How long `--wait-for-arrival` waits for one step's motion to finish.
+
+Generous for a single step: every target is clamped to `MAX_TARGET_STEP` of the
+measured position, so a step that is still moving after this is not a slow
+step, it is a joint that is not going to get there. The loop carries on rather
+than stalling on it, and says so once."""
+
+MOTION_START_WINDOW_S = 0.2
+"""How long `--wait-for-arrival` waits to see a step's motion *start*.
+
+`is_moving()` reads the last status pulled, and right after `push_command` that
+status can still describe a robot at rest -- the same race
+`RobotClient.wait_on_motion_finish` covers with `wait_on_motion_start`. Shorter
+than its 0.5s because it is paid in full by every step whose targets are already
+where the robot is (a held gripper, a clamped joint), and at 15Hz that adds up.
+"""
+
+ARRIVAL_POLL_S = 0.01
+"""Sleep between `is_moving()` polls under `--wait-for-arrival`."""
+
+DESYNC_TOOL_M = 0.01
+DESYNC_JOINT_RAD = 0.05
+"""Past either, the step is flagged as desynced in Rerun's text log. See `Desync`.
+
+A centimetre at the tool, the scale at which a grasp starts missing and the one
+`fr.UNREACHABLE_WARNING_M` uses. 0.05 rad at the worst Franka joint, a quarter
+of the 0.2 rad per-step cap `relative_max_joint_delta` puts on a whole action --
+a gap that size is a large fraction of what the next delta is going to move."""
+
 
 # =============================================================================
 # The robot's stream
@@ -1016,6 +1046,35 @@ class RobotCommander:
         self.last_sent = commanded
         return commanded
 
+    def wait_until_settled(self, timeout: float, keep_waiting: Callable[[], bool]) -> bool:
+        """Block until the motion `send` started has finished, by `RobotClient.is_moving()`.
+
+        What `--wait-for-arrival` does after every step, so that the next
+        `joint_pos_rel` delta is added to where the last one actually got to
+        rather than to a joint still on its way there.
+
+        Not `robot.wait_command()`: that returns None whatever happened, so a
+        timeout looks like an arrival, and it cannot be interrupted -- a stop key
+        pressed during it lands only once the motion is over. `keep_waiting` is
+        polled every cycle for exactly that; it returning False ends the wait.
+
+        Motion has to be *seen* starting before a still robot counts as arrived,
+        within `MOTION_START_WINDOW_S`; see there. Returns True on arrival, False
+        on a timeout or when `keep_waiting` ended it.
+        """
+        started_at = time.monotonic()
+        seen_moving = False
+        while time.monotonic() - started_at < timeout:
+            if not keep_waiting():
+                return False
+            self.robot.pull_status(blocking=True)
+            if self.robot.is_moving():
+                seen_moving = True
+            elif seen_moving or time.monotonic() - started_at >= MOTION_START_WINDOW_S:
+                return True
+            time.sleep(ARRIVAL_POLL_S)
+        return False
+
     def _send_base(self, goal: np.ndarray, measured: dict[str, float]) -> dict[str, float]:
         """A base pose target, as one relative move toward it.
 
@@ -1618,6 +1677,8 @@ class RerunTelemetry:
         self._task: str | None = None
         self._queries: list[float] = []
         """Every model query's wall time this run, for the rolling mean in the log."""
+        self._desynced = False
+        """Whether the last logged step was flagged. See `_log_desync`."""
 
     def _run_tab(self, rrb: Any) -> Any:
         """The default tab: the plan, the frames behind it, and the errors."""
@@ -1692,6 +1753,7 @@ class RerunTelemetry:
         errors: dict[str, float] | None = None,
         scene: SceneSnapshot | None = None,
         timing: TimingNote | None = None,
+        desync: Desync | None = None,
     ) -> None:
         rr = self._rr
         rr.set_time("policy_step", sequence=step)
@@ -1729,10 +1791,46 @@ class RerunTelemetry:
 
         if timing is not None:
             self._log_timing(step, timing)
+        if desync is not None:
+            self._log_desync(step, desync)
 
         if task != self._task:
             self._task = task
             rr.log("run/task", rr.TextDocument(task))
+
+    def _log_desync(self, step: int, desync: Desync) -> None:
+        """The `Desync` scalars every step; a WARN line for every step it is flagged.
+
+        Every flagged step rather than once, so that scrubbing the timeline to a
+        bad reach finds the line at that step. Coming back into sync gets one
+        INFO line, so the end of a desynced stretch is marked too.
+        """
+        rr = self._rr
+        rr.log("error/desync_tool_m", rr.Scalars(desync.tool_m))
+        rr.log("error/desync_joint_rad", rr.Scalars(desync.joint_rad))
+        rr.log("error/desync_gripper_fraction", rr.Scalars(desync.gripper))
+        if desync.flagged:
+            rr.log(
+                "log/desync",
+                rr.TextLog(
+                    f"step {step}: DESYNC -- the Franka the policy is told about is "
+                    f"{desync.tool_m * 100:.1f}cm from where it last sent it at the tool, "
+                    f"{desync.joint_rad:.3f} rad at fr3_joint{desync.worst_joint + 1} "
+                    f"(flagged past {DESYNC_TOOL_M * 100:.0f}cm / {DESYNC_JOINT_RAD:.2f} rad); "
+                    f"gripper {desync.gripper:.0%} of its travel apart.",
+                    level="WARN",
+                ),
+            )
+        elif self._desynced:
+            rr.log(
+                "log/desync",
+                rr.TextLog(
+                    f"step {step}: back in sync -- {desync.tool_m * 100:.1f}cm, "
+                    f"{desync.joint_rad:.3f} rad.",
+                    level="INFO",
+                ),
+            )
+        self._desynced = desync.flagged
 
     def _log_timing(self, step: int, timing: TimingNote) -> None:
         """One line per step about how long the policy took, plus the same as scalars.
@@ -2010,7 +2108,29 @@ class RunSettings:
     wrist_fov_deg: float = 0.0
 
 
-def pose_virtual_franka(franka: fr.VirtualFranka, data: MjData, joint_pos) -> None:
+ROBOTIQ_HAND_JOINTS = tuple(
+    f"gripper/{name}"
+    for name in (
+        "left_driver_joint",
+        "left_spring_link_joint",
+        "left_follower",
+        "right_driver_joint",
+        "right_spring_link_joint",
+        "right_follower_joint",
+    )
+)
+"""The virtual Franka's six Robotiq joints, which `pose_virtual_franka` sets together.
+
+The 2F-85 is a closed linkage held shut by equality constraints, and
+`mj_kinematics` does not enforce those -- so setting the driver alone draws a
+hand that has come apart. Stepping the model to rest at five commands from 0 to
+255 puts all six within 0.0002 rad of the driver angle, so the driver angle
+written into all six is the linkage's own pose, with no physics to run."""
+
+
+def pose_virtual_franka(
+    franka: fr.VirtualFranka, data: MjData, joint_pos, gripper_ctrl: float | None = None
+) -> None:
     """Put a *second* `MjData` for the virtual Franka at `joint_pos`, in place.
 
     `VirtualFranka.fk` already does these kinematics, but it does them in the
@@ -2020,14 +2140,26 @@ def pose_virtual_franka(franka: fr.VirtualFranka, data: MjData, joint_pos) -> No
 
     The joints are addressed by name, the way `VirtualFranka` addresses its own,
     so this cannot silently drift onto the wrong `qpos` slots if the model gains
-    a body. Only the arm is posed: the hand is left at the model's default
-    aperture, because the ghost is in the picture for where its tool centre is
-    and the Robotiq command is already a plot of its own.
+    a body.
+
+    `gripper_ctrl` is the policy's Robotiq command, 0-255, and closes the hand
+    to match; see `ROBOTIQ_HAND_JOINTS`. Without it the hand stays where it was
+    last put. It used to be left at the model's default aperture always, which
+    drew a Franka whose hand never closed next to a Stretch whose hand closed
+    fully on the same command.
     """
     joint_pos = np.asarray(joint_pos, dtype=float).reshape(-1)[: fr.VirtualFranka.N_JOINTS]
     model = franka.model
     for index, value in enumerate(np.clip(joint_pos, *franka.joint_limits.T)):
         data.qpos[model.jnt_qposadr[model.joint(f"fr3_joint{index + 1}").id]] = value
+    if gripper_ctrl is not None:
+        low, high = fr.ROBOTIQ_CTRL_RANGE
+        fraction = float(np.clip((gripper_ctrl - low) / (high - low), 0.0, 1.0))
+        driver = fr.ROBOTIQ_DRIVER_OPEN + fraction * (
+            fr.ROBOTIQ_DRIVER_CLOSED - fr.ROBOTIQ_DRIVER_OPEN
+        )
+        for name in ROBOTIQ_HAND_JOINTS:
+            data.qpos[model.jnt_qposadr[model.joint(name).id]] = driver
     mujoco.mj_kinematics(model, data)
 
 
@@ -2122,6 +2254,56 @@ def tool_errors(
                 np.linalg.norm(target[:3, 3] - commanded[:3, 3])
             )
     return errors
+
+
+@dataclass
+class Desync:
+    """How far the Franka the policy is *told* about is from the one it last commanded.
+
+    The policy never sees Stretch. It sees seven Franka joint angles, solved
+    back out of wherever Stretch's gripper actually is, and adds its next
+    `joint_pos_rel` delta to them. As long as Stretch reaches each command those
+    angles are the command echoed back, and the policy's picture of its own arm
+    is the one it was trained with. When Stretch falls short -- still moving, a
+    `MAX_TARGET_STEP` clamp, a pose outside its reach -- the angles it is told
+    are somewhere it did not send the arm, and the next delta is added to that.
+    `--wait-for-arrival` removes the first cause, not the other two.
+
+    `gripper` is in fractions of the Robotiq's travel and is reported, not
+    flagged: fingers stopped on an object never reach a close command, on the
+    Franka as much as here, so a gap there while holding something is a grasp.
+    """
+
+    tool_m: float
+    joint_rad: float
+    worst_joint: int
+    gripper: float
+
+    @property
+    def flagged(self) -> bool:
+        return self.tool_m > DESYNC_TOOL_M or self.joint_rad > DESYNC_JOINT_RAD
+
+    @classmethod
+    def measure(
+        cls,
+        franka: fr.VirtualFranka,
+        commanded_arm: np.ndarray,
+        reported_arm: np.ndarray,
+        commanded_gripper: float,
+        reported_gripper: float,
+    ) -> "Desync":
+        """Both arms through the Franka's FK, so the tool gap is in the policy's own terms."""
+        gap = np.abs(np.asarray(reported_arm, dtype=float) - np.asarray(commanded_arm, dtype=float))
+        tool = float(
+            np.linalg.norm(franka.fk(reported_arm)[:3, 3] - franka.fk(commanded_arm)[:3, 3])
+        )
+        low, high = fr.ROBOTIQ_CTRL_RANGE
+        return cls(
+            tool_m=tool,
+            joint_rad=float(gap.max()),
+            worst_joint=int(gap.argmax()),
+            gripper=float(abs(reported_gripper - commanded_gripper) / (high - low)),
+        )
 
 
 class RealStretchRunner:
@@ -2331,15 +2513,19 @@ class RealStretchRunner:
             return None
         return observation
 
-    def step(self) -> None:
-        """One control cycle: observe, act, retarget, send, log."""
+    def step(self) -> bool:
+        """One control cycle: observe, act, retarget, send, log.
+
+        Returns whether anything was sent to the robot, which is what
+        `--wait-for-arrival` has to wait on.
+        """
         observation = self._current_observation()
         if observation is None:
             self.pause("no frames from the robot")
-            return
+            return False
         if observation.age > self.settings.max_obs_age:
             self.pause(f"the newest frame is {observation.age:.1f}s old")
-            return
+            return False
 
         measured = self.last_measured = self.mirror.sync(observation)
 
@@ -2365,7 +2551,7 @@ class RealStretchRunner:
             # where the policy is pointing" about a policy that was not driving
             # anything. A held robot should be quiet.
             self._log(observation, head, wrist, measured, commanded={}, action=None)
-            return
+            return False
 
         policy_observation = {
             "task": self.task,
@@ -2380,6 +2566,7 @@ class RealStretchRunner:
         # Copied before the policy sees it: this is the state its `joint_pos_rel`
         # deltas are added to, and `_log` checks it against the measured gripper.
         reported_arm = np.array(policy_observation["qpos"]["arm"], dtype=float)
+        desync = self._desync(reported_arm, policy_observation["qpos"]["gripper"])
 
         started = time.perf_counter()
         action = self.policy.get_action(policy_observation)
@@ -2393,7 +2580,29 @@ class RealStretchRunner:
         if self.commander is not None and self.running:
             commanded = self.commander.send(targets, measured)
 
-        self._log(observation, head, wrist, measured, commanded, action, timing, reported_arm)
+        self._log(
+            observation, head, wrist, measured, commanded, action, timing, reported_arm, desync
+        )
+        return bool(commanded)
+
+    def _desync(self, reported_arm: np.ndarray, reported_gripper: Any) -> Desync | None:
+        """This step's `Desync`, against the command the last step sent.
+
+        Read before `get_action`, which overwrites `last_arm_ctrl`. None when
+        nothing is driving the robot (`--dry-run`), where an arm that never moves
+        is desynced by construction and flagging it every step says nothing.
+        After `new_episode` the proxy's reset has made the last command the arm's
+        own pose, so an episode's first step compares the arm with itself.
+        """
+        if self.commander is None:
+            return None
+        return Desync.measure(
+            self.proxy.franka,
+            commanded_arm=np.asarray(self.proxy.last_arm_ctrl, dtype=float),
+            reported_arm=reported_arm,
+            commanded_gripper=float(np.ravel(self.proxy.last_gripper_ctrl)[0]),
+            reported_gripper=fr.robotiq_ctrl_from_driver(reported_gripper),
+        )
 
     def _timing(self, inference_s: float) -> TimingNote:
         """How long `get_action` took, and whether that was the model or a list index.
@@ -2475,7 +2684,12 @@ class RealStretchRunner:
         )
         if action is None or self._ghost is None:
             return scene
-        pose_virtual_franka(self.proxy.franka, self._ghost, action["arm"])
+        pose_virtual_franka(
+            self.proxy.franka,
+            self._ghost,
+            action["arm"],
+            gripper_ctrl=float(np.ravel(action["gripper"])[0]),
+        )
         ghost = np.array(self.proxy.franka_mount_pose, dtype=float)
         ghost[2, 3] += self.proxy.target_z_offset
         scene.franka_data = self._ghost
@@ -2496,6 +2710,7 @@ class RealStretchRunner:
         action: dict[str, Any] | None,
         timing: TimingNote | None = None,
         reported_arm: np.ndarray | None = None,
+        desync: Desync | None = None,
     ) -> None:
         """One row of telemetry, whether or not the policy was asked for an action.
 
@@ -2552,6 +2767,7 @@ class RealStretchRunner:
             errors=errors,
             scene=scene,
             timing=timing,
+            desync=desync,
         )
 
     def _warn_once(self, key: str, message: str) -> None:
@@ -2777,6 +2993,14 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     help="Scale the per-step target clamps in MAX_TARGET_STEP. Below 1 is more cautious.",
 )
 @click.option(
+    "--wait-for-arrival/--no-wait-for-arrival",
+    default=False,
+    show_default=True,
+    help="After each step, wait for the robot to stop moving (RobotClient.is_moving) and "
+    "for a frame taken after that, before the next step. Every joint_pos_rel delta then "
+    "starts from where the last one arrived, at the cost of a stop-and-go robot.",
+)
+@click.option(
     "--max-obs-age",
     type=float,
     default=0.5,
@@ -2845,6 +3069,7 @@ def main(
     change_stretch_start_pose_pitch_deg: float,
     slow: bool,
     step_limit_scale: float,
+    wait_for_arrival: bool,
     max_obs_age: float,
     rerun: bool,
     rerun_3d: bool,
@@ -2869,7 +3094,10 @@ def main(
     where = "--dry-run, not connecting" if dry_run else (robot_ip or "local")
     click.echo(f"  robot      : {where}")
     click.echo(f"  head       : {head_mode}, crop {crop_to or 'none'}")
-    click.echo(f"  rate       : {control_hz} Hz")
+    click.echo(
+        f"  rate       : {control_hz} Hz"
+        + (", each step waits for the robot to settle (--wait-for-arrival)" if wait_for_arrival else "")
+    )
     click.echo(
         f"  speed      : {SLOW_SPEED_SCALE * 100:.0f}% of the max profile (--slow)"
         if slow
@@ -3066,7 +3294,12 @@ def main(
             # mirror and the viewer stay live while the robot is held. `step`
             # decides what that means: held, it logs and returns without querying
             # the model or sending anything.
-            runner.step()
+            sent = runner.step()
+            if sent and wait_for_arrival and commander is not None:
+                # Inside the period, so `--control-hz` stays a ceiling: a step that
+                # settles quickly still waits out the rest of it.
+                if not _wait_for_arrival(console, runner, commander, stream):
+                    break
             elapsed = time.perf_counter() - started
             if elapsed < period:
                 time.sleep(period - elapsed)
@@ -3081,6 +3314,49 @@ def main(
         if robot is not None:
             robot.stop()
         click.secho(f"\nRan for {runner.step_count} policy steps.", fg="green")
+
+
+def _wait_for_arrival(
+    console: Console, runner: RealStretchRunner, commander: RobotCommander, stream: RobotStream
+) -> bool:
+    """`--wait-for-arrival`: hold the loop until the robot has settled and been seen settled.
+
+    Two waits. `RobotCommander.wait_until_settled` for the motion, and then one
+    for a stream message received after it -- the policy's arm state comes from
+    the stream, not from `RobotClient`'s status, and the newest message when the
+    motion ends can still be one taken mid-reach. "Received after" is the most
+    this side can check: the sender's clock is not this one (see
+    `RobotObservation.received_at`), so the frame may have been taken up to one
+    network latency before the robot stopped. The second wait gives up after
+    `--max-obs-age`, where `step` pauses on a stale stream anyway.
+
+    The console is served throughout, so a stop key lands mid-wait, and any wait
+    ends as soon as the runner is no longer running. False means the run should
+    end.
+    """
+    quit_requested = False
+
+    def keep_waiting() -> bool:
+        nonlocal quit_requested
+        if not _handle_console(console, runner):
+            quit_requested = True
+        return not quit_requested and runner.running
+
+    arrived = commander.wait_until_settled(ARRIVAL_TIMEOUT_S, keep_waiting)
+    if not arrived and keep_waiting():
+        runner._warn_once(
+            "arrival",
+            f"The robot was still moving {ARRIVAL_TIMEOUT_S:.1f}s after a step was sent; "
+            "carrying on without it. Said once.",
+        )
+
+    settled_at = time.monotonic()
+    while keep_waiting() and time.monotonic() - settled_at < runner.settings.max_obs_age:
+        latest = stream.latest()
+        if latest is not None and latest.received_at > settled_at:
+            break
+        time.sleep(ARRIVAL_POLL_S)
+    return not quit_requested
 
 
 def _handle_console(console: Console, runner: RealStretchRunner) -> bool:
