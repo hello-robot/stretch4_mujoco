@@ -219,7 +219,7 @@ that key and the mirror's fingers would sit at whatever they were last written
 to, which is why the absence is an error rather than a default.
 """
 
-STRETCH_GRIPPER_CLOSED_PCT = -100.0
+STRETCH_GRIPPER_CLOSED_PCT = -50.0
 """`pos_pct` with the fingers shut. `GripperUnits` maps the range onto the model's."""
 
 MAX_TARGET_STEP = {
@@ -238,7 +238,7 @@ would throttle every step rather than only the bad ones. `--step-limit-scale`
 tightens all four together.
 """
 
-SLOW_SPEED_SCALE = 0.2
+SLOW_SPEED_SCALE = 0.1
 """What `--slow` multiplies every commanded velocity and acceleration by.
 
 A fifth of the profile the joint would otherwise run, which is its `max`. Both
@@ -1796,6 +1796,55 @@ class Console:
 # =============================================================================
 
 
+def set_chunking(
+    policy: Any, action_horizon: int | None, execute_horizon: int | None
+) -> tuple[int, int, int]:
+    """Apply `--action-horizon` / `--execute-horizon` to a loaded `RealRobotVLAPolicy`.
+
+    `execute_horizon` is how many actions of each chunk are sent before the model
+    is queried again, and `get_action` reads it off the policy every call, so
+    setting the attribute is the whole change. Lower re-plans more often on
+    fresher frames, at a forward pass per re-plan.
+
+    `action_horizon` is not what it looks like. MolmoBot's policy stores its
+    config's value and never reads it: the chunk's length is the *checkpoint's*
+    `action_horizon`, the length of the noise the action expert is sampled from.
+    So this cannot make the model predict more or fewer actions -- it keeps the
+    first `action_horizon` of each chunk and drops the rest, which is what caps
+    `execute_horizon` and what the viewer's plan is drawn from. It can only
+    shorten, never lengthen, the chunk.
+
+    Returns the `(action_horizon, execute_horizon)` in effect, and the chunk
+    length the checkpoint predicts.
+    """
+    predicted = int(getattr(getattr(policy, "agent", None), "action_horizon", policy.action_horizon))
+    kept = predicted if action_horizon is None else action_horizon
+    executed = policy.execute_horizon if execute_horizon is None else execute_horizon
+    if not 1 <= kept <= predicted:
+        raise click.BadParameter(
+            f"must be between 1 and {predicted}, the chunk length this checkpoint predicts.",
+            param_hint="--action-horizon",
+        )
+    if not 1 <= executed <= kept:
+        raise click.BadParameter(
+            f"must be between 1 and the action horizon ({kept}): the policy cannot "
+            "execute actions it does not have.",
+            param_hint="--execute-horizon",
+        )
+
+    policy.action_horizon = kept
+    policy.execute_horizon = executed
+    if kept < predicted:
+        populate = policy._populate_action_buffer
+
+        def populate_truncated(observation: Any) -> None:
+            populate(observation)
+            del policy.action_buffer[kept:]
+
+        policy._populate_action_buffer = populate_truncated
+    return kept, executed, predicted
+
+
 @dataclass
 class RunSettings:
     """Everything the loop is parameterised by, so `main` stays a wiring function."""
@@ -2449,6 +2498,22 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
 )
 @click.option("--control-hz", type=float, default=CONTROL_HZ, show_default=True)
 @click.option(
+    "--execute-horizon",
+    type=int,
+    default=None,
+    help="Actions of each chunk to send before querying the model again. Defaults to "
+    "the policy config's (8). Lower re-plans on fresher frames, at a forward pass each "
+    "time. See set_chunking.",
+)
+@click.option(
+    "--action-horizon",
+    type=int,
+    default=None,
+    help="Keep only the first N actions of each predicted chunk. Defaults to the "
+    "checkpoint's own chunk length (16). Cannot make the model predict more -- the "
+    "length is the checkpoint's -- and must be at least --execute-horizon.",
+)
+@click.option(
     "--include-base/--no-include-base",
     default=False,
     show_default=True,
@@ -2639,6 +2704,8 @@ def main(
     task: str,
     checkpoint: str | None,
     control_hz: float,
+    execute_horizon: int | None,
+    action_horizon: int | None,
     include_base: bool,
     head_mode: str,
     head_crop: str | None,
@@ -2771,6 +2838,11 @@ def main(
     from examples.machine_learning.molmospaces.demo_droid_on_stretch import load_droid_policy
 
     policy = load_droid_policy(checkpoint)
+    kept, executed, predicted = set_chunking(policy, action_horizon, execute_horizon)
+    click.echo(
+        f"  chunking   : execute {executed} of {kept} actions per model query"
+        + (f" (of the {predicted} the checkpoint predicts)" if kept < predicted else "")
+    )
 
     telemetry = None
     if rerun or rrd is not None:
