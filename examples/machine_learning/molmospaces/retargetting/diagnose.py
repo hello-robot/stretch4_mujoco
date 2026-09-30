@@ -58,7 +58,12 @@ from examples.machine_learning.molmospaces.retargetting import mini_benchmark  #
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     apply_tool_correction,
 )
-from examples.machine_learning.molmospaces.stretch.config import Stretch4RobotConfig  # noqa: E402
+from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
+    PG4_TOOL_NAME,
+    SG4_TOOL_NAME,
+    Stretch4RobotConfig,
+    publish_stretch4_tool,
+)
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot  # noqa: E402
 from examples.machine_learning.molmospaces.stretch.robot_view import (  # noqa: E402
     Stretch4RobotView,
@@ -117,17 +122,23 @@ def report_gripper(model, data, view, namespace: str) -> float:
     gripper = view.get_move_group("gripper")
     low, high = gripper.inter_finger_dist_range
     click.echo(f"inter-finger distance range: {low:.4f} .. {high:.4f} m")
-    for angle in (fr.STRETCH_FINGER_CLOSED, 0.25, fr.STRETCH_FINGER_OPEN):
+    kind = gripper.kind
+    click.echo(f"tool: {kind.name}, fingers in {kind.unit}")
+    for fraction in (0.0, 0.5, 1.0):
+        angle = float(kind.joint_pos_for_fraction(fraction))
         view.set_qpos_dict({"gripper": [angle, angle]})
         mujoco.mj_forward(model, data)
         label = ""
-        if angle == fr.STRETCH_FINGER_CLOSED:
+        if fraction == 0.0:
             label = f"  (Robotiq {fr.ROBOTIQ_CTRL_RANGE[1]:.0f}, closed)"
-        elif angle == fr.STRETCH_FINGER_OPEN:
+        elif fraction == 1.0:
             label = f"  (Robotiq {fr.ROBOTIQ_CTRL_RANGE[0]:.0f}, open)"
-        click.echo(f"  finger {angle:.2f} rad -> {gripper.inter_finger_dist:.4f} m apart{label}")
+        click.echo(
+            f"  finger {angle:+.3f} {kind.unit} -> {gripper.inter_finger_dist:.4f} m apart{label}"
+        )
 
-    view.set_qpos_dict({"gripper": [fr.STRETCH_FINGER_CLOSED, fr.STRETCH_FINGER_CLOSED]})
+    closed = float(gripper.CLOSED_JOINT_POS)
+    view.set_qpos_dict({"gripper": [closed, closed]})
     mujoco.mj_forward(model, data)
 
     body_id = model.body(namespace + "base_link").id
@@ -203,7 +214,7 @@ def report_jaw_profile(model, data, view, namespace: str) -> None:
     ]
     for label, aperture in apertures:
         angle = (
-            fr.STRETCH_FINGER_OPEN
+            float(gripper.OPEN_JOINT_POS)
             if aperture is None
             else fr.stretch_finger_for_aperture(gripper, model, data, aperture)
         )
@@ -331,10 +342,17 @@ def report_grasp_offset(view, namespace: str, shortfall: float) -> None:
     help="The offset, in metres, to report the objects against. The policy config's "
     "default is 0; raise it to see which objects a hand-set offset would close above.",
 )
-def main(target_z_offset: float) -> None:
+@click.option(
+    "--parallel_gripper",
+    "parallel_gripper",
+    is_flag=True,
+    help="Measure the parallel jaw gripper (PG4) instead of the stretch gripper (SG4).",
+)
+def main(target_z_offset: float, parallel_gripper: bool) -> None:
     import logging
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    publish_stretch4_tool(PG4_TOOL_NAME if parallel_gripper else SG4_TOOL_NAME)
 
     click.secho("Measuring the retargeting on a standing robot, no policy involved.", bold=True)
     model, data, view, namespace = build_standing_robot()

@@ -142,11 +142,13 @@ from mujoco import MjData, MjSpec  # noqa: E402
 
 from examples.digital_twin import (  # noqa: E402
     REAL_ROBOT_COLOR,
+    TOOL_FOR_GRIPPER_JOINT,
     RerunMujocoRobot,
     RerunUrdfRobot,
     ensure_fleet_directory,
     load_stretch_urdf,
     rgba8,
+    robot_gripper_joint,
 )
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (  # noqa: E402
@@ -162,9 +164,13 @@ from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa:
     apply_aperture,
     apply_tool_correction,
 )
-from examples.machine_learning.molmospaces.stretch.config import Stretch4RobotConfig  # noqa: E402
+from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
+    Stretch4RobotConfig,
+    publish_stretch4_tool,
+)
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot  # noqa: E402
 from examples.machine_learning.molmospaces.stretch.robot_view import (  # noqa: E402
+    GripperKind,
     Stretch4RobotView,
     commandable_limits,
 )
@@ -174,12 +180,11 @@ from stretch4_mujoco.enums.stretch_cameras import StretchCameras  # noqa: E402
 log = logging.getLogger(__name__)
 
 # `connect_robot` imports `stretch4_body`, which reads a fleet directory while it
-# is being imported and exits if there is none -- so the stand-in has to be in
-# place before then, and here is the last point that is true of regardless of
-# which way the run reaches that import. A no-op where the environment already
-# names a fleet directory; see `digital_twin.ensure_fleet_directory` for what
-# using a stand-in costs.
-ensure_fleet_directory()
+# is being imported and exits if there is none. The stand-in is *not* written
+# here, at import, any more: it has to declare the tool that is on the robot, and
+# that is only known once the stream has said which gripper it is reporting --
+# see `main` and `stream_gripper_joint`. `stretch4_body` is imported in
+# `connect_robot` and nowhere earlier, so `main` is still in time.
 
 
 # =============================================================================
@@ -200,42 +205,43 @@ WRIST_CAMERA_FOV_DEG = float(
 )
 """The gripper camera's own vertical field of view. `--wrist-fov-deg` crops into it."""
 
-WRIST_OUTPUT_SIZE = (656, 368)
-"""What a Stretch wrist frame is when a sim rollout hands one to the policy.
-
-`stretch.config.CAMERA_OUTPUT_SIZE["wrist_camera_right"]`. The hardware streams
-640x400, so the real frame is cropped and resized to this: the checkpoint reads
-the wrist channel more closely than any other (see `cameras.RetargetParams.
-wrist_fov_deg`), and a frame with a different aspect is a differently framed
-grasp rather than the same one at another size.
-"""
 
 GRIPPER_JOINT = "stretch_gripper"
-"""The tool joint this runs against.
+PARALLEL_GRIPPER_JOINT = "parallel_gripper"
+"""The end-of-arm joints the two tools register: the SG4's and the PG4's.
 
-The robot's sender polls `status['end_of_arm']['stretch_gripper']` and publishes
-`pos_pct`, so that is the hand this can read. A PG4 would stream nothing under
-that key and the mirror's fingers would sit at whatever they were last written
-to, which is why the absence is an error rather than a default.
+The robot's sender reads whichever of the two `status['end_of_arm']` carries and
+publishes it as `closest_joint_state['gripper']`, naming it under `joint` --
+`pos_pct` for the SG4, `pos_mm` for the PG4. See `stream_gripper_joint`.
 """
 
 STRETCH_GRIPPER_CLOSED_PCT = -50.0
-"""`pos_pct` with the fingers shut. `GripperUnits` maps the range onto the model's."""
+"""`pos_pct` with the SG4's fingers shut. `GripperUnits` maps the range onto the model's."""
+
+PARALLEL_GRIPPER_NOMINAL_RANGE_M = 0.080
+"""The PG4's travel, 0 (tips touching) to this, in metres: `SE4_parallel_gripper_DW4`'s
+`range_mm` in stretch4_body's nominal parameters. `GripperUnits.for_joint` reads the
+robot's own when there is a robot to read it from."""
 
 MAX_TARGET_STEP = {
     "lift": 0.10,
     "arm": 0.10,
     "wrist": 0.60,
-    "gripper": 0.50,
+    "gripper": 1.00,
+    "base": 0.10,
+    "base_yaw": 0.30,
 }
 """How far one step's target may sit from where the joint currently is: metres
-for the prismatic joints, radians for the wrist and the fingers.
+for the prismatic joints and the base's translation, radians for the wrist and
+the base's heading, and a *fraction of the hand's travel* for the gripper -- the
+SG4's fingers are radians and the PG4's metres, so no one number means the same
+on both. 1.0 is the whole travel, which is what the SG4's old 0.5 rad was.
 
 A guard against a garbage prediction, not a speed limit, and deliberately sized
 well above what the robot can do in a control period -- the robot lags a streamed
 target by construction (see `digital_twin.py`), so a clamp near its actual speed
 would throttle every step rather than only the bad ones. `--step-limit-scale`
-tightens all four together.
+tightens all of them together.
 """
 
 SLOW_SPEED_SCALE = 0.1
@@ -255,7 +261,8 @@ rehearsal, not as a measurement.
 
 MAX_BASE_SPEED_MPS = 0.25
 MAX_BASE_TURN_RADPS = 0.5
-"""Caps on what one step may ask the base for, under `--include-base`, at full speed.
+"""The speed the base's relative moves are profiled at, under `--include-base`, at
+full speed.
 
 Half of what `live_policy.py` allows itself in simulation. A base command here
 moves a 25kg robot across a room it shares with whoever is running it, and the
@@ -271,6 +278,10 @@ nothing in accuracy -- the IK hands back an absolute base *pose* and the loop
 re-solves from the measured one every step, so a clipped base closes the same gap
 over more steps rather than aiming somewhere else.
 """
+
+BASE_DEADBAND_M = 0.005
+BASE_DEADBAND_RAD = 0.01
+"""A base gap smaller than this is not sent. See `RobotCommander._send_base`."""
 
 
 # =============================================================================
@@ -611,22 +622,18 @@ def head_frame_for_policy(
 def wrist_frame_for_policy(
     frame: np.ndarray, jaw_flipped: bool, keep_flipped_frame: bool, fov_deg: float = 0.0
 ) -> np.ndarray:
-    """A raw wrist frame, framed and oriented the way the checkpoint reads it.
+    """A raw wrist frame, oriented the way the checkpoint reads it.
 
-    Two corrections, both of which `StretchMolmoBotDroidPolicy` applies to a
-    rendered frame:
+    The frame goes to the policy at the hardware's own 640x400, uncropped: it is
+    *not* reframed to the 656x368 a sim rollout renders. The one correction is
+    the half turn, which `StretchMolmoBotDroidPolicy` applies to a rendered frame
+    too: holding the jaw half over rolls the wrist camera 180 degrees about its
+    own axis, and the checkpoint was trained on a Franka whose hand is not turned
+    over -- hand it an upside-down frame and every lateral correction comes back
+    inverted. See `StretchMolmoBotDroidPolicy._wrist_camera` for the measurement,
+    and for what turning it back still leaves wrong.
 
-    * **The half turn.** Holding the jaw half over rolls the wrist camera 180
-      degrees about its own axis, and the checkpoint was trained on a Franka
-      whose hand is not turned over -- hand it an upside-down frame and every
-      lateral correction comes back inverted. See
-      `StretchMolmoBotDroidPolicy._wrist_camera` for the measurement, and for
-      what turning it back still leaves wrong.
-    * **The framing.** The hardware streams 640x400 and a sim rollout hands the
-      policy 656x368 (`WRIST_OUTPUT_SIZE`), so the frame is cropped to that
-      aspect rather than squashed into it.
-
-    `fov_deg` narrows the view first, which is `RetargetParams.wrist_fov_deg` as
+    `fov_deg` is the one crop left, and it is opt-in: it is `RetargetParams.wrist_fov_deg` as
     it exists on hardware: Stretch's camera sits further back along a longer hand
     than the Robotiq's, so an object at the grasp point subtends 1.55x less of
     the frame, and cropping into the centre is how a real camera is narrowed.
@@ -645,7 +652,7 @@ def wrist_frame_for_policy(
 
     if jaw_flipped and not keep_flipped_frame:
         frame = np.rot90(frame, 2)
-    return _centre_crop_resize(np.ascontiguousarray(frame), WRIST_OUTPUT_SIZE)
+    return np.ascontiguousarray(frame)
 
 
 # =============================================================================
@@ -686,77 +693,122 @@ def build_mirror() -> tuple[Any, MjData, Stretch4RobotView, str]:
 
 
 class GripperUnits:
-    """Converts between the robot's gripper percentage and the model's finger angle.
+    """Converts between the robot's gripper units and the model's finger joints.
 
-    The two ends measure the same hand differently: `stretch_gripper` is
-    commanded and reported in percent over its servo sweep, and the MJCF carries
-    two finger joints running 0 (shut) to 0.5 rad (wide open, 188mm between the
-    tips).
+    The two ends measure the same hand differently, and differently again per
+    tool:
 
-    Mapped as a *fraction of the hand's travel* rather than metre for metre,
-    which is the same choice `digital_twin.GripperMirror` makes for the same
-    reason: what the policy reads on this channel is where the hand is between
-    shut and open (`_ProxyGripperGroup.joint_pos` normalises it again on the way
-    into Robotiq units), and the two stacks' aperture constants disagree by a
+        tool  robot joint        robot units          model fingers
+        SG4   stretch_gripper    percent of servo     revolute, 0 shut .. 0.5 rad open
+        PG4   parallel_gripper   metres of jaw        prismatic, 0 shut .. -0.04 m open
+
+    Mapped as a *fraction of the hand's travel* rather than unit for unit, which
+    is the same choice `digital_twin.GripperMirror` makes for the same reason:
+    what the policy reads on this channel is where the hand is between shut and
+    open (`_ProxyGripperGroup.joint_pos` normalises it again on the way into
+    Robotiq units). On the SG4 the two stacks' aperture constants disagree by a
     centimetre at the open end -- 0.1885 m measured on the compiled model against
-    `robot_settings_se4`'s hand-measured 0.177. A fraction is exact at both ends
-    of the travel and within that centimetre in between; a metre-for-metre map is
-    exact nowhere and pretends otherwise.
+    `robot_settings_se4`'s hand-measured 0.177 -- and a fraction is exact at both
+    ends and within that centimetre in between. On the PG4 the fraction is also
+    what makes the model's negative-is-open slides and the robot's
+    positive-is-open millimetres agree.
 
-    `open_pct` comes off the robot's own parameters, because it is the one number
-    that differs between tools and calibrations.
+    The open end comes off the robot's own parameters, because it is the number
+    that differs between tools and calibrations; the model's ends come off the
+    gripper move group (`GripperKind`), which is the tool the mirror was built
+    with.
     """
 
-    def __init__(self, open_pct: float, closed_pct: float = STRETCH_GRIPPER_CLOSED_PCT) -> None:
-        self.open_pct = float(open_pct)
-        self.closed_pct = float(closed_pct)
+    def __init__(
+        self,
+        joint: str,
+        kind: GripperKind,
+        robot_open: float,
+        robot_closed: float,
+        stream_field: str,
+        stream_scale: float = 1.0,
+        unit: str = "%",
+    ) -> None:
+        self.joint = joint
+        self.kind = kind
+        self.robot_open = float(robot_open)
+        self.robot_closed = float(robot_closed)
+        self.stream_field = stream_field
+        """What the sender publishes the position under, in `closest_joint_state['gripper']`."""
+        self.stream_scale = float(stream_scale)
+        """Stream units -> robot units: 0.001 for the PG4's `pos_mm`, commanded in metres."""
+        self.unit = unit
 
     @classmethod
-    def nominal(cls) -> "GripperUnits":
-        """The percentages the model's own settings imply, for a run with no robot.
+    def for_joint(cls, joint: str, kind: GripperKind, robot: Any = None) -> "GripperUnits":
+        """The units for `joint` on a mirror built with `kind`, from `robot`'s parameters if given.
 
-        `--dry-run` has no `robot_params` to read, and the answer is not 100:
-        `stretch_gripper`'s percentage is scaled so that the *closed* end is -100,
-        which puts fully open at `100 * |open / closed|` of the servo sweep --
-        +300 on an SE4, whose sweep is -100 to +300 degrees
-        (`robot_settings_se4`, and `stretch_body`'s `StretchGripper.pct_max_open`,
-        which is the same arithmetic). Assuming 100 would have the mirror read a
-        wide open hand as a third open.
-        """
-        closed_deg, open_deg = robot_settings_se4["stretch_gripper"]["gripper_servo_range_deg"]
-        return cls(open_pct=100.0 * abs(open_deg / closed_deg) if closed_deg else 100.0)
+        **SG4.** `range_deg` is the servo sweep either side of the fingers
+        touching, and percent is that sweep scaled so -100 is fully shut -- so the
+        open end is `100 * |open / closed|`, exactly as `digital_twin.GripperMirror`
+        derives it. With no robot, `--dry-run`, the model's own settings give the
+        same arithmetic -- +300 on an SE4, whose sweep is -100 to +300 degrees, and
+        not 100: assuming 100 would have the mirror read a wide open hand as a
+        third open.
 
-    @classmethod
-    def from_robot(cls, robot: Any) -> "GripperUnits":
-        """The percentages this robot reports at each end of its travel.
-
-        `range_deg` is the servo sweep either side of the fingers touching, and
-        percent is that sweep scaled so -100 is fully shut -- so the open end is
-        100 * |open / closed|, exactly as `digital_twin.GripperMirror` derives it.
+        **PG4.** `move_to` takes metres of jaw, 0 (tips touching) to `range_mm`,
+        and the sender streams `pos_mm`.
         """
         params = getattr(robot, "robot_params", {}) or {}
-        range_deg = params.get(GRIPPER_JOINT, {}).get("range_deg")
-        if range_deg and range_deg[0]:
-            return cls(open_pct=100.0 * abs(range_deg[1] / range_deg[0]))
-        return cls(open_pct=100.0)
+        if joint == PARALLEL_GRIPPER_JOINT:
+            range_mm = params.get(joint, {}).get("range_mm")
+            robot_open = float(range_mm) / 1000.0 if range_mm else PARALLEL_GRIPPER_NOMINAL_RANGE_M
+            return cls(joint, kind, robot_open, 0.0, "pos_mm", stream_scale=0.001, unit="m")
+        range_deg = params.get(joint, {}).get("range_deg") if robot is not None else None
+        if not range_deg:
+            range_deg = robot_settings_se4["stretch_gripper"]["gripper_servo_range_deg"]
+        closed_deg, open_deg = range_deg
+        robot_open = 100.0 * abs(open_deg / closed_deg) if closed_deg else 100.0
+        return cls(joint, kind, robot_open, STRETCH_GRIPPER_CLOSED_PCT, "pos_pct")
 
-    def fraction(self, pct: float) -> float:
-        span = self.open_pct - self.closed_pct
-        if not span:
-            return 0.0
-        return float(np.clip((pct - self.closed_pct) / span, 0.0, 1.0))
-
-    def finger_rad(self, pct: float) -> float:
-        """Where the model's fingers are, for a gripper the robot reports at `pct`."""
-        return fr.STRETCH_FINGER_CLOSED + self.fraction(pct) * (
-            fr.STRETCH_FINGER_OPEN - fr.STRETCH_FINGER_CLOSED
+    def describe(self) -> str:
+        return (
+            f"{self.joint} ({self.kind.name}), {self.robot_closed:g}{self.unit} shut to "
+            f"{self.robot_open:g}{self.unit} open"
         )
 
-    def pct(self, finger_rad: float) -> float:
-        """What to tell the robot, for a retargeted finger angle."""
-        span = fr.STRETCH_FINGER_OPEN - fr.STRETCH_FINGER_CLOSED
-        fraction = float(np.clip((finger_rad - fr.STRETCH_FINGER_CLOSED) / span, 0.0, 1.0))
-        return self.closed_pct + fraction * (self.open_pct - self.closed_pct)
+    def read(self, observation: "RobotObservation") -> float:
+        """The gripper position in one stream sample, in robot units."""
+        return observation.joint("gripper", self.stream_field) * self.stream_scale
+
+    def fraction(self, robot_value: float) -> float:
+        """How open a robot-units position is, 0 shut to 1 open."""
+        span = self.robot_open - self.robot_closed
+        if not span:
+            return 0.0
+        return float(np.clip((robot_value - self.robot_closed) / span, 0.0, 1.0))
+
+    def finger(self, robot_value: float) -> float:
+        """Where the model's fingers are, for a gripper the robot reports at `robot_value`."""
+        return float(self.kind.joint_pos_for_fraction(self.fraction(robot_value)))
+
+    def finger_fraction(self, finger: float) -> float:
+        """How open a model finger position is, 0 shut to 1 open."""
+        return float(np.clip(self.kind.open_fraction(finger), 0.0, 1.0))
+
+    def robot_value(self, fraction: float) -> float:
+        """What to tell the robot, for a hand `fraction` of the way open."""
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        return self.robot_closed + fraction * (self.robot_open - self.robot_closed)
+
+
+def stream_gripper_joint(observation: "RobotObservation") -> str | None:
+    """Which gripper the robot's sender says it is reporting, or None if it does not say.
+
+    A sender from before the PG4 publishes the SG4's `pos_pct` and no `joint`,
+    and on a PG4 robot it publishes nothing that moves at all -- it takes its
+    new-sample pulse off the SG4's status, which is not there. So None is not
+    evidence of an SG4; `main` assumes one only because that is all an old sender
+    could be serving, and `connect_robot` checks the robot's own answer.
+    """
+    gripper = observation.joints.get("gripper") if isinstance(observation.joints, dict) else None
+    joint = gripper.get("joint") if isinstance(gripper, dict) else None
+    return joint if joint in (GRIPPER_JOINT, PARALLEL_GRIPPER_JOINT) else None
 
 
 class RobotMirror:
@@ -791,7 +843,8 @@ class RobotMirror:
         yaw = observation.joint("wrist_yaw", "angle")
         pitch = observation.joint("wrist_pitch", "angle")
         roll = observation.joint("wrist_roll", "angle")
-        finger = self.gripper.finger_rad(observation.joint("gripper", "pos_pct"))
+        gripper = self.gripper.read(observation)
+        finger = self.gripper.finger(gripper)
 
         qpos = {
             "base": [
@@ -821,7 +874,7 @@ class RobotMirror:
             "wrist_yaw": yaw,
             "wrist_pitch": pitch,
             "wrist_roll": roll,
-            "gripper_pct": observation.joint("gripper", "pos_pct"),
+            "gripper_pos": gripper,
             "gripper_effort": observation.joint("gripper", "effort"),
             "base_x": qpos["base"][0],
             "base_y": qpos["base"][1],
@@ -948,17 +1001,22 @@ class RobotCommander:
                 commanded[name] = value
 
         if "gripper" in targets:
+            # In fractions of the hand's travel, the one unit the two tools share;
+            # see `GripperUnits` and `MAX_TARGET_STEP`.
             finger = float(np.mean(np.asarray(targets["gripper"], dtype=float)))
-            measured_finger = self.gripper.finger_rad(measured["gripper_pct"])
-            finger = self._clamp("gripper", finger, measured_finger)
-            value = self.gripper.pct(finger)
+            fraction = self._clamp(
+                "gripper",
+                self.gripper.finger_fraction(finger),
+                self.gripper.fraction(measured["gripper_pos"]),
+            )
+            value = self.gripper.robot_value(fraction)
             self._check(
-                GRIPPER_JOINT,
+                self.gripper.joint,
                 self.robot.end_of_arm.move_to(
-                    GRIPPER_JOINT, value, eoa_velocity, eoa_acceleration
+                    self.gripper.joint, value, eoa_velocity, eoa_acceleration
                 ),
             )
-            commanded["gripper_pct"] = value
+            commanded["gripper_pos"] = value
 
         if self.include_base and "base" in targets:
             goal = np.ravel(np.asarray(targets["base"], dtype=float))
@@ -969,29 +1027,55 @@ class RobotCommander:
         return commanded
 
     def _send_base(self, goal: np.ndarray, measured: dict[str, float]) -> dict[str, float]:
-        """A base pose target, as the velocity that would close the gap this step.
+        """A base pose target, as one relative move toward it.
 
         The IK hands back an absolute pose and this base steers three omniwheels,
-        so there is nothing absolute to command: the same conversion
-        `live_policy.apply_action` makes, rotated into the base's own frame,
-        capped at `MAX_BASE_SPEED_MPS` / `MAX_BASE_TURN_RADPS` -- at
-        `speed_scale`, so that `--slow` slows the base as well as the arm. See
-        `MAX_BASE_SPEED_MPS` for why the scaling is here and not in the constant.
+        so there is nothing absolute to command: the gap from the measured pose,
+        rotated into the base's own frame, goes out as a `translate_by` or a
+        `rotate_by` -- position moves the wheels close themselves, rather than a
+        velocity that keeps driving until the next step replaces it. Profiled at
+        `MAX_BASE_SPEED_MPS` / `MAX_BASE_TURN_RADPS` times `speed_scale`, so that
+        `--slow` slows the base as well as the arm; see `MAX_BASE_SPEED_MPS` for
+        why the scaling is here and not in the constant.
+
+        **One or the other, never both.** `omnibase.move_by` refuses to blend a
+        translation with a rotation, and two incremental commands in one
+        `push_command` overwrite each other's wheel targets, so the second would
+        silently erase the first. Each step sends whichever axis is further
+        behind, in time at its own speed cap; the other is still there on the
+        next step, re-measured, because the gap is taken from the measured pose
+        every time.
+
+        The gap is clamped to `MAX_TARGET_STEP` like every other joint, and one
+        inside `BASE_DEADBAND_M` / `BASE_DEADBAND_RAD` is not sent at all: an
+        incremental command re-triggers the wheels' trajectory, and a base that
+        has arrived should be left to hold rather than nudged by IK noise.
         """
         yaw = measured["base_theta"]
         delta = goal[:2] - np.array([measured["base_x"], measured["base_y"]])
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-        forward = (cos_yaw * delta[0] + sin_yaw * delta[1]) / self.control_period_s
-        left = (-sin_yaw * delta[0] + cos_yaw * delta[1]) / self.control_period_s
-        turn = math.atan2(math.sin(goal[2] - yaw), math.cos(goal[2] - yaw)) / self.control_period_s
+        forward = float(cos_yaw * delta[0] + sin_yaw * delta[1])
+        left = float(-sin_yaw * delta[0] + cos_yaw * delta[1])
+        turn = math.atan2(math.sin(goal[2] - yaw), math.cos(goal[2] - yaw))
+
+        distance = math.hypot(forward, left)
+        step = self.step_limits["base"]
+        if distance > step:
+            forward, left = forward * step / distance, left * step / distance
+            distance = step
+        turn = self._clamp("base_yaw", turn, 0.0)
 
         speed = MAX_BASE_SPEED_MPS * self.speed_scale
         rate = MAX_BASE_TURN_RADPS * self.speed_scale
-        forward = float(np.clip(forward, -speed, speed))
-        left = float(np.clip(left, -speed, speed))
-        turn = float(np.clip(turn, -rate, rate))
-        self.robot.omnibase.set_velocity(forward, left, turn)
-        return {"base_forward": forward, "base_left": left, "base_turn": turn}
+        translate = distance >= BASE_DEADBAND_M
+        rotate = abs(turn) >= BASE_DEADBAND_RAD
+        if rotate and (not translate or abs(turn) / rate > distance / speed):
+            self.robot.omnibase.rotate_by(turn, v_r=rate)
+            return {"base_dx": 0.0, "base_dy": 0.0, "base_dyaw": turn}
+        if translate:
+            self.robot.omnibase.translate_by(forward, left, v_m=speed)
+            return {"base_dx": forward, "base_dy": left, "base_dyaw": 0.0}
+        return {"base_dx": 0.0, "base_dy": 0.0, "base_dyaw": 0.0}
 
     def hold(self, measured: dict[str, float] | None = None) -> None:
         """Stop the robot where it is now, rather than where it was last sent.
@@ -1056,13 +1140,20 @@ class RobotCommander:
             )
 
 
-def connect_robot(robot_ip: str | None) -> Any:
-    """Start a `RobotClient`, and refuse to go on with a robot that is not homed.
+def connect_robot(robot_ip: str | None, gripper_joint: str = GRIPPER_JOINT) -> Any:
+    """Start a `RobotClient`, and refuse to go on with a robot that is not homed,
+    or that has a different gripper on from `gripper_joint`.
 
     `examples/digital_twin.py._connect` with the homing check folded in, because
     an un-homed robot here does not fail loudly: every `move_to` returns False,
     the loop carries on computing actions, and the robot stands still while the
     terminal fills with a policy running normally.
+
+    The gripper check is the same failure by another route. The client builds its
+    end of arm from the *local* fleet directory, so a directory naming the wrong
+    tool refuses every gripper `move_to` and fails `is_homed` on a joint the robot
+    does not have. The server's status is the robot's own answer, and it is
+    checked first so that a mismatch says what is wrong rather than "not homed".
     """
     from stretch4_body.robot.robot_client import RobotClient
 
@@ -1085,6 +1176,22 @@ def connect_robot(robot_ip: str | None) -> Any:
             f"Failed to start the RobotClient. Is the Stretch Body Server running on {where}?"
         )
     robot.pull_status(blocking=True)
+    reported = robot_gripper_joint(robot)
+    if reported is not None and reported != gripper_joint:
+        robot.stop()
+        raise SystemExit(
+            f"The robot reports a {reported}, but this run was set up for a {gripper_joint}. "
+            "The stream said otherwise, or HELLO_FLEET_PATH names another robot's fleet "
+            "directory: update the sender on the robot, or fix the fleet directory."
+        )
+    if gripper_joint not in getattr(robot.end_of_arm, "joints", [gripper_joint]):
+        robot.stop()
+        raise SystemExit(
+            f"The fleet directory's end of arm has no {gripper_joint} "
+            f"({sorted(robot.end_of_arm.joints)}), so every gripper command would be refused. "
+            "Point HELLO_FLEET_PATH at this robot's own fleet directory, or unset it to let "
+            "this write a stand-in for the right tool."
+        )
     if not robot.is_homed():
         robot.stop()
         raise SystemExit("The robot is not fully homed. Home it first, then rerun.")
@@ -1896,8 +2003,8 @@ class CommandedPose:
     On scratch data, for the same reason `StretchArmIK` is: writing joint
     positions into the live mirror would move the robot the retargeting is about
     to be solved against. The base is copied from the live model rather than
-    commanded -- under `--include-base` the commander sends wheel velocities, and
-    there is no base *pose* on the wire to do kinematics with.
+    commanded -- under `--include-base` the commander sends relative base moves,
+    and there is no base *pose* on the wire to do kinematics with.
     """
 
     WRIST = ("wrist_yaw", "wrist_pitch", "wrist_roll")
@@ -2556,7 +2663,7 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     default=0.0,
     show_default=True,
     help="Move the commanded grasp centre along the approach. See "
-    "setups.STRETCH_GRASP_OFFSET_M for what the search settled on and why.",
+    "setups.STRETCH_GRASP_OFFSET_M for the sim setups' default (-0.009 on the SG4) and why.",
 )
 @click.option(
     "--wrist-tilt-deg",
@@ -2798,18 +2905,36 @@ def main(
         stream.stop()
         raise SystemExit(
             "The stream carries no joint state. This runs against the sender's "
-            f"`closest_joint_state`, whose {GRIPPER_JOINT} entry is also the only gripper "
-            "state it can read."
+            "`closest_joint_state`, whose gripper entry is also the only gripper state it "
+            "can read."
         )
 
-    robot = None if dry_run else connect_robot(robot_ip)
-    gripper_units = GripperUnits.nominal() if robot is None else GripperUnits.from_robot(robot)
-    click.echo(
-        f"  gripper    : {gripper_units.closed_pct:.0f}% shut to {gripper_units.open_pct:.0f}% open"
-    )
+    # The tool, before anything that depends on it: the fleet directory the
+    # client is built from, and the model the retargeting solves on. The stream
+    # is what knows -- see `stream_gripper_joint` -- and `connect_robot` checks
+    # the robot agrees.
+    gripper_joint = stream_gripper_joint(first)
+    if gripper_joint is None:
+        gripper_joint = GRIPPER_JOINT
+        click.secho(
+            "  the stream does not say which gripper it is reporting, which is a sender "
+            "from before the parallel gripper: assuming the stretch gripper (SG4). On a PG4 "
+            "that sender streams a joint state that never updates -- update it on the robot.",
+            fg="yellow",
+        )
+    tool_name = TOOL_FOR_GRIPPER_JOINT[gripper_joint]
+    publish_stretch4_tool(tool_name)
+    if not dry_run:
+        ensure_fleet_directory(tool_name=tool_name)
+
+    robot = None if dry_run else connect_robot(robot_ip, gripper_joint)
 
     click.echo("Building the kinematic mirror...")
     _, _, view, namespace = build_mirror()
+    gripper_units = GripperUnits.for_joint(
+        gripper_joint, view.get_move_group("gripper").kind, robot
+    )
+    click.echo(f"  gripper    : {gripper_units.describe()}")
     mirror = RobotMirror(view, gripper_units)
     measured = mirror.sync(first)
     click.echo(f"  robot is at: {({k: round(v, 3) for k, v in measured.items()})}")
@@ -2830,8 +2955,9 @@ def main(
     proxy.reset()
     click.echo(
         f"  retarget   : grasp offset {grasp_offset_m:+.4f}m, wrist tilt {wrist_tilt_deg:+.1f}deg, "
-        f"z offset {target_z_offset_m:+.4f}m, jaw {proxy.jaw_mode}, opens to "
-        f"{proxy.finger_open:.4f} rad, base {'in' if include_base else 'out of'} the IK"
+        f"z offset {target_z_offset_m:+.4f}m, {proxy.gripper_kind.name} jaw {proxy.jaw_mode}, "
+        f"opens to {proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "
+        f"base {'in' if include_base else 'out of'} the IK"
     )
 
     click.echo("Loading the checkpoint...")

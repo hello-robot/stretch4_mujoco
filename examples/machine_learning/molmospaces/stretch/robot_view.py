@@ -24,6 +24,7 @@ generated MJCF ends up with once the wheel actuators are replaced.
 """
 
 import logging
+from dataclasses import dataclass
 from functools import cached_property
 
 import numpy as np
@@ -203,30 +204,116 @@ class StretchWristGroup(_TCPLeafMixin, SimplyActuatedMoveGroup):
         )
 
 
-class StretchGripperGroup(MJCFFrameMixin, GripperGroup):
-    """The two-finger gripper.
+@dataclass(frozen=True)
+class GripperKind:
+    """What differs between the two Stretch 4 tools, as far as the view is concerned.
 
-    Each finger has its own revolute joint and actuator, both with range
-    [0, 0.5] rad where 0 is fully closed. The fingertip separation that range
-    spans was measured off the compiled model, see `INTER_FINGER_DIST_RANGE`.
-
-    The compliant fingertip joints (`gripper_fingertip_*_compliant_{x,y}`) are
-    deliberately left out: they are passive, so including them would make
-    `joint_pos` wider than the actuator vector and break `JointPosController`.
+    Both drive two fingers through actuators named `gripper_{right,left}_finger`
+    and hang a `grasp_center_link` off `quick_connect_interface_link`, so the
+    group is the same class either way; only the joints, the bodies whose
+    separation is the jaw, and the range those joints span differ. Which one a
+    model carries is read off the compiled model -- see `gripper_kind` -- so
+    nothing that builds a view has to be told.
     """
 
-    # Fingertip separation at joint_pos 0.0 and 0.5, from forward kinematics on
-    # the compiled MJCF.
-    INTER_FINGER_DIST_RANGE = (0.0, 0.1885)
-    OPEN_JOINT_POS = 0.5
-    CLOSED_JOINT_POS = 0.0
+    name: str
+    joints: tuple[str, str]
+    """Right finger, left finger."""
+    tip_bodies: tuple[str, str]
+    """Right, left: the bodies whose origins' separation is the jaw's width."""
+    finger_bodies: tuple[str, str]
+    """Right, left: the root body of each finger, whose subtree is everything on the
+    finger that can touch an object."""
+    open_joint_pos: float
+    closed_joint_pos: float
+    inter_finger_dist_range: tuple[float, float]
+    """Tip separation at `closed_joint_pos` and at `open_joint_pos`."""
+    unit: str
+    """What the finger joints are in, for messages: "rad" or "m"."""
+
+    def open_fraction(self, joint_pos) -> np.ndarray:
+        """How open `joint_pos` is, 0 shut to 1 fully open, whichever way the joints run."""
+        span = self.open_joint_pos - self.closed_joint_pos
+        return (np.asarray(joint_pos, dtype=float) - self.closed_joint_pos) / span
+
+    def joint_pos_for_fraction(self, fraction) -> np.ndarray:
+        """The inverse of `open_fraction`."""
+        span = self.open_joint_pos - self.closed_joint_pos
+        return self.closed_joint_pos + np.asarray(fraction, dtype=float) * span
+
+
+SG4_GRIPPER = GripperKind(
+    name="sg4",
+    joints=("gripper_finger_right_joint", "gripper_finger_left_joint"),
+    tip_bodies=("gripper_fingertip_right_link", "gripper_fingertip_left_link"),
+    finger_bodies=("gripper_finger_right_link", "gripper_finger_left_link"),
+    open_joint_pos=0.5,
+    closed_joint_pos=0.0,
+    inter_finger_dist_range=(0.0, 0.1885),
+    unit="rad",
+)
+"""The compliant stretch gripper: two revolute fingers over [0, 0.5] rad, 0 shut.
+
+The fingertip separation that range spans was measured off the compiled model by
+forward kinematics. The compliant fingertip joints
+(`gripper_fingertip_*_compliant_{x,y}`) are deliberately left out of the group:
+they are passive, so including them would make `joint_pos` wider than the
+actuator vector and break `JointPosController`."""
+
+PG4_GRIPPER = GripperKind(
+    name="pg4",
+    joints=("finger_right_joint", "finger_left_joint"),
+    tip_bodies=("finger_right_link", "finger_left_link"),
+    finger_bodies=("finger_right_link", "finger_left_link"),
+    open_joint_pos=-0.04,
+    closed_joint_pos=0.0,
+    inter_finger_dist_range=(0.0, 0.08),
+    unit="m",
+)
+"""The parallel jaw gripper: two prismatic fingers over [-0.04, 0] m, 0 shut.
+
+**Open is the negative end.** Each slide's axis points into the jaw, so a finger
+opens as its joint goes negative. Anything that assumes "open" is the larger
+number is wrong on this tool; compare fractions of travel (`open_fraction`)
+instead. The finger links' origins sit on the inner faces, so their separation is
+the jaw's clear width, 2|q|: 0 to 80mm, against the Robotiq's 87mm."""
+
+GRIPPER_KINDS = (SG4_GRIPPER, PG4_GRIPPER)
+
+
+def gripper_kind(model, namespace: str = "") -> GripperKind:
+    """The tool a compiled Stretch model carries, from which finger joints it has."""
+    for kind in GRIPPER_KINDS:
+        try:
+            model.joint(f"{namespace}{kind.joints[0]}")
+        except KeyError:
+            continue
+        return kind
+    raise ValueError(
+        f"The model under namespace {namespace!r} has neither tool's finger joints "
+        f"({[kind.joints[0] for kind in GRIPPER_KINDS]})."
+    )
+
+
+class StretchGripperGroup(MJCFFrameMixin, GripperGroup):
+    """The two-finger gripper, on either Stretch 4 tool. See `GripperKind`.
+
+    `OPEN_JOINT_POS`, `CLOSED_JOINT_POS` and `INTER_FINGER_DIST_RANGE` are
+    replaced per instance by the model's tool. The class values are the SG4's,
+    which is what they were before the PG4 existed here.
+    """
+
+    INTER_FINGER_DIST_RANGE = SG4_GRIPPER.inter_finger_dist_range
+    OPEN_JOINT_POS = SG4_GRIPPER.open_joint_pos
+    CLOSED_JOINT_POS = SG4_GRIPPER.closed_joint_pos
 
     def __init__(self, mj_data: MjData, base_group: StretchBaseGroup, namespace: str = "") -> None:
         model = mj_data.model
-        joint_ids = [
-            model.joint(f"{namespace}gripper_finger_right_joint").id,
-            model.joint(f"{namespace}gripper_finger_left_joint").id,
-        ]
+        self.kind = gripper_kind(model, namespace)
+        self.OPEN_JOINT_POS = self.kind.open_joint_pos
+        self.CLOSED_JOINT_POS = self.kind.closed_joint_pos
+        self.INTER_FINGER_DIST_RANGE = self.kind.inter_finger_dist_range
+        joint_ids = [model.joint(f"{namespace}{name}").id for name in self.kind.joints]
         actuator_ids = [
             model.actuator(f"{namespace}gripper_right_finger").id,
             model.actuator(f"{namespace}gripper_left_finger").id,
@@ -239,8 +326,8 @@ class StretchGripperGroup(MJCFFrameMixin, GripperGroup):
             base_group,
         )
         self._tcp_body_id = model.body(f"{namespace}{TCP_BODY}").id
-        self._right_tip_body_id = model.body(f"{namespace}gripper_fingertip_right_link").id
-        self._left_tip_body_id = model.body(f"{namespace}gripper_fingertip_left_link").id
+        self._right_tip_body_id = model.body(f"{namespace}{self.kind.tip_bodies[0]}").id
+        self._left_tip_body_id = model.body(f"{namespace}{self.kind.tip_bodies[1]}").id
 
     @property
     def leaf_frame_id(self) -> int:

@@ -35,6 +35,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,10 @@ Measured on the compiled models at the Franka's home tool pose -- the Franka's
 `gripper/wrist_camera` against `gripper/grasp_site`, Stretch's
 `gripper_camera_right_rgb` against `grasp_center_link`. Stretch's hand is longer
 and its camera is further back along it, which is the whole of the difference.
+
+The Stretch value is the SG4's. The PG4's grasp centre is 68mm shallower, so its
+camera sits 0.1760m from it -- `franka_retarget.stretch_tool_geometry()` carries
+both, and `matched_wrist_fov_deg()` is the per-tool form of the FOV below.
 """
 
 MATCHED_WRIST_FOV_DEG = 38.3
@@ -167,7 +172,26 @@ real camera's frame does, so this is available on the robot as built -- at the
 cost of the peripheral view during the approach. `RetargetParams.wrist_fov_deg`
 is the knob; nothing sets it by default, because whether the trade is worth it
 is a measurement rather than an argument.
+
+The SG4's. On the PG4 the camera is much nearer the grasp centre, so the framing
+nearly matches already and the matched FOV is 51.0 degrees; see
+`matched_wrist_fov_deg`.
 """
+
+
+def matched_wrist_fov_deg(tool_name: str | None = None) -> float:
+    """`MATCHED_WRIST_FOV_DEG` for `tool_name`, or for the tool published for this process.
+
+    The formula above, with the tool's own camera reach. Rounded to a tenth of a
+    degree like the constant, which it reproduces for the SG4.
+    """
+    reach = fr.stretch_tool_geometry(tool_name).wrist_camera_reach_m
+    half = math.atan(
+        math.tan(math.radians(FRANKA_WRIST_FOV / 2.0))
+        * FRANKA_WRIST_CAMERA_REACH_M
+        / reach
+    )
+    return round(math.degrees(2.0 * half), 1)
 
 FRANKA_LINK0_HEIGHT = 0.75
 """
@@ -201,10 +225,15 @@ aspect disagrees -- which quietly warps the frame differently from the hardware.
 DROID_FRAME_SIZE = (640, 360)
 """What the checkpoint was trained on. `--exo-crop` brings a fisheye frame to it."""
 
-STRETCH_GRASP_OFFSET_M = 0.030
+STRETCH_GRASP_OFFSET_M = -0.009
 STRETCH_TARGET_Z_OFFSET_M = 0.0
 """
-The tool correction the Stretch setups retarget with, measured by search.
+The tool correction the Stretch setups retarget with.
+
+**-0.009, the geometric alignment below**: the offset that puts Stretch's
+fingertip front edge flush with the Robotiq's pad front. It replaces the 0.030
+the search further down settled on, whose account is kept because it is the
+evidence for what a deeper grasp buys and costs.
 
 **The grasp centre.** The retargeting drives `grasp_center_link` to the pose the
 policy asked for its Robotiq's `grasp_site`, and the two hands carry that frame
@@ -253,7 +282,7 @@ the hand cannot open around what the Robotiq would have swallowed at all. See
 `franka_retarget.ROBOTIQ_MAX_APERTURE_M`, which carries that calibration; the
 two parameters pick a point on one wedge and cannot be chosen apart.
 
-0.030 is where that comes out, measured by replaying the recorded
+0.030 is where the search came out, measured by replaying the recorded
 `franka_baseline` episodes through the retargeting with the physics on
 (`retargetting/replay.py --replay-as-stretch4`), over all 20 of them:
 
@@ -1003,6 +1032,25 @@ def stretch_camera_choices() -> StretchCameraChoices:
     )
 
 
+def tool_default_params(params: RetargetParams, setup_key: str) -> RetargetParams:
+    """A setup's params with the published tool's own defaults on a Stretch setup.
+
+    Every Stretch setup in `SETUPS` names `STRETCH_GRASP_OFFSET_M`, which is the
+    SG4's searched value, and `SETUPS` is built at import -- before any command
+    line has said which tool the run is on. So the swap happens here, in the
+    parent, where a script turns a setup into the params it will run and record:
+    a trial on the PG4 then says in `trials.csv` which offset it ran with, rather
+    than naming the SG4's and running another.
+
+    Only an offset still at the SG4 default is replaced, so a setup that names
+    its own keeps it, and so does anything applied afterwards (`--param`,
+    `--stretch4-grasp-offset`). The SG4 gets its params back unchanged.
+    """
+    if SETUPS[setup_key].robot != "stretch" or params.grasp_offset_m != STRETCH_GRASP_OFFSET_M:
+        return params
+    return dataclasses.replace(params, grasp_offset_m=fr.stretch_tool_geometry().grasp_offset_m)
+
+
 def publish_stretch_camera_choices(choices: StretchCameraChoices) -> None:
     """Put the camera choices in the environment, for this process and its workers.
 
@@ -1468,13 +1516,17 @@ def apply_aperture(proxy: Any, aperture_m: float) -> None:
 
     Does nothing to a proxy built with `match_robotiq_aperture` off -- that hand
     is already open as wide as it goes, and there is nothing to narrow.
+
+    "As wide as it goes" is tested as a fraction of the tool's travel, not as
+    `finger_open` against a number: the PG4 opens towards its *negative* end, so
+    comparing positions would read every PG4 hand as never open (against the
+    SG4's 0.5) or always open (against its own -0.04).
     """
     from examples.machine_learning.molmospaces.policies.franka_retarget import (
-        STRETCH_FINGER_OPEN,
         stretch_finger_for_aperture,
     )
 
-    if not aperture_m or proxy.finger_open >= STRETCH_FINGER_OPEN:
+    if not aperture_m or proxy.gripper_kind.open_fraction(proxy.finger_open) >= 1.0:
         return
     proxy.robotiq_aperture_m = float(aperture_m)
     proxy.finger_open = stretch_finger_for_aperture(

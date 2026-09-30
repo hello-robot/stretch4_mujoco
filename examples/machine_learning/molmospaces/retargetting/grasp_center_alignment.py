@@ -82,6 +82,12 @@ import numpy as np  # noqa: E402
 
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting import aperture  # noqa: E402
+from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
+    PG4_TOOL_NAME,
+    SG4_TOOL_NAME,
+    publish_stretch4_tool,
+)
+from examples.machine_learning.molmospaces.stretch.robot_view import SG4_GRIPPER  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +96,10 @@ OFFSETS_M = (-0.010, 0.000, 0.0025, 0.015, 0.030, 0.045)
 
 STRETCH_FINGER_ANGLE_RAD = 0.3466
 """
+**The SG4's.** On the PG4 the default is its fully open -0.04 m: its pads are
+parallel, so there is no wedge for the opening to move, and wide open (80mm) is
+already narrower than the Robotiq's 87mm. See `default_finger_position`.
+
 Stretch's fingers at 132mm tip separation -- the opening `aperture.py` calibrates.
 
 The spans below depend on it, because the fingers splay forward as well as out:
@@ -167,18 +177,27 @@ def is_robotiq_pad(name: str) -> bool:
     return name.startswith(aperture.FRANKA_NAMESPACE) and "pad" in name
 
 
-def is_stretch_fingertip(name: str) -> bool:
-    return (
-        name.startswith(aperture.STRETCH_NAMESPACE)
-        and "fingertip" in name
-        and "collision" in name
-        and "aruco" not in name
-    )
+def is_stretch_fingertip(name: str, kind=SG4_GRIPPER) -> bool:
+    """Whether `name` is one of the surfaces Stretch's `kind` of hand grips with.
+
+    The collision geom of each of the tool's tip bodies -- the SG4's fingertips,
+    the PG4's fingers -- and nothing else: not the aruco markers mounted on them,
+    and not the SG4's finger shells behind the tips.
+    """
+    return name in {
+        f"{aperture.STRETCH_NAMESPACE}{body}_collision" for body in kind.tip_bodies
+    }
+
+
+def default_finger_position(kind) -> float:
+    """The finger position the sweep compares surfaces at, for `kind`. See
+    `STRETCH_FINGER_ANGLE_RAD`."""
+    return STRETCH_FINGER_ANGLE_RAD if kind is SG4_GRIPPER else float(kind.open_joint_pos)
 
 
 def sweep(
     offsets=OFFSETS_M,
-    finger_angle: float = STRETCH_FINGER_ANGLE_RAD,
+    finger_angle: float | None = None,
     drop_m: float = FRANKA_DROP_M,
     render_to: Path | None = None,
 ) -> list[dict]:
@@ -190,6 +209,9 @@ def sweep(
     hand, so a configuration settled in free space is right at any arm pose.
     """
     model, data, stretch_view, franka_view, franka_config = aperture.build_overlay_scene()
+    kind = stretch_view.get_move_group("gripper").kind
+    if finger_angle is None:
+        finger_angle = default_finger_position(kind)
     base = np.asarray(stretch_view.get_move_group("base").joint_pos, dtype=float)
     mount = fr.franka_mount_pose_from_base(base)
     proxy = fr.FrankaOnStretchView(
@@ -241,7 +263,7 @@ def sweep(
             wanted = proxy.franka_tool_pose_to_world(proxy.franka.fk(command))
             robotiq_front, robotiq_back = surface_span(model, data, franka_pose, 2, is_robotiq_pad)
             stretch_front, stretch_back = surface_span(
-                model, data, franka_pose, 2, is_stretch_fingertip
+                model, data, franka_pose, 2, lambda name: is_stretch_fingertip(name, kind)
             )
             rows.append(
                 {
@@ -365,10 +387,10 @@ def report(rows: list[dict]) -> None:
 @click.option(
     "--finger-angle",
     type=float,
-    default=STRETCH_FINGER_ANGLE_RAD,
-    show_default=True,
-    help="Stretch's finger angle, in radians. The surfaces move with it; see "
-    "STRETCH_FINGER_ANGLE_RAD.",
+    default=None,
+    help="Stretch's finger position, in the tool's joint units: radians on the SG4 "
+    f"(default {STRETCH_FINGER_ANGLE_RAD}), metres on the PG4 (default -0.04, fully open). "
+    "The surfaces move with it; see STRETCH_FINGER_ANGLE_RAD.",
 )
 @click.option(
     "--drop",
@@ -391,11 +413,23 @@ def report(rows: list[dict]) -> None:
     show_default=True,
     help="Where --render writes its PNGs.",
 )
+@click.option(
+    "--parallel_gripper",
+    "parallel_gripper",
+    is_flag=True,
+    help="Measure the parallel jaw gripper (PG4) instead of the stretch gripper (SG4).",
+)
 def main(
-    offsets: tuple[float, ...], finger_angle: float, drop: float, render: bool, output_dir: Path
+    offsets: tuple[float, ...],
+    finger_angle: float | None,
+    drop: float,
+    render: bool,
+    output_dir: Path,
+    parallel_gripper: bool,
 ) -> None:
     """Measure the offset at which the two hands' gripping surfaces coincide."""
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    publish_stretch4_tool(PG4_TOOL_NAME if parallel_gripper else SG4_TOOL_NAME)
     rows = sweep(
         offsets=tuple(offsets) or OFFSETS_M,
         finger_angle=finger_angle,

@@ -617,7 +617,8 @@ class StretchMolmoBotDroidPolicy(BasePolicy):
         log.info(
             f"[droid] virtual Franka at {np.round(proxy.franka_mount_pose[:3, 3], 3).tolist()}, "
             f"target z offset {proxy.target_z_offset:+.4f}m, "
-            f"jaw {proxy.jaw_mode}, opens to {proxy.finger_open:.4f} rad, "
+            f"{proxy.gripper_kind.name} jaw {proxy.jaw_mode}, opens to "
+            f"{proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "
             f"base {'in' if policy_config.include_base else 'out of'} the IK"
         )
         self._proxy = proxy

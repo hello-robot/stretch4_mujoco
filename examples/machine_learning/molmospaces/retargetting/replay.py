@@ -864,8 +864,6 @@ class _GraspWatch:
     rollout's are the same verdict.
     """
 
-    FINGER_BODIES = ("gripper_finger_right_link", "gripper_finger_left_link")
-
     def __init__(
         self, model, data, view: Stretch4RobotView, object_name: str, namespace: str = ""
     ) -> None:
@@ -885,7 +883,10 @@ class _GraspWatch:
         self.object_geoms = self._collidable(self.body) if self.body >= 0 else []
         self.finger_geoms = [
             geom
-            for name in self.FINGER_BODIES
+            # Off the view rather than a constant, so it is the tool this model
+            # carries: an SG4 name on a PG4 model finds nothing, and the gap
+            # measurement would drop out without a word.
+            for name in view.get_move_group("gripper").kind.finger_bodies
             for geom in self._collidable(
                 mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, namespace + name)
             )

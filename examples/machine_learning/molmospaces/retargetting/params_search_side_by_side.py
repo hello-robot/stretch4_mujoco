@@ -179,10 +179,16 @@ from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa:
     publish_params,
     publish_stretch_camera_choices,
     qualified_config_name,
+    tool_default_params,
 )
 from examples.machine_learning.molmospaces.run_benchmarks import (  # noqa: E402
     InterruptState,
     install_interrupt_handler,
+)
+from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
+    PG4_TOOL_NAME,
+    SG4_TOOL_NAME,
+    publish_stretch4_tool,
 )
 from examples.machine_learning.molmospaces.visualize import (  # noqa: E402
     SCENE_PANEL_SIZE,
@@ -768,7 +774,11 @@ class RunResult:
         only that a side-by-side run has one trial per setup instead of one per
         searched point.
         """
-        params = self.params if self.params is not None else SETUPS[self.setup].params
+        params = (
+            self.params
+            if self.params is not None
+            else tool_default_params(SETUPS[self.setup].params, self.setup)
+        )
         return TrialResult(
             setup=self.setup,
             params_description=params.describe(),
@@ -2211,6 +2221,7 @@ RUN_NAME_ABBREVIATIONS = {
     "match_stretch_spawn_pose_to_franka": "matched-spawn",
     "use_left_gripper_camera": "left-gripper-cam",
     "use_left_fisheye_camera": "left-fisheye-cam",
+    "parallel_gripper": "pg4",
 }
 """
 Short names for the conventions and camera choices, for `run_directory_name`.
@@ -2252,6 +2263,7 @@ def run_directory_name(
     grasp_offset: float | None = None,
     benchmark: str | None = None,
     today: date | None = None,
+    parallel_gripper: bool = False,
 ) -> str:
     """The directory one run of this script writes to, named after what it is.
 
@@ -2263,7 +2275,7 @@ def run_directory_name(
     describe.
 
     What goes in: the date, the pair, the benchmark when it is not the mini one,
-    every convention and camera choice that is on, the Stretch grasp offset when
+    the tool when it is the PG4, every convention and camera choice that is on, the Stretch grasp offset when
     one was typed, and every `--param` override. What stays out is everything
     operational -- the worker count, the checkpoint path, `--rebuild-benchmark`,
     `--scenes` -- which changes how a run is produced rather than what it
@@ -2280,6 +2292,10 @@ def run_directory_name(
         # What was measured rather than how: the same pair over the released pick
         # suite is a different experiment from the same pair over the mini one.
         segments.append(f"bench-{benchmark}")
+    if parallel_gripper:
+        # A different hand on every Stretch setup, and a different grasp offset
+        # default with it -- so a PG4 run must never resume into an SG4 one.
+        segments.append(RUN_NAME_ABBREVIATIONS["parallel_gripper"])
     for name in fr.POSE_CONVENTION_ENV_VARS:
         value = getattr(conventions, name)
         if not value:
@@ -2442,8 +2458,12 @@ def _apply_params(
     the same number; the dedicated flag is the more specific statement. Note the
     asymmetry that leaves: `--param` is applied to whichever setup it is handed,
     Franka included, which is what its own help means by "where it applies".
+
+    Before either, the tool's own defaults (`setups.tool_default_params`): on the
+    PG4 a Stretch setup's SG4 grasp offset becomes the PG4's, and whatever was
+    typed is then applied on top.
     """
-    params = base
+    params = tool_default_params(base, setup_key)
     for spec in specs:
         name, _, value = spec.partition("=")
         if name not in DIMENSIONS:
@@ -2712,6 +2732,17 @@ def _apply_params(
     "on Stretch's head, it substitutes Stretch's real left fisheye instead and leaves every "
     "camera parameter inert. See `setups.StretchCameraChoices`.",
 )
+@click.option(
+    "--parallel_gripper",
+    "parallel_gripper",
+    is_flag=True,
+    help="Put the parallel jaw gripper (PG4) on every Stretch setup instead of the stretch "
+    "gripper (SG4). The Stretch setups' grasp offset default becomes the PG4's geometric "
+    "one, 0.004m, unless --stretch4-grasp-offset or --param names another. Franka setups "
+    "are unaffected. Adds 'pg4' to the run directory, and --report-only / --compose-only / "
+    "--replay-as-stretch4 on a PG4 run need it again, like every other flag the run was "
+    "started with. See `stretch.robot_view.PG4_GRIPPER`.",
+)
 def main(
     pair: str,
     param_specs: tuple[str, ...],
@@ -2741,6 +2772,7 @@ def main(
     match_stretch_spawn_pose_to_franka: bool,
     use_left_gripper_camera: bool,
     use_left_fisheye_camera: bool,
+    parallel_gripper: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -2795,6 +2827,14 @@ def main(
     if camera_choices:
         log.info(f"[camera] Stretch reads: {camera_choices.describe()}")
 
+    # Published in both directions for the same reason again: a PG4 left over in
+    # the environment would put an SG4 run on the other hand. The workers build
+    # their robot config from a class name, so the environment is what reaches
+    # them. See `stretch.config.publish_stretch4_tool`.
+    publish_stretch4_tool(PG4_TOOL_NAME if parallel_gripper else SG4_TOOL_NAME)
+    if parallel_gripper:
+        log.info("[tool] Stretch wears the parallel jaw gripper (PG4)")
+
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
 
@@ -2822,6 +2862,7 @@ def main(
                 ),
                 benchmark=benchmark,
                 today=day,
+                parallel_gripper=parallel_gripper,
             )
 
         found = (

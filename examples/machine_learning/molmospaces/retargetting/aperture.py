@@ -64,7 +64,10 @@ from scipy.spatial.transform import Rotation as R  # noqa: E402
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting import mini_benchmark  # noqa: E402
 from examples.machine_learning.molmospaces.stretch.config import (  # noqa: E402
+    PG4_TOOL_NAME,
+    SG4_TOOL_NAME,
     Stretch4RobotConfig,
+    publish_stretch4_tool,
 )
 from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot  # noqa: E402
 from examples.machine_learning.molmospaces.stretch.robot_view import (  # noqa: E402
@@ -299,11 +302,12 @@ def stretch_angle_for_width(
     A bisection, because the relation is monotone in the angle at any fixed depth
     and the model is the only thing that knows it -- the same argument, and the
     same method, as `franka_retarget.stretch_finger_for_aperture`, which this
-    replaces for the one question that matters. Returns `STRETCH_FINGER_OPEN`
+    replaces for the one question that matters. Returns the tool's open position
     when the hand cannot open that wide at that depth, rather than a midpoint
     that would read as a match.
     """
-    low, high = fr.STRETCH_FINGER_CLOSED, fr.STRETCH_FINGER_OPEN
+    gripper = stretch_view.get_move_group("gripper")
+    low, high = float(gripper.CLOSED_JOINT_POS), float(gripper.OPEN_JOINT_POS)
     widest = stretch_width_at(model, data, stretch_view, high, depth_m)
     if not np.isfinite(widest) or widest <= width_m:
         return float(high)
@@ -550,7 +554,8 @@ def report_sweep(by_offset: dict[float, list[dict]]) -> None:
     type=float,
     multiple=True,
     help="Where the object sits in Stretch's jaw, in metres past its grasp centre. "
-    "Repeatable, to sweep. Defaults to the Stretch setups' own STRETCH_GRASP_OFFSET_M. "
+    "Repeatable, to sweep. Defaults to the Stretch setups' own offset for the tool: "
+    "STRETCH_GRASP_OFFSET_M on the SG4, franka_retarget.stretch_tool_geometry()'s on the PG4. "
     "The matched aperture depends on it, which is the whole finding.",
 )
 @click.option(
@@ -563,12 +568,20 @@ def report_sweep(by_offset: dict[float, list[dict]]) -> None:
     default="eval_output/aperture",
     help="Where --overlay writes its PNGs.",
 )
-def main(grasp_offsets: tuple[float, ...], overlay: bool, output_dir: str) -> None:
+@click.option(
+    "--parallel_gripper",
+    "parallel_gripper",
+    is_flag=True,
+    help="Measure the parallel jaw gripper (PG4) instead of the stretch gripper (SG4).",
+)
+def main(
+    grasp_offsets: tuple[float, ...], overlay: bool, output_dir: str, parallel_gripper: bool
+) -> None:
     """Measure what a gripper command should mean on Stretch. See the module docstring."""
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-    from examples.machine_learning.molmospaces.retargetting.setups import STRETCH_GRASP_OFFSET_M
+    publish_stretch4_tool(PG4_TOOL_NAME if parallel_gripper else SG4_TOOL_NAME)
 
-    offsets = list(grasp_offsets) or [STRETCH_GRASP_OFFSET_M]
+    offsets = list(grasp_offsets) or [fr.stretch_tool_geometry().grasp_offset_m]
     click.secho("Measuring both hands, no policy involved.", bold=True)
     by_offset = sweep(offsets)
     for offset in offsets:

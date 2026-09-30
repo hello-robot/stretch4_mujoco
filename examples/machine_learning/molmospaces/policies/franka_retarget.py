@@ -54,7 +54,13 @@ import numpy as np
 from mujoco import MjData, MjModel, MjSpec
 from scipy.spatial.transform import Rotation as R
 
+from examples.machine_learning.molmospaces.stretch.config import (
+    PG4_TOOL_NAME,
+    SG4_TOOL_NAME,
+    stretch4_tool_name,
+)
 from examples.machine_learning.molmospaces.stretch.robot_view import (
+    SG4_GRIPPER,
     Stretch4RobotView,
     commandable_limits,
 )
@@ -218,10 +224,14 @@ ROBOTIQ_DRIVER_OPEN = 0.003
 ROBOTIQ_DRIVER_CLOSED = 0.824
 ROBOTIQ_CTRL_RANGE = (0.0, 255.0)
 
-# Stretch finger joint angle, per `gripper_finger_{right,left}_joint`: 0 closed,
-# 0.5 rad fully open.
-STRETCH_FINGER_OPEN = 0.5
-STRETCH_FINGER_CLOSED = 0.0
+# The SG4's finger joint angle, per `gripper_finger_{right,left}_joint`: 0 closed,
+# 0.5 rad fully open. **SG4 only.** The PG4's fingers are slides running 0 to
+# -0.04 m, so nothing that drives a hand should read these: every open/closed
+# position below comes off the gripper move group being driven
+# (`StretchGripperGroup.OPEN_JOINT_POS` / `CLOSED_JOINT_POS`), and these remain
+# for the SG4-only analysis scripts that predate the PG4.
+STRETCH_FINGER_OPEN = SG4_GRIPPER.open_joint_pos
+STRETCH_FINGER_CLOSED = SG4_GRIPPER.closed_joint_pos
 
 ROBOTIQ_MAX_APERTURE_M = 0.1885
 """
@@ -270,6 +280,11 @@ any depth.
 At this value `match_robotiq_aperture` is a no-op, because the calibrated
 aperture has reached the end of Stretch's own travel. That is not an accident to
 be tidied away -- it is the finding.
+
+**Everything above is the SG4.** The PG4's pads are parallel, like the Robotiq's,
+and open to 80mm against its 87mm, so it has no wedge to calibrate and no width to
+narrow: any aperture from 80mm up is simply "wide open", and this value -- or the
+Robotiq's own 87mm -- asks for exactly that.
 """
 
 
@@ -285,8 +300,13 @@ def stretch_finger_for_aperture(move_group, model, data, aperture_m: float) -> f
 
     Runs on whatever `data` it is handed, which the caller is expected to make
     scratch data: it moves the fingers to measure them.
+
+    Bisects between the group's own closed and open positions, whichever tool it
+    is: the width grows monotonically from one to the other on both, and the
+    PG4's open end being the *smaller* number does not change which half a
+    bisection keeps.
     """
-    low, high = STRETCH_FINGER_CLOSED, STRETCH_FINGER_OPEN
+    low, high = float(move_group.CLOSED_JOINT_POS), float(move_group.OPEN_JOINT_POS)
 
     def width(angle: float) -> float:
         move_group.joint_pos = [angle, angle]
@@ -370,6 +390,72 @@ FRANKA_SPAWN_GRASP_FORWARD_M = 0.3069
 """How far forward of the base it is mounted on the Franka's grasp site sits at its home pose."""
 
 
+@dataclass(frozen=True)
+class StretchToolGeometry:
+    """The numbers in the retargeting that move with where the tool's grasp centre is.
+
+    The SG4's grasp centre sits 0.2350m out from `quick_connect_interface_link`
+    and the PG4's 0.1669m, so every measurement taken *at* `grasp_center_link`
+    shifts by that 68.1mm. The module constants above (`STRETCH_MAX_GRASP_HEIGHT_M`,
+    `STRETCH_SPAWN_GRASP_*`) are the SG4's values and keep their names;
+    `stretch_tool_geometry()` is what the retargeting reads, so the tool published
+    for the process decides which it gets.
+
+    The PG4 row was measured on the compiled PG4 model with the procedure that
+    reproduces the SG4 row to the tenth of a millimetre (the SG4 height came out
+    at 1.0827 against the recorded 1.0824). It has not been re-derived from
+    rollouts the way the SG4's `grasp_offset_m` was -- see `grasp_offset_m`.
+    """
+
+    max_grasp_height_m: float
+    """`STRETCH_MAX_GRASP_HEIGHT_M` for this tool: the lift at its top, tool pointing down."""
+    spawn_grasp_forward_at_arm_0_m: float
+    """`STRETCH_SPAWN_GRASP_FORWARD_AT_ARM_0_M` for this tool."""
+    spawn_grasp_across_m: float
+    """`STRETCH_SPAWN_GRASP_ACROSS_M` for this tool. The tool's length does not move it."""
+    wrist_camera_reach_m: float
+    """`setups.STRETCH_WRIST_CAMERA_REACH_M` for this tool: `gripper_camera_right_rgb`
+    to `grasp_center_link`. The camera is on `wrist_roll_link`, not on the tool, so
+    only the grasp centre's end of this moves."""
+    grasp_offset_m: float
+    """The Stretch setups' `grasp_offset_m` default, `setups.STRETCH_GRASP_OFFSET_M`
+    for the SG4.
+
+    The PG4's is a geometric first guess, not a searched value. Its grasp centre
+    sits exactly on its pads' front edge, and the Robotiq's grasp site 4.0mm behind
+    its own; +0.004 puts the two front edges flush, the alignment
+    `setups.STRETCH_GRASP_OFFSET_M` explains as the one that survives two
+    differently shaped hands. The PG4's pads are parallel and 120mm long, so
+    unlike the SG4 a deeper grasp costs it no width. For scale: the SG4's search
+    settled 39mm deeper than its own geometric answer, because a replay closes on
+    the Franka's step. Both tools now default to their geometric alignment, so
+    the two are comparable; a search may move either.
+    """
+
+
+STRETCH_TOOL_GEOMETRY: dict[str, StretchToolGeometry] = {
+    SG4_TOOL_NAME: StretchToolGeometry(
+        max_grasp_height_m=STRETCH_MAX_GRASP_HEIGHT_M,
+        spawn_grasp_forward_at_arm_0_m=STRETCH_SPAWN_GRASP_FORWARD_AT_ARM_0_M,
+        spawn_grasp_across_m=STRETCH_SPAWN_GRASP_ACROSS_M,
+        wrist_camera_reach_m=0.2414,
+        grasp_offset_m=-0.009,
+    ),
+    PG4_TOOL_NAME: StretchToolGeometry(
+        max_grasp_height_m=1.1504,
+        spawn_grasp_forward_at_arm_0_m=0.3986,
+        spawn_grasp_across_m=0.0874,
+        wrist_camera_reach_m=0.1760,
+        grasp_offset_m=0.004,
+    ),
+}
+
+
+def stretch_tool_geometry(tool_name: str | None = None) -> StretchToolGeometry:
+    """`STRETCH_TOOL_GEOMETRY` for `tool_name`, or for the tool published for this process."""
+    return STRETCH_TOOL_GEOMETRY[tool_name or stretch4_tool_name()]
+
+
 def stretch_spawn_base_offset_xy() -> tuple[float, float]:
     """How far to stand Stretch back so its spawn gripper pose is the Franka's, in its own axes.
 
@@ -410,12 +496,13 @@ def stretch_spawn_base_offset_xy() -> tuple[float, float]:
         STRETCH_SPAWN_ARM_M,
     )
 
+    geometry = stretch_tool_geometry()
     forward = (
-        STRETCH_SPAWN_GRASP_FORWARD_AT_ARM_0_M
+        geometry.spawn_grasp_forward_at_arm_0_m
         + float(STRETCH_SPAWN_ARM_M)
         - FRANKA_SPAWN_GRASP_FORWARD_M
     )
-    return (-forward, STRETCH_SPAWN_GRASP_ACROSS_M)
+    return (-forward, geometry.spawn_grasp_across_m)
 
 
 def pose_matrix(pos, quat_wxyz) -> np.ndarray:
@@ -824,7 +911,7 @@ def franka_start_arm_qpos(
         mount_height_m,
         roll_180=conventions.change_franka_start_pose_flip_wrist,
         max_height_m=(
-            STRETCH_MAX_GRASP_HEIGHT_M
+            stretch_tool_geometry().max_grasp_height_m
             if conventions.change_franka_start_pose_limit_height
             else None
         ),
@@ -927,7 +1014,9 @@ def robotiq_ctrl_from_driver(driver_angle) -> float:
 
 
 def robotiq_ctrl_from_stretch_fingers(
-    finger_angles, finger_open: float = STRETCH_FINGER_OPEN
+    finger_angles,
+    finger_open: float = STRETCH_FINGER_OPEN,
+    finger_closed: float = STRETCH_FINGER_CLOSED,
 ) -> float:
     """Stretch's finger angles expressed as the Robotiq 0-255 that would produce them.
 
@@ -941,11 +1030,13 @@ def robotiq_ctrl_from_stretch_fingers(
     while the forward direction used a narrowed angle would make the two stop
     being inverses, which is exactly the kind of drift that shows up as a policy
     reading its own gripper command back wrong.
+
+    `finger_closed` is the tool's shut position. The defaults are the SG4's;
+    `FrankaOnStretchView` passes its own, which is what makes this right on the
+    PG4, whose "open" is the negative end of its travel.
     """
     finger = float(np.mean(np.asarray(finger_angles, dtype=float)))
-    open_fraction = np.clip(
-        (finger - STRETCH_FINGER_CLOSED) / (finger_open - STRETCH_FINGER_CLOSED), 0.0, 1.0
-    )
+    open_fraction = np.clip((finger - finger_closed) / (finger_open - finger_closed), 0.0, 1.0)
     # 0 is open on the Robotiq and closed on Stretch, so an open hand is ctrl 0.
     return float(
         ROBOTIQ_CTRL_RANGE[1] + open_fraction * (ROBOTIQ_CTRL_RANGE[0] - ROBOTIQ_CTRL_RANGE[1])
@@ -1366,8 +1457,8 @@ class _ProxyGripperGroup:
         (`gripper_representation_count = 1`), but reads it in these units.
         """
         finger = float(np.mean(self._view.stretch_view.get_move_group("gripper").joint_pos))
-        fraction = (finger - STRETCH_FINGER_CLOSED) / (
-            self._view.finger_open - STRETCH_FINGER_CLOSED
+        fraction = (finger - self._view.finger_closed) / (
+            self._view.finger_open - self._view.finger_closed
         )
         fraction = float(np.clip(fraction, 0.0, 1.0))
         driver = ROBOTIQ_DRIVER_CLOSED + fraction * (ROBOTIQ_DRIVER_OPEN - ROBOTIQ_DRIVER_CLOSED)
@@ -1492,13 +1583,18 @@ class FrankaOnStretchView:
             log.info(f"[retarget] pose conventions: {self.pose_conventions.describe()}")
         self.arm_ik = StretchArmIK(stretch_view, namespace, include_base=include_base)
 
-        # What "fully open" means on Stretch, in finger-joint radians. Narrowed to
-        # the angle at which its jaw is as wide as the Robotiq's so that a gripper
+        # What "fully open" and "shut" mean on Stretch, in finger-joint units --
+        # radians on the SG4, metres on the PG4 -- read off the gripper group so
+        # that they are the tool this model carries. Open is narrowed to the
+        # position at which its jaw is as wide as the Robotiq's so that a gripper
         # command means the same aperture on both robots; see
         # `ROBOTIQ_MAX_APERTURE_M` for why, and for what it costs. Solved on the
         # IK's scratch data, which is what keeps the measurement from moving the
         # robot that is about to be commanded.
-        self.finger_open = STRETCH_FINGER_OPEN
+        gripper = stretch_view.get_move_group("gripper")
+        self.gripper_kind = gripper.kind
+        self.finger_closed = float(gripper.CLOSED_JOINT_POS)
+        self.finger_open = float(gripper.OPEN_JOINT_POS)
         self.robotiq_aperture_m = float(
             ROBOTIQ_MAX_APERTURE_M if robotiq_aperture_m is None else robotiq_aperture_m
         )
@@ -1601,7 +1697,7 @@ class FrankaOnStretchView:
         # `snap_to_franka_home` off, nothing else would have corrected it.
         fingers = self.stretch_view.get_move_group("gripper").joint_pos
         self.last_gripper_ctrl = np.array(
-            [robotiq_ctrl_from_stretch_fingers(fingers, self.finger_open)]
+            [robotiq_ctrl_from_stretch_fingers(fingers, self.finger_open, self.finger_closed)]
         )
         self.last_residual = np.zeros(6)
         self.unreachable_steps = 0
@@ -1850,7 +1946,7 @@ class FrankaOnStretchView:
             log.debug(message)
 
     def retarget_robotiq_ctrl(self, value) -> np.ndarray:
-        """A Robotiq 0-255 command -> Stretch's two finger targets, in radians."""
+        """A Robotiq 0-255 command -> Stretch's two finger targets, in the tool's joint units."""
         command = float(np.asarray(value, dtype=float).reshape(-1)[0])
         self.last_gripper_ctrl = np.array([command])
         fraction = np.clip(
@@ -1861,7 +1957,7 @@ class FrankaOnStretchView:
         # 0 is open on the Robotiq and closed on Stretch, hence the flip. `finger_open`
         # rather than `STRETCH_FINGER_OPEN` so that "open" means the Robotiq's
         # aperture; see `ROBOTIQ_MAX_APERTURE_M`.
-        finger = self.finger_open + fraction * (STRETCH_FINGER_CLOSED - self.finger_open)
+        finger = self.finger_open + fraction * (self.finger_closed - self.finger_open)
         return np.array([finger, finger])
 
     def command_franka_joint_pos(self, joint_pos) -> None:
