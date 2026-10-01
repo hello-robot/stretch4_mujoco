@@ -1333,6 +1333,7 @@ def replay_pair(
                     params.grasp_offset_m,
                     params.tool_offset_x_m,
                     params.tool_offset_y_m,
+                    params.tool_offset_z_m,
                 ),
                 aperture_m=params.aperture_m or None,
                 scene_count=scene_count,
@@ -2262,6 +2263,7 @@ def run_directory_name(
     tool_offset_x: float | None = None,
     tool_offset_y: float | None = None,
     base_translation: bool = False,
+    tool_offset_z: float | None = None,
 ) -> str:
     """The directory one run of this script writes to, named after what it is.
 
@@ -2320,6 +2322,8 @@ def run_directory_name(
         segments.append(f"tool-offset-x{_run_name_value(tool_offset_x)}")
     if tool_offset_y is not None:
         segments.append(f"tool-offset-y{_run_name_value(tool_offset_y)}")
+    if tool_offset_z is not None:
+        segments.append(f"tool-offset-z{_run_name_value(tool_offset_z)}")
     segments += sorted(_run_name_param(spec) for spec in param_specs)
     return "_".join(segments)
 
@@ -2446,6 +2450,7 @@ STRETCH_OFFSET_FLAGS = {
     "stretch4_grasp_offset": "grasp_offset_m",
     "stretch4_tool_offset_x": "tool_offset_x_m",
     "stretch4_tool_offset_y": "tool_offset_y_m",
+    "stretch4_tool_offset_z": "tool_offset_z_m",
 }
 """The Stretch-only offset flags, and the `RetargetParams` field each one writes."""
 
@@ -2471,8 +2476,8 @@ def _apply_params(
 
     Applied after `--param` so it wins over a `--param grasp_offset_m=` naming
     the same number; the dedicated flag is the more specific statement.
-    `--stretch4-tool-offset-x` / `-y` are handled exactly the same way, for
-    `tool_offset_x_m` / `tool_offset_y_m`; see `STRETCH_OFFSET_FLAGS`. Note the
+    `--stretch4-tool-offset-x` / `-y` / `-z` are handled exactly the same way, for
+    `tool_offset_x_m` / `tool_offset_y_m` / `tool_offset_z_m`; see `STRETCH_OFFSET_FLAGS`. Note the
     asymmetry that leaves: `--param` is applied to whichever setup it is handed,
     Franka included, which is what its own help means by "where it applies".
 
@@ -2654,6 +2659,19 @@ def _apply_params(
     "cameras.RetargetParams.tool_offset_x_m.",
 )
 @click.option(
+    "--stretch4-tool-offset-z",
+    "--stretch4_tool_offset_z",
+    "stretch4_tool_offset_z",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="tool_offset_z_m for every Stretch setup this invocation touches, in metres: "
+    "moves the commanded grasp centre across the hand, towards the gripper cameras' side. "
+    "+0.017 puts Stretch's camera as far off the hand as the Franka's, on either tool. "
+    "Stretch only, overrides --param tool_offset_z_m. See "
+    "cameras.RetargetParams.tool_offset_z_m.",
+)
+@click.option(
     "--replay-kinematic",
     "replay_kinematic",
     is_flag=True,
@@ -2783,6 +2801,7 @@ def main(
     stretch4_grasp_offset: float,
     stretch4_tool_offset_x: float,
     stretch4_tool_offset_y: float,
+    stretch4_tool_offset_z: float,
     replay_limit: int | None,
     replay_no_video: bool,
     replay_kinematic: bool,
@@ -2893,6 +2912,9 @@ def main(
                 tool_offset_y=(
                     stretch4_tool_offset_y if _typed("stretch4_tool_offset_y") else None
                 ),
+                tool_offset_z=(
+                    stretch4_tool_offset_z if _typed("stretch4_tool_offset_z") else None
+                ),
             )
 
         found = (
@@ -2952,6 +2974,7 @@ def main(
                     params.grasp_offset_m,
                     params.tool_offset_x_m,
                     params.tool_offset_y_m,
+                    params.tool_offset_z_m,
                 ),
                 aperture_m=params.aperture_m or None,
                 # The run's own --scenes, so `scene_for_house` searches a list

@@ -1329,7 +1329,7 @@ def replay_episode(
     knowing anything about rendering.
 
     `tool_correction` is `(wrist_tilt_deg, grasp_offset_m[, tool_offset_x_m,
-    tool_offset_y_m])`, the terms a setup adds to the fixed Franka-to-Stretch
+    tool_offset_y_m, tool_offset_z_m])`, the terms a setup adds to the fixed Franka-to-Stretch
     tool transform, in `apply_tool_correction`'s order. Passed by a caller
     replaying *against a setup* -- without it the replay measures the bare
     retargeting, which is a different question from the one a side-by-side

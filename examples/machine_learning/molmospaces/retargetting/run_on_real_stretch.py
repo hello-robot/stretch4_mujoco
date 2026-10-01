@@ -2988,6 +2988,15 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "hand. See cameras.RetargetParams.tool_offset_x_m.",
 )
 @click.option(
+    "--tool-offset-z-m",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Move the commanded grasp centre across the hand, towards the gripper cameras' "
+    "side. +0.017 puts Stretch's camera as far off the hand as the Franka's, on either "
+    "tool. See cameras.RetargetParams.tool_offset_z_m.",
+)
+@click.option(
     "--wrist-tilt-deg",
     type=float,
     default=0.0,
@@ -3115,6 +3124,7 @@ def main(
     grasp_offset_m: float,
     tool_offset_x_m: float,
     tool_offset_y_m: float,
+    tool_offset_z_m: float,
     wrist_tilt_deg: float,
     target_z_offset_m: float,
     aperture_m: float,
@@ -3258,12 +3268,14 @@ def main(
         grasp_offset_m=grasp_offset_m,
         tool_offset_x_m=tool_offset_x_m,
         tool_offset_y_m=tool_offset_y_m,
+        tool_offset_z_m=tool_offset_z_m,
     )
     apply_aperture(proxy, aperture_m)
     proxy.reset()
     click.echo(
         f"  retarget   : grasp offset {grasp_offset_m:+.4f}m, "
-        f"tool offset ({tool_offset_x_m:+.4f}, {tool_offset_y_m:+.4f})m, "
+        f"tool offset ({tool_offset_x_m:+.4f}, {tool_offset_y_m:+.4f}, "
+        f"{tool_offset_z_m:+.4f})m, "
         f"wrist tilt {wrist_tilt_deg:+.1f}deg, "
         f"z offset {target_z_offset_m:+.4f}m, {proxy.gripper_kind.name} jaw, "
         f"opens to {proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "

@@ -578,6 +578,7 @@ PARAM_LABELS = {
     "wrist_tilt_deg": "wrist_tilt",
     "tool_offset_x_m": "tool_x",
     "tool_offset_y_m": "tool_y",
+    "tool_offset_z_m": "tool_z",
     "target_z_offset_m": "z_offset",
 }
 """Column headings for the parameter fields, short enough to put in a table."""
@@ -588,6 +589,7 @@ TOOL_FIELDS = (
     "target_z_offset_m",
     "tool_offset_x_m",
     "tool_offset_y_m",
+    "tool_offset_z_m",
 )
 
 PARAM_EXPLANATIONS = {
@@ -635,6 +637,11 @@ PARAM_EXPLANATIONS = {
         "Metres the commanded grasp centre is moved **along Stretch's jaw line**. The "
         "Franka's wrist camera sits 41mm to one side of Stretch's right gripper camera "
         "(21mm of its left). See `RetargetParams.tool_offset_x_m`."
+    ),
+    "tool_offset_z_m": (
+        "Metres the commanded grasp centre is moved **across Stretch's hand**, towards its "
+        "gripper cameras' side. The Franka's wrist camera sits 17mm further off the hand "
+        "than Stretch's do, on either tool. See `RetargetParams.tool_offset_z_m`."
     ),
     "target_z_offset_m": (
         "**Metres** to raise every commanded target by. Stretch's lift runs out of travel "

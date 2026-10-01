@@ -218,6 +218,17 @@ DIMENSIONS: dict[str, Dimension] = {
             robots=("stretch",),
         ),
         Dimension(
+            name="tool_offset_z_m",
+            bounds=(-0.10, 0.10),
+            read=lambda p: p.tool_offset_z_m,
+            write=lambda p, v: dataclasses.replace(p, tool_offset_z_m=float(v)),
+            description="How far to move the commanded grasp centre across Stretch's "
+            "hand, towards its gripper cameras' side -- the knob for the two wrist "
+            "cameras sitting at different heights off the hand. Stretch setups only.",
+            sweep=(0.0, 0.017),
+            robots=("stretch",),
+        ),
+        Dimension(
             name="wrist_tilt_deg",
             bounds=(-60.0, 60.0),
             read=lambda p: p.wrist_tilt_deg,

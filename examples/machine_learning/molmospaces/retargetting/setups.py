@@ -1422,6 +1422,9 @@ class RetargetStretchMolmoBotDroidPolicyConfig(StretchMolmoBotDroidPolicyConfig)
     tool_offset_y_m: float = 0.0
     """See `RetargetParams.tool_offset_y_m`."""
 
+    tool_offset_z_m: float = 0.0
+    """See `RetargetParams.tool_offset_z_m`."""
+
     aperture_m: float = 0.0
     """See `RetargetParams.aperture_m`. 0 keeps `ROBOTIQ_MAX_APERTURE_M`."""
 
@@ -1461,6 +1464,7 @@ class RetargetStretchMolmoBotDroidPolicy(StretchMolmoBotDroidPolicy):
             grasp_offset_m=float(getattr(policy_config, "grasp_offset_m", 0.0)),
             tool_offset_x_m=float(getattr(policy_config, "tool_offset_x_m", 0.0)),
             tool_offset_y_m=float(getattr(policy_config, "tool_offset_y_m", 0.0)),
+            tool_offset_z_m=float(getattr(policy_config, "tool_offset_z_m", 0.0)),
         )
         apply_aperture(proxy, float(getattr(policy_config, "aperture_m", 0.0)))
         return proxy
@@ -1472,13 +1476,15 @@ def apply_tool_correction(
     grasp_offset_m: float,
     tool_offset_x_m: float = 0.0,
     tool_offset_y_m: float = 0.0,
+    tool_offset_z_m: float = 0.0,
 ) -> None:
     """Rewrite a `FrankaOnStretchView`'s tool transform in place.
 
     The composition is rotate-then-translate in the *Stretch* tool frame:
 
         correction = FRANKA_TO_STRETCH_TOOL @ R_y(tilt)
-                     @ T(grasp_offset + tool_offset_x along +x, tool_offset_y along +y)
+                     @ T(grasp_offset + tool_offset_x along +x, tool_offset_y along +y,
+                         tool_offset_z along +z)
 
     so the translation moves the commanded grasp centre in the hand's own axes
     after the tilt has decided which way those point, which is the way round that
@@ -1497,9 +1503,9 @@ def apply_tool_correction(
         "y", wrist_tilt_deg, degrees=True
     ).as_matrix()
     # +x is Stretch's approach axis; see `franka_retarget.FRANKA_TO_STRETCH_TOOL`.
-    # +y is the jaw line.
+    # +y is the jaw line, +z across the hand towards the gripper cameras' side.
     correction[:3, 3] = correction[:3, :3] @ np.array(
-        [grasp_offset_m + tool_offset_x_m, tool_offset_y_m, 0.0]
+        [grasp_offset_m + tool_offset_x_m, tool_offset_y_m, tool_offset_z_m]
     )
 
     proxy._tool_correction = correction
@@ -1626,6 +1632,7 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
             self.policy_config.wrist_tilt_deg = params.wrist_tilt_deg
             self.policy_config.tool_offset_x_m = params.tool_offset_x_m
             self.policy_config.tool_offset_y_m = params.tool_offset_y_m
+            self.policy_config.tool_offset_z_m = params.tool_offset_z_m
             self.policy_config.target_z_offset = params.target_z_offset_m
             self.policy_config.aperture_m = params.aperture_m
 

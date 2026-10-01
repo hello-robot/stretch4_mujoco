@@ -397,6 +397,15 @@ class RetargetParams:
     See `tool_offset_x_m`, which carries the measurement both are set from.
     """
 
+    tool_offset_z_m: float = 0.0
+    """
+    Metres to move the commanded grasp centre across the hand (+z), towards the camera's side.
+
+    The third term of the same measurement as `tool_offset_x_m`: the Franka's wrist
+    camera sits at +74.0mm and both of Stretch's at +57.0mm, on the SG4 and the PG4
+    alike, so +0.017 is the gap that x and y leave.
+    """
+
     target_z_offset_m: float = 0.0
     """
     Metres to raise every commanded target by.
@@ -472,9 +481,10 @@ class RetargetParams:
     def describe(self) -> str:
         extra = "" if not self.wrist_fov_deg else f" wrist_fov={self.wrist_fov_deg:.1f}deg"
         extra += "" if not self.aperture_m else f" aperture={self.aperture_m * 1000:.0f}mm"
-        if self.tool_offset_x_m or self.tool_offset_y_m:
+        if self.tool_offset_x_m or self.tool_offset_y_m or self.tool_offset_z_m:
             extra += (
-                f" tool_offset=({self.tool_offset_x_m:+.3f}, {self.tool_offset_y_m:+.3f})m"
+                f" tool_offset=({self.tool_offset_x_m:+.3f}, {self.tool_offset_y_m:+.3f}, "
+                f"{self.tool_offset_z_m:+.3f})m"
             )
         return (
             f"{self.exo.describe()} | grasp_offset={self.grasp_offset_m:+.3f}m "
