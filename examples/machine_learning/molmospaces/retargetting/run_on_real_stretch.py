@@ -2049,8 +2049,11 @@ class Console:
 
 
 def set_chunking(
-    policy: Any, action_horizon: int | None, execute_horizon: int | None
-) -> tuple[int, int, int]:
+    policy: Any,
+    action_horizon: int | None,
+    execute_horizon: int | None,
+    only_first_n: int | None = None,
+) -> tuple[int, int, int, int]:
     """Apply `--action-horizon` / `--execute-horizon` to a loaded `RealRobotVLAPolicy`.
 
     `execute_horizon` is how many actions of each chunk are sent before the model
@@ -2066,8 +2069,15 @@ def set_chunking(
     `execute_horizon` and what the viewer's plan is drawn from. It can only
     shorten, never lengthen, the chunk.
 
-    Returns the `(action_horizon, execute_horizon)` in effect, and the chunk
-    length the checkpoint predicts.
+    `only_first_n` sends only the first N of the `execute_horizon` actions and
+    then re-queries. To the policy that is the same thing as an `execute_horizon`
+    of N -- `get_action` re-queries off that attribute and nothing else -- so that
+    is what it is set to. What the full `execute_horizon` still decides is the
+    plan the viewer draws (`planned_horizon`), so the steps being thrown away
+    stay visible next to the ones being sent.
+
+    Returns the `(action_horizon, execute_horizon, only_first_n)` in effect, and
+    the chunk length the checkpoint predicts.
     """
     predicted = int(getattr(getattr(policy, "agent", None), "action_horizon", policy.action_horizon))
     kept = predicted if action_horizon is None else action_horizon
@@ -2083,9 +2093,16 @@ def set_chunking(
             "execute actions it does not have.",
             param_hint="--execute-horizon",
         )
+    sent = executed if only_first_n is None else only_first_n
+    if not 1 <= sent <= executed:
+        raise click.BadParameter(
+            f"must be between 1 and the execute horizon ({executed}).",
+            param_hint="--execute-horizon-do-only-first-n-steps",
+        )
 
     policy.action_horizon = kept
-    policy.execute_horizon = executed
+    policy.execute_horizon = sent
+    policy.planned_horizon = executed
     if kept < predicted:
         populate = policy._populate_action_buffer
 
@@ -2094,7 +2111,7 @@ def set_chunking(
             del policy.action_buffer[kept:]
 
         policy._populate_action_buffer = populate_truncated
-    return kept, executed, predicted
+    return kept, executed, sent, predicted
 
 
 @dataclass
@@ -2635,7 +2652,9 @@ class RealStretchRunner:
         The steps between now and the next forward pass are already decided, so
         they can be drawn. Only those: the chunk is `action_horizon` long and
         only `execute_horizon` of it is ever executed, and drawing the tail would
-        be drawing a plan that is about to be thrown away.
+        be drawing a plan that is about to be thrown away. Under
+        `--execute-horizon-do-only-first-n-steps` the line still runs to the end
+        of `execute_horizon` (`planned_horizon`), not just the N actually sent.
 
         **It is a heading, not a trajectory.** The actions are `joint_pos_rel` --
         each is a delta against the arm state at the step it is executed at, and
@@ -2648,7 +2667,13 @@ class RealStretchRunner:
         if not buffer:
             return None
         index = int(getattr(self.policy, "buffer_index", 0))
-        horizon = int(getattr(self.policy, "execute_horizon", len(buffer)))
+        horizon = int(
+            getattr(
+                self.policy,
+                "planned_horizon",
+                getattr(self.policy, "execute_horizon", len(buffer)),
+            )
+        )
         pending = list(buffer[index : min(horizon, len(buffer))])
 
         here = np.asarray(self.proxy.get_move_group("arm").joint_pos, dtype=float)
@@ -2864,6 +2889,15 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "time. See set_chunking.",
 )
 @click.option(
+    "--execute-horizon-do-only-first-n-steps",
+    "only_first_n",
+    type=int,
+    default=None,
+    help="Of the --execute-horizon actions, send only the first N, then query the model "
+    "again. E.g. --execute-horizon 8 with 2 moves two steps per query. The viewer still "
+    "draws all --execute-horizon of the plan. Defaults to all of them.",
+)
+@click.option(
     "--action-horizon",
     type=int,
     default=None,
@@ -3052,6 +3086,7 @@ def main(
     checkpoint: str | None,
     control_hz: float,
     execute_horizon: int | None,
+    only_first_n: int | None,
     action_horizon: int | None,
     include_base: bool,
     head_mode: str,
@@ -3214,10 +3249,13 @@ def main(
     from examples.machine_learning.molmospaces.demo_droid_on_stretch import load_droid_policy
 
     policy = load_droid_policy(checkpoint)
-    kept, executed, predicted = set_chunking(policy, action_horizon, execute_horizon)
+    kept, executed, sent, predicted = set_chunking(
+        policy, action_horizon, execute_horizon, only_first_n
+    )
     click.echo(
         f"  chunking   : execute {executed} of {kept} actions per model query"
         + (f" (of the {predicted} the checkpoint predicts)" if kept < predicted else "")
+        + (f", sending only the first {sent}" if sent < executed else "")
     )
 
     telemetry = None
