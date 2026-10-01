@@ -41,8 +41,9 @@ The chain, once per control step
       -> `RobotCommander`       `move_to` per joint, one `push_command` per step
 
 The MuJoCo model is a *mirror*, not a simulation: nothing is ever stepped in it.
-It is there because the retargeting is kinematics -- `StretchArmIK` solves on an
-`MjData` and `franka_joint_pos()` reads the tool pose out of one -- so the real
+It is there because the retargeting is kinematics -- `Stretch4KinematicsArmIK`
+(stretch4_kinematics' IK) is seeded from and measured on an `MjData`, and
+`franka_joint_pos()` reads the tool pose out of one -- so the real
 robot's joint angles are written in and the solve happens against the pose the
 robot is actually in. That also makes the robot the only integrator in the loop:
 what it reports is what the next action is computed from.
@@ -62,9 +63,10 @@ What is different from a sim rollout, and worth knowing before the first run
   the retargeting from wherever the arm happens to be (`new_episode`). The one
   thing that does move the robot on its own is the opening snap to the Franka's
   home pose, which is a real motion and the first thing to watch.
-* **The base is out of the IK by default.** `--include-base` puts it back and the
-  policy can then drive the robot; on hardware that is a different kind of risk
-  from a lift command, so it is opt-in and speed-capped. See `RobotCommander`.
+* **The base is out of the IK by default.** `--include-base` puts it back, turning
+  in place, and `--base-translation` lets it drive as well; on hardware that is a
+  different kind of risk from a lift command, so both are opt-in and speed-capped.
+  See `RobotCommander`.
 * **A stale stream stops the robot.** If frames stop arriving for
   `--max-obs-age` seconds the loop stops sending and says so, rather than driving
   on the last thing it saw -- and it stays stopped once they come back, because a
@@ -684,10 +686,10 @@ def build_mirror() -> tuple[Any, MjData, Stretch4RobotView, str]:
     """A Stretch 4 standing on an empty floor, for the kinematics to be solved on.
 
     No house and no objects: nothing in this model is ever stepped, rendered or
-    collided. It exists because `StretchArmIK` differentiates the forward
-    kinematics on an `MjData` and `FrankaOnStretchView.franka_joint_pos` reads
-    the tool pose out of one, and both want the configuration the real robot is
-    in -- which `RobotMirror.sync` writes in each step.
+    collided. It exists because the IK seeds from and measures its residual on an
+    `MjData` and `FrankaOnStretchView.franka_joint_pos` reads the tool pose out of
+    one, and both want the configuration the real robot is in -- which
+    `RobotMirror.sync` writes in each step.
 
     The robot is spawned at the origin. The base's *reported* pose is written in
     from the robot's odometry with everything else, so where it is spawned only
@@ -2829,6 +2831,13 @@ class RealStretchRunner:
 # =============================================================================
 
 
+def _base_in_ik(include_base: bool, base_translation: bool) -> str:
+    """What the IK may do with the base, for the startup summary."""
+    if not include_base:
+        return "out of the IK"
+    return "turning and driving in the IK" if base_translation else "turning in place in the IK"
+
+
 def _publish_conventions(**flags: Any) -> fr.PoseConventions:
     """Put the pose conventions in the environment, and return them.
 
@@ -2909,8 +2918,17 @@ def _parse_size(value: str | None) -> tuple[int, int] | None:
     "--include-base/--no-include-base",
     default=False,
     show_default=True,
-    help="Let the holonomic base join the IK, so the policy can drive the robot. Off by "
-    "default: on hardware this moves 25kg around the room you are standing in.",
+    help="Let the holonomic base join the IK, turning in place, so the policy can turn "
+    "the robot. Off by default: on hardware this moves 25kg in the room you are standing "
+    "in. --base-translation lets it drive as well.",
+)
+@click.option(
+    "--base-translation/--no-base-translation",
+    default=False,
+    show_default=True,
+    help="Let the base translate in the IK as well as turn (stretch4_kinematics' "
+    "BASE_PLANAR rather than BASE_ROTATE). Needs --include-base. The base drives only when "
+    "that gets the gripper closer than turning would.",
 )
 @click.option(
     "--head-mode",
@@ -3089,6 +3107,7 @@ def main(
     only_first_n: int | None,
     action_horizon: int | None,
     include_base: bool,
+    base_translation: bool,
     head_mode: str,
     head_crop: str | None,
     head_virtual_pitch_deg: float | None,
@@ -3116,6 +3135,11 @@ def main(
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
+    if base_translation and not include_base:
+        raise click.UsageError(
+            "--base-translation lets the base drive in the IK, and without --include-base "
+            "the base is not in the IK at all. Pass both."
+        )
     crop_to = _parse_size(head_crop)
     if head_virtual_pitch_deg is not None and crop_to is None:
         raise click.BadParameter(
@@ -3224,6 +3248,7 @@ def main(
         include_base=include_base,
         target_z_offset=target_z_offset_m,
         pose_conventions=conventions,
+        ik_choice=fr.IKChoice(stretch4_kinematics=True, base_translation=base_translation),
     )
     # The study's tool parameters, applied the way `setups.py` applies them to a
     # trial, so a run here is the same retargeting a sim trial measured.
@@ -3242,7 +3267,7 @@ def main(
         f"wrist tilt {wrist_tilt_deg:+.1f}deg, "
         f"z offset {target_z_offset_m:+.4f}m, {proxy.gripper_kind.name} jaw, "
         f"opens to {proxy.finger_open:.4f} {proxy.gripper_kind.unit}, "
-        f"base {'in' if include_base else 'out of'} the IK"
+        f"base {_base_in_ik(include_base, base_translation)}"
     )
 
     click.echo("Loading the checkpoint...")
@@ -3286,7 +3311,11 @@ def main(
     if commander is not None and not no_prompt:
         click.secho(
             "\nThe real robot will move: lift, arm, wrist and gripper"
-            + (", and the base." if include_base else ".")
+            + (
+                f", and the base -- {'turning and driving' if base_translation else 'turning'}."
+                if include_base
+                else "."
+            )
             + "\nClear the area, keep the runstop within reach.",
             fg="yellow",
         )

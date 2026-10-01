@@ -1131,6 +1131,421 @@ class StretchArmIK:
         return joint_pos, error
 
 
+IK_SOLVER_ENV_VAR = "STRETCH4_IK_SOLVER"
+IK_BASE_TRANSLATION_ENV_VAR = "STRETCH4_IK_BASE_TRANSLATION"
+"""
+Which solver `FrankaOnStretchView` builds, and whether the base may translate in it.
+
+Environment variables for the reason `POSE_CONVENTION_ENV_VARS` are: the policy
+that builds the view is constructed by `run_evaluation` in worker processes,
+from a class name, with no seam to pass an argument through.
+"""
+
+STRETCH4_KINEMATICS_SOLVER = "stretch4_kinematics"
+
+
+@dataclass(frozen=True)
+class IKChoice:
+    """Which IK `FrankaOnStretchView` solves with. See `make_stretch_arm_ik`.
+
+    The default is `StretchArmIK`, this module's own MuJoCo solver, so nothing
+    that does not ask sees a change.
+    """
+
+    stretch4_kinematics: bool = False
+    """Solve with `Stretch4KinematicsArmIK` -- the stretch4_kinematics library -- instead."""
+
+    base_translation: bool = False
+    """Let the base translate as well as rotate. stretch4_kinematics only.
+
+    Off, a base in the IK only turns in place (`Stretch4IKModes.BASE_ROTATE`);
+    on, it is the full planar base (`BASE_PLANAR`). Whether the base is in the
+    IK at all is still `include_base`.
+    """
+
+    def describe(self) -> str:
+        if not self.stretch4_kinematics:
+            return "MuJoCo IK (StretchArmIK)"
+        return "stretch4_kinematics" + (", base translation on" if self.base_translation else "")
+
+
+def ik_choice_requested() -> IKChoice:
+    """Which IK this process was asked for."""
+    return IKChoice(
+        stretch4_kinematics=(
+            os.environ.get(IK_SOLVER_ENV_VAR, "").strip() == STRETCH4_KINEMATICS_SOLVER
+        ),
+        base_translation=_env_flag(IK_BASE_TRANSLATION_ENV_VAR),
+    )
+
+
+def publish_ik_choice(choice: IKChoice) -> None:
+    """Put the IK choice in the environment, for this process and its workers.
+
+    Both variables written in both directions, as `publish_pose_conventions`
+    does and for the same reason.
+    """
+    if choice.stretch4_kinematics:
+        os.environ[IK_SOLVER_ENV_VAR] = STRETCH4_KINEMATICS_SOLVER
+    else:
+        os.environ.pop(IK_SOLVER_ENV_VAR, None)
+    if choice.base_translation:
+        os.environ[IK_BASE_TRANSLATION_ENV_VAR] = "1"
+    else:
+        os.environ.pop(IK_BASE_TRANSLATION_ENV_VAR, None)
+
+
+def _planar_pose(x: float, y: float, theta: float) -> np.ndarray:
+    pose = np.eye(4)
+    pose[:3, :3] = R.from_euler("z", theta).as_matrix()
+    pose[:2, 3] = (x, y)
+    return pose
+
+
+def _translation(offset: np.ndarray) -> np.ndarray:
+    pose = np.eye(4)
+    pose[:3, 3] = offset
+    return pose
+
+
+class Stretch4KinematicsArmIK:
+    """`StretchArmIK`'s interface, solved by stretch4_kinematics instead of here.
+
+    The solve is the library's damped CLIK on its Pinocchio model of the URDF;
+    what this class adds is only what it takes to put that model and the MuJoCo
+    one in the same place:
+
+    * **Frames.** The two descriptions agree on every joint and every rotation,
+      but not on two translations: the URDF's base origin sits 41mm behind the
+      MJCF's, and the library's URDF always carries the SG4, so on a PG4 the
+      grasp centre is somewhere else on the hand. Both are rigid, so they are
+      measured rather than assumed -- `_calibrate` fits one offset in the base
+      frame and one in the tool frame off a handful of poses -- and every target
+      is moved into the URDF's frames before it is solved.
+    * **Limits.** The library's lift / arm / wrist limits are replaced with the
+      MJCF's commandable ones, as `kinematics.StretchReachSolver` does, so a
+      solution is something the controllers can reach. Its planar model has no
+      in-loop clipping at all (its configuration is not a plain vector), so
+      there the solution is clipped afterwards.
+    * **The base.** `include_base` off fixes it. On, it turns in place
+      (`BASE_ROTATE`), and `base_translation` lets it drive as well
+      (`BASE_PLANAR`). Either way it is held to `base_leash` around where
+      `releash()` last found it, as `StretchArmIK` does.
+
+    What it does not keep from `StretchArmIK` is the task priority: the library
+    trades position against orientation in one least-squares solve, so on a
+    pose the five arm DOFs cannot orient, some of the miss lands in position.
+    The residual this returns is measured on the MuJoCo model, so it says so.
+    """
+
+    ARM_GROUPS = ("lift", "arm", "wrist")
+    TOOL_FRAME = "grasp_center_link"
+    CALIBRATION_POSES = 8
+    CALIBRATION_WARNING_M = 1e-3
+    DRIVE_GAIN_M = 1e-3
+    """How much closer driving has to get the tool than turning in place, to be worth it."""
+
+    def __init__(
+        self,
+        stretch_view: Stretch4RobotView,
+        namespace: str,
+        include_base: bool = True,
+        base_translation: bool = False,
+        base_leash: tuple[float, float, float] = (0.7, 0.15, math.pi / 3),
+        iterations: int = 200,
+        damping: float = 1e-6,
+        tolerance: float = 1e-4,
+    ) -> None:
+        if base_translation and not include_base:
+            raise ValueError("base_translation needs include_base: there is no base in the IK.")
+
+        from stretch4_kinematics import StretchKinematics
+
+        self._live_view = stretch_view
+        self._live_data: MjData = stretch_view.mj_data
+        self._scratch_data = MjData(self._live_data.model)
+        self._scratch_view = Stretch4RobotView(self._scratch_data, namespace)
+
+        self.GROUPS = (("base",) if include_base else ()) + self.ARM_GROUPS
+        self._include_base = include_base
+        self._base_translation = base_translation
+        self._iterations = iterations
+        self._damping = damping
+        self._tolerance = tolerance
+        self._widths = [self._scratch_view.get_move_group(g).pos_dim for g in self.GROUPS]
+        self._arm_limits = np.concatenate(
+            [commandable_limits(self._scratch_view.get_move_group(g)) for g in self.ARM_GROUPS]
+        )
+        self._base_leash = np.asarray(base_leash, dtype=float)
+        self._home = np.zeros(3)
+
+        # Two models: the planar one drives the base in x, y and theta, and the
+        # rotate one only in theta -- which is also how the base is fixed, its
+        # rotation pinned at 0 (see `_rotation_limits`).
+        self._kinematics = StretchKinematics()
+        for model in (self._kinematics.model, self._kinematics.model_ik):
+            arm_start = model.joints[model.getJointId("lift_joint")].idx_q
+            model.lowerPositionLimit[arm_start:] = self._arm_limits[:, 0]
+            model.upperPositionLimit[arm_start:] = self._arm_limits[:, 1]
+
+        self._base_offset = np.zeros(3)
+        self._tool_offset = np.zeros(3)
+        self.releash()
+
+    def releash(self) -> None:
+        """Re-centre the base's leash on where the robot is standing, and re-measure the frames.
+
+        The leash as in `StretchArmIK.releash`. The frame offsets are measured
+        here too because this is called on every `FrankaOnStretchView.reset()`,
+        and an episode in a new house may stand the robot at a new height.
+        """
+        self._home = np.asarray(self._live_view.get_move_group("base").joint_pos, dtype=float)
+        self._calibrate()
+
+    def _calibrate(self) -> None:
+        """Fit the base-frame and tool-frame offsets between the MJCF and the library's URDF.
+
+        For each pose, the MuJoCo tool pose in the base frame is
+        `T(base_offset) @ urdf_tool_pose @ T(tool_offset)`. The rotations are the
+        same on both sides, so the translations give `base_offset + R @
+        tool_offset = mujoco - urdf`, which is linear in the two offsets.
+        """
+        from stretch4_kinematics import StretchJointPositions
+
+        self._scratch_data.qpos[:] = self._live_data.qpos
+        base_inverse = np.linalg.inv(self._base_pose(self._home))
+        rng = np.random.default_rng(0)
+        rows, gaps, rotation_gap = [], [], 0.0
+        for _ in range(self.CALIBRATION_POSES):
+            joint_pos = rng.uniform(self._arm_limits[:, 0], self._arm_limits[:, 1])
+            self._write_arm(self._scratch_view, joint_pos)
+            mujoco.mj_kinematics(self._live_data.model, self._scratch_data)
+            mujoco_tool = (
+                base_inverse @ self._scratch_view.get_move_group("wrist").leaf_frame_to_world
+            )
+            urdf_tool = self._kinematics.forward(
+                StretchJointPositions(
+                    lift=joint_pos[0],
+                    arm=joint_pos[1],
+                    wrist_yaw=joint_pos[2],
+                    wrist_pitch=joint_pos[3],
+                    wrist_roll=joint_pos[4],
+                ),
+                self.TOOL_FRAME,
+            )
+            rotation = R.from_matrix(urdf_tool.rotation.T @ mujoco_tool[:3, :3])
+            rotation_gap = max(rotation_gap, float(np.linalg.norm(rotation.as_rotvec())))
+            rows.append(np.hstack([np.eye(3), urdf_tool.rotation]))
+            gaps.append(mujoco_tool[:3, 3] - urdf_tool.translation)
+        rows, gaps = np.vstack(rows), np.concatenate(gaps)
+        offsets = np.linalg.lstsq(rows, gaps, rcond=None)[0]
+        self._base_offset, self._tool_offset = offsets[:3], offsets[3:]
+        fit = float(np.max(np.abs(rows @ offsets - gaps)))
+        if fit > self.CALIBRATION_WARNING_M or rotation_gap > self.CALIBRATION_WARNING_M:
+            log.warning(
+                f"[stretch4_kinematics] the URDF and the MJCF disagree by more than a rigid "
+                f"offset: {fit * 1000:.1f}mm, {rotation_gap:.4f} rad after fitting one. The "
+                "IK will aim off by about that much."
+            )
+
+    @staticmethod
+    def _base_pose(base: np.ndarray) -> np.ndarray:
+        return _planar_pose(*base)
+
+    def _write_arm(self, view: Any, joint_pos: np.ndarray) -> None:
+        offset = 0
+        for group in self.ARM_GROUPS:
+            width = view.get_move_group(group).pos_dim
+            view.get_move_group(group).joint_pos = joint_pos[offset : offset + width]
+            offset += width
+
+    def _read(self, view: Any) -> np.ndarray:
+        return np.concatenate(
+            [np.asarray(view.get_move_group(g).joint_pos, dtype=float) for g in self.GROUPS]
+        )
+
+    def _write(self, view: Any, joint_pos: np.ndarray) -> None:
+        offset = 0
+        for group, width in zip(self.GROUPS, self._widths):
+            view.get_move_group(group).joint_pos = joint_pos[offset : offset + width]
+            offset += width
+
+    def split(self, joint_pos: np.ndarray) -> dict[str, np.ndarray]:
+        """A flat joint vector split into the per-move-group dict callers want."""
+        offset = 0
+        out = {}
+        for group, width in zip(self.GROUPS, self._widths):
+            out[group] = joint_pos[offset : offset + width]
+            offset += width
+        return out
+
+    def tool_pose(self) -> np.ndarray:
+        """The live robot's current tool pose in the world, as a 4x4."""
+        return self._live_view.get_move_group("wrist").leaf_frame_to_world
+
+    def _rotation_limits(self, theta: float) -> tuple[float, float]:
+        """The rotation joint's interval this solve, relative to where the base faces now."""
+        if not self._include_base:
+            return 0.0, 0.0
+        low = self._home[2] - self._base_leash[2] - theta
+        high = self._home[2] + self._base_leash[2] - theta
+        return max(low, -math.pi), min(high, math.pi)
+
+    def _clik(self, planar: bool, target: np.ndarray, seed: np.ndarray) -> np.ndarray:
+        import pinocchio as pin
+
+        model, data = (
+            (self._kinematics.model, self._kinematics.data)
+            if planar
+            else (self._kinematics.model_ik, self._kinematics.data_ik)
+        )
+        return self._kinematics._closed_loop_inverse_kinematics(
+            model=model,
+            data=data,
+            target_frame=self.TOOL_FRAME,
+            target_pose=pin.SE3(target[:3, :3], target[:3, 3]),
+            q_guess=seed,
+            max_iter=self._iterations,
+            eps=self._tolerance,
+            damp=self._damping,
+        )
+
+    def _to_urdf(self, local_target: np.ndarray, lever: np.ndarray) -> np.ndarray:
+        """A tool target in the MuJoCo base frame -> the library's. `lever` is the base offset."""
+        return _translation(-lever) @ local_target @ _translation(-self._tool_offset)
+
+    def _solve_turning(
+        self,
+        base: np.ndarray,
+        target_pose: np.ndarray,
+        arm: np.ndarray,
+        limits: tuple[float, float],
+    ) -> tuple[float, np.ndarray]:
+        """The library's rotate-in-place solve from `base`: the turn, and the arm joints.
+
+        MuJoCo turns the base about its own origin and the library about the
+        URDF's, `base_offset` away -- so the offset to take out depends on the
+        turn being solved for. A fixed point, settled in a pass or two because
+        the turn barely moves the lever arm. `limits` (0, 0) is the fixed base.
+        """
+        model = self._kinematics.model_ik
+        model.lowerPositionLimit[0], model.upperPositionLimit[0] = limits
+        local = np.linalg.inv(self._base_pose(base)) @ target_pose
+        turn = 0.0
+        q = np.concatenate([[0.0], arm])
+        for _ in range(1 if limits == (0.0, 0.0) else 3):
+            lever = R.from_euler("z", turn).as_matrix() @ self._base_offset
+            q = self._clik(False, self._to_urdf(local, lever), q)
+            settled = abs(float(q[0]) - turn) < 1e-6
+            turn = float(q[0])
+            if settled:
+                break
+        return turn, np.asarray(q[1:], dtype=float)
+
+    def _solve_driving(
+        self, base: np.ndarray, target_pose: np.ndarray, arm: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The library's planar solve from `base`: the new base pose, and the arm joints.
+
+        target = T(d) Rz(turn) T(base_offset) F(q) T(tool_offset) on the MuJoCo
+        side, and the library solves T(d') Rz(turn) F(q) -- so handing it the
+        target with both offsets taken out gives d' = d + Rz(turn) base_offset -
+        base_offset, which is undone here in closed form.
+
+        The planar model is not clipped inside the solve -- not the base, and not
+        the lift, arm or wrist either -- so a solution past any limit is clipped
+        to it afterwards and the arm solved again, with limits, from that base,
+        rather than left reaching for a pose it is not going to get.
+        """
+        local = np.linalg.inv(self._base_pose(base)) @ target_pose
+        seed = np.concatenate([[0.0, 0.0, 1.0, 0.0], arm])
+        q = self._clik(True, self._to_urdf(local, self._base_offset), seed)
+        turn = math.atan2(q[3], q[2])
+        shift = (
+            q[:2]
+            + self._base_offset[:2]
+            - R.from_euler("z", turn).as_matrix()[:2, :2] @ self._base_offset[:2]
+        )
+        xy = base[:2] + R.from_euler("z", base[2]).as_matrix()[:2, :2] @ shift
+        theta = base[2] + turn
+        clipped = np.clip(
+            [xy[0], xy[1], theta], self._home - self._base_leash, self._home + self._base_leash
+        )
+        arm = np.clip(q[4:], self._arm_limits[:, 0], self._arm_limits[:, 1])
+        if np.allclose(clipped, [xy[0], xy[1], theta]) and np.allclose(arm, q[4:]):
+            return clipped, arm
+        _, arm = self._solve_turning(clipped, target_pose, arm, (0.0, 0.0))
+        return clipped, arm
+
+    def solve(self, target_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Joint targets for `target_pose` (world frame), and the residual 6-vector.
+
+        Seeded from the robot's current configuration, like `StretchArmIK.solve`,
+        and solved in the frame of the base where it stands now -- the library's
+        base joint starts at zero, so its answer for the base is a move relative
+        to here.
+        """
+        target_pose = np.asarray(target_pose, dtype=float)
+        self._scratch_data.qpos[:] = self._live_data.qpos
+        base = np.asarray(self._live_view.get_move_group("base").joint_pos, dtype=float)
+        arm = np.clip(
+            np.concatenate(
+                [
+                    np.asarray(self._live_view.get_move_group(g).joint_pos, dtype=float)
+                    for g in self.ARM_GROUPS
+                ]
+            ),
+            self._arm_limits[:, 0],
+            self._arm_limits[:, 1],
+        )
+
+        turn, turned_arm = self._solve_turning(
+            base, target_pose, arm, self._rotation_limits(base[2])
+        )
+        joint_pos = np.concatenate([[base[0], base[1], base[2] + turn], turned_arm])
+        if not self._include_base:
+            joint_pos = joint_pos[3:]
+        error = self._residual(joint_pos, target_pose)
+        if not self._base_translation:
+            return joint_pos, error
+
+        # Driving only when it gets the tool closer than turning in place does.
+        # The library's planar solve does not weigh base motion against arm
+        # motion, and it solves without the arm's limits, so on a target the arm
+        # cannot reach it happily walks the base somewhere that only helps a lift
+        # that does not exist. The comparison is what keeps the base still while
+        # the arm can do the job, which `StretchArmIK` got from `base_cost`.
+        driven = np.concatenate(self._solve_driving(base, target_pose, arm))
+        driven_error = self._residual(driven, target_pose)
+        if np.linalg.norm(driven_error[:3]) + self.DRIVE_GAIN_M < np.linalg.norm(error[:3]):
+            return driven, driven_error
+        return joint_pos, error
+
+    def _residual(self, joint_pos: np.ndarray, target_pose: np.ndarray) -> np.ndarray:
+        """`joint_pos`'s miss on `target_pose`, measured on the MuJoCo model itself."""
+        self._write(self._scratch_view, joint_pos)
+        mujoco.mj_kinematics(self._live_data.model, self._scratch_data)
+        reached = self._scratch_view.get_move_group("wrist").leaf_frame_to_world
+        return _pose_error(reached, target_pose)
+
+
+def make_stretch_arm_ik(
+    stretch_view: Stretch4RobotView,
+    namespace: str,
+    include_base: bool,
+    ik_choice: IKChoice,
+) -> StretchArmIK | Stretch4KinematicsArmIK:
+    """The IK `ik_choice` names, with the base in it or not as `include_base` says."""
+    if ik_choice.stretch4_kinematics:
+        return Stretch4KinematicsArmIK(
+            stretch_view,
+            namespace,
+            include_base=include_base,
+            base_translation=ik_choice.base_translation,
+        )
+    return StretchArmIK(stretch_view, namespace, include_base=include_base)
+
+
 class _ProxyArmGroup:
     """Stretch's lift + arm + wrist, wearing the Franka arm's seven-joint interface."""
 
@@ -1254,6 +1669,7 @@ class FrankaOnStretchView:
         match_robotiq_aperture: bool = True,
         pose_conventions: PoseConventions | None = None,
         robotiq_aperture_m: float | None = None,
+        ik_choice: IKChoice | None = None,
     ) -> None:
         self.stretch_view = stretch_view
         self.namespace = namespace
@@ -1274,7 +1690,12 @@ class FrankaOnStretchView:
             )
         if self.pose_conventions:
             log.info(f"[retarget] pose conventions: {self.pose_conventions.describe()}")
-        self.arm_ik = StretchArmIK(stretch_view, namespace, include_base=include_base)
+        # Read off the environment when not passed, like the pose conventions:
+        # the evaluation's workers build this view with no way to be told.
+        self.ik_choice = ik_choice_requested() if ik_choice is None else ik_choice
+        if self.ik_choice.stretch4_kinematics:
+            log.info(f"[retarget] IK: {self.ik_choice.describe()}")
+        self.arm_ik = make_stretch_arm_ik(stretch_view, namespace, include_base, self.ik_choice)
 
         # What "fully open" and "shut" mean on Stretch, in finger-joint units --
         # radians on the SG4, metres on the PG4 -- read off the gripper group so

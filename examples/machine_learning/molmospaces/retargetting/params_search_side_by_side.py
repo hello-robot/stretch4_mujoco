@@ -2216,6 +2216,7 @@ RUN_NAME_ABBREVIATIONS = {
     "use_left_gripper_camera": "left-gripper-cam",
     "use_left_fisheye_camera": "left-fisheye-cam",
     "parallel_gripper": "pg4",
+    "base_translation": "base-translation",
 }
 """
 Short names for the conventions and camera choices, for `run_directory_name`.
@@ -2260,6 +2261,7 @@ def run_directory_name(
     parallel_gripper: bool = False,
     tool_offset_x: float | None = None,
     tool_offset_y: float | None = None,
+    base_translation: bool = False,
 ) -> str:
     """The directory one run of this script writes to, named after what it is.
 
@@ -2271,8 +2273,9 @@ def run_directory_name(
     describe.
 
     What goes in: the date, the pair, the benchmark when it is not the mini one,
-    the tool when it is the PG4, every convention and camera choice that is on, the Stretch grasp
-    and tool offsets when they were typed, and every `--param` override. What stays out is everything
+    the tool when it is the PG4, base translation in the IK when it is on, every
+    convention and camera choice that is on, the Stretch grasp and tool offsets
+    when they were typed, and every `--param` override. What stays out is everything
     operational -- the worker count, the checkpoint path, `--rebuild-benchmark`,
     `--scenes` -- which changes how a run is produced rather than what it
     measures. `--scenes` is the arguable one: two scene counts land in the same
@@ -2292,6 +2295,10 @@ def run_directory_name(
         # A different hand on every Stretch setup, and a different grasp offset
         # default with it -- so a PG4 run must never resume into an SG4 one.
         segments.append(RUN_NAME_ABBREVIATIONS["parallel_gripper"])
+    if base_translation:
+        # A base that drives reaches targets one that only turns cannot, so the
+        # two must never resume into each other either.
+        segments.append(RUN_NAME_ABBREVIATIONS["base_translation"])
     for name in fr.POSE_CONVENTION_ENV_VARS:
         value = getattr(conventions, name)
         if not value:
@@ -2747,6 +2754,16 @@ def _apply_params(
     "--replay-as-stretch4 on a PG4 run need it again, like every other flag the run was "
     "started with. See `stretch.robot_view.PG4_GRIPPER`.",
 )
+@click.option(
+    "--base-translation",
+    "--base_translation",
+    "base_translation",
+    is_flag=True,
+    help="Let Stretch's base translate in the IK as well as turn in place "
+    "(stretch4_kinematics' BASE_PLANAR rather than BASE_ROTATE). Off by default. The base "
+    "drives only when that gets the gripper closer than turning would. Stretch only. Adds "
+    "'base-translation' to the run directory. See `franka_retarget.Stretch4KinematicsArmIK`.",
+)
 def main(
     pair: str,
     param_specs: tuple[str, ...],
@@ -2775,6 +2792,7 @@ def main(
     use_left_gripper_camera: bool,
     use_left_fisheye_camera: bool,
     parallel_gripper: bool,
+    base_translation: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -2833,6 +2851,13 @@ def main(
     if parallel_gripper:
         log.info("[tool] Stretch wears the parallel jaw gripper (PG4)")
 
+    # Stretch's retargeting solves with stretch4_kinematics, in the evaluation's
+    # workers and in a replay alike; published in both directions like the rest.
+    # See `franka_retarget.publish_ik_choice`.
+    ik_choice = fr.IKChoice(stretch4_kinematics=True, base_translation=base_translation)
+    fr.publish_ik_choice(ik_choice)
+    log.info(f"[ik] Stretch solves with {ik_choice.describe()}")
+
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
 
@@ -2861,6 +2886,7 @@ def main(
                 benchmark=benchmark,
                 today=day,
                 parallel_gripper=parallel_gripper,
+                base_translation=base_translation,
                 tool_offset_x=(
                     stretch4_tool_offset_x if _typed("stretch4_tool_offset_x") else None
                 ),
