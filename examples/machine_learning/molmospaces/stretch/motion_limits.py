@@ -107,6 +107,11 @@ def move_group_limits(
     )
 
 
+SETPOINT_ARRIVED_TOLERANCE = 1e-4
+"""How close a shaped setpoint has to be to its target to have arrived, in metres or radians.
+See `RateLimitedPositionController.ramping`."""
+
+
 class RateLimitedPositionController(AbstractPositionController):
     """Wraps a position controller so its setpoint respects the joint's limits.
 
@@ -151,6 +156,11 @@ class RateLimitedPositionController(AbstractPositionController):
         super().__init__(controller.robot_move_group)
         self._ctrl_dt = ctrl_dt
         self._limiter = TrapezoidalSetpointLimiter(max_vel, max_accel, angular)
+        self._angular = (
+            np.zeros(len(self._limiter), dtype=bool)
+            if angular is None
+            else np.asarray(angular, dtype=bool)
+        )
         self._was_stationary = True
         self.reset()
 
@@ -182,8 +192,24 @@ class RateLimitedPositionController(AbstractPositionController):
     def set_to_stationary(self) -> None:
         self._controller.set_to_stationary()
 
+    @property
+    def ramping(self) -> bool:
+        """Whether the shaped setpoint is still on its way to the commanded target.
+
+        The simulated counterpart of a real joint's `is_moving()` -- its trajectory
+        generator still running -- for `--wait-for-arrival` in a simulated rollout;
+        see `setups.RetargetStretchMolmoBotDroidPolicy`. False while stationary and
+        before the first control step, when there is no ramp to be on.
+        """
+        if self._goal is None or self._controller.stationary:
+            return False
+        error = self._goal - self._limiter.position
+        error = np.where(self._angular, (error + np.pi) % (2 * np.pi) - np.pi, error)
+        return bool(np.any(np.abs(error) > SETPOINT_ARRIVED_TOLERANCE))
+
     def compute_ctrl_inputs(self) -> np.ndarray:
         target = np.asarray(self._controller.compute_ctrl_inputs(), dtype=float)
+        self._goal = target
         if self._controller.stationary:
             self._limiter.reset(target)
             self._was_stationary = True
@@ -196,6 +222,7 @@ class RateLimitedPositionController(AbstractPositionController):
     def reset(self) -> None:
         self._controller.reset()
         self._was_stationary = True
+        self._goal: np.ndarray | None = None
         self._seed_from_robot()
 
     def _seed_from_robot(self) -> None:

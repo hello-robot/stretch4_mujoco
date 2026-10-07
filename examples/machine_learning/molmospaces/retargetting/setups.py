@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,10 @@ from examples.machine_learning.molmospaces.stretch.config import (
 from examples.machine_learning.molmospaces.stretch.episode_overrides import (
     stretch_home_init_qpos,
 )
+from examples.machine_learning.molmospaces.stretch.motion_limits import (
+    RateLimitedPositionController,
+)
+from examples.machine_learning.molmospaces.stretch.robot import Stretch4Robot
 from molmo_spaces.configs.camera_configs import CameraSystemConfig, MjcfCameraConfig
 from molmo_spaces.configs.robot_configs import FrankaRobotConfig
 from molmo_spaces.evaluation.benchmark_schema import EpisodeSpec
@@ -90,6 +95,7 @@ from molmo_spaces.evaluation.robot_eval_overrides import (
     ROBOT_OVERRIDE_REGISTRY,
     register_robot_override,
 )
+from stretch4_mujoco.trapezoidal_profile import TrapezoidalSetpointLimiter
 
 log = logging.getLogger(__name__)
 
@@ -1063,6 +1069,149 @@ def publish_stretch_camera_choices(choices: StretchCameraChoices) -> None:
 
 
 # =============================================================================
+# How a rollout runs: run_on_real_stretch.py's flags, in simulation
+# =============================================================================
+
+ROLLOUT_OPTIONS_ENV_VAR = "STRETCH_RETARGET_ROLLOUT_OPTIONS"
+"""JSON object of the `RolloutOptions` fields a run set away from their defaults.
+
+The environment for `STRETCH_CAMERA_CHOICE_ENV_VARS`' reason: the eval configs,
+the robot and the policy that read these are all built inside rollout workers."""
+
+
+@dataclass(frozen=True)
+class RolloutOptions:
+    """How the policy is stepped and how Stretch follows it, as `run_on_real_stretch.py` sets it.
+
+    The flags of the same names there, carried into the sim study so that one
+    command line means one thing on the robot and in a matched pair. Every field
+    defaults to what a sim rollout did before these existed.
+
+    `execute_horizon` and `only_first_n` apply to both halves of a pair -- they
+    are how the *checkpoint* is queried, and a pair whose halves re-plan at
+    different rates differs in two things rather than one. The rest are about
+    Stretch's hardware and reach only the Stretch half.
+    """
+
+    include_base: bool = True
+    """Let the base join the retargeting IK. On by default in sim, unlike on the robot
+    (`StretchMolmoBotDroidPolicyConfig.include_base` says why)."""
+
+    execute_horizon: int | None = None
+    """Actions of each chunk executed before re-querying. None keeps the policy config's (8)."""
+
+    only_first_n: int | None = None
+    """Of `execute_horizon`'s actions, execute only the first N, then re-query.
+
+    To the policy that is an `execute_horizon` of N, which is what
+    `run_on_real_stretch.set_chunking` sets too; the larger number only decides
+    the plan its viewer draws, and a sim rollout draws none."""
+
+    slow: bool = False
+    """Shape Stretch's joints at what `run_on_real_stretch --slow` commands. See
+    `real_slow_motion_limits`."""
+
+    wait_for_arrival: bool = False
+    """Hold each action until Stretch has stopped moving before the next. See
+    `RetargetStretchMolmoBotDroidPolicy`."""
+
+    def __bool__(self) -> bool:
+        """True when anything differs from a default rollout."""
+        return self != RolloutOptions()
+
+    @property
+    def policy_execute_horizon(self) -> int | None:
+        """The `execute_horizon` to put on the policy config, or None to keep its own."""
+        return self.only_first_n if self.only_first_n is not None else self.execute_horizon
+
+    def describe(self) -> str:
+        parts = [] if self.include_base else ["base out of the IK"]
+        if self.execute_horizon is not None:
+            parts.append(f"execute horizon {self.execute_horizon}")
+        if self.only_first_n is not None:
+            parts.append(f"only the first {self.only_first_n} of each")
+        if self.slow:
+            parts.append("slow")
+        if self.wait_for_arrival:
+            parts.append("wait for arrival")
+        return ", ".join(parts) if parts else "defaults"
+
+
+def rollout_options() -> RolloutOptions:
+    """The rollout options published for this process tree, or the defaults."""
+    blob = os.environ.get(ROLLOUT_OPTIONS_ENV_VAR)
+    return RolloutOptions(**json.loads(blob)) if blob else RolloutOptions()
+
+
+def publish_rollout_options(options: RolloutOptions) -> None:
+    """Put the rollout options in the environment, for this process and its workers.
+
+    Cleared when everything is at its default, for `publish_pose_conventions`'
+    reason: an option exported by an earlier run in the same shell must not leak
+    into this one.
+    """
+    changed = {
+        field.name: getattr(options, field.name)
+        for field in dataclasses.fields(options)
+        if getattr(options, field.name) != field.default
+    }
+    if changed:
+        os.environ[ROLLOUT_OPTIONS_ENV_VAR] = json.dumps(changed)
+    else:
+        os.environ.pop(ROLLOUT_OPTIONS_ENV_VAR, None)
+
+
+def real_slow_motion_limits(move_group_id: str) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """`(max_vel, max_accel, angular)` for one move group, as `run_on_real_stretch --slow` moves it.
+
+    The same numbers `RobotCommander` sends, from the same constants: the lift and
+    arm at `SLOW_SPEED_SCALE` of their `MOTION_PROFILE` (the lift's acceleration
+    backed off by `LIFT_ACCELERATION_SCALE` first), the wrist at that fraction of
+    `EOA_VELOCITY_R` / `EOA_ACCELERATION_R`, and the base capped at that fraction
+    of `MAX_BASE_SPEED_MPS` / `MAX_BASE_TURN_RADPS` with the omnibase's default
+    acceleration, which is what `translate_by` / `rotate_by` get when none is
+    passed. The robot reads its profile off its own parameters; here it is
+    `stretch4_mujoco.config`'s copy of them.
+
+    None for the gripper, which the sim leaves unshaped whatever the speed -- see
+    `stretch.motion_limits.MOVE_GROUP_ACTUATORS`.
+    """
+    from examples.digital_twin import (
+        EOA_ACCELERATION_R,
+        EOA_VELOCITY_R,
+        LIFT_ACCELERATION_SCALE,
+        MOTION_PROFILE,
+    )
+    from examples.machine_learning.molmospaces.retargetting.run_on_real_stretch import (
+        MAX_BASE_SPEED_MPS,
+        MAX_BASE_TURN_RADPS,
+        SLOW_SPEED_SCALE,
+    )
+    from stretch4_mujoco import config
+
+    scale = SLOW_SPEED_SCALE
+    if move_group_id == "base":
+        (_, accel_xy), (_, accel_w) = config.get_base_motion_limits()
+        return (
+            np.array([MAX_BASE_SPEED_MPS, MAX_BASE_SPEED_MPS, MAX_BASE_TURN_RADPS]) * scale,
+            np.array([accel_xy, accel_xy, accel_w]),
+            np.array([False, False, True]),
+        )
+    if move_group_id in ("lift", "arm"):
+        velocity, acceleration = config.get_actuator_motion_limits(move_group_id, MOTION_PROFILE)
+        if move_group_id == "lift":
+            acceleration *= LIFT_ACCELERATION_SCALE
+        return np.array([velocity * scale]), np.array([acceleration * scale]), np.zeros(1, bool)
+    if move_group_id == "wrist":
+        return (
+            np.full(3, EOA_VELOCITY_R * scale),
+            np.full(3, EOA_ACCELERATION_R * scale),
+            np.zeros(3, bool),
+        )
+    return None
+
+
+# =============================================================================
 # Camera systems
 # =============================================================================
 
@@ -1169,11 +1318,36 @@ class RetargetFrankaRobotConfig(FrankaRobotConfig):
     """
 
 
+class RetargetStretch4Robot(Stretch4Robot):
+    """`Stretch4Robot`, shaped to `run_on_real_stretch --slow`'s limits when the rollout asks.
+
+    Every joint's setpoint is already rate-limited, at the sim's default profile
+    (`stretch.motion_limits`); `--slow` swaps each group's limiter for one at the
+    real robot's slow numbers (`real_slow_motion_limits`). The targets are the
+    same targets, so -- as on the robot -- a slow Stretch trails the policy
+    further and the policy closes its loop on a hand that has not arrived yet.
+    """
+
+    def __init__(self, mj_data, exp_config) -> None:
+        super().__init__(mj_data, exp_config)
+        if not rollout_options().slow:
+            return
+        for group, controller in self._controllers.items():
+            limits = real_slow_motion_limits(group)
+            if limits is None or not isinstance(controller, RateLimitedPositionController):
+                continue
+            controller._limiter = TrapezoidalSetpointLimiter(*limits)
+            controller.reset()
+
+
 class RetargetStretch4RobotConfig(Stretch4RobotConfig):
     """`Stretch4RobotConfig` under its own override key. Same reason as above --
     and here it matters more, because `configs.py` has already registered
     `stretch_episode_override` for the parent, and that one installs the full
     `Stretch4CameraSystem` over the exo camera this study is measuring."""
+
+    robot_cls: type[Stretch4Robot] | None = RetargetStretch4Robot
+    robot_factory: Callable[..., Stretch4Robot] | None = RetargetStretch4Robot
 
 
 def _point_base_at(task: dict, base_z: float, retreat: bool = False) -> None:
@@ -1428,6 +1602,9 @@ class RetargetStretchMolmoBotDroidPolicyConfig(StretchMolmoBotDroidPolicyConfig)
     aperture_m: float = 0.0
     """See `RetargetParams.aperture_m`. 0 keeps `ROBOTIQ_MAX_APERTURE_M`."""
 
+    wait_for_arrival: bool = False
+    """See `RolloutOptions.wait_for_arrival` and `RetargetStretchMolmoBotDroidPolicy`."""
+
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
         # The parent sets these to the un-parameterised classes.
@@ -1435,6 +1612,19 @@ class RetargetStretchMolmoBotDroidPolicyConfig(StretchMolmoBotDroidPolicyConfig)
         from molmo_spaces.utils.function_utils import make_lenient
 
         self.policy_factory = make_lenient(RetargetStretchMolmoBotDroidPolicy)
+
+
+ARRIVAL_SPEED_TOLERANCE: dict[str, np.ndarray] = {
+    "base": np.array([0.005, 0.005, 0.01]),
+    "lift": np.array([0.005]),
+    "arm": np.array([0.005]),
+    "wrist": np.array([0.01, 0.01, 0.01]),
+}
+"""Joint speeds below which a group counts as stopped, for `--wait-for-arrival`. m/s or rad/s.
+
+The gripper is not waited on: the sim drives it unshaped (see
+`stretch.motion_limits.MOVE_GROUP_ACTUATORS`), and a hand closed on an object
+would otherwise read as settled or not depending on how the contact chatters."""
 
 
 class RetargetStretchMolmoBotDroidPolicy(StretchMolmoBotDroidPolicy):
@@ -1454,6 +1644,65 @@ class RetargetStretchMolmoBotDroidPolicy(StretchMolmoBotDroidPolicy):
     retargeting module; the transform is one attribute and its inverse, and both
     are recomputed here together.
     """
+
+    def __init__(self, config, task=None) -> None:
+        super().__init__(config, task)
+        self._held: dict[str, Any] | None = None
+        self._held_steps = 0
+        self._warned_arrival = False
+
+    def reset(self) -> None:
+        super().reset()
+        self._held = None
+        self._held_steps = 0
+
+    def get_action(self, observation) -> dict[str, Any]:
+        """The next retargeted action -- or, under `wait_for_arrival`, the last one again.
+
+        `run_on_real_stretch --wait-for-arrival` stops after every step until the
+        robot reports it is no longer moving, and only then takes the next frame
+        and queries the policy. A rollout cannot stop the clock, so the same thing
+        is done the only way it can be: the action just sent is returned again,
+        unchanged -- it is absolute, so that holds it -- and the policy is not
+        consulted until Stretch has arrived. Each held step is a policy step of sim
+        time and counts towards the episode's horizon, the way a real wait costs
+        wall time.
+
+        Arrived means what `RobotClient.is_moving()` going false means: no joint's
+        trajectory is still running (`RateLimitedPositionController.ramping`) and
+        none is still in motion behind it (`ARRIVAL_SPEED_TOLERANCE`). Given up on
+        after `ARRIVAL_TIMEOUT_S`, as on the robot, and said once.
+        """
+        if self._held is not None and self._still_arriving():
+            self._held_steps += 1
+            return dict(self._held)
+        action = super().get_action(observation)
+        if getattr(self.config.policy_config, "wait_for_arrival", False):
+            self._held, self._held_steps = action, 0
+        return action
+
+    def _still_arriving(self) -> bool:
+        from examples.machine_learning.molmospaces.retargetting.run_on_real_stretch import (
+            ARRIVAL_TIMEOUT_S,
+        )
+
+        timeout_steps = math.ceil(ARRIVAL_TIMEOUT_S / (self.config.policy_dt_ms / 1000.0))
+        if self._held_steps >= timeout_steps:
+            if not self._warned_arrival:
+                log.warning(
+                    f"[droid] Stretch was still moving {ARRIVAL_TIMEOUT_S:.1f}s after a step "
+                    "was sent; carrying on without it. Said once."
+                )
+                self._warned_arrival = True
+            return False
+        robot = self.task.env.current_robot
+        if any(getattr(controller, "ramping", False) for controller in robot.controllers.values()):
+            return True
+        view = robot.robot_view
+        return any(
+            np.any(np.abs(view.get_move_group(group).joint_vel) > tolerance)
+            for group, tolerance in ARRIVAL_SPEED_TOLERANCE.items()
+        )
 
     def _build_proxy(self, robot_view):
         proxy = super()._build_proxy(robot_view)
@@ -1591,6 +1840,9 @@ class RetargetFrankaDroidEvalConfig(_RetargetEvalConfig):
         self.camera_config.cameras = list(system.cameras)
         self.camera_config.img_resolution = system.img_resolution
         self.robot_config.action_noise_config.enabled = False
+        execute_horizon = rollout_options().policy_execute_horizon
+        if execute_horizon is not None:
+            self.policy_config.execute_horizon = execute_horizon
 
 
 class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
@@ -1619,10 +1871,14 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
         # for a camera nothing rendered -- which `_camera` raises on, at the
         # first step of every episode. Set on the DROID config rather than this
         # study's subclass of it, because that is where the fields are declared.
+        rollout = rollout_options()
         if isinstance(self.policy_config, StretchMolmoBotDroidPolicyConfig):
             choices = stretch_camera_choices()
             self.policy_config.exo_camera = choices.exo_camera_for(setup_key)
             self.policy_config.wrist_camera = choices.wrist_camera
+            self.policy_config.include_base = rollout.include_base
+            if rollout.policy_execute_horizon is not None:
+                self.policy_config.execute_horizon = rollout.policy_execute_horizon
         # Guarded so that a subclass swapping the policy out -- for a dummy
         # policy, to check that a setup's scene and cameras load without waiting
         # on a VLA -- gets the cameras without being rejected for lacking the
@@ -1635,6 +1891,7 @@ class RetargetStretchDroidEvalConfig(_RetargetEvalConfig):
             self.policy_config.tool_offset_z_m = params.tool_offset_z_m
             self.policy_config.target_z_offset = params.target_z_offset_m
             self.policy_config.aperture_m = params.aperture_m
+            self.policy_config.wait_for_arrival = rollout.wait_for_arrival
 
 
 def qualified_config_name(class_name: str) -> str:

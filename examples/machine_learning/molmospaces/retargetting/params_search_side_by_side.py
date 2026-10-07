@@ -120,7 +120,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -166,12 +166,15 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
     write_trial_csv,
 )
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
+    DROID_FRAME_SIZE,
     PROBE_SINK_ENV_VAR,
     SETUPS,
     STRETCH_CAMERA_CHOICE_ENV_VARS,
+    RolloutOptions,
     StretchCameraChoices,
     params_to_json,
     publish_params,
+    publish_rollout_options,
     publish_stretch_camera_choices,
     qualified_config_name,
     tool_default_params,
@@ -2264,6 +2267,8 @@ def run_directory_name(
     tool_offset_y: float | None = None,
     base_translation: bool = False,
     tool_offset_z: float | None = None,
+    rollout: RolloutOptions | None = None,
+    head_crop: tuple[int, int] | None = None,
 ) -> str:
     """The directory one run of this script writes to, named after what it is.
 
@@ -2276,8 +2281,9 @@ def run_directory_name(
 
     What goes in: the date, the pair, the benchmark when it is not the mini one,
     the tool when it is the PG4, base translation in the IK when it is on, every
-    convention and camera choice that is on, the Stretch grasp and tool offsets
-    when they were typed, and every `--param` override. What stays out is everything
+    convention and camera choice that is on, every `RolloutOptions` field away
+    from its default, the head crop, the Stretch grasp and tool offsets when they
+    were typed, and every `--param` override. What stays out is everything
     operational -- the worker count, the checkpoint path, `--rebuild-benchmark`,
     `--scenes` -- which changes how a run is produced rather than what it
     measures. `--scenes` is the arguable one: two scene counts land in the same
@@ -2301,6 +2307,19 @@ def run_directory_name(
         # A base that drives reaches targets one that only turns cannot, so the
         # two must never resume into each other either.
         segments.append(RUN_NAME_ABBREVIATIONS["base_translation"])
+    rollout = rollout if rollout is not None else RolloutOptions()
+    if not rollout.include_base:
+        segments.append("no-base")
+    if rollout.execute_horizon is not None:
+        segments.append(f"exec{rollout.execute_horizon}")
+    if rollout.only_first_n is not None:
+        segments.append(f"first{rollout.only_first_n}")
+    if rollout.slow:
+        segments.append("slow")
+    if rollout.wait_for_arrival:
+        segments.append("wait-arrival")
+    if head_crop is not None:
+        segments.append(f"head-crop{head_crop[0]}x{head_crop[1]}")
     for name in fr.POSE_CONVENTION_ENV_VARS:
         value = getattr(conventions, name)
         if not value:
@@ -2500,7 +2519,76 @@ def _apply_params(
             if _typed(flag):
                 value = click.get_current_context().params[flag]
                 params = DIMENSIONS[dimension].write(params, float(value))
+    crop_to = _head_crop()
+    if crop_to is not None:
+        # Both halves, unlike the offsets above: the exo camera is the one thing a
+        # matched pair holds identical, so a crop on one side only would make the
+        # pair differ in the view as well as the robot.
+        params = replace(params, exo=replace(params.exo, crop_to=crop_to))
     return params
+
+
+def parse_frame_size(value: str | None) -> tuple[int, int] | None:
+    """`--head-crop`: WxH, or 'droid' for `DROID_FRAME_SIZE`. As `run_on_real_stretch._parse_size`."""
+    if not value:
+        return None
+    if value.lower() == "droid":
+        return DROID_FRAME_SIZE
+    try:
+        width, height = (int(part) for part in value.lower().split("x"))
+    except ValueError:
+        raise click.BadParameter(
+            f"{value!r} is not a size; use WxH, e.g. 640x360, or 'droid'.",
+            param_hint="--head-crop",
+        ) from None
+    return width, height
+
+
+def _head_crop() -> tuple[int, int] | None:
+    """`--head-crop` off the click context, for `_apply_params`' reason. None outside one."""
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return None
+    return parse_frame_size(ctx.params.get("head_crop"))
+
+
+POLICY_ACTION_HORIZON = 16
+POLICY_EXECUTE_HORIZON = 8
+"""The chunk length the DROID checkpoint predicts, and how much of it a rollout executes by
+default -- `StretchMolmoBotDroidPolicyConfig`'s and `FrankaMolmoBotDroidPolicyConfig`'s own."""
+
+
+def rollout_from_flags(
+    include_base: bool,
+    execute_horizon: int | None,
+    only_first_n: int | None,
+    slow: bool,
+    wait_for_arrival: bool,
+) -> RolloutOptions:
+    """The flags as `RolloutOptions`, checked the way `run_on_real_stretch.set_chunking` checks them.
+
+    Checked here rather than in the workers, where a bad number would surface as a
+    rollout error on the first step of every episode.
+    """
+    executed = POLICY_EXECUTE_HORIZON if execute_horizon is None else execute_horizon
+    if not 1 <= executed <= POLICY_ACTION_HORIZON:
+        raise click.BadParameter(
+            f"must be between 1 and the action horizon ({POLICY_ACTION_HORIZON}): the policy "
+            "cannot execute actions it does not have.",
+            param_hint="--execute-horizon",
+        )
+    if only_first_n is not None and not 1 <= only_first_n <= executed:
+        raise click.BadParameter(
+            f"must be between 1 and the execute horizon ({executed}).",
+            param_hint="--execute-horizon-do-only-first-n-steps",
+        )
+    return RolloutOptions(
+        include_base=include_base,
+        execute_horizon=execute_horizon,
+        only_first_n=only_first_n,
+        slow=slow,
+        wait_for_arrival=wait_for_arrival,
+    )
 
 
 @click.command()
@@ -2619,6 +2707,7 @@ def _apply_params(
 @click.option(
     "--stretch4-grasp-offset",
     "--stretch4_grasp_offset",
+    "--grasp-offset-m",
     "stretch4_grasp_offset",
     type=float,
     default=0.0,
@@ -2629,11 +2718,14 @@ def _apply_params(
     "alike, and overrides --param grasp_offset_m. Stretch only, because it is a term in "
     "the Franka-to-Stretch tool transform and means nothing on a Franka: the Franka half "
     "of a pair keeps its own 0. Left untyped, each setup keeps its own offset. The one "
-    "parameter a grasp is most sensitive to; see setups.apply_tool_correction.",
+    "parameter a grasp is most sensitive to; see setups.apply_tool_correction. "
+    "--grasp-offset-m is the same flag, spelled as run_on_real_stretch.py spells it -- "
+    "likewise --tool-offset-x-m / -y-m / -z-m below.",
 )
 @click.option(
     "--stretch4-tool-offset-x",
     "--stretch4_tool_offset_x",
+    "--tool-offset-x-m",
     "stretch4_tool_offset_x",
     type=float,
     default=0.0,
@@ -2648,6 +2740,7 @@ def _apply_params(
 @click.option(
     "--stretch4-tool-offset-y",
     "--stretch4_tool_offset_y",
+    "--tool-offset-y-m",
     "stretch4_tool_offset_y",
     type=float,
     default=0.0,
@@ -2661,6 +2754,7 @@ def _apply_params(
 @click.option(
     "--stretch4-tool-offset-z",
     "--stretch4_tool_offset_z",
+    "--tool-offset-z-m",
     "stretch4_tool_offset_z",
     type=float,
     default=0.0,
@@ -2782,6 +2876,62 @@ def _apply_params(
     "drives only when that gets the gripper closer than turning would. Stretch only. Adds "
     "'base-translation' to the run directory. See `franka_retarget.Stretch4KinematicsArmIK`.",
 )
+@click.option(
+    "--include-base/--no-include-base",
+    "include_base",
+    default=True,
+    show_default=True,
+    help="Let Stretch's base join the retargeting IK, as run_on_real_stretch.py's flag of the "
+    "same name. On by default here, unlike on the robot -- the sim study has always scored "
+    "Stretch with its base in the IK -- so --include-base changes nothing and "
+    "--no-include-base scores the arm alone. Stretch only. --no-include-base adds 'no-base' "
+    "to the run directory.",
+)
+@click.option(
+    "--execute-horizon",
+    type=int,
+    default=None,
+    help="Actions of each chunk to execute before querying the model again, as "
+    "run_on_real_stretch.py's flag. Defaults to the policy config's (8). Both halves of a "
+    "pair, so they re-plan at the same rate. Adds 'exec<N>' to the run directory.",
+)
+@click.option(
+    "--execute-horizon-do-only-first-n-steps",
+    "only_first_n",
+    type=int,
+    default=None,
+    help="Of the --execute-horizon actions, execute only the first N, then query the model "
+    "again -- to the policy, an execute horizon of N. As run_on_real_stretch.py's flag. Both "
+    "halves of a pair. Adds 'first<N>' to the run directory.",
+)
+@click.option(
+    "--head-crop",
+    type=str,
+    default=None,
+    help="Crop the exo frame to WxH (or 'droid' for 640x360), as run_on_real_stretch.py "
+    "crops the head frame: ExoCameraParams.crop_to. Both halves of a pair, which share "
+    "their exo camera. On the baseline pair, which already renders 640x360, 'droid' "
+    "changes nothing. Adds 'head-crop<W>x<H>' to the run directory.",
+)
+@click.option(
+    "--slow",
+    is_flag=True,
+    help="Move Stretch's lift, arm, wrist and base at what run_on_real_stretch.py --slow "
+    "commands -- 20% of the robot's max profile -- instead of the sim's default profile. "
+    "The gripper stays unshaped. Stretch only. Slower joints take more control steps per "
+    "action, so consider a larger --episode-steps. Adds 'slow' to the run directory. See "
+    "setups.real_slow_motion_limits.",
+)
+@click.option(
+    "--wait-for-arrival/--no-wait-for-arrival",
+    "wait_for_arrival",
+    default=False,
+    show_default=True,
+    help="After each action, hold it until Stretch has stopped moving before querying the "
+    "policy again, as run_on_real_stretch.py's flag. The held steps are sim time and count "
+    "towards --episode-steps, so raise that too. Stretch only. Adds 'wait-arrival' to the "
+    "run directory. See setups.RetargetStretchMolmoBotDroidPolicy.",
+)
 def main(
     pair: str,
     param_specs: tuple[str, ...],
@@ -2812,6 +2962,12 @@ def main(
     use_left_fisheye_camera: bool,
     parallel_gripper: bool,
     base_translation: bool,
+    include_base: bool,
+    execute_horizon: int | None,
+    only_first_n: int | None,
+    head_crop: str | None,
+    slow: bool,
+    wait_for_arrival: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -2837,6 +2993,14 @@ def main(
             "--scenes builds the mini benchmark, which --benchmark replaces. Cap a "
             "released benchmark with --episodes instead."
         )
+
+    if base_translation and not include_base:
+        raise click.UsageError(
+            "--base-translation lets the base drive in the IK, and with --no-include-base "
+            "the base is not in the IK at all."
+        )
+    rollout = rollout_from_flags(include_base, execute_horizon, only_first_n, slow, wait_for_arrival)
+    crop_to = parse_frame_size(head_crop)
 
     conventions = fr.PoseConventions(
         change_franka_start_pose_limit_height=change_franka_start_pose_limit_height,
@@ -2877,6 +3041,14 @@ def main(
     fr.publish_ik_choice(ik_choice)
     log.info(f"[ik] Stretch solves with {ik_choice.describe()}")
 
+    # How the policy is stepped and how Stretch follows it -- run_on_real_stretch's
+    # flags -- published the same way, in both directions. See `RolloutOptions`.
+    publish_rollout_options(rollout)
+    if rollout:
+        log.info(f"[rollout] {rollout.describe()}")
+    if crop_to is not None:
+        log.info(f"[camera] exo frame cropped to {crop_to[0]}x{crop_to[1]} on both halves")
+
     pair_names = list(MATCHED_PAIRS) if pair == ALL_PAIRS else [pair]
     setup_keys = [key for name in pair_names for key in MATCHED_PAIRS[name]]
 
@@ -2915,6 +3087,8 @@ def main(
                 tool_offset_z=(
                     stretch4_tool_offset_z if _typed("stretch4_tool_offset_z") else None
                 ),
+                rollout=rollout,
+                head_crop=crop_to,
             )
 
         found = (

@@ -305,7 +305,7 @@ class GripperMirror:
         eoa_joints = getattr(robot.end_of_arm, "joints", [])
         if "parallel_gripper" in eoa_joints:
             self.joint = "parallel_gripper"
-            range_mm = robot.robot_params.get("parallel_gripper", {}).get("range_mm", 80.0)
+            range_mm = robot.robot_params.get("parallel_gripper", {}).get("range_mm", 77.0)
             self.robot_min, self.robot_max = 0.0, range_mm / 1000.0
         elif "stretch_gripper" in eoa_joints:
             self.joint = "stretch_gripper"
@@ -1273,7 +1273,7 @@ def _parallel_gripper_fingers(hand: dict, limits: tuple[float, float] | None) ->
     from stretch4_body.core.robot_params import RobotParams
 
     _, params = RobotParams.get_params()
-    range_mm = float(params.get("parallel_gripper", {}).get("range_mm", 80.0)) or 80.0
+    range_mm = float(params.get("parallel_gripper", {}).get("range_mm", 77.0)) or 77.0
     lower, upper = limits
     value = upper + (float(pos_mm) / range_mm) * (lower - upper)
     return {"finger_left_joint": value, "finger_right_joint": value}
