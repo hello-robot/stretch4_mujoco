@@ -53,6 +53,10 @@ class StatusStretchJoints:
     """
     in_overtilt: bool = False
     """Whether `SafeMotionOvertiltAvoid` is currently overriding motion."""
+    guarded_events: int = 0
+    """Running count of guarded contact events, as the robot's steppers keep."""
+    in_guarded_event: dict[str, bool] = field(default_factory=dict)
+    """Per-actuator guarded contact state, keyed by MJCF actuator name."""
 
     def __getitem__(self, name:str):
         """For backward compatibility: allows access with the square brackets []"""

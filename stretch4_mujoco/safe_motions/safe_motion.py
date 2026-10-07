@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from stretch4_mujoco.mujoco_server import MujocoServer
+    from stretch4_mujoco.safe_motions.motion_overrides import MotionOverrides
 
 
 class SafeMotion:
@@ -16,12 +17,20 @@ class SafeMotion:
     last word before the physics step, and re-asserting itself every cycle is
     what stands in for the latch.
 
-    Subclasses implement `step()`, returning whether they are overriding motion.
+    Subclasses implement `step()`, returning whether they are overriding motion,
+    and take their actions through `self.overrides` so that two safe motions
+    wanting the same joint stopped do not undo each other.
     """
 
-    def __init__(self, name: str, mujoco_server: "MujocoServer"):
+    def __init__(
+        self,
+        name: str,
+        mujoco_server: "MujocoServer",
+        overrides: "MotionOverrides",
+    ):
         self.name = name
         self.mujoco_server = mujoco_server
+        self.overrides = overrides
         self.params: dict[str, Any] = mujoco_server.robot_settings.get(name, {})
         self.status: dict[str, Any] = {}
 
