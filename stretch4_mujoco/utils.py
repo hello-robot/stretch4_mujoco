@@ -146,6 +146,66 @@ def rotation_3x3_matrix(theta):
     )
 
 
+def gravity_tilt_from_z_axis(z_axis) -> float:
+    """Angle between a frame's local +Z and world +Z, i.e. how far it leans.
+
+    This is the sim's stand-in for the base IMU's `gravity_tilt` on the robot --
+    see `IMUBase.calculate_tilt_angle` in stretch4_body, which takes the same
+    arccos of the dot product against world +Z.
+
+    Args:
+        z_axis: the frame's local +Z expressed in world coordinates. In MuJoCo
+            that is the third column of the frame's rotation matrix, e.g.
+            `mjdata.site_xmat[id].reshape(3, 3)[:, 2]`.
+
+    Returns:
+        The tilt in radians, in `[0, pi]`. Upright is 0.
+    """
+    v = np.asarray(z_axis, dtype=float)
+    norm = float(np.linalg.norm(v))
+    if norm == 0.0:
+        return 0.0
+    return float(np.arccos(np.clip(v[2] / norm, -1.0, 1.0)))
+
+
+def gravity_tilt_from_quaternion(q_wxyz) -> float:
+    """`gravity_tilt_from_z_axis` for a frame given as a quaternion.
+
+    Args:
+        q_wxyz: the frame's orientation as `(w, x, y, z)` -- MuJoCo's `framequat`
+            order, and the order the robot's IMU reports.
+
+    Returns:
+        The tilt in radians, in `[0, pi]`. A zero-norm quaternion reads as
+        upright, which is what the robot does while the IMU is still warming up.
+    """
+    w, x, y, z = (float(v) for v in q_wxyz)
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm == 0.0:
+        return 0.0
+    w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    # Third column of the quaternion's rotation matrix: local +Z in world frame.
+    return gravity_tilt_from_z_axis(
+        (2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y))
+    )
+
+
+def site_gravity_tilt(mjmodel, mjdata, site_name: str = "imu") -> float:
+    """The tilt of a named site, read straight off the current kinematics.
+
+    Preferred over the `base_quat` sensor inside the control callback: sensor
+    values are whatever the last `mj_step` left behind, while `site_xmat` is the
+    pose the next control cycle will act on.
+
+    Returns:
+        The tilt in radians, or 0.0 if the model has no such site.
+    """
+    site_id = mujoco.mj_name2id(mjmodel, mujoco._enums.mjtObj.mjOBJ_SITE, site_name)
+    if site_id == -1:
+        return 0.0
+    return gravity_tilt_from_z_axis(mjdata.site_xmat[site_id].reshape(3, 3)[:, 2])
+
+
 def diff_drive_fwd_kinematics(w_left: float, w_right: float) -> tuple:
     """
     Calculate the linear and angular velocity of a differential drive robot.
