@@ -108,9 +108,8 @@ Requires `stretch4_body` (`uv pip install -e ".[digital-twin]"`), `pyzmq`,
 `rerun-sdk`, and MolmoBot on the path -- see `policies/molmobot_droid_policy.py`
 for the last one. `stretch4_body` also wants a *fleet directory*, which a
 workstation does not have; `digital_twin.ensure_fleet_directory` writes a nominal
-stand-in so the import succeeds, and `--fleet-path` / `--fleet-id` point at the
-robot's real one, which is what you want for anything read back out of
-`robot_params`. `--dry-run` needs none of `stretch4_body`: it runs the whole
+stand-in for the end of arm the robot's own status reports. `--dry-run` needs
+none of `stretch4_body`: it runs the whole
 chain against the stream and logs it, without connecting to the robot or moving
 anything, which is the way to check the cameras and the retargeting before
 anything can move.
@@ -150,6 +149,7 @@ from examples.digital_twin import (  # noqa: E402
     ensure_fleet_directory,
     load_stretch_urdf,
     rgba8,
+    robot_gripper_joint,
 )
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.policies.molmobot_droid_policy import (  # noqa: E402
@@ -181,11 +181,9 @@ from stretch4_mujoco.enums.stretch_cameras import StretchCameras  # noqa: E402
 log = logging.getLogger(__name__)
 
 # `connect_robot` imports `stretch4_body`, which reads a fleet directory while it
-# is being imported and exits if there is none. The stand-in is *not* written
-# here, at import, any more: it has to declare the tool that is on the robot, and
-# that is only known once the stream has said which gripper it is reporting --
-# see `main` and `stream_gripper_joint`. `stretch4_body` is imported in
-# `connect_robot` and nowhere earlier, so `main` is still in time.
+# is being imported and exits if there is none. The directory is written there,
+# for the tool the robot's status reports, so nothing may import
+# `stretch4_body.core.robot_params` before it.
 
 
 # =============================================================================
@@ -1034,8 +1032,8 @@ class RobotCommander:
             value = self.gripper.robot_value(fraction)
             self._check(
                 self.gripper.joint,
-                end_of_arm_move_to(
-                    self.robot, self.gripper.joint, value, eoa_velocity, eoa_acceleration
+                self.robot.end_of_arm.move_to(
+                    self.gripper.joint, value, eoa_velocity, eoa_acceleration
                 ),
             )
             commanded["gripper_pos"] = value
@@ -1191,65 +1189,6 @@ class RobotCommander:
             )
 
 
-def robot_gripper_joint(robot: Any) -> str | None:
-    """Which gripper the robot has on, from its own status: `stretch_gripper` or
-    `parallel_gripper`, or None if it reports neither.
-
-    `robot.end_of_arm.status` is the server's whole `end_of_arm` status, copied
-    in by `pull_status` whatever the local fleet directory says the tool is -- so
-    this is the robot's answer, not the fleet directory's.
-    """
-    status = getattr(getattr(robot, "end_of_arm", None), "status", None) or {}
-    for joint in (GRIPPER_JOINT, PARALLEL_GRIPPER_JOINT):
-        if joint in status:
-            return joint
-    return None
-
-
-def end_of_arm_joint_homed(robot: Any, joint: str) -> bool:
-    """Whether the robot reports `joint` calibrated, from its own status."""
-    return bool(robot.end_of_arm.status.get(joint, {}).get("pos_calibrated", False))
-
-
-def end_of_arm_move_to(robot: Any, joint: str, value: float, v_r=None, a_r=None) -> bool:
-    """`robot.end_of_arm.move_to`, for a joint the local fleet directory may not know.
-
-    `EndOfArmClient` builds its joint list from the *local* fleet directory and
-    refuses any joint not in it, so a directory naming the SG4 refuses every
-    command to a PG4's `parallel_gripper` -- although the robot's server, which
-    has the robot's own parameters, would execute it. A joint the client knows
-    goes through the client as always. One it does not is queued exactly as the
-    client's own `move_to` queues it, after the same homing check made against
-    the robot's status rather than the local parameters: the server resolves the
-    joint, applies its calibration and clamps the target to its range.
-    """
-    end_of_arm = robot.end_of_arm
-    if joint in end_of_arm.joints:
-        return end_of_arm.move_to(joint, value, v_r, a_r)
-    if not end_of_arm_joint_homed(robot, joint):
-        return False
-    end_of_arm._queue_command(f"{joint}.end_of_arm", "move_to", joint, value, v_r, a_r)
-    return True
-
-
-def robot_is_homed(robot: Any, gripper_joint: str | None) -> bool:
-    """`robot.is_homed()`, with the end of arm checked against what the robot has on.
-
-    `RobotClient.is_homed` checks the end-of-arm joints the local fleet directory
-    lists, so on a PG4 driven through an SG4 directory it waits for a
-    `stretch_gripper` that will never report calibrated. The other subsystems
-    are checked as `is_homed` checks them; the end of arm is checked joint by
-    joint in the robot's own status -- the wrist, and the gripper it reports.
-    """
-    for subsystem in robot.subsystems.values():
-        if subsystem is robot.end_of_arm or not hasattr(subsystem, "is_homed"):
-            continue
-        if not subsystem.is_homed():
-            return False
-    joints = ["wrist_yaw", "wrist_pitch", "wrist_roll"] + ([gripper_joint] if gripper_joint else [])
-    return all(end_of_arm_joint_homed(robot, joint) for joint in joints)
-
-
 def connect_robot(robot_ip: str | None) -> tuple[Any, str]:
     """Start a `RobotClient`, and refuse to go on with a robot that is not homed.
     Returns the client and the gripper the robot reports having on.
@@ -1259,15 +1198,28 @@ def connect_robot(robot_ip: str | None) -> tuple[Any, str]:
     the loop carries on computing actions, and the robot stands still while the
     terminal fills with a policy running normally.
 
-    The gripper is read off the robot's status (`robot_gripper_joint`) rather
-    than the fleet directory, so a directory naming the other tool costs only
-    the nominal `range_mm` -- see `GripperUnits.for_joint` -- and is said, not
-    fatal: commands go through `end_of_arm_move_to` and homing through
-    `robot_is_homed`, neither of which trusts the local end of arm.
+    `stretch4_body` needs a fleet directory before `RobotClient` can be imported,
+    and it has to declare the tool that is on the robot. So the robot is asked
+    first, over a bare `StretchBodyClient` -- the transport, which imports without
+    one -- and `ensure_fleet_directory` writes the stand-in for the gripper its
+    status reports. A real fleet directory, named by `HELLO_FLEET_PATH`, is used
+    as it is, and refused if it names another tool.
     """
-    from stretch4_body.robot.robot_client import RobotClient
+    from stretch4_body.core.client_server import StretchBodyClient
 
     where = f"tcp://{robot_ip}" if robot_ip else "the local robot"
+    click.echo(f"Reading {where}'s status...")
+    probe = StretchBodyClient(ip_address=robot_ip)
+    # `allow_different_user_connection` for the reason given at `robot.startup` below.
+    if not (probe.startup(allow_different_user_connection=True) if robot_ip else probe.startup()):
+        raise SystemExit(f"Could not reach the Stretch Body Server on {where}. Is it running?")
+    try:
+        ensure_fleet_directory(client=probe)
+    finally:
+        probe.stop()
+
+    from stretch4_body.robot.robot_client import RobotClient
+
     click.echo(f"Connecting to {where}...")
     robot = RobotClient(ip_address=robot_ip)
     # Over the network, `allow_different_user_connection` is not optional. The
@@ -1291,16 +1243,18 @@ def connect_robot(robot_ip: str | None) -> tuple[Any, str]:
         robot.stop()
         raise SystemExit(
             f"The robot reports neither a {GRIPPER_JOINT} nor a {PARALLEL_GRIPPER_JOINT} "
-            f"(its end of arm reports {sorted(robot.end_of_arm.status)}). This runs a gripper."
+            f"(its end of arm reports {sorted(robot.status.get('end_of_arm') or {})}). "
+            "This runs a gripper."
         )
     if gripper_joint not in robot.end_of_arm.joints:
-        click.secho(
-            f"  the fleet directory's end of arm is {sorted(robot.end_of_arm.joints)}, but the "
-            f"robot has a {gripper_joint} on. Commanding it by the robot's status; only its "
-            "nominal range is known here.",
-            fg="yellow",
+        robot.stop()
+        raise SystemExit(
+            f"The fleet directory declares an end of arm of {sorted(robot.end_of_arm.joints)}, "
+            f"but the robot has a {gripper_joint} on. Fix robot.tool in "
+            "$HELLO_FLEET_PATH/$HELLO_FLEET_ID, or unset HELLO_FLEET_PATH to have it "
+            "written from the robot's status."
         )
-    if not robot_is_homed(robot, gripper_joint):
+    if not robot.is_homed():
         robot.stop()
         raise SystemExit("The robot is not fully homed. Home it first, then rerun.")
     return robot, gripper_joint
@@ -3218,8 +3172,7 @@ def main(
     # The tool, before anything that depends on it: the model the retargeting
     # solves on and the units the gripper is read and commanded in. The robot's
     # own status decides (`connect_robot`); the stream's word is what a dry run
-    # has instead, and what the stand-in fleet directory is written for, when
-    # there has to be one, so that it matches the robot too.
+    # has instead.
     streamed_joint = stream_gripper_joint(first)
     if streamed_joint is None:
         click.secho(
@@ -3231,7 +3184,6 @@ def main(
     gripper_joint = streamed_joint or GRIPPER_JOINT
     robot = None
     if not dry_run:
-        ensure_fleet_directory(tool_name=TOOL_FOR_GRIPPER_JOINT[gripper_joint])
         robot, gripper_joint = connect_robot(robot_ip)
         if streamed_joint not in (None, gripper_joint):
             click.secho(

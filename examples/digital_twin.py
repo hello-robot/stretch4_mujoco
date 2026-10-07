@@ -81,7 +81,11 @@ number because anything that prints the fleet id should say what this is.
 """
 
 
-def ensure_fleet_directory(tool_name: str | None = None) -> Path:
+FLEET_STATUS_TIMEOUT_S = 5.0
+"""How long `ensure_fleet_directory` waits for the server's first status message."""
+
+
+def ensure_fleet_directory(tool_name: str | None = None, client=None) -> Path:
     """Give `stretch4_body` a fleet directory to read, inventing one if there is none.
 
     `RobotParams` reads `$HELLO_FLEET_PATH/$HELLO_FLEET_ID/` **while it is being
@@ -109,6 +113,12 @@ def ensure_fleet_directory(tool_name: str | None = None) -> Path:
     same tool the simulator builds its own model with, so the two halves of a
     twin describe one robot.
 
+    `client`, a started `stretch4_body.core.client_server.StretchBodyClient`, is
+    how to get that right: its status is pulled first and the tool declared is
+    the gripper the robot's server reports, over `tool_name`. Not a
+    `RobotClient`, which cannot be built until this directory exists; the
+    transport underneath it imports without one.
+
     Returns the fleet directory in use, spoofed or not.
     """
     fleet_path, fleet_id = os.environ.get("HELLO_FLEET_PATH"), os.environ.get("HELLO_FLEET_ID")
@@ -116,6 +126,8 @@ def ensure_fleet_directory(tool_name: str | None = None) -> Path:
         return Path(fleet_path) / fleet_id
 
     model_name, _, default_tool = Stretch4MujocoSimulator.get_default_model_batch_tool_names()
+    if client is not None:
+        tool_name = _tool_from_server_status(client)
     tool_name = tool_name or default_tool
     directory = NOMINAL_FLEET_PATH / NOMINAL_FLEET_ID
     directory.mkdir(parents=True, exist_ok=True)
@@ -159,10 +171,29 @@ def ensure_fleet_directory(tool_name: str | None = None) -> Path:
     return directory
 
 
-# Before anything imports `stretch4_body`, which this module does lazily in
-# `_connect` -- and which is far enough down that the import would otherwise be
-# the first thing on this machine to discover the variables are missing.
-ensure_fleet_directory()
+def _tool_from_server_status(client) -> str:
+    """The end of arm the server's status reports, by the gripper it carries."""
+    status = None
+    deadline = time.monotonic() + FLEET_STATUS_TIMEOUT_S
+    while status is None and time.monotonic() < deadline:
+        status = client._do_recv_status()
+        if status is None:
+            time.sleep(0.01)
+    if status is None:
+        raise SystemExit(
+            f"No status from the Stretch Body Server in {FLEET_STATUS_TIMEOUT_S:g}s, so "
+            "there is no telling which tool is on the robot."
+        )
+    end_of_arm = status.get("end_of_arm") or {}
+    for joint, tool in TOOL_FOR_GRIPPER_JOINT.items():
+        if joint in end_of_arm:
+            return tool
+    raise SystemExit(
+        f"The robot reports neither of {sorted(TOOL_FOR_GRIPPER_JOINT)} (its end of arm "
+        f"reports {sorted(end_of_arm)}), so there is no tool to declare."
+    )
+
+
 
 # Base channels are mirrored as relative motions / velocities rather than
 # positions, so they get their own names in the pending-command table.
@@ -1545,6 +1576,10 @@ def _add(a, b):
 
 def _connect(robot_ip: str | None):
     """Start a `RobotClient`, local or over IP."""
+    # Here rather than at import, so that importing this module for its helpers
+    # writes nothing and sets no environment: `stretch4_body` is first imported
+    # just below.
+    ensure_fleet_directory()
     try:
         from stretch4_body.robot.robot_client import RobotClient
     except ImportError as exception:
