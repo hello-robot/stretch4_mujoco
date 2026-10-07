@@ -252,14 +252,15 @@ class StretchMolmoBotDroidPolicyConfig(BasePolicyConfig):
     prediction rather than a throttle.
     """
 
-    include_base: bool = True
+    include_base: bool = False
     """
-    Let the holonomic base join the IK.
+    Let the holonomic base join the IK. Off by default, as on the robot
+    (`run_on_real_stretch.py --include-base`).
 
     Stretch's lift, arm and wrist reach a corridor roughly 0.2m either side of
     the arm's line, which is not enough for benchmark tasks that put the target
-    anywhere on a counter. The base joins on a leash and at a cost; see
-    `franka_retarget.StretchArmIK`. Set False to score what the arm alone can do.
+    anywhere on a counter. With the base in, it turns on a leash; see
+    `franka_retarget.Stretch4KinematicsArmIK`.
     """
 
     target_z_offset: float = 0.0

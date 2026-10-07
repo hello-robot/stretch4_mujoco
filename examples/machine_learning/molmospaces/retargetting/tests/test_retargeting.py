@@ -568,6 +568,14 @@ class RetargetRig:
             include_base=include_base,
             target_z_offset=target_z_offset,
             pose_conventions=pose_conventions,
+            # Driving as well as turning, whenever the base is in. The waypoints
+            # are a 15cm cross either side of the arm's line, and with the arm
+            # retracted to its stop turning in place cannot move the tool across
+            # it: walked from `reach_in`, the best a turn finds for `across_left`
+            # is 31mm short, where driving 9cm sideways reaches it. Measured with
+            # the retargeting's earlier MuJoCo IK, which always drove, and with
+            # stretch4_kinematics alike.
+            ik_choice=fr.IKChoice(base_translation=include_base),
         )
 
         # Through `apply_tool_correction`, which is what a rollout goes through:

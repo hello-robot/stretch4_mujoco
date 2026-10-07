@@ -234,7 +234,13 @@ DROID_FRAME_SIZE = (640, 360)
 STRETCH_GRASP_OFFSET_M = -0.009
 STRETCH_TARGET_Z_OFFSET_M = 0.0
 """
-The tool correction the Stretch setups retarget with.
+The grasp offset the geometric alignment below gives on the SG4, and the target z
+offset the Stretch setups retarget with.
+
+**The setups do not apply -0.009 by default.** Their `grasp_offset_m` is
+`RetargetParams`' 0, which is what `run_on_real_stretch.py --grasp-offset-m`
+defaults to, so a flag left out means the same thing in simulation and on the
+robot. Pass `--grasp-offset-m -0.009` to either to apply it.
 
 **-0.009, the geometric alignment below**: the offset that puts Stretch's
 fingertip front edge flush with the Robotiq's pad front. It replaces the 0.030
@@ -617,7 +623,6 @@ SETUPS: dict[str, Setup] = {
             camera_dims=(),
             description="Stretch + the DROID shoulder camera, at the same height in the room",
             params=RetargetParams(
-                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
                 target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 exo=ExoCameraParams(
                     # The same camera as `franka_baseline`, at the same height
@@ -665,7 +670,6 @@ SETUPS: dict[str, Setup] = {
             robot="stretch",
             description="Stretch + the same upright pinhole",
             params=RetargetParams(
-                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
                 target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
@@ -696,7 +700,6 @@ SETUPS: dict[str, Setup] = {
             robot="stretch",
             description="Stretch + its real 123-degree fisheye",
             params=RetargetParams(
-                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
                 target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 exo=_stretch_head_camera_params(
                     "robot_0/base_link",
@@ -740,7 +743,6 @@ SETUPS: dict[str, Setup] = {
             camera_dims=("pitch_deg", "fovy"),
             description="Stretch + that fisheye, rectified, whole frame",
             params=RetargetParams(
-                grasp_offset_m=STRETCH_GRASP_OFFSET_M,
                 target_z_offset_m=STRETCH_TARGET_Z_OFFSET_M,
                 # Rectified and nothing else; see `franka_rectified`.
                 exo=_stretch_head_camera_params(
@@ -1034,25 +1036,6 @@ def stretch_camera_choices() -> StretchCameraChoices:
     )
 
 
-def tool_default_params(params: RetargetParams, setup_key: str) -> RetargetParams:
-    """A setup's params with the published tool's own defaults on a Stretch setup.
-
-    Every Stretch setup in `SETUPS` names `STRETCH_GRASP_OFFSET_M`, which is the
-    SG4's searched value, and `SETUPS` is built at import -- before any command
-    line has said which tool the run is on. So the swap happens here, in the
-    parent, where a script turns a setup into the params it will run and record:
-    a trial on the PG4 then says in `trials.csv` which offset it ran with, rather
-    than naming the SG4's and running another.
-
-    Only an offset still at the SG4 default is replaced, so a setup that names
-    its own keeps it, and so does anything applied afterwards (`--param`,
-    `--stretch4-grasp-offset`). The SG4 gets its params back unchanged.
-    """
-    if SETUPS[setup_key].robot != "stretch" or params.grasp_offset_m != STRETCH_GRASP_OFFSET_M:
-        return params
-    return dataclasses.replace(params, grasp_offset_m=fr.stretch_tool_geometry().grasp_offset_m)
-
-
 def publish_stretch_camera_choices(choices: StretchCameraChoices) -> None:
     """Put the camera choices in the environment, for this process and its workers.
 
@@ -1093,9 +1076,8 @@ class RolloutOptions:
     Stretch's hardware and reach only the Stretch half.
     """
 
-    include_base: bool = True
-    """Let the base join the retargeting IK. On by default in sim, unlike on the robot
-    (`StretchMolmoBotDroidPolicyConfig.include_base` says why)."""
+    include_base: bool = False
+    """Let the base join the retargeting IK. Off by default, as on the robot."""
 
     execute_horizon: int | None = None
     """Actions of each chunk executed before re-querying. None keeps the policy config's (8)."""

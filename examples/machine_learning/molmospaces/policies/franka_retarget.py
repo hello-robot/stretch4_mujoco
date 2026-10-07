@@ -11,7 +11,7 @@ Stretch anyway:
       -> VirtualFranka.fk           -> tool pose in the Franka's base frame
       -> franka_mount_pose          -> tool pose in the world
       -> FRANKA_TO_STRETCH_TOOL     -> Stretch's tool convention
-      -> StretchArmIK.solve         -> base / lift / arm extension / wrist targets
+      -> Stretch4KinematicsArmIK.solve -> base / lift / arm extension / wrist targets
       -> Stretch's own move groups
 
 and back the other way for proprioception, so what the policy reads is where
@@ -33,10 +33,10 @@ Stretch camera, which is not what it was trained on.
 This is not the repository's general-purpose Stretch IK. `policies/kinematics.py`
 holds that -- a Pinocchio solver for a tool *position* plus a wrist pitch and
 roll, which is what the scripted experts ask for. What is needed here is
-different in three ways, so `StretchArmIK` below is its own solver: the target is
-a full 6-DOF pose (the policy picks the orientation, not a grasp heuristic), the
-holonomic base has to be able to join the solve, and position has to outrank
-orientation rather than trade against it. See `_task_priority_step`.
+different in two ways, so `Stretch4KinematicsArmIK` below solves with the
+stretch4_kinematics library instead: the target is a full 6-DOF pose (the policy
+picks the orientation, not a grasp heuristic), and the holonomic base has to be
+able to join the solve.
 """
 
 from __future__ import annotations
@@ -810,48 +810,39 @@ def _damped_pseudo_inverse(jacobian: np.ndarray, damping: float) -> np.ndarray:
     return jacobian.T @ np.linalg.inv(jacobian @ jacobian.T + (damping**2) * np.eye(n))
 
 
-def _task_priority_step(
-    linear_jacobian: np.ndarray,
-    linear_error: np.ndarray,
-    angular_jacobian: np.ndarray,
-    angular_error: np.ndarray,
+def _prioritised_step(
+    tasks: list[tuple[np.ndarray, np.ndarray]],
     damping: float,
     joint_scale: np.ndarray | None = None,
 ) -> np.ndarray:
-    """A joint step that serves position first and orientation with what is left.
+    """A joint step that serves `tasks` in order, each only with what the ones before leave.
 
-    Stretch's manipulator has five DOFs: enough to put the gripper at a point
-    (three) with two to spare, and not enough to also pick its orientation
-    freely. Asking one least-squares solve for all six at once means choosing an
-    exchange rate between metres and radians, and whatever rate is chosen, poses
-    the arm cannot orient bleed into position error -- measured, a target 18cm
-    inside the reachable envelope came back 18cm short because the solver was
-    buying unreachable orientation with it.
-
-    Task priority removes the exchange rate. The position step is solved first;
-    the orientation step is then solved only within its null space, so it can
-    never move the tool off the point it was placed on. That is also the right
-    priority for these tasks: reaching the object matters, and the angle the
-    gripper arrives at is worth having only once it gets there.
+    `tasks` is `(jacobian, error)` pairs, highest priority first. Each is solved
+    within the null space of every task above it, so a lower one can never move
+    a higher one off what it achieved. That removes the exchange rate a single
+    least-squares solve has to choose: Stretch's five arm DOFs cannot both place
+    the gripper and orient it freely, and solved together, poses the wrist cannot
+    orient bleed into position error -- measured, a target 18cm inside the
+    reachable envelope came back 18cm short because the solver was buying
+    unreachable orientation with it.
 
     `joint_scale` weights the joints against each other: a joint scaled to half
     contributes half as much to the same step, so the solve reaches for it only
     when the others cannot do the job. It is applied as a change of variables
     (solve in `q / scale`, scale the answer back), which leaves the priority
-    structure above untouched.
+    structure untouched.
     """
-    if joint_scale is not None:
-        linear_jacobian = linear_jacobian * joint_scale
-        angular_jacobian = angular_jacobian * joint_scale
-
-    linear_inverse = _damped_pseudo_inverse(linear_jacobian, damping)
-    step = linear_inverse @ linear_error
-
-    null_space = np.eye(linear_jacobian.shape[1]) - linear_inverse @ linear_jacobian
-    residual = angular_error - angular_jacobian @ step
-    projected = angular_jacobian @ null_space
-    step = step + null_space @ (_damped_pseudo_inverse(projected, damping) @ residual)
-    return step if joint_scale is None else step * joint_scale
+    width = tasks[0][0].shape[1]
+    scale = np.ones(width) if joint_scale is None else joint_scale
+    step = np.zeros(width)
+    null_space = np.eye(width)
+    for jacobian, error in tasks:
+        scaled = jacobian * scale
+        projected = scaled @ null_space
+        inverse = _damped_pseudo_inverse(projected, damping)
+        step = step + null_space @ (inverse @ (error - scaled @ step))
+        null_space = null_space - null_space @ (inverse @ projected)
+    return step * scale
 
 
 class VirtualFranka:
@@ -980,215 +971,45 @@ class VirtualFranka:
         return joint_pos
 
 
-class StretchArmIK:
-    """Solves for Stretch's base / lift / telescoping arm / wrist given a tool pose.
-
-    Runs on its own `MjData` over the scene's model rather than on the live one.
-    An IK iteration has to move the robot to evaluate the next Jacobian, and
-    doing that in the data the simulation is stepping would drag the robot
-    through every intermediate guess. The scratch copy is re-synced from the live
-    `qpos` at the start of each solve, so the base pose (and anything else the
-    chain hangs off) is current.
-
-    Five DOFs against a six-dimensional pose error, so most targets are not
-    exactly reachable. `_task_priority_step` decides what gives: position is
-    solved for outright and orientation only in what is left over, so an
-    unreachable *angle* costs nothing in *position*.
-
-    Those five are lift, extension and wrist -- and on their own they are not
-    enough for these tasks. The arm telescopes along one fixed direction and the
-    wrist can swing the tool about 0.2m off that line, so a standing Stretch
-    reaches a narrow corridor: measured in the kitchen this was developed in, a
-    base that can touch the salt shaker was 0.41m short of the bowl 0.73m away.
-    The real robot solves this by driving, which is what `include_base` lets the
-    solver do -- the holonomic base joins the IK as three more DOFs.
-
-    It joins on a leash and at a price. `base_leash` bounds how far the base may
-    end up from where it was placed, so a solve for an unreachable target cannot
-    walk the robot out of the room; `base_cost` makes a metre of driving as
-    expensive as `base_cost` metres of arm motion, so the base stays put while
-    the arm can still do the job and contributes only when it cannot. Turn
-    `include_base` off to see what the arm alone can do.
-    """
-
-    ARM_GROUPS = ("lift", "arm", "wrist")
-
-    def __init__(
-        self,
-        stretch_view: Stretch4RobotView,
-        namespace: str,
-        include_base: bool = True,
-        base_leash: tuple[float, float, float] = (0.7, 0.15, math.pi / 3),
-        base_cost: float = 5.0,
-        iterations: int = 80,
-        damping: float = 0.08,
-        tolerance: float = 1e-3,
-    ) -> None:
-        self._live_view = stretch_view
-        self._live_data: MjData = stretch_view.mj_data
-        self._scratch_data = MjData(self._live_data.model)
-        self._scratch_view = Stretch4RobotView(self._scratch_data, namespace)
-
-        self.GROUPS = (("base",) if include_base else ()) + self.ARM_GROUPS
-        self._iterations = iterations
-        self._damping = damping
-        self._tolerance = tolerance
-        self._widths = [self._scratch_view.get_move_group(g).pos_dim for g in self.GROUPS]
-        self._limits = np.concatenate(
-            [commandable_limits(self._scratch_view.get_move_group(g)) for g in self.GROUPS]
-        )
-        self._joint_scale = np.ones(sum(self._widths))
-        self._base_leash = np.asarray(base_leash, dtype=float)
-        self._include_base = include_base
-        self._base_cost = float(base_cost)
-        if include_base:
-            self.releash()
-
-    def releash(self) -> None:
-        """Re-centre the base's leash on wherever the robot is standing now.
-
-        The base's own limits are the +-25m travel of the virtual slide joints,
-        which is no constraint at all, so they are replaced with a box around the
-        robot's current position. Called at construction and again on every
-        `FrankaOnStretchView.reset()`, because an episode that starts in a new
-        house starts with the box centred on the last one otherwise.
-
-        The box is in *world* axes, because that is what
-        `HoloJointsRobotBaseGroup` reports. The default leash is therefore
-        deliberately close to isotropic in the plane rather than tight across the
-        robot's facing: a per-episode spawn yaw is not known here, and a box that
-        assumed one would be a leash that let the robot drive into the counter in
-        half the houses. It is the IK's only collision awareness -- it is solving
-        kinematics, not contacts.
-        """
-        if not self._include_base:
-            return
-        home = np.asarray(self._live_view.get_move_group("base").joint_pos, dtype=float)
-        self._limits[:3, 0] = home - self._base_leash
-        self._limits[:3, 1] = home + self._base_leash
-        self._joint_scale[:3] = 1.0 / self._base_cost
-
-    def _read(self, view: Any) -> np.ndarray:
-        return np.concatenate(
-            [np.asarray(view.get_move_group(g).joint_pos, dtype=float) for g in self.GROUPS]
-        )
-
-    def _write(self, view: Any, joint_pos: np.ndarray) -> None:
-        offset = 0
-        for group, width in zip(self.GROUPS, self._widths):
-            view.get_move_group(group).joint_pos = joint_pos[offset : offset + width]
-            offset += width
-
-    def split(self, joint_pos: np.ndarray) -> dict[str, np.ndarray]:
-        """A flat joint vector split into the per-move-group dict callers want."""
-        offset = 0
-        out = {}
-        for group, width in zip(self.GROUPS, self._widths):
-            out[group] = joint_pos[offset : offset + width]
-            offset += width
-        return out
-
-    def tool_pose(self) -> np.ndarray:
-        """The live robot's current tool pose in the world, as a 4x4."""
-        return self._live_view.get_move_group("wrist").leaf_frame_to_world
-
-    def solve(self, target_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Joint targets for `target_pose` (world frame), and the residual 6-vector.
-
-        Seeded from the robot's current configuration, so the answer is the
-        nearest compromise to where the arm already is rather than an unrelated
-        branch of the same least-squares problem.
-        """
-        self._scratch_data.qpos[:] = self._live_data.qpos
-        joint_pos = np.clip(self._read(self._live_view), self._limits[:, 0], self._limits[:, 1])
-
-        error = np.zeros(6)
-        for _ in range(self._iterations):
-            self._write(self._scratch_view, joint_pos)
-            mujoco.mj_kinematics(self._live_data.model, self._scratch_data)
-            mujoco.mj_comPos(self._live_data.model, self._scratch_data)
-
-            current = self._scratch_view.get_move_group("wrist").leaf_frame_to_world
-            error = _pose_error(current, target_pose)
-            step_error = _clamped_pose_error(current, target_pose)
-            if np.linalg.norm(step_error) < self._tolerance:
-                break
-
-            jacobian = self._scratch_view.get_jacobian("wrist", list(self.GROUPS))
-            step = _task_priority_step(
-                jacobian[:3],
-                step_error[:3],
-                jacobian[3:],
-                step_error[3:],
-                self._damping,
-                self._joint_scale,
-            )
-            joint_pos = np.clip(
-                joint_pos + np.clip(step, -MAX_IK_JOINT_STEP, MAX_IK_JOINT_STEP),
-                self._limits[:, 0],
-                self._limits[:, 1],
-            )
-        return joint_pos, error
-
-
-IK_SOLVER_ENV_VAR = "STRETCH4_IK_SOLVER"
 IK_BASE_TRANSLATION_ENV_VAR = "STRETCH4_IK_BASE_TRANSLATION"
 """
-Which solver `FrankaOnStretchView` builds, and whether the base may translate in it.
+Whether the base may translate in the IK, as well as turn.
 
-Environment variables for the reason `POSE_CONVENTION_ENV_VARS` are: the policy
+An environment variable for the reason `POSE_CONVENTION_ENV_VARS` are: the policy
 that builds the view is constructed by `run_evaluation` in worker processes,
 from a class name, with no seam to pass an argument through.
 """
 
-STRETCH4_KINEMATICS_SOLVER = "stretch4_kinematics"
-
 
 @dataclass(frozen=True)
 class IKChoice:
-    """Which IK `FrankaOnStretchView` solves with. See `make_stretch_arm_ik`.
+    """How `Stretch4KinematicsArmIK` -- the one IK there is -- may use the base.
 
-    The default is `StretchArmIK`, this module's own MuJoCo solver, so nothing
-    that does not ask sees a change.
+    Whether the base is in the IK at all is `include_base`.
     """
 
-    stretch4_kinematics: bool = False
-    """Solve with `Stretch4KinematicsArmIK` -- the stretch4_kinematics library -- instead."""
-
     base_translation: bool = False
-    """Let the base translate as well as rotate. stretch4_kinematics only.
+    """Let the base translate as well as rotate.
 
     Off, a base in the IK only turns in place (`Stretch4IKModes.BASE_ROTATE`);
-    on, it is the full planar base (`BASE_PLANAR`). Whether the base is in the
-    IK at all is still `include_base`.
+    on, it is the full planar base (`BASE_PLANAR`).
     """
 
     def describe(self) -> str:
-        if not self.stretch4_kinematics:
-            return "MuJoCo IK (StretchArmIK)"
         return "stretch4_kinematics" + (", base translation on" if self.base_translation else "")
 
 
 def ik_choice_requested() -> IKChoice:
-    """Which IK this process was asked for."""
-    return IKChoice(
-        stretch4_kinematics=(
-            os.environ.get(IK_SOLVER_ENV_VAR, "").strip() == STRETCH4_KINEMATICS_SOLVER
-        ),
-        base_translation=_env_flag(IK_BASE_TRANSLATION_ENV_VAR),
-    )
+    """Which IK options this process was asked for."""
+    return IKChoice(base_translation=_env_flag(IK_BASE_TRANSLATION_ENV_VAR))
 
 
 def publish_ik_choice(choice: IKChoice) -> None:
     """Put the IK choice in the environment, for this process and its workers.
 
-    Both variables written in both directions, as `publish_pose_conventions`
-    does and for the same reason.
+    Written in both directions, as `publish_pose_conventions` does and for the
+    same reason.
     """
-    if choice.stretch4_kinematics:
-        os.environ[IK_SOLVER_ENV_VAR] = STRETCH4_KINEMATICS_SOLVER
-    else:
-        os.environ.pop(IK_SOLVER_ENV_VAR, None)
     if choice.base_translation:
         os.environ[IK_BASE_TRANSLATION_ENV_VAR] = "1"
     else:
@@ -1209,11 +1030,14 @@ def _translation(offset: np.ndarray) -> np.ndarray:
 
 
 class Stretch4KinematicsArmIK:
-    """`StretchArmIK`'s interface, solved by stretch4_kinematics instead of here.
+    """Solves for Stretch's base / lift / telescoping arm / wrist given a tool pose,
+    with the stretch4_kinematics library. The only IK the retargeting uses.
 
-    The solve is the library's damped CLIK on its Pinocchio model of the URDF;
-    what this class adds is only what it takes to put that model and the MuJoCo
-    one in the same place:
+    The solve runs on the library's Pinocchio model of the URDF -- its forward
+    kinematics and its Jacobians -- with a task-priority loop of this module's
+    in place of the library's own CLIK; see `_clik` for why and what it
+    measured. The rest of what this class adds is what it takes to put that
+    model and the MuJoCo one in the same place:
 
     * **Frames.** The two descriptions agree on every joint and every rotation,
       but not on two translations: the URDF's base origin sits 41mm behind the
@@ -1230,12 +1054,12 @@ class Stretch4KinematicsArmIK:
     * **The base.** `include_base` off fixes it. On, it turns in place
       (`BASE_ROTATE`), and `base_translation` lets it drive as well
       (`BASE_PLANAR`). Either way it is held to `base_leash` around where
-      `releash()` last found it, as `StretchArmIK` does.
+      `releash()` last found it.
 
-    What it does not keep from `StretchArmIK` is the task priority: the library
-    trades position against orientation in one least-squares solve, so on a
-    pose the five arm DOFs cannot orient, some of the miss lands in position.
-    The residual this returns is measured on the MuJoCo model, so it says so.
+    Position outranks the approach direction, which outranks the roll about it
+    (`_prioritised_step`), so on a pose the five arm DOFs cannot orient, the
+    miss is the roll. The residual this
+    returns is measured on the MuJoCo model.
     """
 
     ARM_GROUPS = ("lift", "arm", "wrist")
@@ -1244,6 +1068,30 @@ class Stretch4KinematicsArmIK:
     CALIBRATION_WARNING_M = 1e-3
     DRIVE_GAIN_M = 1e-3
     """How much closer driving has to get the tool than turning in place, to be worth it."""
+    SETTLED_POSITION_M = 1e-4
+    SETTLED_ORIENTATION_RAD = 1e-3
+    SETTLE_WINDOW = 20
+    """When a solve is done for practical purposes, well inside what anything here measures
+    (`tests/test_retargeting.py` holds 5mm and 0.02 rad): the tool within 0.1mm, and
+    oriented within a milliradian or no longer improving by a tenth of one over
+    `SETTLE_WINDOW` iterations."""
+    STALL_STEP = 1e-6
+    """A solve whose configuration moved less than this in one iteration has settled, in
+    radians or metres -- for a pose it cannot match exactly, on the best compromise."""
+    WRIST_LIMIT_MARGIN_RAD = 0.5
+    WRIST_LIMIT_FLOOR = 0.1
+    """How the wrist is kept off its stops: inside this margin of a limit a wrist joint's
+    column is scaled down linearly, to `WRIST_LIMIT_FLOOR` at the stop itself.
+
+    A weighted least-norm, so the solve prefers the configurations that leave the
+    wrist room to orient. Without it, walking `tests/test_retargeting.py`'s path
+    drove `wrist_roll_joint` onto -1.135 rad on the way to `out_and_left` and the
+    tool could not be turned the rest of the way: 0.187 rad short, with position
+    exact. With it, 0.030 rad, and the largest step the wrist takes between two
+    commands (1.21 rad) is no larger than the retargeting's earlier MuJoCo IK's
+    (1.34). The wrist only: a lift or arm at its stop is where a reach
+    legitimately ends.
+    """
 
     def __init__(
         self,
@@ -1252,9 +1100,10 @@ class Stretch4KinematicsArmIK:
         include_base: bool = True,
         base_translation: bool = False,
         base_leash: tuple[float, float, float] = (0.7, 0.15, math.pi / 3),
-        iterations: int = 200,
-        damping: float = 1e-6,
-        tolerance: float = 1e-4,
+        base_cost: float = 5.0,
+        iterations: int = 100,
+        damping: float = 0.08,
+        tolerance: float = 1e-5,
     ) -> None:
         if base_translation and not include_base:
             raise ValueError("base_translation needs include_base: there is no base in the IK.")
@@ -1277,6 +1126,7 @@ class Stretch4KinematicsArmIK:
             [commandable_limits(self._scratch_view.get_move_group(g)) for g in self.ARM_GROUPS]
         )
         self._base_leash = np.asarray(base_leash, dtype=float)
+        self._base_cost = float(base_cost)
         self._home = np.zeros(3)
 
         # Two models: the planar one drives the base in x, y and theta, and the
@@ -1295,7 +1145,7 @@ class Stretch4KinematicsArmIK:
     def releash(self) -> None:
         """Re-centre the base's leash on where the robot is standing, and re-measure the frames.
 
-        The leash as in `StretchArmIK.releash`. The frame offsets are measured
+        The frame offsets are measured
         here too because this is called on every `FrankaOnStretchView.reset()`,
         and an episode in a new house may stand the robot at a new height.
         """
@@ -1392,6 +1242,29 @@ class Stretch4KinematicsArmIK:
         return max(low, -math.pi), min(high, math.pi)
 
     def _clik(self, planar: bool, target: np.ndarray, seed: np.ndarray) -> np.ndarray:
+        """Solve the library's model for `target`, from `seed`: position first, then orientation.
+
+        The model, its forward kinematics and its Jacobians are stretch4_kinematics';
+        the loop is not the library's `_closed_loop_inverse_kinematics`, and the
+        difference is measured rather than stylistic. That one takes a full,
+        nearly undamped Gauss-Newton step and clips to the limits afterwards, and
+        trades position against orientation in one least-squares solve. Walking a
+        policy's joint-space path with it, `tests/test_retargeting.py` measured
+        the tool 90mm off, 41 of 180 steps past 5mm: a step from a seed near a
+        limit would throw the wrist across its range into the opposite limit and
+        stay there, and a pose the wrist could not orient cost position too.
+
+        So, as the retargeting's own solver used to: `_prioritised_step` solves
+        position outright, then the approach direction, then the roll about it,
+        each only in what the ones before leave, the pose error a
+        step chases is capped (`MAX_IK_LINEAR_STEP`, `MAX_IK_ANGULAR_STEP`) and so
+        is the joint motion it may ask for (`MAX_IK_JOINT_STEP`), the base's
+        columns are scaled by `1 / base_cost` so it moves only when the arm cannot
+        do the job, the wrist's are scaled down near its stops
+        (`WRIST_LIMIT_MARGIN_RAD`), and the limits are applied every iteration --
+        on the planar model too, whose arm the library leaves unclipped. Measured
+        on the same path: under 1mm worst, none past 5mm.
+        """
         import pinocchio as pin
 
         model, data = (
@@ -1399,16 +1272,91 @@ class Stretch4KinematicsArmIK:
             if planar
             else (self._kinematics.model_ik, self._kinematics.data_ik)
         )
-        return self._kinematics._closed_loop_inverse_kinematics(
-            model=model,
-            data=data,
-            target_frame=self.TOOL_FRAME,
-            target_pose=pin.SE3(target[:3, :3], target[:3, 3]),
-            q_guess=seed,
-            max_iter=self._iterations,
-            eps=self._tolerance,
-            damp=self._damping,
-        )
+        frame = model.getFrameId(self.TOOL_FRAME)
+        base_dofs = 3 if planar else 1
+        base_scale = np.ones(model.nv)
+        base_scale[:base_dofs] = 1.0 / self._base_cost
+        wrist_low, wrist_high = self._arm_limits[2:, 0], self._arm_limits[2:, 1]
+
+        q = np.array(seed, dtype=float)
+        q = self._clip_to_limits(model, q, planar)
+        orientation_history: list[float] = []
+        for _ in range(self._iterations):
+            pin.forwardKinematics(model, data, q)
+            pin.updateFramePlacements(model, data)
+            current = data.oMf[frame]
+            linear = target[:3, 3] - current.translation
+            angular = pin.log3(target[:3, :3] @ current.rotation.T)
+            if np.linalg.norm(np.concatenate([linear, angular])) < self._tolerance:
+                break
+            # Done for practical purposes: placed, and either oriented or no longer
+            # getting any more so. Without this, a pose with the arm against a stop
+            # crawls the last fraction of a millimetre for a thousand iterations.
+            orientation_history.append(float(np.linalg.norm(angular)))
+            if np.linalg.norm(linear) < self.SETTLED_POSITION_M and (
+                orientation_history[-1] < self.SETTLED_ORIENTATION_RAD
+                or (
+                    len(orientation_history) > self.SETTLE_WINDOW
+                    and orientation_history[-1 - self.SETTLE_WINDOW] - orientation_history[-1]
+                    < self.SETTLED_ORIENTATION_RAD / 10
+                )
+            ):
+                break
+            jacobian = pin.computeFrameJacobian(
+                model, data, q, frame, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            )
+            # The wrist is the last three joints in either model's configuration.
+            wrist = q[-3:]
+            room = np.minimum(wrist - wrist_low, wrist_high - wrist)
+            joint_scale = base_scale.copy()
+            joint_scale[-3:] *= np.clip(
+                room / self.WRIST_LIMIT_MARGIN_RAD, self.WRIST_LIMIT_FLOOR, 1.0
+            )
+            # Position, then the approach direction, then the roll about it: on a
+            # pose the wrist cannot fully orient, the gripper still points where
+            # it was asked to and only its roll falls short. +x is the approach;
+            # see `FRANKA_TO_STRETCH_TOOL`.
+            approach = current.rotation[:, 0]
+            across = np.eye(3) - np.outer(approach, approach)
+            tasks = [
+                (jacobian[:3], _clamp_norm(linear, MAX_IK_LINEAR_STEP)),
+                (
+                    across @ jacobian[3:],
+                    _clamp_norm(np.cross(approach, target[:3, 0]), MAX_IK_ANGULAR_STEP),
+                ),
+                (
+                    approach[None, :] @ jacobian[3:],
+                    np.clip([float(angular @ approach)], -MAX_IK_ANGULAR_STEP, MAX_IK_ANGULAR_STEP),
+                ),
+            ]
+            step = _prioritised_step(tasks, self._damping, joint_scale)
+            step = np.clip(step, -MAX_IK_JOINT_STEP, MAX_IK_JOINT_STEP)
+            moved = q
+            q = self._clip_to_limits(model, pin.integrate(model, q, step), planar)
+            # Settled on a compromise: a pose the wrist cannot fully orient never
+            # reaches `tolerance`, and the iterations after this point move nothing.
+            if np.max(np.abs(q - moved)) < self.STALL_STEP:
+                break
+        return q
+
+    def _clip_to_limits(self, model: Any, q: np.ndarray, planar: bool) -> np.ndarray:
+        """`q` inside the joint limits, and a planar base inside the leash's extent.
+
+        The rotate model's configuration is a plain vector and carries its own
+        limits (the arm's are the MJCF's, see `__init__`; the turn's are set per
+        solve by `_solve_turning`). The planar model's base is `[x, y, cos, sin]`,
+        a move from where the robot stands, so it is held to the leash's size
+        here and to the leash itself -- which is centred on `releash()`'s pose,
+        not this one -- by `_solve_driving` afterwards.
+        """
+        if not planar:
+            return np.clip(q, model.lowerPositionLimit, model.upperPositionLimit)
+        q = q.copy()
+        q[4:] = np.clip(q[4:], self._arm_limits[:, 0], self._arm_limits[:, 1])
+        q[:2] = np.clip(q[:2], -self._base_leash[:2], self._base_leash[:2])
+        theta = float(np.clip(math.atan2(q[3], q[2]), -self._base_leash[2], self._base_leash[2]))
+        q[2], q[3] = math.cos(theta), math.sin(theta)
+        return q
 
     def _to_urdf(self, local_target: np.ndarray, lever: np.ndarray) -> np.ndarray:
         """A tool target in the MuJoCo base frame -> the library's. `lever` is the base offset."""
@@ -1480,8 +1428,7 @@ class Stretch4KinematicsArmIK:
     def solve(self, target_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Joint targets for `target_pose` (world frame), and the residual 6-vector.
 
-        Seeded from the robot's current configuration, like `StretchArmIK.solve`,
-        and solved in the frame of the base where it stands now -- the library's
+        Seeded from the robot's current configuration, and solved in the frame of the base where it stands now -- the library's
         base joint starts at zero, so its answer for the base is a move relative
         to here.
         """
@@ -1514,7 +1461,7 @@ class Stretch4KinematicsArmIK:
         # motion, and it solves without the arm's limits, so on a target the arm
         # cannot reach it happily walks the base somewhere that only helps a lift
         # that does not exist. The comparison is what keeps the base still while
-        # the arm can do the job, which `StretchArmIK` got from `base_cost`.
+        # the arm can do the job.
         driven = np.concatenate(self._solve_driving(base, target_pose, arm))
         driven_error = self._residual(driven, target_pose)
         if np.linalg.norm(driven_error[:3]) + self.DRIVE_GAIN_M < np.linalg.norm(error[:3]):
@@ -1534,16 +1481,14 @@ def make_stretch_arm_ik(
     namespace: str,
     include_base: bool,
     ik_choice: IKChoice,
-) -> StretchArmIK | Stretch4KinematicsArmIK:
-    """The IK `ik_choice` names, with the base in it or not as `include_base` says."""
-    if ik_choice.stretch4_kinematics:
-        return Stretch4KinematicsArmIK(
-            stretch_view,
-            namespace,
-            include_base=include_base,
-            base_translation=ik_choice.base_translation,
-        )
-    return StretchArmIK(stretch_view, namespace, include_base=include_base)
+) -> Stretch4KinematicsArmIK:
+    """The IK, with the base in it or not as `include_base` says."""
+    return Stretch4KinematicsArmIK(
+        stretch_view,
+        namespace,
+        include_base=include_base,
+        base_translation=ik_choice.base_translation,
+    )
 
 
 class _ProxyArmGroup:
@@ -1634,7 +1579,7 @@ class FrankaOnStretchView:
       not reached -- `last_residual` reports by how much, and
       `last_position_error` is the part of it you can see. The holonomic base
       joins the solve when `include_base` is set, which buys most of the reach
-      back; see `StretchArmIK`.
+      back; see `Stretch4KinematicsArmIK`.
     * The policy is looking through Stretch's camera at a Stretch arm, which is
       not what it was trained on. Retargeting fixes the action interface, not
       the visual domain gap.
@@ -1693,8 +1638,7 @@ class FrankaOnStretchView:
         # Read off the environment when not passed, like the pose conventions:
         # the evaluation's workers build this view with no way to be told.
         self.ik_choice = ik_choice_requested() if ik_choice is None else ik_choice
-        if self.ik_choice.stretch4_kinematics:
-            log.info(f"[retarget] IK: {self.ik_choice.describe()}")
+        log.info(f"[retarget] IK: {self.ik_choice.describe()}")
         self.arm_ik = make_stretch_arm_ik(stretch_view, namespace, include_base, self.ik_choice)
 
         # What "fully open" and "shut" mean on Stretch, in finger-joint units --

@@ -1,11 +1,10 @@
 """
 Watch the Franka and Stretch attempt the same grasp, side by side, in one video.
 
-`params_search.py` scores setups and writes a table. A table is the wrong
-instrument for the question this answers: when `stretch_fisheye` picks up two
-objects and `franka_fisheye` picks up four with the *same camera*, the difference
-is somewhere in a 300-step rollout, and no column of `report.md` says where. This
-runs both halves of a matched pair over the same episodes and puts them in one
+A table of scores is the wrong instrument for the question this answers: when
+`stretch_fisheye` picks up two objects and `franka_fisheye` picks up four with
+the *same camera*, the difference is somewhere in a 300-step rollout, and no
+column of `report.md` says where. This runs both halves of a matched pair over the same episodes and puts them in one
 frame:
 
     +---------------------------+---------------------------+
@@ -70,7 +69,7 @@ What it costs
 Two evaluations rather than one, run *sequentially* -- which is not a detail to
 optimise away. Each rollout worker loads its own copy of the DROID checkpoint and
 peaks near 17 GiB, so two policies live at once do not fit on a 32 GiB card; see
-`params_search.WORKER_VRAM_GIB`. Running them one after the other means one
+`WORKER_VRAM_GIB`. Running them one after the other means one
 policy is resident at a time, at the price of the two halves not being
 frame-synchronised to the same action stream. They are synchronised to the same
 *episode* -- same house, same object, same start -- which is what the comparison
@@ -104,9 +103,8 @@ See `write_alignment_outputs` and `replay.GraspAlignment`.
 
 What it is not
 --------------
-Not a search: it runs one point per setup and scores it exactly as
-`params_search` would, so the numbers are comparable, but nothing is optimised.
-Use `params_search.py` to find parameters and this to see what they do.
+Not a search: it runs one point per setup and scores it, and nothing is
+optimised. Set the point with `--param` and the offset flags.
 """
 
 from __future__ import annotations
@@ -137,7 +135,7 @@ elif sys.platform == "linux":
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-# See `params_search`: read by CUDA's caching allocator when torch first
+# Read by CUDA's caching allocator when torch first
 # initialises it, so it has to be set before torch is imported.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -153,13 +151,6 @@ from examples.machine_learning.molmospaces.retargetting import mini_benchmark  #
 from examples.machine_learning.molmospaces.retargetting.cameras import (  # noqa: E402
     RetargetParams,
 )
-from examples.machine_learning.molmospaces.retargetting.params_search import (  # noqa: E402
-    DIMENSIONS,
-    SECONDS_PER_ROLLOUT,
-    _label_episodes,
-    affordable_workers,
-    preserve_previous_run,
-)
 from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa: E402
     EpisodeScore,
     TrialResult,
@@ -172,6 +163,7 @@ from examples.machine_learning.molmospaces.retargetting.scoring import (  # noqa
 )
 from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa: E402
     DROID_FRAME_SIZE,
+    MATCHED_WRIST_FOV_DEG,
     PROBE_SINK_ENV_VAR,
     SETUPS,
     STRETCH_CAMERA_CHOICE_ENV_VARS,
@@ -182,7 +174,6 @@ from examples.machine_learning.molmospaces.retargetting.setups import (  # noqa:
     publish_rollout_options,
     publish_stretch_camera_choices,
     qualified_config_name,
-    tool_default_params,
 )
 from examples.machine_learning.molmospaces.run_benchmarks import (  # noqa: E402
     InterruptState,
@@ -199,6 +190,229 @@ from examples.machine_learning.molmospaces.visualize import (  # noqa: E402
 )
 
 log = logging.getLogger(__name__)
+
+
+# =============================================================================
+# What --param can set, and how many workers a run gets
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Dimension:
+    """One searchable number: how to read it off a `RetargetParams` and put it back.
+
+    A named handle rather than a path into the dataclass, because the
+    interesting parameters are not all fields -- the camera's pitch is one
+    number of a euler triple, and its height one of a position -- and because
+    the names are what a command line says.
+    """
+
+    name: str
+    bounds: tuple[float, float]
+    read: Callable[[RetargetParams], float]
+    write: Callable[[RetargetParams, float], RetargetParams]
+    description: str
+
+
+    robots: tuple[str, ...] = ("franka", "stretch")
+    """
+    Which setups this dimension does anything to.
+
+    The gripper parameters only exist on the Stretch path -- there is nothing to
+    retarget on the Franka the policy was trained on.
+    """
+
+
+def _with_exo(params: RetargetParams, **changes: Any) -> RetargetParams:
+    return replace(params, exo=replace(params.exo, **changes))
+
+
+DIMENSIONS: dict[str, Dimension] = {
+    dimension.name: dimension
+    for dimension in (
+        Dimension(
+            name="pitch_deg",
+            bounds=(5.0, 60.0),
+            read=lambda p: p.exo.pitch_deg,
+            write=lambda p, v: _with_exo(p, pitch_deg=float(v)),
+            description="Camera tilt, measured up from straight down: 0 looks at "
+            "the floor and 90 at the horizon, so SMALLER points further DOWN. "
+            "The default 43 is 47 degrees below horizontal.",
+        ),
+        Dimension(
+            name="virtual_pitch_deg",
+            bounds=(5.0, 60.0),
+            read=lambda p: (
+                p.exo.virtual_pitch_deg if p.exo.virtual_pitch_deg is not None else p.exo.pitch_deg
+            ),
+            write=lambda p, v: _with_exo(p, virtual_pitch_deg=float(v)),
+            description="Pitch synthesised by cropping the rectified fisheye off-centre, "
+            "with the camera left at the 43 degrees it is built at. Same scale as "
+            "pitch_deg, and swept over the same values so each trial has a "
+            "physically-tilted twin. Needs a rectified, cropped setup.",
+        ),
+        Dimension(
+            name="fovy",
+            bounds=(30.0, 140.0),
+            read=lambda p: p.exo.fovy,
+            write=lambda p, v: _with_exo(p, fovy=float(v)),
+            description="Vertical field of view. 71 is DROID's, 123 is Stretch's fisheye.",
+        ),
+        Dimension(
+            name="grasp_offset_m",
+            bounds=(-0.10, 0.20),
+            read=lambda p: p.grasp_offset_m,
+            write=lambda p, v: replace(p, grasp_offset_m=float(v)),
+            description="How far to push the commanded grasp centre along Stretch's "
+            "approach axis, to account for its much longer gripper. Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="tool_offset_x_m",
+            bounds=(-0.15, 0.15),
+            read=lambda p: p.tool_offset_x_m,
+            write=lambda p, v: replace(p, tool_offset_x_m=float(v)),
+            description="How far to move the commanded grasp centre along Stretch's "
+            "approach axis, on top of grasp_offset_m -- the knob for the two wrist "
+            "cameras sitting at different depths. Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="tool_offset_y_m",
+            bounds=(-0.10, 0.10),
+            read=lambda p: p.tool_offset_y_m,
+            write=lambda p, v: replace(p, tool_offset_y_m=float(v)),
+            description="How far to move the commanded grasp centre along Stretch's "
+            "jaw line -- the knob for the two wrist cameras sitting to different sides "
+            "of the hand. Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="tool_offset_z_m",
+            bounds=(-0.10, 0.10),
+            read=lambda p: p.tool_offset_z_m,
+            write=lambda p, v: replace(p, tool_offset_z_m=float(v)),
+            description="How far to move the commanded grasp centre across Stretch's "
+            "hand, towards its gripper cameras' side -- the knob for the two wrist "
+            "cameras sitting at different heights off the hand. Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="wrist_tilt_deg",
+            bounds=(-60.0, 60.0),
+            read=lambda p: p.wrist_tilt_deg,
+            write=lambda p, v: replace(p, wrist_tilt_deg=float(v)),
+            description="Extra pitch between the Franka's tool frame and Stretch's. "
+            "Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="aperture_m",
+            bounds=(0.06, 0.1885),
+            read=lambda p: p.aperture_m,
+            write=lambda p, v: replace(p, aperture_m=float(v)),
+            description="How wide Stretch's hand opens, in metres between the fingertips. "
+            "0 keeps ROBOTIQ_MAX_APERTURE_M. Its fingers converge behind their tips, so a "
+            "deep grasp_offset_m needs a wide hand -- see diagnose.py's jaw profile. "
+            "Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="wrist_fov_deg",
+            bounds=(15.0, 60.0),
+            read=lambda p: p.wrist_fov_deg,
+            write=lambda p, v: replace(p, wrist_fov_deg=float(v)),
+            description="Vertical FOV to render Stretch's wrist camera at, which is a "
+            "centre crop of the real one. 0 keeps the hardware's 58 degrees; "
+            "MATCHED_WRIST_FOV_DEG frames a grasp the way the Robotiq's does. "
+            "Stretch setups only.",
+            robots=("stretch",),
+        ),
+        Dimension(
+            name="target_z_offset_m",
+            bounds=(0.0, 0.15),
+            read=lambda p: p.target_z_offset_m,
+            write=lambda p, v: replace(p, target_z_offset_m=float(v)),
+            description="Metres to raise every commanded target by, for clearance over "
+            "the counter. Absolute, not a fraction of a measurement -- see "
+            "StretchMolmoBotDroidPolicyConfig.target_z_offset. Stretch setups only.",
+            robots=("stretch",),
+        ),
+    )
+}
+
+
+def _label_episodes(episodes: list[EpisodeScore], setup_key: str) -> list[EpisodeScore]:
+    """Say which object each episode was about, and which setup it belongs to.
+
+    Matched on the instruction, never on order. Order was already unreliable --
+    an episode that errors before its first step still produces a record -- and
+    with several workers it is meaningless: records arrive per worker, in
+    whichever order the workers finished. The instruction names the object
+    unambiguously, and the episode carries its own `scene`, so the pair
+    identifies it without reference to where it sits in the list.
+    """
+    by_instruction = {target.instruction: target.key for target in mini_benchmark.TARGETS}
+    for index, episode in enumerate(episodes):
+        episode.setup = setup_key
+        episode.target = by_instruction.get(
+            episode.instruction,
+            mini_benchmark.episode_target(index).key if index < len(mini_benchmark.TARGETS) else "?",
+        )
+    return episodes
+
+
+WORKER_VRAM_GIB = 17.0
+"""
+GPU memory one rollout worker needs at its *peak*, in GiB.
+
+Each worker is a separate process that loads its own copy of the DROID
+checkpoint -- `molmobot_droid_policy._LOADED_MODELS` caches per process, and
+processes share nothing -- so VRAM, not the scene count, is what caps
+parallelism.
+
+Sized on the peak rather than the steady state, which is the correction that
+matters: a worker sits around 12.7 GiB between inferences and climbs past
+16.5 GiB while generating an action chunk. Two workers therefore fit *most* of
+the time and collide whenever both happen to be mid-inference, which is how a
+run gets an hour in before failing. Measured from an OOM report with two workers
+live: 12.74 + 16.55 = 29.3 GiB of a 31.3 GiB card.
+
+The consequence is worth stating plainly rather than hiding in a number: on a
+32 GiB card this checkpoint supports **one** worker. Parallel rollouts need a
+bigger card, a smaller model, or fewer scenes per trial -- see `--scenes`.
+"""
+
+
+def affordable_workers(scene_count: int) -> int:
+    """How many workers the GPU can actually hold, capped at the scene count.
+
+    More workers than scenes would idle -- MolmoSpaces takes a *house* as its
+    unit of work -- and more workers than VRAM allows would crash partway
+    through, so the default is the smaller of the two. Falls back to the scene
+    count when there is no GPU to ask, which is the CPU case where memory is not
+    the constraint.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return scene_count
+        free_bytes, _ = torch.cuda.mem_get_info()
+        affordable = int(free_bytes / (WORKER_VRAM_GIB * 1024**3))
+    except Exception:  # noqa: BLE001 - a default must not depend on torch importing
+        return 1
+    return max(1, min(scene_count, affordable))
+
+
+SECONDS_PER_ROLLOUT = 45
+"""
+Rough wall-clock per rollout, for the estimate printed before a run.
+
+Measured on this machine over a few hundred episodes: a 20-second episode at
+15Hz is ~300 policy steps, and one that grasps early stops sooner. Only ever
+used to print an order of magnitude, so it does not need to be right.
+"""
 
 
 # =============================================================================
@@ -379,7 +593,7 @@ def instruction_target(instruction: str) -> str:
 def label_benchmark_episodes(episodes: list[EpisodeScore], setup_key: str) -> list[EpisodeScore]:
     """Say which object each released-benchmark episode was about.
 
-    The counterpart of `params_search._label_episodes`, which cannot be used
+    The counterpart of `_label_episodes`, which cannot be used
     here: it matches the mini benchmark's four instructions and falls back to
     *position* among them, so the first four episodes of a Pick-v2 run would come
     back labelled bowl, potato, salt shaker and knife whatever they were actually
@@ -777,11 +991,7 @@ class RunResult:
         only that a side-by-side run has one trial per setup instead of one per
         searched point.
         """
-        params = (
-            self.params
-            if self.params is not None
-            else tool_default_params(SETUPS[self.setup].params, self.setup)
-        )
+        params = self.params if self.params is not None else SETUPS[self.setup].params
         return TrialResult(
             setup=self.setup,
             params_description=params.describe(),
@@ -795,7 +1005,7 @@ class RunResult:
         """Probe records, keyed the way `SplitPanelRecorder` keys its panels.
 
         Keyed on scene *and* instruction rather than on order, for the reason
-        `params_search._label_episodes` gives: with several workers the records
+        `_label_episodes` gives: with several workers the records
         arrive per worker, in whichever order they finished.
 
         The scene has to be in the key. A benchmark runs the same four
@@ -1878,7 +2088,7 @@ def _finishing(seconds: float) -> str:
 class Pace:
     """How long an episode is taking, and so how long what is left will take.
 
-    Starts at `params_search.SECONDS_PER_ROLLOUT`, which is an order of magnitude
+    Starts at `SECONDS_PER_ROLLOUT`, which is an order of magnitude
     rather than a measurement, and replaces it with this run's own rate the
     moment there is one. An episode's cost depends on the horizon, the policy,
     the card and what else is on it, so the only source worth trusting for it is
@@ -2313,8 +2523,8 @@ def run_directory_name(
         # two must never resume into each other either.
         segments.append(RUN_NAME_ABBREVIATIONS["base_translation"])
     rollout = rollout if rollout is not None else RolloutOptions()
-    if not rollout.include_base:
-        segments.append("no-base")
+    if rollout.include_base:
+        segments.append("with-base")
     if rollout.execute_horizon is not None:
         segments.append(f"exec{rollout.execute_horizon}")
     if rollout.only_first_n is not None:
@@ -2504,12 +2714,8 @@ def _apply_params(
     `tool_offset_x_m` / `tool_offset_y_m` / `tool_offset_z_m`; see `STRETCH_OFFSET_FLAGS`. Note the
     asymmetry that leaves: `--param` is applied to whichever setup it is handed,
     Franka included, which is what its own help means by "where it applies".
-
-    Before either, the tool's own defaults (`setups.tool_default_params`): on the
-    PG4 a Stretch setup's SG4 grasp offset becomes the PG4's, and whatever was
-    typed is then applied on top.
     """
-    params = tool_default_params(base, setup_key)
+    params = base
     for spec in specs:
         name, _, value = spec.partition("=")
         if name not in DIMENSIONS:
@@ -2611,7 +2817,7 @@ def rollout_from_flags(
     multiple=True,
     help="Set a retargeting parameter, as name=value. Repeatable. Applied to both halves "
     "where it applies -- the gripper parameters exist only on the Stretch side. The names "
-    "are params_search's own; see its --list-dims.",
+    "are DIMENSIONS' keys; an unknown one is refused with the list.",
 )
 @click.option(
     "--scenes",
@@ -2657,7 +2863,7 @@ def rollout_from_flags(
     "--num-workers",
     type=int,
     default=None,
-    help="Rollout workers per run. Defaults as params_search does: whichever is smaller of "
+    help="Rollout workers per run. Defaults to whichever is smaller of "
     "one per scene or as many as fit in free GPU memory.",
 )
 @click.option(
@@ -2722,7 +2928,7 @@ def rollout_from_flags(
     "the retargeting puts the Franka's. Applies to the evaluation runs and to a replay "
     "alike, and overrides --param grasp_offset_m. Stretch only, because it is a term in "
     "the Franka-to-Stretch tool transform and means nothing on a Franka: the Franka half "
-    "of a pair keeps its own 0. Left untyped, each setup keeps its own offset. The one "
+    "of a pair keeps its own 0. Left untyped, 0, as on the robot. The one "
     "parameter a grasp is most sensitive to; see setups.apply_tool_correction. "
     "--grasp-offset-m is the same flag, spelled as run_on_real_stretch.py spells it -- "
     "likewise --tool-offset-x-m / -y-m / -z-m below.",
@@ -2865,9 +3071,8 @@ def rollout_from_flags(
     "parallel_gripper",
     is_flag=True,
     help="Put the parallel jaw gripper (PG4) on every Stretch setup instead of the stretch "
-    "gripper (SG4). The Stretch setups' grasp offset default becomes the PG4's geometric "
-    "one, 0.004m, unless --stretch4-grasp-offset or --param names another. Franka setups "
-    "are unaffected. Adds 'pg4' to the run directory, and --report-only / --compose-only / "
+    "gripper (SG4). The grasp offset stays at 0 unless --grasp-offset-m or --param names "
+    "another, as on the robot. Franka setups are unaffected. Adds 'pg4' to the run directory, and --report-only / --compose-only / "
     "--replay-as-stretch4 on a PG4 run need it again, like every other flag the run was "
     "started with. See `stretch.robot_view.PG4_GRIPPER`.",
 )
@@ -2884,13 +3089,12 @@ def rollout_from_flags(
 @click.option(
     "--include-base/--no-include-base",
     "include_base",
-    default=True,
+    default=False,
     show_default=True,
-    help="Let Stretch's base join the retargeting IK, as run_on_real_stretch.py's flag of the "
-    "same name. On by default here, unlike on the robot -- the sim study has always scored "
-    "Stretch with its base in the IK -- so --include-base changes nothing and "
-    "--no-include-base scores the arm alone. Stretch only. --no-include-base adds 'no-base' "
-    "to the run directory.",
+    help="Let Stretch's base join the retargeting IK, turning in place, as "
+    "run_on_real_stretch.py's flag of the same name -- and off by default, as there. "
+    "--base-translation lets it drive as well. Stretch only. Adds 'with-base' to the run "
+    "directory.",
 )
 @click.option(
     "--execute-horizon",
@@ -3015,8 +3219,8 @@ def main(
         )
     if base_translation and not include_base:
         raise click.UsageError(
-            "--base-translation lets the base drive in the IK, and with --no-include-base "
-            "the base is not in the IK at all."
+            "--base-translation lets the base drive in the IK, and without --include-base "
+            "the base is not in the IK at all. Pass both."
         )
     rollout = rollout_from_flags(include_base, execute_horizon, only_first_n, slow, wait_for_arrival)
     crop_to = parse_frame_size(head_crop)
@@ -3056,7 +3260,7 @@ def main(
     # Stretch's retargeting solves with stretch4_kinematics, in the evaluation's
     # workers and in a replay alike; published in both directions like the rest.
     # See `franka_retarget.publish_ik_choice`.
-    ik_choice = fr.IKChoice(stretch4_kinematics=True, base_translation=base_translation)
+    ik_choice = fr.IKChoice(base_translation=base_translation)
     fr.publish_ik_choice(ik_choice)
     log.info(f"[ik] Stretch solves with {ik_choice.describe()}")
 

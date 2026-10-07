@@ -554,7 +554,7 @@ def report_sweep(by_offset: dict[float, list[dict]]) -> None:
     type=float,
     multiple=True,
     help="Where the object sits in Stretch's jaw, in metres past its grasp centre. "
-    "Repeatable, to sweep. Defaults to the Stretch setups' own offset for the tool: "
+    "Repeatable, to sweep. Defaults to the tool's geometric alignment: "
     "STRETCH_GRASP_OFFSET_M on the SG4, franka_retarget.stretch_tool_geometry()'s on the PG4. "
     "The matched aperture depends on it, which is the whole finding.",
 )

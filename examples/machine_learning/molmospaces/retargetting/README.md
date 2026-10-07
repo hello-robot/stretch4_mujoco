@@ -1,4 +1,4 @@
-# Retargeting parameter search
+# Retargeting MolmoBot-DROID onto Stretch 4
 
 Finding the camera and gripper settings that let the released `allenai/MolmoBot-DROID`
 checkpoint drive Stretch 4.
@@ -8,13 +8,12 @@ reaches Stretch through a retargeting layer *and* a camera it was never trained
 on, so when a rollout fails there is no way to tell which of the two is at
 fault. This package runs the same four grasps through seven setups that walk
 from the Franka and camera the policy knows to the Stretch and fisheye it does
-not, one change at a time, and then searches the settings that are actually
-free.
+not, one change at a time.
 
 ```
 examples/machine_learning/molmospaces/retargetting/
-    params_search.py               the entry point: trials, grid, CMA-ES, report
-    params_search_side_by_side.py  a matched pair of setups, tiled into one video
+    params_search_side_by_side.py  the entry point: a matched pair of setups, tiled into one video
+    run_on_real_stretch.py         the same retargeting on a real Stretch 4
     replay.py                      the recorded Franka actions, retargeted offline
     setups.py                      the seven setups, their eval configs and overrides
     cameras.py                     the exo camera: mount, fisheye, rectify, crop
@@ -23,65 +22,10 @@ examples/machine_learning/molmospaces/retargetting/
     scoring.py                     the objective, and the report
 ```
 
-## Running it
-
-```bash
-# the default: sweep every parameter that applies to each setup, in stages.
-# 184 trials, 736 rollouts, roughly 9 hours. Prints the plan before it starts.
-python -m examples.machine_learning.molmospaces.retargetting.params_search
-
-# the quick comparison table instead: each setup once, at its own defaults.
-# 7 trials, ~20 minutes.
-python -m ...params_search --search none
-
-# one setup, a grid over dimensions you name
-python -m ...params_search --setup stretch_stretchcam \
-    --search grid --dim pitch_deg=15:50:4 --dim fovy=50:100:3
-
-# the gripper parameters by CMA-ES
-python -m ...params_search --setup stretch_fisheye --search cmaes \
-    --dim grasp_offset_m=-0.05:0.15 --dim wrist_tilt_deg=-20:60 \
-    --population 6 --generations 5
-
-python -m ...params_search --list-setups   # what the seven are
-python -m ...params_search --list-dims     # what can be searched, and what the sweep tries
-python -m ...retargetting.diagnose         # measure the retargeting, no policy needed
-```
-
-Output lands under `--output-dir` (default `eval_output/retarget_params/`): an
-MP4 per rollout, `episodes.csv`, `trials.csv`, `trials.jsonl`, and `report.md`
-ranking the trials. **Everything is rewritten after every trial**, so a long
-sweep can be stopped at any point and what it has is already on disk.
-
-### What the default sweep does
-
-Per setup, a full grid per stage, carrying the winning parameters into the next
-stage:
-
-| stage | dimensions | points | applies to |
-|---|---|---:|---|
-| camera | `pitch_deg` (4) × `fovy` (4) | 16 | every setup |
-| gripper | `grasp_offset_m` (4) × `z_offset_fraction` (2) × `wrist_tilt_deg` (3) | 24 | Stretch setups |
-
-Staged rather than one grid over all five, because the full cross product is 384
-points per Stretch setup — days of rollouts, most of them re-measuring a camera
-a previous point already showed was bad. Parameters that *interact* are kept in
-the same stage: `grasp_offset_m` and `z_offset_fraction` are inseparable (see
-the debugging section below), and swept one at a time neither would have looked
-like the answer. What staging cannot see is an interaction *across* stages — a
-camera that is only good with a particular gripper correction. `--search grid`
-over a hand-picked pair is how you check one if you suspect it.
-
-Dimensions declare which robot they apply to, so the gripper stage is skipped on
-Franka setups (there is nothing to retarget on the robot the policy was trained
-on), and `--dim grasp_offset_m` on a Franka setup is refused rather than running
-16 identical trials.
-
 ## Matched pairs, side by side
 
-`params_search_side_by_side.py` answers a different question from the sweep
-above. The sweep asks "which settings score best on Stretch"; this asks "what
-does the Franka do that Stretch does not, on the *same* episode". It runs a
+`params_search_side_by_side.py` asks "what does the Franka do that Stretch does
+not, on the *same* episode". It runs a
 matched pair of setups over one benchmark and tiles each episode into one video:
 the Franka's third-person view and its two camera feeds on the left, Stretch's on
 the right, each captioned with its own outcome and the Stretch half with the
@@ -301,29 +245,13 @@ Mind the sign when searching the tilt: `pitch_deg` is measured **up from
 straight down** (0 = floor, 90 = horizon), so pointing further down is a
 *smaller* number.
 
-## What can be searched
+## What `--param` can set
 
-| dimension | applies to | what it moves |
-|---|---|---|
-| `pitch_deg` | all | camera tilt, measured up from straight down: smaller looks further *down* (0 = floor, 90 = horizon) |
-| `fovy` | all | vertical field of view (71 = DROID, 123 = Stretch's fisheye) |
-| `grasp_offset_m` | Stretch | commanded grasp centre along the approach axis |
-| `wrist_tilt_deg` | Stretch | extra pitch between the Franka tool frame and Stretch's |
-| `z_offset_fraction` | Stretch | how much of the measured lift shortfall to add to targets |
-
-`--list-dims` prints each one's range and the values the sweep tries. The three
-Stretch-only dimensions are carried on a Franka setup's parameters but never
-read there, so one parameter vector still describes a trial on either robot —
-`--dim` refuses to *search* them on a Franka setup, since every trial would be
-identical.
-
-Output lands under `--output-dir` (default `eval_output/retarget_params/`): an
-MP4 per rollout, `episodes.csv`, `trials.csv`, `trials.jsonl`, and `report.md`
-ranking the trials.
-
-One trial is four rollouts of ~300 steps with a VLA in the loop — minutes, not
-seconds. That is what makes the default sweep a 9-hour job; `--search none` is
-the 20-minute version.
+`--param name=value`, repeatable, on `params_search_side_by_side.py`. The names
+and ranges are `params_search_side_by_side.DIMENSIONS`; an unknown name is
+refused with the list. The camera dimensions (`pitch_deg`, `virtual_pitch_deg`,
+`fovy`) apply to both halves of a pair; the rest are Stretch-only and are
+carried on a Franka setup's parameters but never read there.
 
 ## Debugging the retargeting: what was wrong, and the fix
 
@@ -583,117 +511,6 @@ None of this is recorded by the evaluation pipeline (its H5 has `success` and
 `rewards`, and neither says how close a failure came), so `scoring.GraspProbe`
 watches the rollout itself through the same observer hook the MP4 recorder uses.
 See `scoring.py`.
-
-## The CMA-ES implementation
-
-`params_search.SimpleCMAES` is about sixty lines of textbook
-(μ/μ_w, λ)-CMA-ES — Hansen's tutorial algorithm with the standard parameter
-defaults — written out rather than taken from the `cma` package, which is not in
-this repository's environment and would be a new dependency for one script.
-
-### What the algorithm does
-
-CMA-ES keeps a multivariate normal over the search space and moves it towards
-wherever the good points were. Each generation it samples λ points, keeps the
-best μ, and updates three things: **where** the distribution is centred, **how
-far** it reaches, and **which directions** it reaches furthest in. That third
-part is what makes it worth the code over random search or a grid: it learns the
-shape of the landscape, so a valley running diagonally through (pitch, fovy) is
-followed along its floor rather than crossed.
-
-It suits this problem because the objective is expensive (four VLA rollouts per
-evaluation), noisy (contact-rich physics, a stochastic policy), and has no
-usable gradient. CMA-ES is derivative-free, uses only the *ranking* of the
-scores rather than their values, and is the standard choice at this budget.
-
-### The state
-
-| field | what it is |
-|---|---|
-| `mean` | centre of the sampling distribution: the current best guess |
-| `sigma` | overall step size, scaling everything the distribution does |
-| `covariance` | the shape: which directions are promising, and how correlated |
-| `path_sigma` | evolution path used to decide whether `sigma` is too big or small |
-| `path_c` | evolution path used for the rank-one covariance update |
-| `weights` | the μ recombination weights, `log(μ + 0.5) - log(i)`, normalised |
-
-### One generation
-
-**`ask()`** — eigendecompose the covariance into `B · diag(d)`, and for each of
-the λ points draw `z ~ N(0, I)`, map it through that basis to `y = B·(d ⊙ z)`,
-and sample `x = mean + sigma · y`. So `sigma` sets the scale and the covariance
-sets the shape and orientation.
-
-**`tell(scores)`** — sort by score descending (this maximises; CMA-ES is
-conventionally written to minimise) and take the best μ:
-
-1. **Recombination.** The new `mean` is the weighted average of the best μ
-   points. The weights are log-decreasing, so the best point counts for more
-   than the μ-th.
-
-2. **The step-size path.** `path_sigma` accumulates the mean's displacement,
-   whitened by `C^(-1/2)` so successive steps are comparable. If consecutive
-   steps keep pointing the same way, the path grows long and `sigma` is raised —
-   the search is making steady progress and should move faster. If they cancel
-   out, the path stays short and `sigma` shrinks — the search is circling an
-   optimum and should refine. The final line is exactly that comparison, against
-   `chi_n`, the expected length of a random walk of the same number of steps.
-
-3. **The covariance path and update.** `path_c` accumulates the same
-   displacement unwhitened, and `h_sigma` switches it off when `path_sigma` has
-   grown implausibly long — which happens right after a large `sigma` increase,
-   where the step is an artefact of the rescaling rather than of the landscape.
-   The covariance is then a blend of three things: what it already was, a
-   **rank-one** term `path_c · path_cᵀ` that stretches it along the direction the
-   mean has been travelling, and a **rank-μ** term summing the selected points'
-   own outer products, which captures the local shape from this generation
-   alone. The rank-one term learns a long-run direction from few samples; the
-   rank-μ term learns the shape fast when λ is large. Small populations lean on
-   the first.
-
-### The choices this implementation makes
-
-**No restarts, no IPOP.** The budget here is tens of evaluations, not thousands.
-The machinery that earns its keep over long runs — detecting stagnation,
-restarting with a doubled population — would never come into play.
-
-**Bounds by clipping.** `--dim name=lo:hi` is a box, and `ask()` clips what it
-proposes into it. Clipping biases the search towards a boundary it is pressed
-against, which is the known weakness of the approach; it is acceptable here
-because every bound is a physical limit (a camera cannot have a negative field
-of view) and a search that wants to sit on one is telling you something. The
-*unclipped* samples are what `tell()` updates from, so the distribution is not
-also distorted by the projection.
-
-**Starting point and initial step size.** The mean starts at the setup's own
-defaults, clipped into the box, so generation zero is a neighbourhood of the
-configuration you would otherwise have run by hand. `sigma0` is a quarter of the
-mean axis range: wide enough to leave that neighbourhood on the first
-generation, narrow enough that most of a small population lands inside the box
-rather than on its faces.
-
-**Population.** `--population 6`, `--generations 5` by default, so 30 trials =
-120 rollouts. That is small for CMA-ES — `4 + 3·ln(n)` is the usual λ, which is
-about 6 for two dimensions and 8 for four — so search two or three dimensions at
-a time, not eight.
-
-**Noise is not handled explicitly.** Each point is evaluated once, on four fixed
-episodes with a fixed seed, and there is no re-evaluation or averaging over
-repeats. The four-object mean is the only variance reduction. Treat a
-single-generation improvement as suggestive and the trend across generations as
-the result.
-
-### Reading the output
-
-Every point CMA-ES evaluates is an ordinary trial: a row in `trials.csv`, a
-section in `report.md`, four MP4s. The log line at the end of each generation
-reports the best score of that generation and the distribution's new `mean` and
-`sigma` — a `sigma` that keeps shrinking means it has found something and is
-refining; one that keeps growing means the landscape is flat and the ranking is
-noise.
-
-`report.md` ranks every trial by score regardless of which generation produced
-it, so the top row is the best setting found, not the last one tried.
 
 ## What this cannot tell you
 

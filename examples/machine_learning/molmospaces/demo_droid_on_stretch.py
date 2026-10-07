@@ -468,8 +468,10 @@ def load_droid_policy(checkpoint: str | None) -> Any:
 )
 @click.option(
     "--include-base/--no-include-base",
-    default=True,
-    help="Let the holonomic base join the IK. Off scores what the arm alone can reach.",
+    default=False,
+    show_default=True,
+    help="Let the holonomic base join the IK. Off by default, as on the robot "
+    "(run_on_real_stretch.py --include-base).",
 )
 @click.option(
     "--z-offset",

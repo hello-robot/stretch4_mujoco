@@ -36,7 +36,7 @@ being picked up, which is what makes "this setup grasps the knife but not the
 salt shaker" a statement about the setup.
 
 Build it with `python -m ...retargetting.mini_benchmark --scenes N`, or let
-`params_search.py` build it on demand.
+`params_search_side_by_side.py` build it on demand.
 """
 
 from __future__ import annotations

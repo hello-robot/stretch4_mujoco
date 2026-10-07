@@ -3210,7 +3210,7 @@ def main(
         include_base=include_base,
         target_z_offset=target_z_offset_m,
         pose_conventions=conventions,
-        ik_choice=fr.IKChoice(stretch4_kinematics=True, base_translation=base_translation),
+        ik_choice=fr.IKChoice(base_translation=base_translation),
     )
     # The study's tool parameters, applied the way `setups.py` applies them to a
     # trial, so a run here is the same retargeting a sim trial measured.

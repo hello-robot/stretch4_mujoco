@@ -1309,7 +1309,7 @@ def replay_episode(
     episode: RecordedEpisode,
     target_z_offset: float = 0.0,
     match_robotiq_aperture: bool = True,
-    include_base: bool = True,
+    include_base: bool | None = None,
     scene_count: int = mini_benchmark.DEFAULT_SCENE_COUNT,
     exo: ExoCameraParams | None = None,
     stage: dict[str, Any] | None = None,
@@ -1377,7 +1377,15 @@ def replay_episode(
     decided by whoever built it, and `scene_count`, `exo` and `stage` are
     ignored. See `ReplayScene`, and note that a scene built without `stage` holds
     no object to grasp however the physics is stepped.
+
+    `include_base` left None is the run's own `--include-base`, as published for
+    the rollouts (`setups.rollout_options`), so a replay retargets the way the
+    run it replays did.
     """
+    if include_base is None:
+        from examples.machine_learning.molmospaces.retargetting.setups import rollout_options
+
+        include_base = rollout_options().include_base
     if scene is None:
         scene = build_stretch_in_scene(
             episode.house, episode.base_xytheta, scene_count=scene_count, exo=exo, stage=stage
@@ -1502,7 +1510,7 @@ class _ScenePanel:
 
     `base_xytheta` is where the *recording* stood its robot, and it has to be
     passed in rather than read off the robot when the first frame arrives. With
-    `include_base` set -- the default -- the base is part of what the IK solves,
+    `include_base` set, the base is part of what the IK solves,
     and the opening `snap_to_franka_joint_pos` can drive it metres to reach the
     Franka's home pose before a single frame is rendered. A camera framed on
     where the base ended up after that is a camera outside the house looking at

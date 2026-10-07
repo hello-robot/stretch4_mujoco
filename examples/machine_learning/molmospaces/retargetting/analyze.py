@@ -79,7 +79,7 @@ def load(run_dir: Path) -> pd.DataFrame:
     carries the parameters as structured values (the CSV has only the
     human-readable description) and `episodes.csv` carries the per-object
     outcome. Both are written in the same order, four episodes per trial, by the
-    same function -- `params_search._write_outputs` rewrites all of them together
+    same function -- `params_search_side_by_side.write_outputs` rewrites all of them together
     after every trial, so they cannot be out of step with each other.
     """
     trials = [json.loads(line) for line in (run_dir / "trials.jsonl").read_text().splitlines()]
@@ -292,7 +292,7 @@ def analyse(df: pd.DataFrame) -> str:
     "run_dirs",
     multiple=True,
     type=click.Path(path_type=Path, exists=True),
-    help="A directory `params_search` wrote: trials.jsonl, trials.csv, episodes.csv. "
+    help="A directory `params_search_side_by_side` wrote: trials.jsonl, trials.csv, episodes.csv. "
     "Repeatable — later directories supersede earlier ones for any setup they share, "
     "so a re-run of one setup can be pooled with the sweep it corrects.",
 )

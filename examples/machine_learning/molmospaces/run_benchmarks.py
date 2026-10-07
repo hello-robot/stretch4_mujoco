@@ -536,7 +536,7 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     type=str,
     default="stretch_stretchcam",
     help="Which retargetting setup --policy molmobot_droid_retarget starts from: its "
-    "camera, lens and tool correction. See `retargetting/params_search.py --list-setups`.",
+    "camera, lens and tool correction. See `retargetting/setups.SETUPS`.",
 )
 @click.option(
     "--retarget-params",
@@ -595,10 +595,11 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
 @click.option(
     "--include-base/--no-include-base",
     "include_base",
-    default=True,
+    default=False,
     show_default=True,
-    help="Let Stretch's base join the retargeting IK, as run_on_real_stretch.py's flag. On "
-    "by default in sim, unlike on the robot. --policy molmobot_droid_retarget only.",
+    help="Let Stretch's base join the retargeting IK, turning in place, as "
+    "run_on_real_stretch.py's flag -- and off by default, as there. --policy "
+    "molmobot_droid_retarget only.",
 )
 @click.option(
     "--base-translation/--no-base-translation",
@@ -740,7 +741,7 @@ def main(
         "--tool-offset-x-m": tool_offset_x_m is not None,
         "--tool-offset-y-m": tool_offset_y_m is not None,
         "--tool-offset-z-m": tool_offset_z_m is not None,
-        "--no-include-base": not include_base,
+        "--include-base": include_base,
         "--base-translation": base_translation,
         "--execute-horizon": execute_horizon is not None,
         "--execute-horizon-do-only-first-n-steps": only_first_n is not None,
@@ -756,8 +757,8 @@ def main(
         )
     if base_translation and not include_base:
         raise click.UsageError(
-            "--base-translation lets the base drive in the IK, and with --no-include-base "
-            "the base is not in the IK at all."
+            "--base-translation lets the base drive in the IK, and without --include-base "
+            "the base is not in the IK at all. Pass both."
         )
     rollout = rollout_from_flags(include_base, execute_horizon, only_first_n, slow, wait_for_arrival)
     # Published in both directions whatever the policy, so options left in the
@@ -766,14 +767,14 @@ def main(
     if rollout:
         log.info(f"[rollout] {rollout.describe()}")
 
-    if policy == "molmobot_droid_retarget":
-        from examples.machine_learning.molmospaces.policies import franka_retarget as fr
+    # Every policy, in both directions: whatever builds a `FrankaOnStretchView` --
+    # this one and --policy molmobot_droid -- reads it, and a base translation
+    # left in the environment by an earlier run must not leak into this one.
+    from examples.machine_learning.molmospaces.policies import franka_retarget as fr
 
-        # The IK run_on_real_stretch.py and params_search_side_by_side.py solve with,
-        # so one set of flags is one retargeting everywhere. See `fr.publish_ik_choice`.
-        ik_choice = fr.IKChoice(stretch4_kinematics=True, base_translation=base_translation)
-        fr.publish_ik_choice(ik_choice)
-        log.info(f"[ik] Stretch solves with {ik_choice.describe()}")
+    fr.publish_ik_choice(fr.IKChoice(base_translation=base_translation))
+
+    if policy == "molmobot_droid_retarget":
         _publish_retarget_params(
             retarget_setup,
             retarget_params,
@@ -911,7 +912,7 @@ def _publish_retarget_params(
     `run_evaluation` builds the experiment config itself, from a class named by a
     "module:Class" string, so there is no seam to pass a parameter through: the
     config reads its trial out of the environment instead. This is the same route
-    `params_search.py` uses, which is what lets a configuration found by the
+    `params_search_side_by_side.py` uses, which is what lets a configuration found by the
     search be replayed here on a real benchmark without retyping it.
 
     `override` is accepted in whichever form it is to hand -- the description

@@ -1113,7 +1113,7 @@ def load_trials(run_dir: Path) -> list[TrialResult]:
     report reads, so it can be rebuilt instead.
 
     `trial` in the CSV is the index into `trials.jsonl`; both are written
-    together by `params_search._write_outputs` after every trial.
+    together by `params_search_side_by_side.write_outputs`.
     """
     trials_path = run_dir / "trials.jsonl"
     records = [json.loads(line) for line in trials_path.read_text().splitlines() if line.strip()]
@@ -1187,7 +1187,7 @@ def rebuild_report(run_dir: Path, targets: tuple[str, ...]) -> Path:
     "--run-dir",
     type=click.Path(path_type=Path, exists=True),
     default=Path("eval_output") / "retarget_params",
-    help="A directory `params_search` wrote: trials.jsonl and episodes.csv.",
+    help="A directory `params_search_side_by_side` wrote: trials.jsonl and episodes.csv.",
 )
 def main(run_dir: Path) -> None:
     """Re-render `report.md` for a finished run, without re-running the rollouts."""
