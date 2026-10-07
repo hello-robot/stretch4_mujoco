@@ -46,6 +46,13 @@ class StatusStretchJoints:
     is_self_colliding: bool = False
     actuators_in_motion: list[str] = field(default_factory=list)
     """MJCF actuator names whose motion profile is still ramping."""
+    gravity_tilt: float = 0.0
+    """How far the base leans off vertical, in radians. Upright is 0.
+
+    Mirrors `power_periph.imu.status['gravity_tilt']` on the robot.
+    """
+    in_overtilt: bool = False
+    """Whether `SafeMotionOvertiltAvoid` is currently overriding motion."""
 
     def __getitem__(self, name:str):
         """For backward compatibility: allows access with the square brackets []"""

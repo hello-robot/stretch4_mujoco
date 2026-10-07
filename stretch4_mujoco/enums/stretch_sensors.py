@@ -13,6 +13,12 @@ class StretchSensors(Enum):
     base_gyro = 0
     base_accel = 1
     base_lidar = 2
+    base_quat = 3
+    """Orientation of the base `imu` site, as a `(w, x, y, z)` quaternion.
+
+    The sim's counterpart to the robot IMU's `qw`..`qz`, and the input to
+    `StatusStretchSensors.gravity_tilt`.
+    """
 
     @staticmethod
     def all() -> list["StretchSensors"]:
