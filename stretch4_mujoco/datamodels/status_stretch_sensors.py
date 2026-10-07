@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
-from stretch4_mujoco.utils import dataclass_from_dict
+from stretch4_mujoco.utils import dataclass_from_dict, gravity_tilt_from_quaternion
 
 
 @dataclass
@@ -18,7 +18,21 @@ class StatusStretchSensors:
 
     base_gyro: np.ndarray | None = None
     base_imu: np.ndarray | None = None
+    base_quat: np.ndarray | None = None
     lidar: np.ndarray | None = None
+
+    @property
+    def gravity_tilt(self) -> float:
+        """How far the base leans off vertical, in radians.
+
+        The same quantity the robot publishes as
+        `power_periph.imu.status['gravity_tilt']`, so a tilt threshold written
+        against the robot reads the same here. Upright is 0. Reads 0 when the
+        `base_quat` sensor is absent from the model.
+        """
+        if self.base_quat is None:
+            return 0.0
+        return gravity_tilt_from_quaternion(self.base_quat)
 
     def get_data(self, sensor: StretchSensors) -> np.ndarray:
         """
@@ -32,6 +46,8 @@ class StatusStretchSensors:
             data = self.base_gyro
         elif sensor == StretchSensors.base_accel:
             data = self.base_imu
+        elif sensor == StretchSensors.base_quat:
+            data = self.base_quat
         elif sensor == StretchSensors.base_lidar:
             data = self.lidar
 
@@ -52,6 +68,9 @@ class StatusStretchSensors:
             return
         if sensor == StretchSensors.base_accel:
             self.base_imu = value
+            return
+        if sensor == StretchSensors.base_quat:
+            self.base_quat = value
             return
         if sensor == StretchSensors.base_lidar:
             self.lidar = value

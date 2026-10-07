@@ -93,7 +93,23 @@ robot_settings_se4 = {
         "wheel0_polarity": -1,
         "wheel1_polarity": -1,
         "wheel2_polarity": -1,
-    }
+    },
+    # Safe motions, mirrored from stretch4_body's `robot/robot_params_SE4.py`.
+    'safe_motion_manager': {'controllers': ['safe_motion_overtilt_avoid']},
+    'safe_motion_overtilt_avoid': {
+        'py_module_name': 'stretch4_mujoco.safe_motions.safe_motion_overtilt_avoid',
+        'py_class_name': 'SafeMotionOvertiltAvoid',
+        # Angles (deg) before the robot pauses motion to prevent tipping over
+        'gravity_tilt_thresh_deg': {'default': 6.0, 'conservative': 9.0, 'aggressive': 3.0},
+        'enabled': 1,
+        'alert_period': 2.0,
+        # Tilt (deg) the base must come back under before motion is released.
+        # The robot has no such band -- its motors latch into safety/freewheel
+        # until something re-commands them -- but the sim re-decides every
+        # control cycle, so without hysteresis a robot parked right on 6 deg
+        # would chatter in and out of the override at 100 Hz.
+        'gravity_tilt_release_deg': 4.0,
+    },
 }
 
 

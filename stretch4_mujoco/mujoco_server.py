@@ -22,6 +22,7 @@ from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 import stretch4_mujoco.config as config
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
+from stretch4_mujoco.safe_motions.safe_motion_manager import SafeMotionManager
 from stretch4_mujoco.mujoco_server_camera_manager import (
     MujocoServerCameraManagerThreaded,
     MujocoServerCameraManagerSync,
@@ -605,6 +606,10 @@ class MujocoServer:
 
         self.joint_profiles = self._build_joint_profiles()
 
+        # Needs the profiles and the base controller it overrides, so it is
+        # built last.
+        self.safe_motion_manager = SafeMotionManager(self)
+
         signal.signal(signal.SIGTERM, lambda num, h: self.request_to_stop())
         signal.signal(signal.SIGINT, lambda num, h: self.request_to_stop())
 
@@ -981,6 +986,9 @@ class MujocoServer:
         self.physics_fps_counter.tick(sim_time=data.time)
         self.pull_status()
         self.push_command(self.data_proxies.get_command())
+        # Last, so a safe motion overrides the setpoints `push_command()` just
+        # wrote rather than being overwritten by them. See `SafeMotion`.
+        self.safe_motion_manager.step()
 
     def pull_status(self):
         """
@@ -1097,6 +1105,13 @@ class MujocoServer:
                 # A lot of geoms might technically intersect by design depending on limits, but ncon tracks active contacts.
                 new_status.is_self_colliding = True
                 break
+
+        # From the previous control cycle: `pull_status()` runs ahead of the
+        # safe motions, so this is the tilt they last acted on.
+        overtilt = self.safe_motion_manager.controllers.get("safe_motion_overtilt_avoid")
+        if overtilt is not None:
+            new_status.gravity_tilt = overtilt.status["gravity_tilt"]
+            new_status.in_overtilt = overtilt.status["in_overtilt"]
 
         self.data_proxies.set_status(new_status)
 
