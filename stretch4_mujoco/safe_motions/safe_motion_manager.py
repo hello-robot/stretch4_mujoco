@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from stretch4_mujoco.safe_motions.motion_overrides import MotionOverrides
 from stretch4_mujoco.safe_motions.safe_motion import SafeMotion
 
 if TYPE_CHECKING:
@@ -22,6 +23,9 @@ class SafeMotionManager:
         self.mujoco_server = mujoco_server
         self.controllers: dict[str, SafeMotion] = {}
         self.status: dict[str, list[str]] = {"safe_motions_triggered": []}
+        # Shared, so two safe motions holding the same joint do not release it
+        # out from under each other. See `MotionOverrides`.
+        self.overrides = MotionOverrides(mujoco_server)
 
         settings = mujoco_server.robot_settings
         for name in settings.get("safe_motion_manager", {}).get("controllers", []):
@@ -29,7 +33,9 @@ class SafeMotionManager:
             if not params or not params.get("enabled", 1):
                 continue
             module = importlib.import_module(params["py_module_name"])
-            controller = getattr(module, params["py_class_name"])(mujoco_server)
+            controller = getattr(module, params["py_class_name"])(
+                mujoco_server, self.overrides
+            )
             self.controllers[name] = controller
             click.secho(f"Started SafeMotion {name}", fg="green")
 
