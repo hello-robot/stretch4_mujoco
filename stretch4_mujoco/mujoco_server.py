@@ -606,6 +606,15 @@ class MujocoServer:
 
         self.joint_profiles = self._build_joint_profiles()
 
+        # Bumped every time a caller commands an actuator. A safe motion that
+        # has stopped a joint needs to tell "the caller has said nothing since"
+        # from "the caller has asked for something new", and it cannot read
+        # that off the profile: an override parks a joint on a zero-velocity
+        # goal, which is byte for byte what an explicit stop command leaves.
+        self.actuator_command_seq: dict[str, int] = {
+            name: 0 for name in self.joint_profiles
+        }
+
         # Needs the profiles and the base controller it overrides, so it is
         # built last.
         self.safe_motion_manager = SafeMotionManager(self)
@@ -691,6 +700,8 @@ class MujocoServer:
                 self.mjmodel, mujoco._enums.mjtObj.mjOBJ_ACTUATOR, i
             )
             profile = self.joint_profiles.get(actuator_name) if actuator_name else None
+            if actuator_name:
+                self._note_command(actuator_name)
             if profile is None:
                 self.mjdata.ctrl[i] = float(ctrl[i])
             else:
@@ -703,6 +714,11 @@ class MujocoServer:
     def _measured_position(self, actuator_name: str) -> float:
         return float(self.mjdata.actuator(actuator_name).length[0])
 
+    def _note_command(self, actuator_name: str) -> None:
+        """Record that a caller has just commanded this actuator."""
+        if actuator_name in self.actuator_command_seq:
+            self.actuator_command_seq[actuator_name] += 1
+
     def _set_actuator_position(
         self,
         actuator_name: str,
@@ -711,6 +727,7 @@ class MujocoServer:
         max_accel: float | None = None,
     ) -> None:
         """Command an absolute position, rate limited if the actuator has limits."""
+        self._note_command(actuator_name)
         profile = self.joint_profiles.get(actuator_name)
         if profile is None:
             self.mjdata.actuator(actuator_name).ctrl = pos
@@ -726,6 +743,7 @@ class MujocoServer:
         max_accel: float | None = None,
     ) -> None:
         """Jog an actuator, rate limited if the actuator has limits."""
+        self._note_command(actuator_name)
         profile = self.joint_profiles.get(actuator_name)
         if profile is None:
             current = float(self.mjdata.actuator(actuator_name).ctrl[0])
@@ -1112,6 +1130,11 @@ class MujocoServer:
         if overtilt is not None:
             new_status.gravity_tilt = overtilt.status["gravity_tilt"]
             new_status.in_overtilt = overtilt.status["in_overtilt"]
+
+        guarded = self.safe_motion_manager.controllers.get("safe_motion_guarded_contact")
+        if guarded is not None:
+            new_status.guarded_events = guarded.status["guarded_events"]
+            new_status.in_guarded_event = dict(guarded.status["in_guarded_event"])
 
         self.data_proxies.set_status(new_status)
 
