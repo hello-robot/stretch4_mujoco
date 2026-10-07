@@ -563,6 +563,90 @@ def format_results_table(results: list[BenchmarkResult]) -> str:
     "Costs most of the arm's remaining reach and moves the base-mounted exo camera with "
     "it -- see `fr.stretch_spawn_base_offset_xy` for both numbers.",
 )
+@click.option(
+    "--grasp-offset-m",
+    type=float,
+    default=None,
+    help="Move Stretch's commanded grasp centre along the approach, as run_on_real_stretch.py's "
+    "flag. Left unset, --retarget-setup's own offset. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--tool-offset-x-m",
+    type=float,
+    default=None,
+    help="Move the commanded grasp centre forward along the approach, on top of "
+    "--grasp-offset-m, as run_on_real_stretch.py's flag. See "
+    "cameras.RetargetParams.tool_offset_x_m. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--tool-offset-y-m",
+    type=float,
+    default=None,
+    help="Move the commanded grasp centre along the jaw line, as run_on_real_stretch.py's "
+    "flag. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--tool-offset-z-m",
+    type=float,
+    default=None,
+    help="Move the commanded grasp centre across the hand, as run_on_real_stretch.py's flag. "
+    "--policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--include-base/--no-include-base",
+    "include_base",
+    default=True,
+    show_default=True,
+    help="Let Stretch's base join the retargeting IK, as run_on_real_stretch.py's flag. On "
+    "by default in sim, unlike on the robot. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--base-translation/--no-base-translation",
+    "base_translation",
+    default=False,
+    show_default=True,
+    help="Let the base translate in the IK as well as turn, as run_on_real_stretch.py's flag. "
+    "Needs the base in the IK. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--execute-horizon",
+    type=int,
+    default=None,
+    help="Actions of each chunk to execute before querying the model again, as "
+    "run_on_real_stretch.py's flag. Defaults to the policy config's (8). --policy "
+    "molmobot_droid_retarget only.",
+)
+@click.option(
+    "--execute-horizon-do-only-first-n-steps",
+    "only_first_n",
+    type=int,
+    default=None,
+    help="Of the --execute-horizon actions, execute only the first N, then query the model "
+    "again, as run_on_real_stretch.py's flag. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--head-crop",
+    type=str,
+    default=None,
+    help="Crop the exo frame to WxH (or 'droid' for 640x360), as run_on_real_stretch.py "
+    "crops the head frame. --policy molmobot_droid_retarget only.",
+)
+@click.option(
+    "--slow",
+    is_flag=True,
+    help="Move Stretch's lift, arm, wrist and base at what run_on_real_stretch.py --slow "
+    "commands. Consider a larger --task-horizon-steps. --policy molmobot_droid_retarget only. "
+    "See setups.real_slow_motion_limits.",
+)
+@click.option(
+    "--wait-for-arrival/--no-wait-for-arrival",
+    "wait_for_arrival",
+    default=False,
+    show_default=True,
+    help="After each action, hold it until Stretch has stopped moving before querying the "
+    "policy again, as run_on_real_stretch.py's flag. The held steps count towards the "
+    "episode's horizon. --policy molmobot_droid_retarget only.",
+)
 @click.option("--list", "list_only", is_flag=True, help="List the benchmarks and exit.")
 def main(
     benchmark_keys: tuple[str, ...],
@@ -583,6 +667,17 @@ def main(
     retarget_params: str | None,
     change_franka_start_pose_limit_height: bool,
     match_stretch_spawn_pose_to_franka: bool,
+    grasp_offset_m: float | None,
+    tool_offset_x_m: float | None,
+    tool_offset_y_m: float | None,
+    tool_offset_z_m: float | None,
+    include_base: bool,
+    base_translation: bool,
+    execute_horizon: int | None,
+    only_first_n: int | None,
+    head_crop: str | None,
+    slow: bool,
+    wait_for_arrival: bool,
     list_only: bool,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -630,8 +725,62 @@ def main(
         raise click.UsageError(
             "--retarget-params only applies to --policy molmobot_droid_retarget."
         )
+    # run_on_real_stretch.py's flags, which reach the rollout through the
+    # retargeting study's configs and so mean nothing to any other policy.
+    from examples.machine_learning.molmospaces.retargetting.params_search_side_by_side import (
+        parse_frame_size,
+        rollout_from_flags,
+    )
+    from examples.machine_learning.molmospaces.retargetting.setups import (
+        publish_rollout_options,
+    )
+
+    real_robot_flags = {
+        "--grasp-offset-m": grasp_offset_m is not None,
+        "--tool-offset-x-m": tool_offset_x_m is not None,
+        "--tool-offset-y-m": tool_offset_y_m is not None,
+        "--tool-offset-z-m": tool_offset_z_m is not None,
+        "--no-include-base": not include_base,
+        "--base-translation": base_translation,
+        "--execute-horizon": execute_horizon is not None,
+        "--execute-horizon-do-only-first-n-steps": only_first_n is not None,
+        "--head-crop": head_crop is not None,
+        "--slow": slow,
+        "--wait-for-arrival": wait_for_arrival,
+    }
+    given = [flag for flag, set_ in real_robot_flags.items() if set_]
+    if given and policy != "molmobot_droid_retarget":
+        raise click.UsageError(
+            f"{', '.join(given)} {'applies' if len(given) == 1 else 'apply'} only to "
+            "--policy molmobot_droid_retarget."
+        )
+    if base_translation and not include_base:
+        raise click.UsageError(
+            "--base-translation lets the base drive in the IK, and with --no-include-base "
+            "the base is not in the IK at all."
+        )
+    rollout = rollout_from_flags(include_base, execute_horizon, only_first_n, slow, wait_for_arrival)
+    # Published in both directions whatever the policy, so options left in the
+    # environment by an earlier run in the same shell cannot leak into this one.
+    publish_rollout_options(rollout)
+    if rollout:
+        log.info(f"[rollout] {rollout.describe()}")
+
     if policy == "molmobot_droid_retarget":
-        _publish_retarget_params(retarget_setup, retarget_params)
+        from examples.machine_learning.molmospaces.policies import franka_retarget as fr
+
+        # The IK run_on_real_stretch.py and params_search_side_by_side.py solve with,
+        # so one set of flags is one retargeting everywhere. See `fr.publish_ik_choice`.
+        ik_choice = fr.IKChoice(stretch4_kinematics=True, base_translation=base_translation)
+        fr.publish_ik_choice(ik_choice)
+        log.info(f"[ik] Stretch solves with {ik_choice.describe()}")
+        _publish_retarget_params(
+            retarget_setup,
+            retarget_params,
+            grasp_offset_m=grasp_offset_m,
+            tool_offset_m=(tool_offset_x_m, tool_offset_y_m, tool_offset_z_m),
+            head_crop=parse_frame_size(head_crop),
+        )
 
     # Published before the first rollout and before any worker is forked, so both
     # this process and its children agree on where an episode starts. Every
@@ -750,7 +899,13 @@ def main(
         _write_reports(results)
 
 
-def _publish_retarget_params(setup_key: str, override: str | None) -> None:
+def _publish_retarget_params(
+    setup_key: str,
+    override: str | None,
+    grasp_offset_m: float | None = None,
+    tool_offset_m: tuple[float | None, float | None, float | None] = (None, None, None),
+    head_crop: tuple[int, int] | None = None,
+) -> None:
     """Put the retargeting parameters where the eval config will read them.
 
     `run_evaluation` builds the experiment config itself, from a class named by a
@@ -762,7 +917,11 @@ def _publish_retarget_params(setup_key: str, override: str | None) -> None:
     `override` is accepted in whichever form it is to hand -- the description
     line from a report, the JSON from `trials.jsonl`, or a file containing
     either -- because the point of this flag is copy-and-paste from a result.
+
+    `grasp_offset_m`, `tool_offset_m` and `head_crop` are run_on_real_stretch.py's
+    flags, applied on top of both: None leaves the setup's own value.
     """
+    import dataclasses
 
     from examples.machine_learning.molmospaces.retargetting.setups import (
         SETUP_KEYS,
@@ -786,6 +945,19 @@ def _publish_retarget_params(setup_key: str, override: str | None) -> None:
             setup_key, params = params_from_json(text)
         else:
             params = _params_from_description(params, text)
+
+    changes = {
+        field: value
+        for field, value in zip(
+            ("grasp_offset_m", "tool_offset_x_m", "tool_offset_y_m", "tool_offset_z_m"),
+            (grasp_offset_m, *tool_offset_m),
+            strict=True,
+        )
+        if value is not None
+    }
+    if head_crop is not None:
+        changes["exo"] = dataclasses.replace(params.exo, crop_to=head_crop)
+    params = dataclasses.replace(params, **changes)
 
     log.info(f"[retarget] {setup_key}: {params.describe()}")
     publish_params(setup_key, params)

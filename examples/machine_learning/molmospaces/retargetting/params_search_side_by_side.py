@@ -128,8 +128,12 @@ from typing import Any
 import click
 
 # MuJoCo binds the backend named by MUJOCO_GL when it is first imported, which
-# the imports below trigger -- so this has to come before them.
-if sys.platform == "linux":
+# the imports below trigger -- so this has to come before them. `--visualize`
+# needs GLFW instead, for `run_benchmarks.py`'s reason: an EGL context cannot be
+# created while the passive viewer holds a GLFW window open.
+if "--visualize" in sys.argv:
+    os.environ.setdefault("MUJOCO_GL", "glfw")
+elif sys.platform == "linux":
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
@@ -143,6 +147,7 @@ from examples.machine_learning.molmospaces.benchmarks import (  # noqa: E402
     BENCHMARKS,
     resolve_benchmark_dir,
 )
+from examples.machine_learning.molmospaces.configs import VIEWER_ENV_VAR  # noqa: E402
 from examples.machine_learning.molmospaces.policies import franka_retarget as fr  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting import mini_benchmark  # noqa: E402
 from examples.machine_learning.molmospaces.retargetting.cameras import (  # noqa: E402
@@ -2932,6 +2937,14 @@ def rollout_from_flags(
     "towards --episode-steps, so raise that too. Stretch only. Adds 'wait-arrival' to the "
     "run directory. See setups.RetargetStretchMolmoBotDroidPolicy.",
 )
+@click.option(
+    "--visualize",
+    is_flag=True,
+    help="Watch the rollouts as they run, as run_benchmarks.py --visualize does: MuJoCo's "
+    "passive viewer on a free camera aimed at the robot, and the Rerun stream of the "
+    "cameras the policy reads. The Franka half, then the Stretch half. Forces --num-workers "
+    "1. The split-screen videos are still written.",
+)
 def main(
     pair: str,
     param_specs: tuple[str, ...],
@@ -2968,6 +2981,7 @@ def main(
     head_crop: str | None,
     slow: bool,
     wait_for_arrival: bool,
+    visualize: bool,
 ) -> None:
     """Run a matched pair over the same episodes and tile them into one video each."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -2994,6 +3008,11 @@ def main(
             "released benchmark with --episodes instead."
         )
 
+    if visualize and (compose_only or report_only or replay_as_stretch4):
+        raise click.UsageError(
+            "--visualize watches rollouts; --compose-only, --report-only and "
+            "--replay-as-stretch4 run none."
+        )
     if base_translation and not include_base:
         raise click.UsageError(
             "--base-translation lets the base drive in the IK, and with --no-include-base "
@@ -3247,6 +3266,16 @@ def main(
     # caps it there is --episodes, or nothing.
     work_units = scene_count if benchmark is None else (max_episodes or UNCAPPED_WORK_UNITS)
     workers = num_workers if num_workers is not None else affordable_workers(work_units)
+    if visualize:
+        # The viewer runs in the process that runs the rollouts, and only a single
+        # worker runs them in this one. See `run_benchmarks.py --visualize`.
+        if workers != 1:
+            click.secho("--visualize forces --num-workers 1.", fg="yellow")
+        workers = 1
+        os.environ[VIEWER_ENV_VAR] = "1"
+        log.info(f"[visualize] rendering through MUJOCO_GL={os.environ.get('MUJOCO_GL')}")
+    else:
+        os.environ.pop(VIEWER_ENV_VAR, None)
     benchmark_dir = _benchmark_for_run(
         output_root,
         output_dir,
@@ -3259,6 +3288,11 @@ def main(
     # panels and episode numbering separate.
     recorder = SplitPanelRecorder(output_dir / "runs")
     _install(recorder)
+    if visualize:
+        # After `_install`, which clears every other observer.
+        from examples.machine_learning.molmospaces.visualize import install_eval_visualize_hook
+
+        install_eval_visualize_hook()
 
     # Which setups have something on disk to keep: the ones a stopped run got
     # partway through. A fresh run has none, and wipes as it always did.

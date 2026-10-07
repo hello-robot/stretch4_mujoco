@@ -1615,6 +1615,8 @@ class EpisodeVideoRecorder:
                     f"[video] scene panel clamped to the model's offscreen buffer: "
                     f"{width}x{height}"
                 )
+            if _viewer_holds_gl(task):
+                return _SharedEnvRenderer.for_task(task, width, height)
             return mujoco.Renderer(model, height=height, width=width)
         except Exception as error:  # noqa: BLE001 - the camera panels do not need a renderer
             log.warning(
@@ -1693,6 +1695,82 @@ class EpisodeVideoRecorder:
         self._last_body = None
         self._scene_panel = None
         self._grid_width = None
+
+
+def _viewer_holds_gl(task: Any) -> bool:
+    """Whether MuJoCo's passive viewer is open, so no new GL context may be made.
+
+    `launch_passive` runs GLFW on a thread of its own, and creating another GLFW
+    context from the rollout's thread while it does -- which is what
+    `mujoco.Renderer` does under the GLFW backend `--visualize` selects -- takes
+    the process down with `X_GLXMakeCurrent: BadAccess`. That is `--visualize`
+    and `--export-to-mp4` together. The env's own renderer survives it because it
+    was built before the viewer was launched; see `_SharedEnvRenderer`.
+
+    Not tested against `MUJOCO_GL`: MuJoCo binds its backend once, at import, and
+    by the time a rollout runs the variable can read `egl` while GLFW is what is
+    actually bound.
+    """
+    return getattr(task, "viewer", None) is not None
+
+
+class _SharedEnvRenderer:
+    """`mujoco.Renderer`'s interface, drawn through the env's own renderer.
+
+    For when a viewer is open (`_viewer_holds_gl`): the env renders the policy's
+    cameras through an `MjOpenGLRenderer` whose context predates the viewer, so
+    the scene panel is drawn through that one too rather than through a context
+    of its own. Its offscreen buffer is the camera system's, which is smaller
+    than a scene panel, so the panel is rendered at the largest size of its own
+    aspect that fits and scaled up -- every frame stays the size the MP4 was
+    opened with. Not closed here: the env owns it.
+    """
+
+    def __init__(self, renderer: Any, width: int, height: int) -> None:
+        self._renderer = renderer
+        self._size = (width, height)
+        scale = min(1.0, renderer.width / width, renderer.height / height)
+        self._render_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+
+    @classmethod
+    def for_task(cls, task: Any, width: int, height: int) -> _SharedEnvRenderer | None:
+        from molmo_spaces.renderer.opengl_rendering import MjOpenGLRenderer
+
+        renderer = getattr(task.env, "_renderer", None)
+        if not isinstance(renderer, MjOpenGLRenderer):
+            log.warning(
+                "[video] the viewer is open and the env renders through "
+                f"{type(renderer).__name__}, which this cannot share; recording the camera "
+                "feeds only"
+            )
+            return None
+        shared = cls(renderer, width, height)
+        if shared._render_size != shared._size:
+            log.info(
+                f"[video] viewer open: scene panel drawn through the env's renderer at "
+                f"{shared._render_size[0]}x{shared._render_size[1]} and scaled to "
+                f"{width}x{height}"
+            )
+        return shared
+
+    @property
+    def scene(self) -> Any:
+        return self._renderer.scene
+
+    def update_scene(self, data: Any, camera: Any) -> None:
+        self._renderer.update(data, camera)
+
+    def render(self) -> np.ndarray:
+        import cv2
+
+        width, height = self._render_size
+        frame = self._renderer.render(width=width, height=height)
+        if (width, height) != self._size:
+            frame = cv2.resize(frame, self._size, interpolation=cv2.INTER_LINEAR)
+        return frame
+
+    def close(self) -> None:
+        pass
 
 
 @contextlib.contextmanager
@@ -1903,6 +1981,11 @@ def _install_eval_rollout_hook(observer: Any) -> None:
     @functools.wraps(original_run_single_rollout)
     def run_single_rollout(episode_seed: int, task: Any, policy: Any, **kwargs: Any) -> bool:
         observers = list(_EVAL_OBSERVERS)
+        # `BaseMujocoTask.viewer` is MolmoSpaces' own placeholder for this, but the
+        # eval runner hands the viewer over as an argument without filling it in --
+        # and the recorder has to know one is open; see `_viewer_holds_gl`.
+        if getattr(task, "viewer", None) is None and kwargs.get("viewer") is not None:
+            task.viewer = kwargs["viewer"]
         for watcher in observers:
             watcher.start_episode(episode_seed, task, policy=policy)
         success = None

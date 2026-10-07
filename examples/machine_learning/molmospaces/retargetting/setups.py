@@ -1810,6 +1810,14 @@ class _RetargetEvalConfig(JsonBenchmarkEvalConfig):
     sim_dt_ms: float = 2.0
     end_on_success: bool = True
 
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        # `params_search_side_by_side --visualize`, read the way
+        # `configs.Stretch4BenchmarkEvalConfig` reads `run_benchmarks --visualize`.
+        from examples.machine_learning.molmospaces.configs import viewer_requested
+
+        self.use_passive_viewer = viewer_requested()
+
     def _apply_trial(self) -> tuple[str, RetargetParams]:
         """Read this process's trial and register its cameras. Called from `model_post_init`.
 
