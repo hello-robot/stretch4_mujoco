@@ -21,17 +21,27 @@ CAMERAS_PATH = "cameras"
 
 
 def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True) -> None:
+    """
+    The scene camera, when there is one, is the big view; the 3D scene sits in the column with
+    the other cameras and the metrics.
+    """
     rr.init(app_name, spawn=False)
     if spawn:
         rr.spawn(memory_limit="5GB")
+    big = "scene" if "scene" in camera_names else None
+    main_view = (
+        rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{big}", name=big)
+        if big
+        else rrb.Spatial3DView(origin="world", name="3D scene")
+    )
+    column = ([rrb.Spatial3DView(origin="world", name="3D scene")] if big else []) + [
+        rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in camera_names if name != big
+    ]
     rr.send_blueprint(
         rrb.Blueprint(
             rrb.Horizontal(
-                rrb.Spatial3DView(origin="world", name="Scene"),
-                rrb.Vertical(
-                    *[rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in camera_names],
-                    rrb.TimeSeriesView(origin="metrics", name="Metrics"),
-                ),
+                main_view,
+                rrb.Vertical(*column, rrb.TimeSeriesView(origin="metrics", name="Metrics")),
                 column_shares=[3, 2],
             ),
             collapse_panels=True,
@@ -39,27 +49,41 @@ def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True) -> No
     )
 
 
+def clear_scene() -> None:
+    """Forget the last scene entirely, static geometry included (between benchmark episodes)."""
+    rr.log("world", rr.Clear(recursive=True), static=True)
+
+
 class RerunScene:
     """
-    Logs every visual geom of `model` once, then only the ones under `moving_bodies` (the
-    robot, the target object, the ghost) on each `log()`.
+    Logs every visual geom of `model` once, with the ones that never move placed for good
+    (static), then only the ones under `moving_bodies` (the robot, the target object, the
+    ghost) on each `log()`.
     """
 
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, moving_bodies: list[str]):
         self.model = model
         self.scene = RerunMujocoRobot(rr, model, "world", SCENE_PATH, tint=None)
-        self.scene.log(data)
         moving = {model.body(name).id for name in moving_bodies if _has_body(model, name)}
         self.moving_geoms = [
             geom for geom in self.scene.geoms if _ancestor_in(model, int(model.geom_bodyid[geom]), moving)
         ]
+        moving_set = set(self.moving_geoms)
+        for geom in self.scene.geoms:
+            if geom not in moving_set:
+                self._log_pose(geom, data, static=True)
+        self.log(data)
+
+    def _log_pose(self, geom: int, data: mujoco.MjData, static: bool = False) -> None:
+        rr.log(
+            self.scene._paths[geom],
+            rr.Transform3D(translation=data.geom_xpos[geom], mat3x3=data.geom_xmat[geom].reshape(3, 3)),
+            static=static,
+        )
 
     def log(self, data: mujoco.MjData) -> None:
         for geom in self.moving_geoms:
-            rr.log(
-                self.scene._paths[geom],
-                rr.Transform3D(translation=data.geom_xpos[geom], mat3x3=data.geom_xmat[geom].reshape(3, 3)),
-            )
+            self._log_pose(geom, data)
 
 
 def set_step(step: int) -> None:
