@@ -158,7 +158,7 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
 | `--use_parallel_gripper` | off | Stretch 4 with the parallel jaw gripper (PG4) instead of the Stretch gripper (SG4). |
 | `--grasp-offset-mm x,y,z` | `-9,0,0` with SG4; `4,0,0` with PG4 | Stretch's tool relative to the Franka TCP, in the TCP frame (x = approach, y = between the fingers). The defaults line each tool's fingers up with the Robotiq's. The policy never sees it. |
 | `--grasp-offset-deg roll,yaw,pitch` | `0,0,0` | The same, rotations about x, z and y. |
-| `--exo_camera droid\|left\|right\|center` | `center` | The policy's exo view. `droid` is the DROID shoulder camera where the virtual Franka's would be (sim only). |
+| `--exo_camera droid\|left\|right\|center` | `left` | The policy's exo view. `droid` is the DROID shoulder camera where the virtual Franka's would be (sim only). |
 | `--gripper_camera left\|right` | `left` | Which gripper camera stands in for the wrist camera. |
 | `--include_franka` | off | Overlay the Franka being driven: see-through, no collisions. Moving in Rerun and the scene camera. In MuJoCo's viewer it is static at home, in geom group 5 (press `5` to show it). It is in group 5 so that none of Stretch's cameras, and so not the policy, can see it. |
 
@@ -177,7 +177,7 @@ All are run as modules from the repo root, e.g. `python -m examples.vla.molmobot
 
 A benchmark run writes to `outputs/molmobot_droid/<run name>/`. The run name is the robot
 plus the flags, joined with underscores, e.g.
-`stretch4_exo-center_grip-left_eh-8_n-2_crop-droid_slow-0_wait-1_pg-0_offmm--9,0,0_offdeg-0,0,0_ghost-0`.
+`stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-0_wait-1_pg-0_offmm--9,0,0_offdeg-0,0,0_ghost-0`.
 The directory contains:
 
 - `<run name>_ep<#>_<camera>.mp4` for each camera: `exo` and `wrist` (what the policy saw),

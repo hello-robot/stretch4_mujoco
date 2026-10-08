@@ -105,8 +105,8 @@ STRETCH_GRIPPER_TOOL = "eoa_wrist_dw4_tool_sg4"
 PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
-    STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
-    PARALLEL_GRIPPER_TOOL: (4.0, 0.0, 0.0),
+    STRETCH_GRIPPER_TOOL: (-9.0 + 101, 21.0, 17.0),
+    PARALLEL_GRIPPER_TOOL: (4.0 + 33, 21.0, 17.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
 compared to the Robotiq's relative to its grasp_site, so the fingers line up with the Franka's."""
@@ -123,7 +123,7 @@ class RetargetParams:
     """x (approach), y (between the fingers), z. None: DEFAULT_GRASP_OFFSET_MM for the tool."""
     grasp_offset_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     """(roll, yaw, pitch) about the TCP's x (approach), z and y axes."""
-    exo_camera: str = "center"
+    exo_camera: str = "left"
     gripper_camera: str = "left"
     use_parallel_gripper: bool = False
 
@@ -279,7 +279,7 @@ def retarget_options(function):
             help="roll,yaw,pitch offset of Stretch's tool from the Franka TCP, about the TCP's "
             "x, z and y axes. Hidden from the policy.",
         ),
-        exo_camera_option("center"),
+        exo_camera_option("left"),
         click.option(
             "--gripper_camera",
             "--gripper-camera",
