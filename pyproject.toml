@@ -11,7 +11,7 @@ dependencies = [
     "hello-robot-stretch4-urdf>=2026.5.6",
     "matplotlib>=3.10.1",
     "mujoco~=3.5.0",
-    "numpy==2.2.5",
+    "numpy==2.2.6",
     "opencv-python",
     "pynput>=1.8.1",
     "rerun-sdk>=0.23.1",
@@ -48,6 +48,15 @@ line-length = 100
 
 [tool.uv.sources]
 molmo-spaces = { git = "https://github.com/allenai/molmospaces.git" }
+# Blackwell GPUs (sm_120, e.g. RTX 5090) need a CUDA 12.8 build of torch; the default
+# PyPI wheel has no kernels for them.
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [project.optional-dependencies]
 dev = [
@@ -66,4 +75,30 @@ molmo = [
 ]
 digital-twin = [
     "hello-robot-stretch4-body",
+]
+# examples/vla/molmobot_droid: MolmoBot-DROID retargeted onto Stretch 4. MolmoBot's own code
+# is cloned at runtime (see examples/vla/molmobot_droid/checkpoint.py) because it pins
+# Python 3.11; these are the packages its inference path imports.
+molmobot-droid = [
+    "molmo-spaces[mujoco]",
+    "hello-robot-stretch4-kinematics>=2026.9.15",
+    "hello-robot-stretch4-body",
+    "pyzmq",
+    "imageio[ffmpeg]",
+    "huggingface_hub",
+    "torch>=2.7.1",
+    "torchvision",
+    "accelerate",
+    "av",
+    "cached_path",
+    "cached_property",
+    "einops",
+    "einops-exts",
+    "fiddle",
+    "hydra-core",
+    "rich",
+    "sentencepiece",
+    "tokenizers",
+    "torchmetrics",
+    "transformers~=5.4.0",
 ]
