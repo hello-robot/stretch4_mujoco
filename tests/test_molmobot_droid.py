@@ -234,7 +234,8 @@ def test_grasp_offset_moves_stretch_but_not_the_franka_state():
 
 def test_unreachable_target_is_clamped_or_refused():
     """The Franka's home pose over a tall counter is above Stretch's lift; it goes as close as it can."""
-    pose, retargeter = make_retargeter(link0_height=0.671)  # FrankaPickDroidMiniBench episode 0
+    # fr3_link0 at 0.75 m: the Franka's downward TCP at 1.185 m, just over what Stretch reaches.
+    pose, retargeter = make_retargeter(link0_height=0.75)
     targets = retargeter.franka_to_stretch(
         np.append(checkpoint.FRANKA_HOME_QPOS, 0), pose.matrix(), StretchJoints(0.6, 0.1, 0, 0, 0, 1)
     )
@@ -304,14 +305,16 @@ def test_run_name_joins_flags_with_underscores():
     flags = RetargetParams(grasp_offset_mm=(0, 5, 0), slow=True).flags()
     name = run_name("stretch4", {**flags, "include_franka": False})
     assert name == (
-        "stretch4_exo-center_grip-left_eh-8_n-2_crop-droid_slow-1_wait-1_pg-0_offmm-0,5,0_offdeg-0,0,0_ghost-0"
+        "stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-1_wait-1_pg-0_offmm-0,5,0_offdeg-0,0,0_ghost-0"
     )
 
 
-@pytest.mark.parametrize("use_parallel_gripper, offset", [(False, (-9, 0, 0)), (True, (4, 0, 0))])
-def test_default_grasp_offset_per_tool(use_parallel_gripper, offset):
+@pytest.mark.parametrize("use_parallel_gripper", [False, True])
+def test_default_grasp_offset_per_tool(use_parallel_gripper):
+    from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import DEFAULT_GRASP_OFFSET_MM
+
     params = RetargetParams(use_parallel_gripper=use_parallel_gripper)
-    assert params.effective_grasp_offset_mm == offset
+    assert params.effective_grasp_offset_mm == DEFAULT_GRASP_OFFSET_MM[params.tool_name]
     assert RetargetParams(use_parallel_gripper=use_parallel_gripper, grasp_offset_mm=(1, 2, 3)).effective_grasp_offset_mm == (1, 2, 3)
 
 
