@@ -20,6 +20,7 @@ stretch4_mujoco.)
 
 import math
 import os
+import uuid
 
 import mujoco
 import numpy as np
@@ -135,7 +136,10 @@ def rotation_error_deg(a: np.ndarray, b: np.ndarray) -> float:
 
 @pytest.fixture
 def rerun_recording(request):
-    rr.init("stretch4_retargeting_test", spawn=False)
+    # A recording of its own: `rr.init` reuses the process's recording id, so the parametrized
+    # runs would share one, and the Stretch gripper's geoms the parallel gripper's scene lacks
+    # would hang about where the first run left them.
+    rr.init("stretch4_retargeting_test", recording_id=f"{request.node.name}-{uuid.uuid4().hex[:8]}", spawn=False)
     save_to = os.environ.get("RERUN_SAVE")
     if save_to:
         rr.save(save_to)
@@ -162,6 +166,9 @@ def test_stretch_follows_franka_across_wide_poses(rerun_recording, use_parallel_
 
     errors, followed = [], []
     for index, franka_q7 in enumerate(wide_franka_poses(np.random.default_rng(7), retargeter)):
+        # Each pose is a new target anywhere in the range, not the next step of a motion, so
+        # the per-step jump limit (which keeps a policy's motion from flipping the wrist) is off.
+        retargeter.at_start = True
         targets = retargeter.franka_to_stretch(np.append(franka_q7, 0.0), world_from_footprint, joints)
         assert targets is not None, f"pose {index}: Stretch cannot reach it"
 
