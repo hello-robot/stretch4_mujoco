@@ -1,0 +1,991 @@
+"""
+Retarget MolmoBot-DROID's Franka actions onto Stretch 4, and Stretch 4's state back onto the
+Franka, by matching the tool centre point (TCP).
+
+    Franka joints --FK--> grasp_site pose --(mount, TCP alignment, grasp offset)-->
+    Stretch grasp_center_link pose --stretch4_kinematics IK--> base rotation, lift, arm,
+    wrist yaw/pitch/roll
+
+The virtual Franka stands where `custom_scene` puts it: `fr3_link0` above Stretch's starting
+footprint, facing the same way, at the height molmospaces trains at. Both robots reach along
+their +x, so no extra mount rotation is needed. FK/IK of the Franka is `droid.FrankaKinematics`;
+Stretch's is `stretch4_kinematics.StretchKinematics` (6 DOF for a 6-D pose: base rotation,
+lift, arm, and the three wrist joints; base translation is not used).
+
+The grasp offset (`--grasp-offset-mm`, `--grasp-offset-deg`) moves where Stretch's real tool
+goes relative to the Franka's TCP, in the TCP frame. The policy never sees it: Stretch's state
+has it removed again before it is mapped back to Franka joints.
+
+Frames: Franka's `grasp_site` approaches along +z with the fingers on y; Stretch's
+`grasp_center_link` approaches along +x with the fingers on y. `TCP_ALIGN` maps one onto the
+other and puts both wrist cameras on the same side.
+"""
+
+from __future__ import annotations
+
+import functools
+import math
+import time
+from dataclasses import dataclass
+
+import click
+import cv2
+import numpy as np
+
+from examples.vla.molmobot_droid.checkpoint import (
+    ACTION_HORIZON,
+    DROID_IMAGE_SIZE,
+    FRANKA_HOME_QPOS,
+    GRIPPER_CLOSED,
+    POLICY_DT,
+    ROBOTIQ_DRIVER_CLOSED,
+    ROBOTIQ_DRIVER_OPEN,
+)
+from examples.vla.molmobot_droid.droid import (
+    EXO_CAMERAS,
+    HEAD_CAMERAS,
+    FrankaKinematics,
+    FrankaSpawn,
+    Observation,
+    make_transform,
+    pose_to_transform,
+    rotz,
+)
+
+STRETCH_TCP = "grasp_center_link"
+
+TCP_ALIGN = np.array(
+    [
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+"""Pose of Stretch's `grasp_center_link` axes in Franka's `grasp_site` frame (same origin)."""
+
+TCP_FLIP = np.diag([1.0, -1.0, -1.0, 1.0])
+"""Half a turn about the TCP's approach (x) axis. Both grippers are two symmetric fingers, so a
+grasp turned this way is the same grasp: the retargeter uses it when Stretch's wrist cannot
+reach the orientation as given (its roll cannot pass -65 degrees, for one)."""
+
+GRIPPER_CAMERAS = ("left", "right")
+HEAD_CROPS = ("droid", "none")
+
+SLOW_FACTOR = 0.2
+"""`--slow` runs every joint at 20% of its default speed (80% slower)."""
+
+ARM_RANGE = (0.0, 0.52)
+"""Stretch 4 telescoping arm travel, m (the `arm` actuator's range)."""
+
+LIFT_RANGE = (0.0, 1.2)
+
+END_STOP_MARGIN = 0.005
+"""m. Lift and arm targets stay this far inside their travel: driven into an end stop, a joint
+pushes on it and trips its guarded contact."""
+
+MIN_BASE_ROTATION = math.radians(0.3)
+"""Base rotations smaller than this are skipped rather than commanded."""
+
+STEP_ARRIVAL_TIMEOUT = 3.0
+"""s. A step moves each joint 0.2 rad at most, so this only runs out when something holds a
+joint back (a guarded contact), and then waiting longer does not help."""
+
+MAX_CLAMPED_POSITION_ERROR = 0.05
+MAX_CLAMPED_ROTATION_ERROR = math.radians(20)
+"""How far from an unreachable target Stretch may go instead (m, rad); further is a failure."""
+
+
+# ---------------------------------------------------------------------------
+# Parameters and CLI flags
+# ---------------------------------------------------------------------------
+
+
+STRETCH_GRIPPER_TOOL = "eoa_wrist_dw4_tool_sg4"
+PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
+
+DEFAULT_GRASP_OFFSET_MM = {
+    STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
+    PARALLEL_GRIPPER_TOOL: (4.0, 0.0, 0.0),
+}
+"""Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
+compared to the Robotiq's relative to its grasp_site, so the fingers line up with the Franka's."""
+
+
+@dataclass
+class RetargetParams:
+    slow: bool = False
+    wait_for_arrival: bool = True
+    head_crop: str = "droid"
+    execute_horizon: int = 8
+    execute_first_n: int = 2
+    grasp_offset_mm: tuple[float, float, float] | None = None
+    """x (approach), y (between the fingers), z. None: DEFAULT_GRASP_OFFSET_MM for the tool."""
+    grasp_offset_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """(roll, yaw, pitch) about the TCP's x (approach), z and y axes."""
+    exo_camera: str = "center"
+    gripper_camera: str = "left"
+    use_parallel_gripper: bool = False
+
+    def __post_init__(self):
+        if not 1 <= self.execute_first_n <= self.execute_horizon <= ACTION_HORIZON:
+            raise ValueError(
+                "Need 1 <= --execute-horizon-do-only-first-n-steps <= --execute-horizon <= "
+                f"{ACTION_HORIZON}, got {self.execute_first_n} and {self.execute_horizon}"
+            )
+        if self.exo_camera not in EXO_CAMERAS:
+            raise ValueError(f"--exo_camera must be one of {EXO_CAMERAS}")
+        if self.gripper_camera not in GRIPPER_CAMERAS:
+            raise ValueError(f"--gripper_camera must be one of {GRIPPER_CAMERAS}")
+        if self.head_crop not in HEAD_CROPS:
+            raise ValueError(f"--head-crop must be one of {HEAD_CROPS}")
+
+    @property
+    def tool_name(self) -> str:
+        """The stretch4_urdf / stretch4_mujoco tool: the Stretch gripper (SG4) or parallel (PG4)."""
+        return PARALLEL_GRIPPER_TOOL if self.use_parallel_gripper else STRETCH_GRIPPER_TOOL
+
+    @property
+    def effective_grasp_offset_mm(self) -> tuple[float, float, float]:
+        if self.grasp_offset_mm is not None:
+            return tuple(self.grasp_offset_mm)
+        return DEFAULT_GRASP_OFFSET_MM[self.tool_name]
+
+    @property
+    def tcp_offset(self) -> np.ndarray:
+        """Stretch's tool relative to the Franka's TCP, in the (Stretch-axes) TCP frame."""
+        roll, yaw, pitch = (math.radians(a) for a in self.grasp_offset_deg)
+        rotation = rotz(yaw) @ _roty(pitch) @ _rotx(roll)
+        return make_transform(rotation, np.asarray(self.effective_grasp_offset_mm, dtype=float) / 1000.0)
+
+    def flags(self) -> dict[str, object]:
+        """The CLI flags these came from (spelled as on the command line), for reports and run names."""
+        return {
+            "exo_camera": self.exo_camera,
+            "gripper_camera": self.gripper_camera,
+            **execution_flags(self.execute_horizon, self.execute_first_n),
+            "head-crop": self.head_crop,
+            "slow": self.slow,
+            "wait-for-arrival": self.wait_for_arrival,
+            "use_parallel_gripper": self.use_parallel_gripper,
+            "grasp-offset-mm": ",".join(f"{v:g}" for v in self.effective_grasp_offset_mm),
+            "grasp-offset-deg": ",".join(f"{v:g}" for v in self.grasp_offset_deg),
+        }
+
+
+def execution_flags(execute_horizon: int, execute_first_n: int) -> dict[str, int]:
+    return {
+        "execute-horizon": execute_horizon,
+        "execute-horizon-do-only-first-n-steps": execute_first_n,
+    }
+
+
+def _rotx(angle):
+    c, s = math.cos(angle), math.sin(angle)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+def _roty(angle):
+    c, s = math.cos(angle), math.sin(angle)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+def _parse_triplet(ctx, param, value):
+    if value is None:
+        return None
+    try:
+        values = tuple(float(v) for v in value.split(","))
+    except ValueError:
+        values = ()
+    if len(values) != 3:
+        raise click.BadParameter("expected three comma-separated numbers, e.g. 0,0,10")
+    return values
+
+
+def execution_options(function):
+    """--execute-horizon and --execute-horizon-do-only-first-n-steps."""
+    function = click.option(
+        "--execute-horizon-do-only-first-n-steps",
+        "execute_first_n",
+        type=int,
+        default=2,
+        show_default=True,
+        help="Of the actions kept, execute this many, then discard the rest and query again.",
+    )(function)
+    function = click.option(
+        "--execute-horizon",
+        type=int,
+        default=8,
+        show_default=True,
+        help=f"How many of the {ACTION_HORIZON} actions in each predicted chunk to keep.",
+    )(function)
+    return function
+
+
+def exo_camera_option(default: str):
+    return click.option(
+        "--exo_camera",
+        "--exo-camera",
+        "exo_camera",
+        type=click.Choice(EXO_CAMERAS),
+        default=default,
+        show_default=True,
+        help="droid: the DROID shoulder camera on the Franka. left/right/center: Stretch 4's "
+        "head camera (on the Franka: transplanted to the same place relative to the floor).",
+    )
+
+
+def retarget_options(function):
+    """Every `RetargetParams` flag, for the Stretch 4 scripts."""
+    options = [
+        click.option("--slow", is_flag=True, help="Run every joint at 20% of its default speed."),
+        click.option(
+            "--wait-for-arrival/--no-wait-for-arrival",
+            default=True,
+            show_default=True,
+            help="Wait for Stretch to reach each action before executing the next.",
+        ),
+        click.option(
+            "--head-crop",
+            type=click.Choice(HEAD_CROPS),
+            default="droid",
+            show_default=True,
+            help=f"droid: center-crop head images to the DROID exo camera's "
+            f"{DROID_IMAGE_SIZE[0]}x{DROID_IMAGE_SIZE[1]} aspect, then resize to it.",
+        ),
+        execution_options,
+        click.option(
+            "--use_parallel_gripper",
+            "--use-parallel-gripper",
+            "use_parallel_gripper",
+            is_flag=True,
+            help="Stretch 4 with the parallel jaw gripper (PG4) instead of the Stretch gripper (SG4).",
+        ),
+        click.option(
+            "--grasp-offset-mm",
+            default=None,
+            callback=_parse_triplet,
+            help="x,y,z offset of Stretch's tool from the Franka TCP, in the TCP frame "
+            "(x along the approach, y between the fingers). Hidden from the policy. "
+            "Default: the tool's, to line its fingers up with the Franka's: "
+            + ", ".join(f"{','.join(f'{v:g}' for v in o)} for {t[-3:].upper()}" for t, o in DEFAULT_GRASP_OFFSET_MM.items())
+            + ".",
+        ),
+        click.option(
+            "--grasp-offset-deg",
+            default="0,0,0",
+            show_default=True,
+            callback=_parse_triplet,
+            help="roll,yaw,pitch offset of Stretch's tool from the Franka TCP, about the TCP's "
+            "x, z and y axes. Hidden from the policy.",
+        ),
+        exo_camera_option("center"),
+        click.option(
+            "--gripper_camera",
+            "--gripper-camera",
+            "gripper_camera",
+            type=click.Choice(GRIPPER_CAMERAS),
+            default="left",
+            show_default=True,
+            help="Which gripper camera stands in for the Franka's wrist camera.",
+        ),
+    ]
+    for option in reversed(options):
+        function = option(function)
+    return function
+
+
+def params_from_kwargs(kwargs: dict) -> RetargetParams:
+    """Pop the `retarget_options()` values out of a click command's kwargs."""
+    return RetargetParams(
+        slow=kwargs.pop("slow"),
+        wait_for_arrival=kwargs.pop("wait_for_arrival"),
+        head_crop=kwargs.pop("head_crop"),
+        execute_horizon=kwargs.pop("execute_horizon"),
+        execute_first_n=kwargs.pop("execute_first_n"),
+        grasp_offset_mm=kwargs.pop("grasp_offset_mm"),
+        grasp_offset_deg=kwargs.pop("grasp_offset_deg"),
+        exo_camera=kwargs.pop("exo_camera"),
+        gripper_camera=kwargs.pop("gripper_camera"),
+        use_parallel_gripper=kwargs.pop("use_parallel_gripper"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Images
+# ---------------------------------------------------------------------------
+
+
+def crop_to_aspect(image: np.ndarray, aspect: float) -> np.ndarray:
+    """Largest centered crop with width/height == aspect."""
+    height, width = image.shape[:2]
+    if width / height > aspect:
+        new_width = round(height * aspect)
+        x0 = (width - new_width) // 2
+        return image[:, x0 : x0 + new_width]
+    new_height = round(width / aspect)
+    y0 = (height - new_height) // 2
+    return image[y0 : y0 + new_height]
+
+
+def to_droid_frame(image: np.ndarray) -> np.ndarray:
+    """Center-crop to the DROID camera aspect and resize to DROID_IMAGE_SIZE."""
+    width, height = DROID_IMAGE_SIZE
+    cropped = crop_to_aspect(image, width / height)
+    return cv2.resize(cropped, DROID_IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+
+
+def wrist_view(gripper_image: np.ndarray, flipped: bool) -> np.ndarray:
+    """The wrist image the policy sees: DROID-framed, and turned back upright if the gripper is
+    flipped (TCP_FLIP), so it looks like the Franka's wrist camera either way."""
+    image = to_droid_frame(gripper_image)
+    return np.ascontiguousarray(image[::-1, ::-1]) if flipped else image
+
+
+def prepare_exo(image: np.ndarray, params: RetargetParams) -> np.ndarray:
+    """The exo image the policy sees: head images are cropped per `--head-crop`."""
+    if params.exo_camera in HEAD_CAMERAS and params.head_crop == "droid":
+        return to_droid_frame(image)
+    return image
+
+
+# ---------------------------------------------------------------------------
+# Kinematics
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StretchJoints:
+    """Stretch 4's arm joints, as its simulator and RobotClient report them."""
+
+    lift: float
+    arm: float
+    wrist_yaw: float
+    wrist_pitch: float
+    wrist_roll: float
+    gripper_open_fraction: float
+    """0 closed .. 1 fully open."""
+
+
+@dataclass
+class StretchTargets:
+    base_rotate_by: float
+    lift: float
+    arm: float
+    wrist_yaw: float
+    wrist_pitch: float
+    wrist_roll: float
+    gripper_closed: bool
+    clamped: bool = False
+    """The target was out of reach and this is the closest pose found."""
+    flipped: bool = False
+    """Stretch's gripper is turned half a turn about its approach axis from the Franka's
+    (see TCP_FLIP); its camera image must be turned back for the policy."""
+    tool_error_m: float = 0.0
+
+
+@functools.cache
+def measure_arm_offset() -> float:
+    """
+    How much further out stretch4_kinematics puts the tool than the URDF does, for the same
+    arm extension (m).
+
+    stretch4_urdf's IK-URDF generator merges the four telescoping arm joints into one, and
+    sums their offsets from `joint.origin[3, :3]` (the homogeneous row, always zero) instead of
+    `joint.origin[:3, 3]`, dropping the inner links' offsets. Measuring it here, against the URDF
+    the simulator is built from, keeps this right whether or not that is fixed upstream.
+    """
+    from stretch4_kinematics import StretchJointPositions
+
+    urdf = _stretch_urdf(STRETCH_GRIPPER_TOOL)
+    kinematics = stretch_kinematics()
+
+    def urdf_tcp(arm):
+        cfg = {"lift_joint": 0.6, "wrist_yaw_joint": 0.0, "wrist_pitch_joint": 0.0, "wrist_roll_joint": 0.0}
+        cfg.update({f"arm_l{i}_joint": arm / 4 for i in range(1, 5)})
+        urdf.update_cfg(cfg)
+        return urdf.get_transform(STRETCH_TCP, "base_footprint")[:3, 3]
+
+    axis = urdf_tcp(0.3) - urdf_tcp(0.2)
+    axis /= np.linalg.norm(axis)
+    kin_tcp = kinematics.forward(StretchJointPositions(0, 0, 0, 0.6, 0.2, 0, 0, 0), STRETCH_TCP).translation
+    error = kin_tcp - urdf_tcp(0.2)
+    offset = float(error @ axis)
+    residual = np.linalg.norm(error - offset * axis)
+    if residual > 1e-3:
+        raise RuntimeError(f"stretch4_kinematics disagrees with the URDF by {residual * 1000:.1f} mm off the arm axis")
+    return offset
+
+
+@functools.cache
+def _stretch_urdf(tool_name: str):
+    import yourdfpy
+
+    from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+    return yourdfpy.URDF.load(Stretch4MujocoSimulator.get_urdf_path(tool_name))
+
+
+@functools.cache
+def tool_tcp_correction(tool_name: str) -> np.ndarray:
+    """
+    The tool's `grasp_center_link` in the Stretch gripper's, both hung off `wrist_roll_link`,
+    from the stretch4_mujoco URDFs. Everything up to the wrist roll is the same for every tool,
+    so IK solved for the Stretch gripper's TCP at `goal @ inv(this)` puts this tool's at `goal`.
+
+    (stretch4_kinematics models the parallel gripper only on an unreleased branch; this needs
+    nothing but the Stretch gripper model it ships.)
+    """
+    if tool_name == STRETCH_GRIPPER_TOOL:
+        return np.eye(4)
+    roll_from_sg4 = _stretch_urdf(STRETCH_GRIPPER_TOOL).get_transform(STRETCH_TCP, "wrist_roll_link")
+    roll_from_tool = _stretch_urdf(tool_name).get_transform(STRETCH_TCP, "wrist_roll_link")
+    return np.linalg.inv(roll_from_sg4) @ roll_from_tool
+
+
+WRIST_ROLL_RANGE = (math.radians(-65), math.radians(245))
+"""The wrist roll's travel on the robot (stretch4_body `SE4_wrist_roll_DW4` range_deg) and in the
+simulator (mjcf_generator's FLIP_WRIST_ROLL_RANGE). The URDF, and so stretch4_kinematics, has it
+mirrored as [-245, 65] degrees."""
+
+
+@functools.cache
+def stretch_kinematics():
+    """stretch4_kinematics' model of Stretch 4 with the Stretch gripper, roll limits corrected."""
+    from stretch4_kinematics import StretchKinematics
+
+    kinematics = StretchKinematics()
+    for model in (kinematics.model, kinematics.model_ik):
+        index = model.joints[model.getJointId("wrist_roll_joint")].idx_q
+        model.lowerPositionLimit[index], model.upperPositionLimit[index] = WRIST_ROLL_RANGE
+    return kinematics
+
+
+class FrankaStretchRetargeter:
+    """
+    Maps Franka joint actions to Stretch 4 joint targets and Stretch 4 joints back to the
+    Franka state, for one virtual Franka (`franka`, fixed in the world).
+    """
+
+    def __init__(self, franka: FrankaSpawn, params: RetargetParams):
+        self.franka = franka
+        self.params = params
+        self.franka_kinematics = FrankaKinematics()
+        self.stretch_kinematics = stretch_kinematics()
+        self.arm_offset = measure_arm_offset()
+        # IK runs on the Stretch gripper model; this carries its TCP to the tool's.
+        self.tool_correction = tool_tcp_correction(params.tool_name)
+        self.tool_correction_inv = np.linalg.inv(self.tool_correction)
+        # The IK model's arm runs `arm_offset` ahead of the real one; give it the real travel.
+        for model in (self.stretch_kinematics.model, self.stretch_kinematics.model_ik):
+            index = model.joints[model.getJointId("arm_l4_joint")].idx_q
+            model.lowerPositionLimit[index] = ARM_RANGE[0] + END_STOP_MARGIN - self.arm_offset
+            model.upperPositionLimit[index] = ARM_RANGE[1] - END_STOP_MARGIN - self.arm_offset
+        self.tcp_offset = params.tcp_offset
+        self.franka_tcp_to_stretch_tool = TCP_ALIGN @ self.tcp_offset
+        self.stretch_tool_to_franka_tcp = np.linalg.inv(self.franka_tcp_to_stretch_tool)
+        self.franka_seed = np.array(FRANKA_HOME_QPOS, dtype=float)
+        self.last_state_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
+        self.tcp_flipped = False
+        self.ik_failures = 0
+        self.ik_clamped = 0
+        self.last_targets: StretchTargets | None = None
+        self.last_target_tool_world: np.ndarray | None = None
+
+    # -- Franka -> Stretch --------------------------------------------------
+
+    def stretch_tool_target_world(self, franka_q7) -> np.ndarray:
+        """Where Stretch's `grasp_center_link` should be, in the world, for this Franka pose."""
+        return (
+            self.franka.world_from_link0
+            @ self.franka_kinematics.fk(franka_q7)
+            @ self.franka_tcp_to_stretch_tool
+        )
+
+    def franka_to_stretch(
+        self, action8: np.ndarray, world_from_footprint: np.ndarray, current: StretchJoints
+    ) -> StretchTargets | None:
+        """
+        Stretch targets for a Franka action, from Stretch's current footprint pose and joints.
+
+        Out of reach (Stretch's lift tops out ~0.12 m below a Franka TCP pointing down from
+        1.2 m, for one), the closest pose within MAX_CLAMPED_* is used and counted in
+        `ik_clamped`. Returns None, counted in `ik_failures`, if there is none.
+        """
+        from stretch4_kinematics import StretchJointPositions
+
+        target_world = self.stretch_tool_target_world(action8[:7])
+        self.last_target_tool_world = target_world
+        self.franka_seed = np.asarray(action8[:7], dtype=float)
+        target = np.linalg.inv(world_from_footprint) @ target_world
+        seed = StretchJointPositions(
+            base_x=0.0,
+            base_y=0.0,
+            base_theta=0.0,
+            lift=current.lift,
+            arm=current.arm - self.arm_offset,
+            wrist_yaw=current.wrist_yaw,
+            wrist_pitch=current.wrist_pitch,
+            wrist_roll=current.wrist_roll,
+        )
+        # The grasp as given, or turned half a turn about the approach axis; whichever Stretch
+        # reaches, staying with the current choice while it still works.
+        choices = []
+        for flipped in (self.tcp_flipped, not self.tcp_flipped):
+            goal = (target @ TCP_FLIP if flipped else target) @ self.tool_correction_inv
+            solution, clamped = solve_stretch_ik(self.stretch_kinematics, goal, seed)
+            reached = self.stretch_kinematics.forward(solution, STRETCH_TCP).homogeneous
+            position_error = float(np.linalg.norm(reached[:3, 3] - goal[:3, 3]))
+            rotation_error = _rotation_angle(reached[:3, :3].T @ goal[:3, :3])
+            choices.append((clamped, position_error + 0.1 * rotation_error, flipped, solution, position_error, rotation_error))
+            if not clamped:
+                break
+        clamped, _, flipped, solution, position_error, rotation_error = min(choices, key=lambda c: c[:2])
+        arm = solution.arm + self.arm_offset
+        if (
+            position_error > MAX_CLAMPED_POSITION_ERROR
+            or rotation_error > MAX_CLAMPED_ROTATION_ERROR
+            or not ARM_RANGE[0] - 1e-3 <= arm <= ARM_RANGE[1] + 1e-3
+        ):
+            self.ik_failures += 1
+            return None
+        lift = float(np.clip(solution.lift, LIFT_RANGE[0] + END_STOP_MARGIN, LIFT_RANGE[1] - END_STOP_MARGIN))
+        arm_target = float(np.clip(arm, ARM_RANGE[0] + END_STOP_MARGIN, ARM_RANGE[1] - END_STOP_MARGIN))
+        # Held off an end stop by more than a hair is not reaching the target either.
+        clamped = clamped or abs(lift - solution.lift) > 1e-3 or abs(arm_target - arm) > 1e-3
+        if clamped:
+            self.ik_clamped += 1
+        self.tcp_flipped = flipped
+        if flipped:
+            self.last_target_tool_world = target_world @ TCP_FLIP
+
+        targets = StretchTargets(
+            base_rotate_by=_wrap(solution.base_theta),
+            lift=lift,
+            arm=arm_target,
+            wrist_yaw=solution.wrist_yaw,
+            wrist_pitch=solution.wrist_pitch,
+            wrist_roll=solution.wrist_roll,
+            gripper_closed=bool(action8[7] >= GRIPPER_CLOSED / 2),
+            clamped=clamped,
+            tool_error_m=position_error,
+            flipped=flipped,
+        )
+        self.last_targets = targets
+        return targets
+
+    # -- Stretch -> Franka --------------------------------------------------
+
+    def stretch_tool_world(self, world_from_footprint: np.ndarray, joints: StretchJoints) -> np.ndarray:
+        from stretch4_kinematics import StretchJointPositions
+
+        q = StretchJointPositions(
+            0.0, 0.0, 0.0, joints.lift, joints.arm - self.arm_offset,
+            joints.wrist_yaw, joints.wrist_pitch, joints.wrist_roll,
+        )
+        return world_from_footprint @ self.stretch_kinematics.forward(q, STRETCH_TCP).homogeneous @ self.tool_correction
+
+    def stretch_to_franka(
+        self, world_from_footprint: np.ndarray, joints: StretchJoints
+    ) -> tuple[np.ndarray, bool]:
+        """
+        The Franka state (7 joints + Robotiq driver angle) whose TCP is where Stretch's tool is,
+        with the grasp offset taken back out. Returns (state8, ik_converged).
+
+        The Franka is redundant, so which of its arm poses this is depends on the seed: the
+        last action commanded (see `franka_to_stretch()`), so that when Stretch tracks, the
+        policy sees the arm where it put it.
+        """
+        tool_world = self.stretch_tool_world(world_from_footprint, joints)
+        if self.tcp_flipped:
+            tool_world = tool_world @ TCP_FLIP
+        franka_tcp = (
+            np.linalg.inv(self.franka.world_from_link0) @ tool_world @ self.stretch_tool_to_franka_tcp
+        )
+        # When Stretch could not follow the last command, the arm pose it is in is nearer the
+        # previous state than the command, so fall back on that, then on home.
+        for seed in (self.franka_seed, self.last_state_q7, FRANKA_HOME_QPOS):
+            q7, converged = self.franka_kinematics.ik(franka_tcp, seed)
+            if converged:
+                break
+        self.franka_seed = q7
+        self.last_state_q7 = q7
+        driver = ROBOTIQ_DRIVER_OPEN + (1.0 - np.clip(joints.gripper_open_fraction, 0, 1)) * (
+            ROBOTIQ_DRIVER_CLOSED - ROBOTIQ_DRIVER_OPEN
+        )
+        return np.concatenate([q7, [driver]]), converged
+
+    def reset(self) -> None:
+        self.franka_seed = np.array(FRANKA_HOME_QPOS, dtype=float)
+        self.last_state_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
+        self.tcp_flipped = False
+        self.ik_failures = 0
+        self.ik_clamped = 0
+        self.last_targets = None
+        self.last_target_tool_world = None
+
+
+IK_EXACT_POSITION = 1e-3
+IK_EXACT_ROTATION = math.radians(0.5)
+"""m, rad. Closer than this to the target counts as reaching it rather than being clamped."""
+
+
+WRIST_LIMIT_MARGIN = 0.15
+"""rad. Exact IK solutions with a wrist joint closer than this to a limit are passed over for
+ones that are not, so the next step has room to move."""
+
+
+def solve_stretch_ik(kinematics, target: np.ndarray, seed):
+    """
+    Stretch 4 IK for a `grasp_center_link` pose in the current base_footprint frame:
+    (solution, clamped).
+
+    The 6 DOF (base rotation, lift, arm, wrist yaw/pitch/roll) usually reach a pose several
+    ways, and from a seed against a joint limit the solver stalls, so it starts from several
+    seeds: the current joints, the same with the wrist flipped (yaw + pi, roll - pi), and
+    canonical wrist poses with the base turned toward the target. Of the exact solutions it
+    prefers, in order:
+      1. the gripper upright (|roll| <= 90 degrees): pointing down, yaw and roll turn about
+         nearly the same axis, but the wrist servo cannot hold an upside-down gripper pitched
+         down (it saturates at ~1.2 rad of pitch in simulation);
+      2. every wrist joint WRIST_LIMIT_MARGIN inside its limits;
+      3. the least change from the current joints.
+
+    This is the solver behind `StretchKinematics.inverse_6dof_local()`, called directly because
+    that keeps only exact solutions; for an unreachable target the closest one is wanted.
+    """
+    import pinocchio as pin
+    from stretch4_kinematics import Stretch4IKModes, StretchJointPositions
+
+    target_pose = pin.SE3(target[:3, :3], target[:3, 3])
+    toward = math.atan2(target[1, 3], target[0, 3])
+    # Rz(y + pi) Ry(pi - p) Rx(r + pi) == Rz(y) Ry(p) Rx(r): the same tool orientation.
+    flipped_yaw = seed.wrist_yaw + math.pi if seed.wrist_yaw < math.pi / 2 else seed.wrist_yaw - math.pi
+    flipped_roll = seed.wrist_roll + math.pi
+    if flipped_roll > WRIST_ROLL_RANGE[1]:
+        flipped_roll -= 2 * math.pi
+    seeds = [seed] + [
+        StretchJointPositions(0, 0, base, seed.lift, seed.arm, yaw, pitch, roll)
+        for base, yaw, pitch, roll in [
+            (0, flipped_yaw, math.pi - seed.wrist_pitch, flipped_roll),
+            (toward, 0, math.pi / 2, 0),
+            (toward, math.pi / 2, math.pi / 2, 0),
+            (toward, 0, 0, 0),
+            (0, 0, math.pi / 2, 0),
+            (0, math.pi, math.pi / 2, 0),
+            (0, math.pi / 2, 0, 0),
+        ]
+    ]
+    model = kinematics.model_ik
+    current = seed.to_numpy()
+    exact: list[tuple[tuple, object]] = []
+    best, best_error = None, np.inf
+    for start in seeds:
+        q = kinematics._closed_loop_inverse_kinematics(
+            model,
+            kinematics.data_ik,
+            STRETCH_TCP,
+            target_pose,
+            q_guess=start.to_pinocchio_q(Stretch4IKModes.BASE_ROTATE),
+            max_iter=300,
+        )
+        solution = StretchJointPositions.from_pinocchio_q(q)
+        reached = kinematics.forward(solution, STRETCH_TCP)
+        position_error = np.linalg.norm(reached.translation - target[:3, 3])
+        rotation_error = _rotation_angle(reached.rotation.T @ target[:3, :3])
+        if position_error < IK_EXACT_POSITION and rotation_error < IK_EXACT_ROTATION:
+            # q is [base, lift, arm, yaw, pitch, roll]; the wrist is the last three.
+            margin = min(np.min(q[3:] - model.lowerPositionLimit[3:]), np.min(model.upperPositionLimit[3:] - q[3:]))
+            score = (
+                abs(_wrap(solution.wrist_roll)) > math.pi / 2,
+                margin < WRIST_LIMIT_MARGIN,
+                float(np.linalg.norm(solution.to_numpy()[2:] - current[2:])),
+            )
+            exact.append((score, solution))
+            continue
+        # Closest in position, among those not far off in orientation.
+        error = position_error + (np.inf if rotation_error > MAX_CLAMPED_ROTATION_ERROR else 0)
+        if best is None or error < best_error:
+            best, best_error = solution, error
+    if exact:
+        return min(exact, key=lambda pair: pair[0])[1], False
+    return best, True
+
+
+def _rotation_angle(rotation: np.ndarray) -> float:
+    return float(math.acos(np.clip((np.trace(rotation) - 1) / 2, -1.0, 1.0)))
+
+
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def planar_transform(x: float, y: float, yaw: float, z: float = 0.0) -> np.ndarray:
+    return make_transform(rotz(yaw), [x, y, z])
+
+
+def planar_from_pose(pos, quat_wxyz, floor_z: float = 0.0) -> np.ndarray:
+    """The footprint-on-floor transform of a body pose: its x, y and heading, at floor_z."""
+    rotation = pose_to_transform(pos, quat_wxyz)[:3, :3]
+    yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+    return planar_transform(pos[0], pos[1], yaw, floor_z)
+
+
+# ---------------------------------------------------------------------------
+# Stretch 4 in simulation
+# ---------------------------------------------------------------------------
+
+
+def stretch_cameras_to_use(params: RetargetParams):
+    """Only the cameras the policy needs, so the simulator renders nothing else."""
+    from stretch4_mujoco.enums.stretch_cameras import StretchCameras
+
+    gripper = {
+        "left": StretchCameras.cam_gripper_se4_left_rgb,
+        "right": StretchCameras.cam_gripper_se4_right_rgb,
+    }[params.gripper_camera]
+    cameras = [gripper]
+    if params.exo_camera in HEAD_CAMERAS:
+        # The simulator's center camera is the low-resolution one unless asked otherwise, and
+        # it is reported under `cam_nav_rgb_se4_center`.
+        cameras.append(
+            StretchCameras.cam_nav_rgb_se4_center
+            if params.exo_camera == "center"
+            else HEAD_CAMERAS[params.exo_camera]
+        )
+    return cameras
+
+
+SPAWN_LIFT_FRACTION = 0.9
+"""Stretch spawns with its lift this far up its travel, clear of table tops."""
+
+
+def spawn_stretch4(stretch_scene, params: RetargetParams):
+    """
+    A `Stretch4MujocoSimulator` for a `custom_scene.Stretch4Scene` (not started), rendering only
+    the cameras `params` needs and publishing the robot's and the target object's poses.
+
+    Stretch spawns with its lift SPAWN_LIFT_FRACTION up (see `spawn_with_lift_raised()`): at the
+    model's lift of 0 the gripper is often under a table, which `start()`'s homing would then
+    drive it up into.
+    """
+    from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+    spawn_with_lift_raised(stretch_scene.model, SPAWN_LIFT_FRACTION)
+    sim = Stretch4MujocoSimulator(
+        model=stretch_scene.model,
+        cameras_to_use=stretch_cameras_to_use(params),
+        tool_name=params.tool_name,
+    )
+    sim.watch_bodies(stretch_scene.watched_bodies)
+    return sim
+
+
+def spawn_with_lift_raised(model, fraction: float) -> None:
+    """
+    Start Stretch's lift `fraction` of the way up: its initial `qpos0`, and the `home` keyframe
+    that `Stretch4MujocoSimulator.start()` homes to, so it stays there. The other joints keep
+    the model's home pose.
+    """
+    import mujoco
+
+    low, high = model.joint("lift_joint").range
+    lift = low + fraction * (high - low)
+    model.qpos0[model.joint("lift_joint").qposadr[0]] = lift
+    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if home != -1:
+        model.key_qpos[home][model.joint("lift_joint").qposadr[0]] = lift
+        model.key_ctrl[home][model.actuator("lift").id] = lift
+
+
+def sim_gripper_open_aperture() -> float:
+    """The simulator's gripper command (aperture angle, rad) for fully open."""
+    from stretch4_mujoco.config import robot_settings_se4
+
+    conversion = robot_settings_se4["gripper_conversion"]
+    return 2 * math.asin(conversion["aperture_open_m"] / (2 * conversion["finger_length_m"]))
+
+
+SIM_GRIPPER_CLOSED = 0.0
+"""rad. Fingertips touching: the fingers' ctrlrange stops there, and with an object between them
+the position actuators squeeze it in proportion to how far they are held open."""
+
+
+def joint_speed(actuator: str, params: RetargetParams) -> float | None:
+    """The velocity to command an actuator at: its default, or 20% of it with --slow."""
+    from stretch4_mujoco.config import get_actuator_motion_limits
+
+    if not params.slow:
+        return None
+    limits = get_actuator_motion_limits(actuator, "default")
+    return None if limits is None else SLOW_FACTOR * limits[0]
+
+
+class Stretch4SimEnv:
+    """
+    Stretch 4 in stretch4_mujoco, driven by Franka actions: what the rollout loop and the
+    benchmark step, the same way they step `droid.FrankaDroidEnv`.
+
+    `observe()` returns the Franka-equivalent state and Stretch's own camera images; `step()`
+    retargets an action and moves Stretch, waiting for it to arrive with --wait-for-arrival
+    and otherwise for one policy period of simulated time.
+    """
+
+    robot_root = "stretch4"
+
+    def __init__(self, sim, stretch_scene, params: RetargetParams, mirror):
+        self.sim = sim
+        self.stretch_scene = stretch_scene
+        self.params = params
+        self.mirror = mirror
+        self.retargeter = FrankaStretchRetargeter(stretch_scene.franka, params)
+        self.gripper_open = sim_gripper_open_aperture()
+        self._gripper_closed: bool | None = None
+        self.ik_converged = True
+        self.reverse_ik_failures = 0
+
+    # -- state ------------------------------------------------------------
+
+    def world_from_footprint(self) -> np.ndarray:
+        pos, quat = self.sim.pull_body_poses()["stretch4"]
+        return planar_from_pose(pos, quat, self.stretch_scene.scene.floor_z)
+
+    def joints(self, status=None) -> StretchJoints:
+        status = status or self.sim.pull_status()
+        return StretchJoints(
+            lift=status.lift.pos,
+            arm=status.arm.pos,
+            wrist_yaw=status.wrist_yaw.pos,
+            wrist_pitch=status.wrist_pitch.pos,
+            wrist_roll=status.wrist_roll.pos,
+            gripper_open_fraction=float(np.clip(status.gripper.pos / self.gripper_open, 0, 1)),
+        )
+
+    def camera_images(self) -> tuple[np.ndarray | None, np.ndarray]:
+        """(head image or None, gripper image), RGB and upright, as the simulator renders them."""
+        cameras = self.sim.pull_camera_data()
+        gripper_camera, *head = stretch_cameras_to_use(self.params)
+        gripper = cameras.get_camera_data(gripper_camera, auto_correct_rgb=False)
+        head_image = cameras.get_camera_data(head[0], auto_correct_rgb=False) if head else None
+        return head_image, gripper
+
+    def observe(self) -> Observation:
+        status = self.sim.pull_status()
+        poses = self.sim.pull_body_poses()
+        footprint = planar_from_pose(*poses["stretch4"], self.stretch_scene.scene.floor_z)
+        state8, self.ik_converged = self.retargeter.stretch_to_franka(footprint, self.joints(status))
+        self.reverse_ik_failures += not self.ik_converged
+        self.mirror.update(status, poses)
+        self.mirror.set_ghost(state8[:7])
+
+        head, gripper = self.camera_images()
+        if self.params.exo_camera == "droid":
+            from examples.vla.molmobot_droid.molmospaces.custom_scene import DROID_EXO_IN_STRETCH_SCENE
+
+            exo = self.mirror.render(DROID_EXO_IN_STRETCH_SCENE)
+        else:
+            exo = prepare_exo(head, self.params)
+        extra = {"gripper_raw": gripper}
+        if head is not None:
+            extra["head_raw"] = head
+        return Observation(
+            exo_rgb=exo, wrist_rgb=wrist_view(gripper, self.retargeter.tcp_flipped), state8=state8, extra_cameras=extra
+        )
+
+    def render_scene(self) -> np.ndarray:
+        from examples.vla.molmobot_droid.molmospaces.custom_scene import SCENE_CAMERA
+
+        return self.mirror.render(SCENE_CAMERA, show_ghost=True)
+
+    # -- acting -------------------------------------------------------------
+
+    def step(self, action8: np.ndarray) -> StretchTargets | None:
+        targets = self.retargeter.franka_to_stretch(action8, self.world_from_footprint(), self.joints())
+        start = self.sim.pull_status().time
+        if targets is not None:
+            self.send(targets)
+        else:
+            self.send_gripper(bool(action8[7] >= GRIPPER_CLOSED / 2))
+        self.wait(start)
+        return targets
+
+    def send(self, targets: StretchTargets, params: RetargetParams | None = None) -> None:
+        sim, params = self.sim, params or self.params
+        if abs(targets.base_rotate_by) > MIN_BASE_ROTATION:
+            sim.base.rotate_by(targets.base_rotate_by)
+        sim.lift.move_to(targets.lift, v_m=joint_speed("lift", params))
+        sim.arm.move_to(targets.arm, v_m=joint_speed("arm", params))
+        sim.end_of_arm.wrist_yaw.move_to(targets.wrist_yaw, v_m=joint_speed("wrist_yaw", params))
+        sim.end_of_arm.wrist_pitch.move_to(targets.wrist_pitch, v_m=joint_speed("wrist_pitch", params))
+        sim.end_of_arm.wrist_roll.move_to(targets.wrist_roll, v_m=joint_speed("wrist_roll", params))
+        self.send_gripper(targets.gripper_closed)
+
+    def send_gripper(self, closed: bool) -> None:
+        if closed == self._gripper_closed:
+            return
+        self._gripper_closed = closed
+        # Both grippers take the simulator's aperture angle (stretch4_mujoco maps it per tool).
+        gripper = self.sim.end_of_arm.parallel_gripper if self.params.use_parallel_gripper else self.sim.end_of_arm.stretch_gripper
+        gripper.move_to(SIM_GRIPPER_CLOSED if closed else self.gripper_open)
+
+    def wait(self, command_sim_time: float) -> None:
+        if self.params.wait_for_arrival:
+            self.sim.wait_command(timeout=STEP_ARRIVAL_TIMEOUT, check_interval=0.02)
+        # Never less than one policy period, so the observation history keeps its spacing.
+        while self.sim.is_running() and self.sim.pull_status().time < command_sim_time + POLICY_DT:
+            time.sleep(0.005)
+
+    def move_to_franka_pose(self, franka_q7=FRANKA_HOME_QPOS, timeout: float = 30.0) -> StretchTargets:
+        """
+        Put Stretch where the Franka at `franka_q7` would have its tool, gripper open, and wait
+        for it. Do this before a rollout, so the policy starts from the state it expects.
+        """
+        self.retargeter.reset()
+        self.retargeter.franka_seed = np.asarray(franka_q7, dtype=float)
+        action = np.concatenate([franka_q7, [0.0]])
+        targets = self.retargeter.franka_to_stretch(action, self.world_from_footprint(), self.joints())
+        if targets is None:
+            raise RuntimeError("Stretch 4 cannot reach the Franka's start pose from here")
+        # Slowly: this can be a large wrist swing. The guarded contacts can still stop a joint on
+        # the effort of it alone; a new command releases one, so send again until it arrives.
+        slow = RetargetParams(**{**self.params.__dict__, "slow": True})
+        deadline = time.monotonic() + timeout
+        for _ in range(5):
+            self._gripper_closed = None
+            self.send(targets, slow)
+            self.sim.wait_command(timeout=max(1.0, deadline - time.monotonic()), check_interval=0.05)
+            if self._arrived(targets) or time.monotonic() > deadline:
+                break
+        self.retargeter.ik_failures = self.retargeter.ik_clamped = 0
+        self.reverse_ik_failures = 0
+        return targets
+
+    def _arrived(self, targets: StretchTargets, tolerance: float = 0.02) -> bool:
+        joints = self.joints()
+        return all(
+            abs(getattr(joints, name) - getattr(targets, name)) < tolerance
+            for name in ("lift", "arm", "wrist_yaw", "wrist_pitch", "wrist_roll")
+        )
+
+    def reset(self) -> None:
+        """Back to the Franka's home pose (Stretch's base stays where it is)."""
+        self.move_to_franka_pose(FRANKA_HOME_QPOS)
+
+    def stats(self) -> dict[str, float]:
+        return {
+            "ik_failures": float(self.retargeter.ik_failures),
+            "ik_clamped": float(self.retargeter.ik_clamped),
+            "reverse_ik_failures": float(self.reverse_ik_failures),
+            "furniture_removed": float(len(self.stretch_scene.removed_bodies)),
+        }
+
+    # -- scene state, for success checks ----------------------------------------
+
+    def body_pose(self, name: str) -> tuple[np.ndarray, np.ndarray]:
+        return self.sim.pull_body_poses()[name]
+
+    def body_contacts(self, name: str) -> list[str]:
+        return self.sim.pull_body_contacts()[name]
+
+    def close(self) -> None:
+        self.mirror.close()
