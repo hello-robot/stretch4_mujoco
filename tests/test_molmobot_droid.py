@@ -30,7 +30,6 @@ from examples.vla.molmobot_droid.droid import (  # noqa: E402
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (  # noqa: E402
     STRETCH_TCP,
     TCP_ALIGN,
-    TCP_FLIP,
     FrankaStretchRetargeter,
     RetargetParams,
     StretchJoints,
@@ -205,7 +204,7 @@ def test_franka_to_stretch_and_back():
         footprint = pose.matrix() @ planar_transform(0, 0, targets.base_rotate_by)
         joints = StretchJoints(targets.lift, targets.arm, targets.wrist_yaw, targets.wrist_pitch, targets.wrist_roll, 1)
         tool = retargeter.stretch_tool_world(footprint, joints)
-        expected = retargeter.stretch_tool_target_world(q) @ (TCP_FLIP if targets.flipped else np.eye(4))
+        expected = retargeter.stretch_tool_target_world(q)
         np.testing.assert_allclose(tool, expected, atol=1e-3)
         retargeter.franka_seed = q
         state8, converged = retargeter.stretch_to_franka(footprint, joints)
@@ -262,15 +261,14 @@ def test_ik_respects_the_robots_wrist_roll_range(stretch_mujoco):
             assert lower - 1e-6 <= targets.wrist_roll <= upper + 1e-6
 
 
-def test_flipped_grasp_keeps_the_fingers_on_the_same_line_and_turns_the_wrist_image():
+def test_wrist_view_is_the_gripper_camera_droid_framed():
     from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import wrist_view
 
-    # Half a turn about the approach axis: approach kept, finger axis reversed.
-    np.testing.assert_allclose(TCP_FLIP[:3, :3] @ [1, 0, 0], [1, 0, 0])
-    np.testing.assert_allclose(TCP_FLIP[:3, :3] @ [0, 1, 0], [0, -1, 0])
     image = np.zeros((270, 480, 3), np.uint8)
     image[:10, :10] = 255
-    assert wrist_view(image, flipped=True)[-1, -1].all() and not wrist_view(image, flipped=False)[-1, -1].any()
+    view = wrist_view(image)
+    assert view.shape == (368, 640, 3)
+    assert view[0, 0].all() and not view[-1, -1].any(), "never turned round"
 
 
 def test_params_validation():
