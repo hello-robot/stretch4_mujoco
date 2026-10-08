@@ -425,7 +425,7 @@ class RealStretch4Env:
         self.last_state8 = state8
         return Observation(
             exo_rgb=prepare_exo(message["head_rgb"], self.params),
-            wrist_rgb=wrist_view(message["wrist_rgb"], self.retargeter.tcp_flipped),
+            wrist_rgb=wrist_view(message["wrist_rgb"]),
             state8=state8,
             extra_cameras={"head_raw": message["head_rgb"], "gripper_raw": message["wrist_rgb"]},
         )
