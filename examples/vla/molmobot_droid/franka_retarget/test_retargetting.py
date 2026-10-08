@@ -9,9 +9,6 @@ stretch4_kinematics), sits on the Franka's `grasp_site` (plus the tool's default
 fingers up) within TOLERANCE_MM / TOLERANCE_DEG, for the Stretch gripper and the parallel one,
 and that mapping Stretch back gives the Franka's TCP again.
 
-Where Stretch's wrist cannot turn the gripper as the Franka's is, the retargeter turns it half a
-turn about the approach axis instead (`TCP_FLIP`): the same grasp for two symmetric fingers.
-Those poses are compared against the Franka's TCP turned the same way.
 
 Rerun opens a viewer when there is a display; set RERUN_SAVE=<file.rrd> to record instead.
 
@@ -43,7 +40,6 @@ from examples.vla.molmobot_droid.droid import (  # noqa: E402
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (  # noqa: E402
     TCP_ALIGN,
-    TCP_FLIP,
     FrankaStretchRetargeter,
     RetargetParams,
     StretchJoints,
@@ -74,14 +70,46 @@ def build_scene(tool_name: str):
     return model, mujoco.MjData(model), franka
 
 
-def franka_trajectory(rng: np.random.Generator) -> list[np.ndarray]:
-    """NUM_POSES Franka arm poses wandering away from home, as a policy would command them."""
-    q = np.array(FRANKA_HOME_QPOS, dtype=float)
+STRETCH_RANGES = {
+    "lift": (0.25, 1.10),
+    "arm": (0.0, 0.50),
+    # 0.15 rad inside each wrist limit (yaw and pitch -65..245 degrees, roll -65..245 on the
+    # robot); pitch stops short of folding the gripper back over the arm.
+    "wrist_yaw": (-0.98, 4.12),
+    "wrist_pitch": (-0.98, 2.40),
+    "wrist_roll": (-0.98, 4.12),
+}
+"""Where the test poses come from: Stretch joint values spread across these ranges."""
+
+
+def wide_franka_poses(rng: np.random.Generator, retargeter: FrankaStretchRetargeter) -> list[np.ndarray]:
+    """
+    NUM_POSES Franka arm poses whose TCPs are spread over Stretch's lift, arm and wrist ranges:
+    random Stretch joint values within STRETCH_RANGES, mapped back to the Franka (its TCP where
+    Stretch's tool is, less the grasp offset), keeping only those the Franka reaches too. So
+    every pose is one both robots can take, and the wrist turns well beyond what a pick needs.
+    """
+    franka = retargeter.franka_kinematics
+    footprint = ROBOT_POSE.matrix()
+    seeds = [np.array(FRANKA_HOME_QPOS)] + [
+        np.clip(np.array(FRANKA_HOME_QPOS) + rng.uniform(-1.0, 1.0, 7), franka.lower, franka.upper) for _ in range(4)
+    ]
     poses = []
-    for _ in range(NUM_POSES):
-        q = q + rng.uniform(-0.12, 0.12, 7)
-        q = np.clip(q, np.array(FRANKA_HOME_QPOS) - 0.5, np.array(FRANKA_HOME_QPOS) + 0.5)
-        poses.append(q.copy())
+    while len(poses) < NUM_POSES:
+        values = {name: rng.uniform(*bounds) for name, bounds in STRETCH_RANGES.items()}
+        joints = StretchJoints(gripper_open_fraction=1.0, **values)
+        tool_world = retargeter.stretch_tool_world(footprint, joints)
+        franka_tcp = (
+            np.linalg.inv(retargeter.franka.world_from_link0)
+            @ tool_world
+            @ np.linalg.inv(retargeter.tcp_offset)
+            @ TCP_ALIGN.T
+        )
+        for seed in seeds:
+            q, converged = franka.ik(franka_tcp, seed)
+            if converged:
+                poses.append(q)
+                break
     return poses
 
 
@@ -119,7 +147,7 @@ def rerun_recording(request):
 
 
 @pytest.mark.parametrize("use_parallel_gripper", [False, True], ids=["stretch_gripper", "parallel_gripper"])
-def test_stretch_follows_franka_across_20_poses(rerun_recording, use_parallel_gripper):
+def test_stretch_follows_franka_across_wide_poses(rerun_recording, use_parallel_gripper):
     params = RetargetParams(use_parallel_gripper=use_parallel_gripper)
     model, data, franka = build_scene(params.tool_name)
     retargeter = FrankaStretchRetargeter(franka, params)
@@ -132,9 +160,8 @@ def test_stretch_follows_franka_across_20_poses(rerun_recording, use_parallel_gr
     # The ghost is in a geom group MuJoCo hides by default; RerunScene draws every visual geom.
     scene = rerun_scene.RerunScene(model, data, ["stretch4", franka.base_name])
 
-    errors = []
-    flips = 0
-    for index, franka_q7 in enumerate(franka_trajectory(np.random.default_rng(7))):
+    errors, followed = [], []
+    for index, franka_q7 in enumerate(wide_franka_poses(np.random.default_rng(7), retargeter)):
         targets = retargeter.franka_to_stretch(np.append(franka_q7, 0.0), world_from_footprint, joints)
         assert targets is not None, f"pose {index}: Stretch cannot reach it"
 
@@ -148,8 +175,6 @@ def test_stretch_follows_franka_across_20_poses(rerun_recording, use_parallel_gr
         # Where Stretch's tool belongs: the Franka's TCP, with the tool's default grasp offset that
         # lines its fingers up with the Robotiq's.
         franka_tcp = site_transform(data, f"{franka.prefix}gripper/grasp_site") @ TCP_ALIGN @ params.tcp_offset
-        if targets.flipped:
-            franka_tcp = franka_tcp @ TCP_FLIP
         stretch_tcp = body_transform(data, "grasp_center_link")
         position_mm = float(np.linalg.norm(franka_tcp[:3, 3] - stretch_tcp[:3, 3]) * 1000)
         rotation_deg = rotation_error_deg(franka_tcp, stretch_tcp)
@@ -168,9 +193,15 @@ def test_stretch_follows_franka_across_20_poses(rerun_recording, use_parallel_gr
             {"position_error_mm": position_mm, "rotation_error_deg": rotation_deg, "reverse_error_mm": reverse_mm}
         )
         errors.append((index, position_mm, rotation_deg, reverse_mm, targets.clamped, converged))
-        flips += targets.flipped
+        followed.append([joints.lift, joints.arm, joints.wrist_yaw, joints.wrist_pitch, joints.wrist_roll])
 
-    print(f"\n{params.tool_name}: {NUM_POSES} poses, {flips} with the gripper turned half a turn:")
+    spread = np.array(followed)
+    print(f"\n{params.tool_name}: {NUM_POSES} poses; Stretch followed through")
+    for name, column, scale, unit in [
+        ("lift", 0, 1, "m"), ("arm", 1, 1, "m"),
+        ("wrist yaw", 2, 180 / math.pi, "deg"), ("wrist pitch", 3, 180 / math.pi, "deg"), ("wrist roll", 4, 180 / math.pi, "deg"),
+    ]:
+        print(f"  {name:12s} {spread[:, column].min() * scale:7.2f} .. {spread[:, column].max() * scale:7.2f} {unit}")
     for index, position_mm, rotation_deg, reverse_mm, *_ in errors:
         print(f"  {index:2d}: {position_mm:.3f} mm, {rotation_deg:.3f} deg, back to the Franka {reverse_mm:.3f} mm")
     for index, position_mm, rotation_deg, reverse_mm, clamped, converged in errors:
