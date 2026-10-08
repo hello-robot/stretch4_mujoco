@@ -334,7 +334,7 @@ FLAG_ABBREVIATIONS = {
 
 
 def run_name(robot: str, flags: dict[str, object]) -> str:
-    """e.g. "stretch4_exo-center_grip-right_eh-8_n-2_crop-droid_slow-0_wait-1_offmm-0,0,0_offdeg-0,0,0"."""
+    """e.g. "stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-0_wait-1_pg-0_offmm-0,0,0_offdeg-0,0,0"."""
     parts = [robot]
     for key, value in flags.items():
         if isinstance(value, bool):
