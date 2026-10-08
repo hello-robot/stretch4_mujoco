@@ -1,5 +1,5 @@
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import cv2
 import numpy as np
 
@@ -13,7 +13,18 @@ class StatusStretchCameras:
     A dataclass and helper methods to pack camera data.
     """
     time: float
+    """Simulation time the newest of these frames was rendered at."""
     fps: float
+
+    camera_times: dict = field(default_factory=dict)
+    """Simulation time each frame was rendered at, keyed by `StretchCameras` name.
+
+    Cameras run at their own rates and a batch is assembled over several
+    milliseconds of simulation, so two frames published together are not
+    necessarily simultaneous. Use `get_camera_time()` when timing matters --
+    triangulating a moving object across the head pair, say, or differentiating
+    a position to get a velocity.
+    """
 
     cam_gripper_rgb: np.ndarray|None = None
     cam_gripper_depth:np.ndarray|None = None
@@ -120,6 +131,14 @@ class StatusStretchCameras:
             raise ValueError(f"Tried to get {camera} data, but it is empty or not implemented.")
 
         return data
+
+    def get_camera_time(self, camera: StretchCameras) -> float:
+        """When `camera`'s frame was rendered, in simulation time.
+
+        Falls back to the batch's own `time` for a camera that did not report
+        one.
+        """
+        return self.camera_times.get(camera.name, self.time)
 
     def set_camera_data(self, camera:StretchCameras, data:np.ndarray):
         """
