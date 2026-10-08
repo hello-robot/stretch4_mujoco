@@ -111,7 +111,7 @@ class MujocoServerCameraManagerSync:
         width, height = settings.width, settings.height
 
         if for_camera.is_fisheye:
-            # A fisheye renders cube faces rather than the frame itself.
+            # A fisheye renders several pinhole views rather than the frame itself.
             fisheye_renderer = for_camera.create_fisheye_renderer()
             self.fisheye_renderers[for_camera] = fisheye_renderer
             width, height = fisheye_renderer.render_size
@@ -152,7 +152,7 @@ class MujocoServerCameraManagerSync:
         fisheye_renderer = self.fisheye_renderers.get(camera)
         if fisheye_renderer is not None:
             with self.camera_lock:
-                fisheye_renderer.render_faces(
+                fisheye_renderer.render_views(
                     renderer, self.mujoco_server.mjdata, camera.camera_name_in_mjcf
                 )
             return (camera, fisheye_renderer.project())
