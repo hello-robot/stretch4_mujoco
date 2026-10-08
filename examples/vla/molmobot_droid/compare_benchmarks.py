@@ -6,7 +6,7 @@ per-episode results.
 Usage:
     python -m examples.vla.molmobot_droid.compare_benchmarks \\
         --franka outputs/molmobot_droid/franka_exo-droid_eh-8_n-2 \\
-        --stretch4 outputs/molmobot_droid/stretch4_exo-center_grip-right_eh-8_n-2_...
+        --stretch4 outputs/molmobot_droid/stretch4_exo-left_grip-left_eh-8_n-2_...
 """
 
 from __future__ import annotations
