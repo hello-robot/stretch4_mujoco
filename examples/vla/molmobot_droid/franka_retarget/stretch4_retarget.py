@@ -72,7 +72,7 @@ reach the orientation as given (its roll cannot pass -65 degrees, for one)."""
 GRIPPER_CAMERAS = ("left", "right")
 HEAD_CROPS = ("droid", "none")
 
-SLOW_FACTOR = 0.2
+SLOW_FACTOR = 0.1
 """`--slow` runs every joint at 20% of its default speed (80% slower)."""
 
 ARM_RANGE = (0.0, 0.52)
