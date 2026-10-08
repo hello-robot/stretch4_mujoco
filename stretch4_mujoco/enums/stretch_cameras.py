@@ -6,6 +6,7 @@ from typing import Callable
 import numpy as np
 
 from stretch4_mujoco import config, utils
+from stretch4_mujoco.fisheye_renderer import FisheyeRenderer
 
 
 class StretchCameras(Enum):
@@ -156,10 +157,10 @@ class StretchCameras(Enum):
         raise NotImplementedError(f"Camera {self} is_depth is not implemented")
 
     @property
-    def applies_fisheye_distortion(self) -> bool:
-        """Whether `post_processing_callback` warps this camera's frames.
+    def is_fisheye(self) -> bool:
+        """Whether this camera is rendered through `fisheye_renderer`.
 
-        Only the two head cameras do. The centre camera carries distortion
+        Only the two head cameras are. The centre camera carries distortion
         parameters as well, but its frames are left as MuJoCo rendered them.
         """
         return self in [
@@ -167,57 +168,17 @@ class StretchCameras(Enum):
             StretchCameras.cam_nav_rgb_se4_right,
         ] and self.initial_camera_settings.distortion_params is not None
 
-    def fisheye_params_for_frame(
-        self, width: int, height: int
-    ) -> tuple[float, float, float, float, tuple, float]:
-        """`(fx, fy, cx, cy, distortion_params, fov_deg)` for a frame this size.
-
-        The calibration is for the sensor's own resolution, so a frame rendered
-        at any other size needs it projected across. Carrying the real optical
-        centre matters: it sits ~20px off centre horizontally on these lenses,
-        and re-centring it warps a downscaled frame differently from the
-        full-resolution one.
-        """
+    def create_fisheye_renderer(self) -> FisheyeRenderer:
+        """A `FisheyeRenderer` for this camera's calibration."""
         settings = self.initial_camera_settings
-        if settings.distortion_params is None:
-            raise NotImplementedError(f"Camera {self} has no distortion parameters")
+        if not self.is_fisheye or settings.image_circle_radius_px is None:
+            raise NotImplementedError(f"Camera {self} is not a fisheye camera")
 
         fx, fy = settings.focal
         cx, cy = settings.optical_center
-        fov_deg = float(settings.field_of_view_vertical_in_degrees)
-        scale_x = width / float(settings.width)
-        scale_y = height / float(settings.height)
-
-        if abs(scale_x - scale_y) >= 1e-3 * scale_y:
-            # A frame that is not this camera's shape has no meaningful
-            # principal point, so fall back to a centred approximation rather
-            # than projecting the calibration somewhere it does not belong.
-            # Nothing in the simulation or datagen paths takes this branch; a
-            # hand-fed test image does.
-            return (fx * scale_y, fy * scale_y, width / 2.0, height / 2.0,
-                    settings.distortion_params, fov_deg)
-
-        return (fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y,
-                settings.distortion_params, fov_deg)
-
-    def fisheye_crop_zoom(self, width: int, height: int) -> float:
-        """How far `post_processing_callback` zooms into a frame this size.
-
-        The distortion crops away the surround the pinhole render cannot fill
-        and hands back a frame of the original size, which multiplies the
-        frame's focal length by this and pulls its principal point in with it
-        (`fisheye_crop_rect`). A consumer that reports intrinsics for a
-        distorted frame has to account for it; one that only looks at pixels
-        does not.
-        """
-        _, _, crop_width, _ = self.fisheye_crop_rect(width, height)
-        return width / float(crop_width)
-
-    def fisheye_crop_rect(self, width: int, height: int) -> tuple[int, int, int, int]:
-        """`(x, y, width, height)` of the window the distortion crops to."""
-        fx, fy, cx, cy, distortion_params, fov_deg = self.fisheye_params_for_frame(width, height)
-        return utils.get_fisheye_crop_rect(
-            fx, fy, cx, cy, tuple(distortion_params), width, height, fov_deg
+        return FisheyeRenderer(
+            fx, fy, cx, cy, settings.distortion_params, settings.width, settings.height,
+            settings.image_circle_radius_px,
         )
 
     @property
@@ -228,17 +189,6 @@ class StretchCameras(Enum):
 
         if self == StretchCameras.cam_d435i_depth:
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["d435i"])
-
-        if self.applies_fisheye_distortion:
-
-            def _distort(render: np.ndarray) -> np.ndarray:
-                h, w = render.shape[:2]
-                fx, fy, cx, cy, distortion_params, fov_deg = self.fisheye_params_for_frame(w, h)
-                return utils.apply_fisheye_distortion(
-                    render, fx, fy, cx, cy, distortion_params, fov_deg=fov_deg
-                )
-
-            return _distort
 
         if not self.is_depth:
             return None
@@ -307,6 +257,7 @@ class StretchCameras(Enum):
                     -0.005848339151583135,
                     0.0007940458582321494,
                 ),
+                image_circle_radius_px=825,  # measured on SE4 head_left frames
                 rotate_number_of_times=1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_right:
@@ -332,6 +283,7 @@ class StretchCameras(Enum):
                     -0.005205105236511768,
                     0.0004939891505609986,
                 ),
+                image_circle_radius_px=825,  # measured on SE4 head_left frames, same lens
                 rotate_number_of_times=-1,
             )
         if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
@@ -442,6 +394,8 @@ class CameraSettings:
     """Specify this if they are available. Zeros will be used in `get_distortion_params_d()` otherwise."""
     optical_center_px: tuple[float, float] | None = None
     """Optional (cx, cy) optical center in pixels."""
+    image_circle_radius_px: float | None = None
+    """For a fisheye lens, the radius of the image circle around the optical center. Everything past it is black."""
     rotate_number_of_times: int = 0
     """Number of times to rotate the image (because the sensor is mounted rotated)"""
 

@@ -10,6 +10,7 @@ import numpy as np
 from stretch4_mujoco import config, utils
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
+from stretch4_mujoco.fisheye_renderer import FisheyeRenderer
 from stretch4_mujoco.utils import FpsCounter, switch_to_glfw_renderer
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class MujocoServerCameraManagerSync:
         self.camera_rate = 1 / camera_hz  # Hz to seconds
 
         self.camera_renderers: dict[StretchCameras, mujoco.Renderer] = {}
+        self.fisheye_renderers: dict[StretchCameras, FisheyeRenderer] = {}
 
         self._set_camera_properties_and_create_renderers_in_mujoco(set(cameras_to_use))
 
@@ -106,19 +108,24 @@ class MujocoServerCameraManagerSync:
 
     def _create_camera_renderer(self, for_camera: StretchCameras):
         settings = for_camera.initial_camera_settings
+        width, height = settings.width, settings.height
+
+        if for_camera.is_fisheye:
+            # A fisheye renders cube faces rather than the frame itself.
+            fisheye_renderer = for_camera.create_fisheye_renderer()
+            self.fisheye_renderers[for_camera] = fisheye_renderer
+            width, height = fisheye_renderer.render_size
 
         # Update mujoco's offscreen gl buffer size to accommodate bigger resolutions:
         offscreen_buffer_width = self.mujoco_server.mjmodel.vis.global_.offwidth
         offscreen_buffer_height = self.mujoco_server.mjmodel.vis.global_.offheight
 
-        if settings.width > offscreen_buffer_width:
-            self.mujoco_server.mjmodel.vis.global_.offwidth = settings.width
-        if settings.height > offscreen_buffer_height:
-            self.mujoco_server.mjmodel.vis.global_.offheight = settings.height
+        if width > offscreen_buffer_width:
+            self.mujoco_server.mjmodel.vis.global_.offwidth = width
+        if height > offscreen_buffer_height:
+            self.mujoco_server.mjmodel.vis.global_.offheight = height
 
-        renderer = mujoco.Renderer(
-            self.mujoco_server.mjmodel, width=settings.width, height=settings.height
-        )
+        renderer = mujoco.Renderer(self.mujoco_server.mjmodel, width=width, height=height)
 
         renderer._scene_option.flags[mujoco._enums.mjtVisFlag.mjVIS_RANGEFINDER] = False # Disables the lidar yellow lines.
 
@@ -142,6 +149,14 @@ class MujocoServerCameraManagerSync:
         Use this with the _toggle_camera() functionality in this class.
         """
 
+        fisheye_renderer = self.fisheye_renderers.get(camera)
+        if fisheye_renderer is not None:
+            with self.camera_lock:
+                fisheye_renderer.render_faces(
+                    renderer, self.mujoco_server.mjdata, camera.camera_name_in_mjcf
+                )
+            return (camera, fisheye_renderer.project())
+
         with self.camera_lock:
             renderer.update_scene(data=self.mujoco_server.mjdata, camera=camera.camera_name_in_mjcf)
 
@@ -161,6 +176,7 @@ class MujocoServerCameraManagerSync:
         """
         if camera in self.camera_renderers:
             del self.camera_renderers[camera]
+            self.fisheye_renderers.pop(camera, None)
             return
 
         raise Exception(f"Camera {camera} was not in {self.camera_renderers=}")
