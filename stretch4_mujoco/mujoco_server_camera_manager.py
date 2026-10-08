@@ -45,6 +45,14 @@ class MujocoServerCameraManagerSync:
 
         self.camera_last_render_time: dict[StretchCameras, float] = {}
         self.cached_camera_data: dict[StretchCameras, np.ndarray] = {}
+        self.camera_render_sim_time: dict[StretchCameras, float] = {}
+        """Simulation time each camera's cached pixels were drawn at.
+
+        Not the same as when the batch is published: rendering a pair of head
+        cameras takes tens of milliseconds of simulation, and a camera whose own
+        frame rate has not come round again is served from the cache and is
+        older still. Anything measuring motion needs the time the light was
+        captured, not the time the envelope was posted."""
 
     def close(self):
         """
@@ -87,7 +95,6 @@ class MujocoServerCameraManagerSync:
         Per-camera rates: Center camera runs at 10 Hz; Left/Right nav cameras run at 30 Hz.
         """
         new_imagery = StatusStretchCameras.default()
-        new_imagery.time = self.mujoco_server.mjdata.time
         new_imagery.fps = self.camera_fps_counter.fps
 
         now = time.perf_counter()
@@ -104,7 +111,27 @@ class MujocoServerCameraManagerSync:
             if data is not None:
                 new_imagery.set_camera_data(camera, data)
 
+        self._stamp_times(new_imagery)
         self.mujoco_server.data_proxies.set_cameras(new_imagery)
+
+    def _stamp_times(self, imagery: StatusStretchCameras) -> None:
+        """Record when each camera in `imagery` was actually rendered.
+
+        `imagery.time` becomes the newest of those, so it still advances once
+        per batch for callers watching it for a new frame, but now names a
+        moment the pixels were really taken at rather than one before they were
+        drawn.
+        """
+        imagery.camera_times = {
+            camera.name: sim_time
+            for camera, sim_time in self.camera_render_sim_time.items()
+            if camera in self.camera_renderers
+        }
+        imagery.time = (
+            max(imagery.camera_times.values())
+            if imagery.camera_times
+            else self.mujoco_server.mjdata.time
+        )
 
     def _create_camera_renderer(self, for_camera: StretchCameras):
         settings = for_camera.initial_camera_settings
@@ -152,12 +179,14 @@ class MujocoServerCameraManagerSync:
         fisheye_renderer = self.fisheye_renderers.get(camera)
         if fisheye_renderer is not None:
             with self.camera_lock:
+                self.camera_render_sim_time[camera] = self.mujoco_server.mjdata.time
                 fisheye_renderer.render_views(
                     renderer, self.mujoco_server.mjdata, camera.camera_name_in_mjcf
                 )
             return (camera, fisheye_renderer.project())
 
         with self.camera_lock:
+            self.camera_render_sim_time[camera] = self.mujoco_server.mjdata.time
             renderer.update_scene(data=self.mujoco_server.mjdata, camera=camera.camera_name_in_mjcf)
 
             render = renderer.render()
@@ -342,7 +371,6 @@ class MujocoServerCameraManagerThreaded(MujocoServerCameraManagerSync):
         Uses a ThreadPoolExecutor to render a scene at each camera using the simulator and populate the imagery dictionary with the raw image pixels and camera params.
         """
         new_imagery = StatusStretchCameras.default()
-        new_imagery.time = self.mujoco_server.mjdata.time
         new_imagery.fps = self.camera_fps_counter.fps
 
         # This is a bit hard to read, so here's an explanation,
@@ -359,6 +387,8 @@ class MujocoServerCameraManagerThreaded(MujocoServerCameraManagerSync):
             # Put the rendered image data into the new_imagery dictionary
             (camera, render) = future.result()
             new_imagery.set_camera_data(camera, render)
+
+        self._stamp_times(new_imagery)
 
         # new_imagery.cam_gripper_K = self.get_camera_params(StretchCameras.cam_gripper_rgb)
         # new_imagery.cam_d435i_K = self.get_camera_params(StretchCameras.cam_d435i_rgb)

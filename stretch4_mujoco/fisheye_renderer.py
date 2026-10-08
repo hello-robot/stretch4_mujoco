@@ -246,7 +246,17 @@ class FisheyeRenderer:
         z_axis = np.array(gl_camera.forward, dtype=np.float64)
         y_axis = -np.array(gl_camera.up, dtype=np.float64)
         optical_to_world = np.stack([np.cross(y_axis, z_axis), y_axis, z_axis], axis=1)
-        position = np.array(gl_camera.pos, dtype=np.float64) + z_axis * self.lens_protrusion_m
+        # `scene.camera` is a stereo pair: [0] and [1] are the left and right
+        # eyes, each offset half of `vis.global_.ipd` (34mm by default) along
+        # the camera's x axis. The lens sits at neither -- it sits at their
+        # midpoint, which is the camera's own position. Rendering from
+        # `camera[0]` puts every head frame 34mm to the left of where the
+        # camera is, which is an error the size of a tennis ball at 1m.
+        eye_midpoint = 0.5 * (
+            np.array(gl_camera.pos, dtype=np.float64)
+            + np.array(scene.camera[1].pos, dtype=np.float64)
+        )
+        position = eye_midpoint + z_axis * self.lens_protrusion_m
         near = gl_camera.frustum_near
 
         if renderer._gl_context:
