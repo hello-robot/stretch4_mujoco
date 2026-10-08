@@ -81,7 +81,7 @@ number because anything that prints the fleet id should say what this is.
 """
 
 
-def ensure_fleet_directory(tool_name: str | None = None) -> Path:
+def ensure_fleet_directory(tool_name: str | None = None, rewrite: bool = False) -> Path:
     """Give `stretch4_body` a fleet directory to read, inventing one if there is none.
 
     `RobotParams` reads `$HELLO_FLEET_PATH/$HELLO_FLEET_ID/` **while it is being
@@ -109,10 +109,14 @@ def ensure_fleet_directory(tool_name: str | None = None) -> Path:
     same tool the simulator builds its own model with, so the two halves of a
     twin describe one robot.
 
+    `rewrite` writes the stand-in again even if the variables already point at it, e.g. with
+    the tool a robot turned out to have once connected to (`stretch4_body` reads the files at
+    import, so re-import it afterwards). A real fleet directory is never rewritten.
+
     Returns the fleet directory in use, spoofed or not.
     """
     fleet_path, fleet_id = os.environ.get("HELLO_FLEET_PATH"), os.environ.get("HELLO_FLEET_ID")
-    if fleet_path and fleet_id:
+    if fleet_path and fleet_id and not (rewrite and is_nominal_fleet_directory()):
         return Path(fleet_path) / fleet_id
 
     model_name, _, default_tool = Stretch4MujocoSimulator.get_default_model_batch_tool_names()
@@ -157,6 +161,12 @@ def ensure_fleet_directory(tool_name: str | None = None) -> Path:
         fg="yellow",
     )
     return directory
+
+
+def is_nominal_fleet_directory() -> bool:
+    """Whether stretch4_body is reading `ensure_fleet_directory`'s stand-in."""
+    fleet_path, fleet_id = os.environ.get("HELLO_FLEET_PATH"), os.environ.get("HELLO_FLEET_ID")
+    return bool(fleet_path) and Path(fleet_path) == NOMINAL_FLEET_PATH and fleet_id == NOMINAL_FLEET_ID
 
 
 # Before anything imports `stretch4_body`, which this module does lazily in
