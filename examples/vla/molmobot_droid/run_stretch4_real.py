@@ -44,7 +44,6 @@ from examples.vla.molmobot_droid.droid import (
     RobotPose,
     add_franka_ghost,
     franka_link0_height_for_object,
-    hold_ghost_pose,
     mat_to_quat,
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
@@ -148,7 +147,6 @@ class RobotModel:
         spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[3, 3, 0.1])
         self.franka = add_franka_ghost(spec, RobotPose(0.0, 0.0, 0.0), franka_link0_height_for_object(object_height))
         self.model = spec.compile()
-        hold_ghost_pose(self.model, self.franka)
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
 

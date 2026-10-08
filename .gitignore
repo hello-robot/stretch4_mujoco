@@ -26,3 +26,4 @@ stretch_temp_abs.xml
 
 # Generated motion profile plots from tests/test_movement.py
 tests/motion_profile_plots/
+outputs/
