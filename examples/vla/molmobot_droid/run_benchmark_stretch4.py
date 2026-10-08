@@ -83,7 +83,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                         env.move_to_franka_pose(setup.franka_init_qpos or FRANKA_HOME_QPOS)
                         logger = None
                         if rerun:
-                            rerun_scene.rr.log("world", rerun_scene.rr.Clear(recursive=True))
+                            rerun_scene.clear_scene()
                             env.observe()
                             logger = StretchRerunLogger(env)
 

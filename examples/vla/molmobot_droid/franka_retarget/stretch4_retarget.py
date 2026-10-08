@@ -783,18 +783,29 @@ def spawn_stretch4(stretch_scene, params: RetargetParams):
 
 def spawn_with_lift_raised(model, fraction: float) -> None:
     """
-    Start Stretch's lift `fraction` of the way up: its initial `qpos0`, and the `home` keyframe
-    that `Stretch4MujocoSimulator.start()` homes to, so it stays there. The other joints keep
-    the model's home pose.
+    Start Stretch's lift `fraction` of the way up, and make the `home` keyframe that
+    `Stretch4MujocoSimulator.start()` homes to hold it there. The other joints keep the model's
+    home pose.
+
+    MuJoCo places a slide joint's body at `body_pos + axis * (qpos - qpos0)`, so raising `qpos0`
+    alone would leave the carriage where it was while the joint reads higher. The lift link's
+    origin is moved up by the same amount, so the carriage is where its joint says.
     """
     import mujoco
 
-    low, high = model.joint("lift_joint").range
+    joint = model.joint("lift_joint")
+    low, high = joint.range
     lift = low + fraction * (high - low)
-    model.qpos0[model.joint("lift_joint").qposadr[0]] = lift
+    adr = joint.qposadr[0]
+    delta = lift - model.qpos0[adr]
+    body = joint.bodyid[0]
+    axis_in_parent = np.zeros(3)
+    mujoco.mju_rotVecQuat(axis_in_parent, model.jnt_axis[joint.id], model.body_quat[body])
+    model.body_pos[body] += axis_in_parent * delta
+    model.qpos0[adr] = lift
     home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if home != -1:
-        model.key_qpos[home][model.joint("lift_joint").qposadr[0]] = lift
+        model.key_qpos[home][adr] = lift
         model.key_ctrl[home][model.actuator("lift").id] = lift
 
 
@@ -909,9 +920,9 @@ class Stretch4SimEnv:
         self.wait(start)
         return targets
 
-    def send(self, targets: StretchTargets, params: RetargetParams | None = None) -> None:
+    def send(self, targets: StretchTargets, params: RetargetParams | None = None, rotate_base: bool = True) -> None:
         sim, params = self.sim, params or self.params
-        if abs(targets.base_rotate_by) > MIN_BASE_ROTATION:
+        if rotate_base and abs(targets.base_rotate_by) > MIN_BASE_ROTATION:
             sim.base.rotate_by(targets.base_rotate_by)
         sim.lift.move_to(targets.lift, v_m=joint_speed("lift", params))
         sim.arm.move_to(targets.arm, v_m=joint_speed("arm", params))
@@ -950,9 +961,10 @@ class Stretch4SimEnv:
         # the effort of it alone; a new command releases one, so send again until it arrives.
         slow = RetargetParams(**{**self.params.__dict__, "slow": True})
         deadline = time.monotonic() + timeout
-        for _ in range(5):
+        for attempt in range(5):
             self._gripper_closed = None
-            self.send(targets, slow)
+            # The base rotation is relative: send it once.
+            self.send(targets, slow, rotate_base=attempt == 0)
             self.sim.wait_command(timeout=max(1.0, deadline - time.monotonic()), check_interval=0.05)
             if self._arrived(targets) or time.monotonic() > deadline:
                 break

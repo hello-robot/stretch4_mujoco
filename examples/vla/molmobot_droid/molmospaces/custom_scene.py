@@ -39,7 +39,6 @@ from examples.vla.molmobot_droid.droid import (
     RobotPose,
     add_franka_ghost,
     franka_link0_height_for_object,
-    hold_ghost_pose,
     mat_to_quat,
     pose_to_transform,
     spawn_franka_droid,
@@ -446,8 +445,6 @@ def _build_stretch4_scene(
     add_scene_camera(spec, robot_pose, scene.object_pos)
 
     model = spec.compile()
-    if include_franka:
-        hold_ghost_pose(model, franka)
     return Stretch4Scene(model, scene, robot_pose, franka, include_franka)
 
 

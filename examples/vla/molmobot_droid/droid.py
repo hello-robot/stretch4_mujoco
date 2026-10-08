@@ -376,10 +376,11 @@ def add_franka_ghost(
     """
     Add a see-through Franka that nothing collides with, for overlaying on Stretch 4.
 
-    It has no actuators, so a simulator driving its own robot never commands it, and it is
-    held at `arm_qpos` by joint springs (call `hold_ghost_pose()` on the compiled model to
-    start it there rather than spring into it). Its geoms are in GHOST_GEOM_GROUP: in MuJoCo's
-    viewer, turn that group on (key 5, or Rendering > Geom groups) to see it.
+    It has no actuators, so a simulator driving its own robot never commands it, and joint
+    springs carry it to `arm_qpos` and hold it there. (Starting it there instead would mean
+    changing `qpos0`, which MuJoCo also takes as the joints' zero.) Its geoms are in
+    GHOST_GEOM_GROUP: in MuJoCo's viewer, turn that group on (key 5, or Rendering > Geom groups)
+    to see it.
     """
     spawn = spawn_franka_droid(
         spec, robot_pose, link0_height, exo_camera=None, floor_z=floor_z, prefix=prefix
@@ -413,12 +414,6 @@ def add_franka_ghost(
     for camera in base.find_all("camera"):
         spec.delete(camera)
     return spawn
-
-
-def hold_ghost_pose(model: mujoco.MjModel, spawn: FrankaSpawn, arm_qpos=FRANKA_HOME_QPOS):
-    """Start the ghost at `arm_qpos` (sets `qpos0`, which a new `MjData` starts from)."""
-    for index, joint_name in enumerate(_arm_joint_names(spawn.prefix)):
-        model.qpos0[model.joint(joint_name).qposadr[0]] = arm_qpos[index]
 
 
 def _arm_joint_names(prefix: str) -> list[str]:
