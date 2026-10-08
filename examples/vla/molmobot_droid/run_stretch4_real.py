@@ -1,14 +1,10 @@
 """
 MolmoBot-DROID driving a real Stretch 4, through Franka retargeting, continuously: type an
-instruction and press Enter, and the robot works on it until told otherwise. While it runs:
+instruction and press Enter, and the robot works on it until told otherwise (see KEYS_HELP).
+It asks before it first moves the robot to the start pose.
 
-  - type another instruction + Enter to switch to it straight away;
-  - press Enter or Space (on an empty line) to stop the robot where it is;
-  - type `home` + Enter to stop and go back to the start pose, lift raised first;
-  - type `quit` + Enter, or press Ctrl+C, to stop and exit.
-
-Watch it in Rerun: the policy's views, the raw cameras, the robot and the ghost Franka it is
-retargeted from.
+Rerun shows the robot's cameras and pose live from the moment they arrive, and, while an
+instruction runs, the policy's views and the ghost Franka it is retargeted from.
 
 On the robot, run the image + joint-state publisher from stretch4_compliant_gripper first:
 
@@ -16,7 +12,7 @@ On the robot, run the image + joint-state publisher from stretch4_compliant_grip
 
 with its head and wrist camera sides matching --exo_camera and --gripper_camera. Commands go
 through stretch4_body's `RobotClient`; with --wait-for-arrival (the default) each action waits
-for `wait_command()`. Ctrl+C stops the rollout and the robot.
+for the robot to stop moving.
 
 There is no scene to read the target's height from, so give it with --object-height: the
 virtual Franka stands where molmospaces would put it for an object at that height.
@@ -86,25 +82,32 @@ PARALLEL_GRIPPER_OPEN_MM = 77.0
 DEFAULT_SPEEDS = {"lift": 0.3, "arm": 0.4, "wrist": 7.0, "base_rotate": 2.0}
 
 
-KEYS_HELP = """Type an instruction and press Enter to run it. While it runs:
-  another instruction + Enter   switch to it
-  Enter or Space                stop the robot where it is
-  home + Enter                  stop, raise the lift, go back to the start pose
-  quit + Enter, or Ctrl+C       stop and exit"""
+KEYS_HELP = (
+    "  Type an instruction + Enter   run it (typing another while one runs switches to it)\n"
+    "  Enter or Space                stop the robot where it is\n"
+    "  'home' + Enter                  raise the lift, go back to the start pose\n"
+    "  'quit' + Enter, or Ctrl+C       stop and exit"
+)
 
 MOTION_SUBSYSTEMS = ["arm", "lift", "omnibase", "end_of_arm"]
 LIFT_RANGE = (0.0, 1.2)
 
 
-class KeyCommands:
+class Console:
     """
-    Reads the keyboard on a thread and queues commands for the control loop, without waiting
-    for it: ("stop", None) the moment Enter or Space is pressed on an empty line, else
-    ("text", line) when a line is entered. Falls back to whole lines when stdin is no terminal.
+    The terminal while the robot runs: a status line at the bottom with what is being typed
+    after it, events printed above it, and commands queued for the control loop as they are
+    typed -- ("stop", None) the moment Enter or Space is pressed on an empty line, ("text",
+    line) when a line is entered. Falls back to plain lines when stdin is not a terminal.
     """
+
+    PROMPT = click.style("› ", fg="cyan", bold=True)
 
     def __init__(self):
         self.queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        self._lock = threading.Lock()
+        self._status = ""
+        self._buffer = ""
         self._terminal = None
         if sys.stdin.isatty():
             import termios
@@ -113,6 +116,31 @@ class KeyCommands:
             self._terminal = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin)  # keys arrive one at a time; Ctrl+C still interrupts
         threading.Thread(target=self._read, daemon=True).start()
+        self._render()
+
+    # -- output -------------------------------------------------------------
+
+    def _render(self) -> None:
+        if self._terminal is None:
+            return
+        status = f"{self._status}  " if self._status else ""
+        sys.stdout.write(f"\r\x1b[2K{status}{self.PROMPT}{self._buffer}")
+        sys.stdout.flush()
+
+    def event(self, message: str, color: str | None = None) -> None:
+        """A line above the status line."""
+        with self._lock:
+            if self._terminal is not None:
+                sys.stdout.write("\r\x1b[2K")
+            click.secho(message, fg=color)
+            self._render()
+
+    def status(self, text: str) -> None:
+        with self._lock:
+            self._status = text
+            self._render()
+
+    # -- input --------------------------------------------------------------
 
     def _read(self) -> None:
         if self._terminal is None:
@@ -121,42 +149,36 @@ class KeyCommands:
                 self.queue.put(("text", text) if text else ("stop", None))
             self.queue.put(("text", "quit"))
             return
-        buffer = ""
         while True:
             char = os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
-            if not char:
-                self.queue.put(("text", "quit"))
-                return
-            if char in ("\n", "\r"):
-                print(flush=True)
-                self.queue.put(("text", buffer.strip()) if buffer.strip() else ("stop", None))
-                buffer = ""
-            elif char == " " and not buffer:
-                print("[stop]", flush=True)
-                self.queue.put(("stop", None))
-            elif char in ("\x7f", "\b"):
-                if buffer:
-                    buffer = buffer[:-1]
-                    print("\b \b", end="", flush=True)
-            elif char.isprintable():
-                buffer += char
-                print(char, end="", flush=True)
+            with self._lock:
+                if not char:
+                    self.queue.put(("text", "quit"))
+                    return
+                if char in ("\n", "\r") or (char == " " and not self._buffer):
+                    text, self._buffer = self._buffer.strip(), ""
+                    self.queue.put(("text", text) if text else ("stop", None))
+                elif char in ("\x7f", "\b"):
+                    self._buffer = self._buffer[:-1]
+                elif char.isprintable():
+                    self._buffer += char
+                self._render()
 
     def pending(self) -> bool:
         return not self.queue.empty()
 
-    def get(self, timeout: float | None = None) -> tuple[str, str | None] | None:
-        try:
-            return self.queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+    def get(self) -> tuple[str, str | None]:
+        return self.queue.get()
 
     def close(self) -> None:
         if self._terminal is not None:
             import termios
 
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._terminal)
-            self._terminal = None
+            with self._lock:
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.flush()
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._terminal)
+                self._terminal = None
 
 
 def _start_client(robot_ip: str):
@@ -248,8 +270,9 @@ def _decode(message: dict, *keys: str) -> np.ndarray | None:
 
 class ImageAndJointReceiver:
     """
-    Subscribes to the robot's synced wrist + head frames and joint states, keeping only the
-    newest message, as recv_gripper_and_head_images_with_joint_states.py does.
+    Subscribes to the robot's synced wrist + head frames and joint states on a thread, as
+    recv_gripper_and_head_images_with_joint_states.py does, keeping only the newest message,
+    decoded. `receive()` waits for the next one; `latest()` does not wait.
     """
 
     def __init__(self, robot_ip: str, port: int = IMAGE_PORT):
@@ -262,21 +285,45 @@ class ImageAndJointReceiver:
         self.socket.setsockopt(zmq.RCVHWM, 1)
         self.socket.setsockopt(zmq.CONFLATE, 1)
         self.socket.connect(f"tcp://{robot_ip}:{port}")
+        self._message: dict | None = None
+        self._count = 0
+        self._new = threading.Condition()
+        self._running = True
+        self._thread = threading.Thread(target=self._receive_loop, daemon=True)
+        self._thread.start()
+
+    def _receive_loop(self) -> None:
+        while self._running:
+            if not self.socket.poll(100):
+                continue
+            message = self.socket.recv_pyobj()
+            message["wrist_rgb"] = _decode(
+                message, "wrist_color_image_compressed", "wrist_color_image", "color_image_compressed", "color_image"
+            )
+            head = _decode(message, "head_color_image_compressed", "head_color_image")
+            message["head_rgb"] = (
+                rotate_head_image_to_upright(head, message.get("head_camera_side", "")) if head is not None else None
+            )
+            with self._new:
+                self._message, self._count = message, self._count + 1
+                self._new.notify_all()
+
+    def latest(self) -> tuple[int, dict | None]:
+        """(how many messages so far, the newest), without waiting."""
+        with self._new:
+            return self._count, self._message
 
     def receive(self, timeout_s: float = 5.0) -> dict:
-        if not self.socket.poll(int(timeout_s * 1000)):
-            raise TimeoutError("No images from the robot; is the publisher running with -r?")
-        message = self.socket.recv_pyobj()
-        message["wrist_rgb"] = _decode(
-            message, "wrist_color_image_compressed", "wrist_color_image", "color_image_compressed", "color_image"
-        )
-        head = _decode(message, "head_color_image_compressed", "head_color_image")
-        message["head_rgb"] = (
-            rotate_head_image_to_upright(head, message.get("head_camera_side", "")) if head is not None else None
-        )
-        return message
+        """The next message to arrive."""
+        with self._new:
+            seen = self._count
+            if not self._new.wait_for(lambda: self._count > seen, timeout_s):
+                raise TimeoutError("No images from the robot; is the publisher running with -r?")
+            return self._message
 
     def close(self) -> None:
+        self._running = False
+        self._thread.join(timeout=1.0)
         self.socket.close(linger=0)
         self.context.term()
 
@@ -324,6 +371,8 @@ class RealStretch4Env:
         self._gripper_closed: bool | None = None
         self._odometry_origin: np.ndarray | None = None
         self.last_message: dict = {}
+        self.last_state8 = np.append(FRANKA_HOME_QPOS, 0.0)
+        """The Franka state the policy last saw; Rerun's ghost follows it."""
         self.interrupted = lambda: False
         """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
         self.check_camera_sides()
@@ -338,6 +387,7 @@ class RealStretch4Env:
             )
         if message["head_rgb"] is None:
             raise click.ClickException("The robot is not publishing a head image")
+        self._state(message)  # fixes the odometry origin: the world frame is where we start
 
     # -- state ------------------------------------------------------------
 
@@ -372,6 +422,7 @@ class RealStretch4Env:
         self.last_message = message
         footprint, joints = self._state(message)
         state8, _ = self.retargeter.stretch_to_franka(footprint, joints)
+        self.last_state8 = state8
         return Observation(
             exo_rgb=prepare_exo(message["head_rgb"], self.params),
             wrist_rgb=wrist_view(message["wrist_rgb"], self.retargeter.tcp_flipped),
@@ -418,11 +469,6 @@ class RealStretch4Env:
 
     def send(self, targets: StretchTargets) -> None:
         robot = self.robot
-        print(
-            f"  base {math.degrees(targets.base_rotate_by):+.1f}°  lift {targets.lift:.3f}  arm {targets.arm:.3f}  "
-            f"yaw {targets.wrist_yaw:+.2f}  pitch {targets.wrist_pitch:+.2f}  roll {targets.wrist_roll:+.2f}  "
-            f"gripper {'closed' if targets.gripper_closed else 'open'}" + ("  (clamped)" if targets.clamped else "")
-        )
         if abs(targets.base_rotate_by) > MIN_BASE_ROTATION:
             robot.base.rotate_by(targets.base_rotate_by, v_r=self._speed("base_rotate"))
         robot.lift.move_to(targets.lift, v_m=self._speed("lift"))
@@ -438,13 +484,21 @@ class RealStretch4Env:
             joint = "parallel_gripper" if self.params.use_parallel_gripper else "stretch_gripper"
             self.robot.end_of_arm.pose(joint, "close" if closed else "open")
 
+    def tool_error_m(self) -> float | None:
+        """How far Stretch's tool is from where the policy wants it."""
+        target = self.retargeter.last_target_tool_world
+        if target is None or not self.last_message:
+            return None
+        footprint, joints = self._state(self.last_message)
+        return float(np.linalg.norm(self.retargeter.stretch_tool_world(footprint, joints)[:3, 3] - target[:3, 3]))
+
     def move_to_franka_pose(self, franka_q7=FRANKA_HOME_QPOS) -> None:
         self.retargeter.reset()
         self.retargeter.franka_seed = np.asarray(franka_q7, dtype=float)
         footprint, joints = self._state(self.receiver.receive())
         targets = self.retargeter.franka_to_stretch(np.concatenate([franka_q7, [0.0]]), footprint, joints)
         if targets is None:
-            raise click.ClickException("Stretch 4 cannot reach the Franka's home pose; check --object-height")
+            raise RuntimeError("Stretch 4 cannot reach the Franka's home pose; check --object-height")
         self._gripper_closed = None
         self.send(targets)
         self.wait_for_arrival(30.0)
@@ -476,41 +530,94 @@ class RealStretch4Env:
         self.robot.push_command()
 
 
-def continuous_session(env: RealStretch4Env, policy, params: RetargetParams, max_steps: int, on_step) -> None:
+class LiveView:
     """
-    The control loop: runs the current instruction until a key says otherwise (see KeyCommands
-    and the module docstring), indefinitely unless `max_steps` > 0.
+    Logs the robot's raw cameras and pose (and the ghost Franka at the state the policy last
+    saw) to Rerun at `hz`, on its own thread, from the first message on -- whether or not an
+    instruction is running.
     """
-    keys = KeyCommands()
-    env.interrupted = keys.pending
-    print(KEYS_HELP)
-    print("> ", end="", flush=True)
-    try:
-        command = keys.get()
-        while True:
-            kind, text = command
-            if kind == "stop":
-                env.stop_motion()
-                print("Stopped.\n> ", end="", flush=True)
-            elif text in ("quit", "exit", "q"):
-                return
-            elif text == "home":
-                print("Going home...", flush=True)
+
+    def __init__(self, env: RealStretch4Env, robot_model: RobotModel, hz: float = 10.0):
+        self.env, self.robot_model, self.period = env, robot_model, 1.0 / hz
+        _, message = env.receiver.latest()
+        robot_model.pose(*self._robot_state(message or env.receiver.receive()))
+        self.scene = rerun_scene.RerunScene(robot_model.model, robot_model.data, ["stretch4", robot_model.franka.base_name])
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _robot_state(self, message: dict):
+        footprint, joints = self.env._state(message)
+        return footprint, joints, self.env.last_state8[:7]
+
+    def _loop(self) -> None:
+        last = 0
+        while self._running:
+            count, message = self.env.receiver.latest()
+            if message is not None and count != last:
+                last = count
+                rerun_scene.rr.set_time("time", timestamp=time.time())
+                rerun_scene.log_cameras({"head_raw": message["head_rgb"], "gripper_raw": message["wrist_rgb"]})
+                self.robot_model.pose(*self._robot_state(message))
+                self.scene.log(self.robot_model.data)
+            time.sleep(self.period)
+
+    def close(self) -> None:
+        self._running = False
+        self._thread.join(timeout=1.0)
+
+
+def continuous_session(
+    env: RealStretch4Env, policy, params: RetargetParams, max_steps: int, on_step, console: Console
+) -> None:
+    """
+    The control loop: runs the current instruction until a key says otherwise (KEYS_HELP),
+    indefinitely unless `max_steps` > 0.
+    """
+    env.interrupted = console.pending
+    command = console.get()
+    while True:
+        kind, text = command
+        if kind == "stop":
+            env.stop_motion()
+            console.status("")
+            console.event("■ stopped", "yellow")
+        elif text in ("quit", "exit", "q"):
+            return
+        elif text == "home":
+            console.status(click.style("◆ going home", fg="yellow"))
+            try:
                 env.go_home()
-                print("Home.\n> ", end="", flush=True)
-            else:
-                print(f"Running: {text}  (Enter/Space stops, type to switch)\n> ", end="", flush=True)
-                result = run_rollout(
-                    env, policy, text, params.execute_horizon, params.execute_first_n,
-                    max_steps if max_steps > 0 else 10**12, on_step, should_stop=keys.pending,
+                console.event("◆ home" if not console.pending() else "◆ home (interrupted)", "yellow")
+            except RuntimeError as error:
+                console.event(f"◆ {error}", "red")
+            console.status("")
+        else:
+            console.event(f"▶ {text}", "green")
+
+            def step(info: StepInfo) -> None:
+                on_step(info)
+                error = env.tool_error_m()
+                console.status(
+                    click.style(f"▶ {text}", fg="green")
+                    + click.style(
+                        f"  step {info.step}"
+                        + (f" · tool {error * 1000:.0f} mm off" if error is not None else "")
+                        + (f" · {env.retargeter.ik_failures} unreachable" if env.retargeter.ik_failures else "")
+                        + "  · Enter/Space stops",
+                        dim=True,
+                    )
                 )
-                if not keys.pending():
-                    env.stop_motion()
-                    print(f"Done after {result.steps} steps.\n> ", end="", flush=True)
-            command = keys.get()
-    finally:
-        env.interrupted = lambda: False
-        keys.close()
+
+            result = run_rollout(
+                env, policy, text, params.execute_horizon, params.execute_first_n,
+                max_steps if max_steps > 0 else 10**12, step, should_stop=console.pending,
+            )
+            if not console.pending():
+                env.stop_motion()
+                console.status("")
+                console.event(f"■ done after {result.steps} steps", "yellow")
+        command = console.get()
 
 
 @click.command()
@@ -527,6 +634,7 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, **kwargs):
     if params.exo_camera == "droid":
         raise click.BadParameter("the real robot has no DROID exo camera; use left, right or center", param_hint="--exo_camera")
 
+    click.secho(f"Connecting to Stretch 4 at {robot_ip}...", dim=True)
     robot, gripper = connect(robot_ip)
     if not robot.is_homed():
         robot.stop()
@@ -538,45 +646,62 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, **kwargs):
         if params.use_parallel_gripper:
             click.secho(f"--use_parallel_gripper was given, but the robot has a {gripper}; using it.", fg="yellow")
         params.use_parallel_gripper = detected_parallel
-    click.secho(f"Gripper: {gripper} ({params.tool_name}), grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
     robot_model = RobotModel(object_height, params.tool_name)
     receiver = ImageAndJointReceiver(robot_ip)
-    env = RealStretch4Env(robot, receiver, params, robot_model.franka)
-
-    logger = None
-    if rerun:
-        rerun_scene.init_rerun("MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"])
-        logger = rerun_scene.RerunScene(
-            robot_model.model, robot_model.data, ["stretch4", robot_model.franka.base_name]
-        )
-    step_count = 0
-
-    def on_step(info: StepInfo):
-        nonlocal step_count
-        step_count += 1
-        if logger is None:
-            return
-        rerun_scene.set_step(step_count)
-        observation = info.observation
-        rerun_scene.log_cameras(
-            {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, **observation.extra_cameras}
-        )
-        footprint, joints = env._state(env.last_message)
-        robot_model.pose(footprint, joints, observation.state8[:7])
-        logger.log(robot_model.data)
-        rerun_scene.log_tool_poses(
-            env.retargeter.last_target_tool_world, env.retargeter.stretch_tool_world(footprint, joints)
-        )
-
-    click.secho("Raising the lift and moving Stretch 4 to the Franka's home pose...", fg="yellow")
-    env.go_home()
-    policy = load_policy(checkpoint)
+    env = live = console = None
     try:
-        continuous_session(env, policy, params, max_steps, on_step)
+        env = RealStretch4Env(robot, receiver, params, robot_model.franka)
+        offset = ",".join(f"{v:g}" for v in params.effective_grasp_offset_mm)
+        click.echo(
+            click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
+            + click.style("Cameras  ", bold=True) + f"head {params.exo_camera}, gripper {params.gripper_camera}"
+            + (" (head cropped to DROID)" if params.head_crop == "droid" else "") + "\n"
+            + click.style("Motion   ", bold=True) + ("slow" if params.slow else "full speed")
+            + (", waiting for each action to arrive" if params.wait_for_arrival else "")
+            + f", {params.execute_first_n} of every {params.execute_horizon} predicted actions"
+        )
+        if rerun:
+            rerun_scene.init_rerun("MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"])
+            live = LiveView(env, robot_model)
+            click.secho("Rerun is showing the cameras live.", dim=True)
+
+        click.secho("Loading MolmoBot-DROID...", dim=True)
+        policy = load_policy(checkpoint)
+
+        if click.confirm(click.style("Raise the lift and move Stretch 4 to the start pose?", bold=True), default=True):
+            click.secho("Moving to the start pose...", dim=True)
+            env.go_home()
+        else:
+            click.secho("Staying put; type home when ready.", dim=True)
+
+        click.echo("\n" + KEYS_HELP + "\n")
+        console = Console()
+        step_count = 0
+
+        def on_step(info: StepInfo) -> None:
+            nonlocal step_count
+            step_count += 1
+            if not rerun:
+                return
+            rerun_scene.set_step(step_count)
+            rerun_scene.rr.set_time("time", timestamp=time.time())
+            rerun_scene.log_cameras({"exo": info.observation.exo_rgb, "wrist": info.observation.wrist_rgb})
+            footprint, joints = env._state(env.last_message)
+            rerun_scene.log_tool_poses(
+                env.retargeter.last_target_tool_world, env.retargeter.stretch_tool_world(footprint, joints)
+            )
+
+        continuous_session(env, policy, params, max_steps, on_step, console)
     except KeyboardInterrupt:
-        print()
+        pass
     finally:
-        env.stop_motion()
+        if console is not None:
+            console.close()
+        click.secho("Stopping the robot and exiting.", dim=True)
+        if env is not None:
+            env.stop_motion()
+        if live is not None:
+            live.close()
         unload_policy()
         receiver.close()
         robot.stop()
