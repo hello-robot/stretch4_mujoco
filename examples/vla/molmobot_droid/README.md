@@ -121,17 +121,15 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
   - IK is multi-start (current joints, then a few canonical wrist poses), so it finds e.g.
     roll +180° rather than stalling at −65°.
 - **Wrist orientation.**
-  - IK tries several seeds. Of the exact solutions, it prefers:
-    1. an upright gripper (|roll| ≤ 90°), since the wrist servo can't hold an upside-down
-       gripper pitched down;
-    2. wrist joints at least 0.15 rad inside their limits;
-    3. the least joint change.
-  - **Flipped grasps.** When Stretch's wrist can't reach the Franka's gripper orientation (its
-    roll can't pass −65°), it turns the gripper half a turn about the approach axis
-    (`TCP_FLIP`) instead.
-    - That is the same grasp for two symmetric fingers.
-    - The reverse mapping takes the flip back out.
-    - The gripper image is turned 180° so the policy still sees its wrist view upright.
+  - The mapping is camera-aligned: Stretch's gripper camera sees what the Franka's wrist
+    camera would, the right way up, and the grasp is never turned the other way round.
+  - That puts Stretch's roll near 180° for the Franka's usual downward grasp. The first solve
+    after a reset, i.e. the start pose, takes the solution with the most room to the wrist
+    limits (yaw ≈ 0°, pitch ≈ 90°, roll ≈ 180°).
+  - After that, IK takes the exact solution closest to the current joints, keeping 0.15 rad
+    clear of a wrist limit where it can.
+  - Where the Franka's grasp needs more roll than Stretch's 245°, Stretch goes to the closest
+    pose within 5 cm / 20° (`ik_clamped`), or holds (`ik_failure`).
 - **Parallel gripper.**
   - IK always runs on stretch4_kinematics' Stretch-gripper model. Its PG4 support is only on an
     unpublished branch.
@@ -218,7 +216,9 @@ python -m pytest examples/vla/molmobot_droid/franka_retarget/test_retargetting.p
 `test_retargetting.py` opens Rerun; set `RERUN_SAVE=<file.rrd>` to record instead.
 
 - It overlays the Franka on Stretch 4, for both grippers, using each robot's own MuJoCo model.
-- It commands the Franka through 20 poses and has Stretch follow each one.
+- The poses come from Stretch joint values spread over lift 0.25–1.1 m, arm 0–0.5 m and the
+  wrist's whole range, mapped back to Franka poses the Franka can also reach.
+- It commands the Franka through 40 of them and has Stretch follow from wherever it is.
 - At every pose it asserts the tools match (within 3 mm and 1°) and that mapping Stretch back
   recovers the Franka's TCP.
 
