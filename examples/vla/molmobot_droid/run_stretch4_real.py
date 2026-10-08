@@ -1,7 +1,14 @@
 """
-MolmoBot-DROID driving a real Stretch 4, through Franka retargeting. Works like
-`run_stretch4_sim.py`: type instructions at the prompt and watch in Rerun (the policy's views,
-the raw cameras, the robot and the ghost Franka it is retargeted from).
+MolmoBot-DROID driving a real Stretch 4, through Franka retargeting, continuously: type an
+instruction and press Enter, and the robot works on it until told otherwise. While it runs:
+
+  - type another instruction + Enter to switch to it straight away;
+  - press Enter or Space (on an empty line) to stop the robot where it is;
+  - type `home` + Enter to stop and go back to the start pose, lift raised first;
+  - type `quit` + Enter, or press Ctrl+C, to stop and exit.
+
+Watch it in Rerun: the policy's views, the raw cameras, the robot and the ghost Franka it is
+retargeted from.
 
 On the robot, run the image + joint-state publisher from stretch4_compliant_gripper first:
 
@@ -22,6 +29,10 @@ Usage:
 from __future__ import annotations
 
 import math
+import os
+import queue
+import sys
+import threading
 import time
 
 import click
@@ -34,7 +45,6 @@ from examples.vla.molmobot_droid.checkpoint import (
     FRANKA_HOME_QPOS,
     GRIPPER_CLOSED,
     POLICY_DT,
-    build_instruction,
     load_policy,
     unload_policy,
 )
@@ -49,6 +59,7 @@ from examples.vla.molmobot_droid.droid import (
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     MIN_BASE_ROTATION,
     SLOW_FACTOR,
+    SPAWN_LIFT_FRACTION,
     STEP_ARRIVAL_TIMEOUT,
     FrankaStretchRetargeter,
     RetargetParams,
@@ -60,7 +71,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     retarget_options,
     wrist_view,
 )
-from examples.vla.molmobot_droid.rollout import StepInfo, interactive_session
+from examples.vla.molmobot_droid.rollout import StepInfo, run_rollout
 
 IMAGE_PORT = 4409
 """`gripper_networking.gripper_and_joints_port` in stretch4_compliant_gripper."""
@@ -68,11 +79,148 @@ IMAGE_PORT = 4409
 GRIPPER_PCT_OPEN = 300.0
 """stretch4_body StretchGripper `pct_max_open` for SE4 (range_deg [-100, 300]); 0 is fingertips touching."""
 
-PARALLEL_GRIPPER_OPEN_MM = 80.0
+PARALLEL_GRIPPER_OPEN_MM = 77.0
 """The parallel gripper's widest opening: two fingers of 40 mm travel (the PG4 URDF); 0 is closed."""
 
 # stretch4_body SE4 default motion profiles; --slow runs at SLOW_FACTOR of them.
 DEFAULT_SPEEDS = {"lift": 0.3, "arm": 0.4, "wrist": 7.0, "base_rotate": 2.0}
+
+
+KEYS_HELP = """Type an instruction and press Enter to run it. While it runs:
+  another instruction + Enter   switch to it
+  Enter or Space                stop the robot where it is
+  home + Enter                  stop, raise the lift, go back to the start pose
+  quit + Enter, or Ctrl+C       stop and exit"""
+
+MOTION_SUBSYSTEMS = ["arm", "lift", "omnibase", "end_of_arm"]
+LIFT_RANGE = (0.0, 1.2)
+
+
+class KeyCommands:
+    """
+    Reads the keyboard on a thread and queues commands for the control loop, without waiting
+    for it: ("stop", None) the moment Enter or Space is pressed on an empty line, else
+    ("text", line) when a line is entered. Falls back to whole lines when stdin is no terminal.
+    """
+
+    def __init__(self):
+        self.queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        self._terminal = None
+        if sys.stdin.isatty():
+            import termios
+            import tty
+
+            self._terminal = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin)  # keys arrive one at a time; Ctrl+C still interrupts
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        if self._terminal is None:
+            for line in sys.stdin:
+                text = line.strip()
+                self.queue.put(("text", text) if text else ("stop", None))
+            self.queue.put(("text", "quit"))
+            return
+        buffer = ""
+        while True:
+            char = os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
+            if not char:
+                self.queue.put(("text", "quit"))
+                return
+            if char in ("\n", "\r"):
+                print(flush=True)
+                self.queue.put(("text", buffer.strip()) if buffer.strip() else ("stop", None))
+                buffer = ""
+            elif char == " " and not buffer:
+                print("[stop]", flush=True)
+                self.queue.put(("stop", None))
+            elif char in ("\x7f", "\b"):
+                if buffer:
+                    buffer = buffer[:-1]
+                    print("\b \b", end="", flush=True)
+            elif char.isprintable():
+                buffer += char
+                print(char, end="", flush=True)
+
+    def pending(self) -> bool:
+        return not self.queue.empty()
+
+    def get(self, timeout: float | None = None) -> tuple[str, str | None] | None:
+        try:
+            return self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        if self._terminal is not None:
+            import termios
+
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._terminal)
+            self._terminal = None
+
+
+def _start_client(robot_ip: str):
+    from stretch4_body.robot.robot_client import RobotClient
+
+    robot = RobotClient(ip_address=robot_ip)
+    # Over the network this check has to be skipped: it stats the robot's local server socket,
+    # which a workstation does not have (see examples/digital_twin.py `_connect`).
+    if not robot.startup(allow_different_user_connection=True):
+        raise click.ClickException(f"Could not connect to Stretch 4 at {robot_ip}")
+    return robot
+
+
+def _configured_tool() -> str:
+    from stretch4_body.core.robot_params import RobotParams
+
+    return RobotParams.get_params()[1]["robot"]["tool"]
+
+
+def connect(robot_ip: str):
+    """
+    A `RobotClient` whose end of arm is the robot's real one, and that gripper's joint name.
+
+    stretch4_body builds the end of arm from the fleet directory's tool, and reads that once,
+    at import. On a workstation the fleet directory is `ensure_fleet_directory()`'s stand-in,
+    which names the simulator's default tool (the Stretch gripper); when the robot reports the
+    parallel gripper, or vice versa, the stand-in is rewritten, stretch4_body re-imported, and
+    the client started again.
+    """
+    from examples.digital_twin import (
+        TOOL_FOR_GRIPPER_JOINT,
+        ensure_fleet_directory,
+        is_nominal_fleet_directory,
+        robot_gripper_joint,
+    )
+
+    robot = _start_client(robot_ip)
+    robot.pull_status()
+    gripper = robot_gripper_joint(robot)
+    if gripper is None:
+        robot.stop()
+        raise click.ClickException("The robot reports neither a stretch_gripper nor a parallel_gripper")
+    tool = TOOL_FOR_GRIPPER_JOINT[gripper]
+    configured = _configured_tool()
+    if configured == tool:
+        return robot, gripper
+
+    robot.stop()
+    if not is_nominal_fleet_directory():
+        raise click.ClickException(
+            f"The fleet directory ({os.environ.get('HELLO_FLEET_PATH')}/{os.environ.get('HELLO_FLEET_ID')}) "
+            f"says the tool is {configured}, but the robot has a {gripper} ({tool}). Fix its "
+            "stretch_configuration_params.yaml, or unset HELLO_FLEET_PATH to use a stand-in."
+        )
+    click.secho(f"The robot has a {gripper}; rebuilding the client for {tool}.", fg="yellow")
+    ensure_fleet_directory(tool, rewrite=True)
+    for name in [n for n in sys.modules if n == "stretch4_body" or n.startswith("stretch4_body.")]:
+        del sys.modules[name]
+    robot = _start_client(robot_ip)
+    robot.pull_status()
+    if robot_gripper_joint(robot) != gripper or _configured_tool() != tool:
+        robot.stop()
+        raise click.ClickException(f"Rebuilt the client for {tool}, but it still does not match the robot")
+    return robot, gripper
 
 
 def rotate_head_image_to_upright(image: np.ndarray, head_camera_side: str) -> np.ndarray:
@@ -176,6 +324,8 @@ class RealStretch4Env:
         self._gripper_closed: bool | None = None
         self._odometry_origin: np.ndarray | None = None
         self.last_message: dict = {}
+        self.interrupted = lambda: False
+        """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
         self.check_camera_sides()
 
     def check_camera_sides(self) -> None:
@@ -241,11 +391,27 @@ class RealStretch4Env:
             self.send_gripper(bool(action8[7] >= GRIPPER_CLOSED / 2))
             self.robot.push_command()
         if self.params.wait_for_arrival:
-            self.robot.wait_command(timeout=STEP_ARRIVAL_TIMEOUT)
+            self.wait_for_arrival(STEP_ARRIVAL_TIMEOUT)
         remaining = POLICY_DT - (time.monotonic() - start)
-        if remaining > 0:
+        if remaining > 0 and not self.interrupted():
             time.sleep(remaining)
         return targets
+
+    def wait_for_arrival(self, timeout: float) -> bool:
+        """
+        `robot.wait_command()`, except that `interrupted()` ends it early. Returns whether the
+        robot stopped moving.
+        """
+        self.robot.wait_on_motion_start(MOTION_SUBSYSTEMS, timeout=0.2)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.interrupted():
+                return False
+            self.robot.pull_status()
+            if not self.robot.is_moving():
+                return True
+            time.sleep(0.02)
+        return False
 
     def _speed(self, joint: str) -> float | None:
         return SLOW_FACTOR * DEFAULT_SPEEDS[joint] if self.params.slow else None
@@ -281,47 +447,98 @@ class RealStretch4Env:
             raise click.ClickException("Stretch 4 cannot reach the Franka's home pose; check --object-height")
         self._gripper_closed = None
         self.send(targets)
-        self.robot.wait_command(timeout=30.0)
+        self.wait_for_arrival(30.0)
+
+    def go_home(self, franka_q7=FRANKA_HOME_QPOS) -> None:
+        """
+        Back to the start pose: the lift up to SPAWN_LIFT_FRACTION of its travel first, so the
+        gripper clears whatever it is over, then where the Franka at `franka_q7` has its tool.
+        """
+        self.stop_motion()
+        _, joints = self._state(self.receiver.receive())
+        high = LIFT_RANGE[0] + SPAWN_LIFT_FRACTION * (LIFT_RANGE[1] - LIFT_RANGE[0])
+        if joints.lift < high:
+            self.robot.lift.move_to(high, v_m=self._speed("lift"))
+            self.robot.push_command()
+            if not self.wait_for_arrival(15.0):
+                return
+        self.move_to_franka_pose(franka_q7)
 
     def stop_motion(self) -> None:
-        """Hold every joint where it is."""
-        footprint, joints = self._state(self.receiver.receive())
-        self.robot.lift.move_to(joints.lift)
-        self.robot.arm.move_to(joints.arm)
+        """Hold every joint where it is now."""
+        self.robot.pull_status()
+        status = self.robot.status
         self.robot.base.set_velocity(0.0, 0.0, 0.0)
+        self.robot.lift.move_to(status["lift"]["pos"])
+        self.robot.arm.move_to(status["arm"]["pos"])
+        for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
+            self.robot.end_of_arm.move_to(joint, status["end_of_arm"][joint]["pos"])
         self.robot.push_command()
+
+
+def continuous_session(env: RealStretch4Env, policy, params: RetargetParams, max_steps: int, on_step) -> None:
+    """
+    The control loop: runs the current instruction until a key says otherwise (see KeyCommands
+    and the module docstring), indefinitely unless `max_steps` > 0.
+    """
+    keys = KeyCommands()
+    env.interrupted = keys.pending
+    print(KEYS_HELP)
+    print("> ", end="", flush=True)
+    try:
+        command = keys.get()
+        while True:
+            kind, text = command
+            if kind == "stop":
+                env.stop_motion()
+                print("Stopped.\n> ", end="", flush=True)
+            elif text in ("quit", "exit", "q"):
+                return
+            elif text == "home":
+                print("Going home...", flush=True)
+                env.go_home()
+                print("Home.\n> ", end="", flush=True)
+            else:
+                print(f"Running: {text}  (Enter/Space stops, type to switch)\n> ", end="", flush=True)
+                result = run_rollout(
+                    env, policy, text, params.execute_horizon, params.execute_first_n,
+                    max_steps if max_steps > 0 else 10**12, on_step, should_stop=keys.pending,
+                )
+                if not keys.pending():
+                    env.stop_motion()
+                    print(f"Done after {result.steps} steps.\n> ", end="", flush=True)
+            command = keys.get()
+    finally:
+        env.interrupted = lambda: False
+        keys.close()
 
 
 @click.command()
 @click.option("--robot_ip", "--robot-ip", "robot_ip", required=True, help="Stretch 4's IP address.")
 @click.option("--object-height", type=float, default=0.80, show_default=True,
               help="Height of the target object above the floor (m); sets the virtual Franka's height.")
-@click.option("--object-name", default="object", show_default=True, help="For the default instruction.")
-@click.option("--max-steps", type=int, default=300, show_default=True)
+@click.option("--max-steps", type=int, default=0, show_default=True,
+              help="Stop an instruction after this many steps (15/s). 0: run until told otherwise.")
 @click.option("--checkpoint", default=None)
 @click.option("--rerun/--no-rerun", default=True, show_default=True)
 @retarget_options
-def main(robot_ip, object_height, object_name, max_steps, checkpoint, rerun, **kwargs):
+def main(robot_ip, object_height, max_steps, checkpoint, rerun, **kwargs):
     params = params_from_kwargs(kwargs)
     if params.exo_camera == "droid":
         raise click.BadParameter("the real robot has no DROID exo camera; use left, right or center", param_hint="--exo_camera")
 
-    from stretch4_body.robot.robot_client import RobotClient
-
-    robot = RobotClient(ip_address=robot_ip)
-    if not robot.startup():
-        raise click.ClickException(f"Could not connect to Stretch 4 at {robot_ip}")
+    robot, gripper = connect(robot_ip)
     if not robot.is_homed():
         robot.stop()
         raise click.ClickException("Home the robot first")
 
-    gripper_joint = "parallel_gripper" if params.use_parallel_gripper else "stretch_gripper"
-    if gripper_joint not in robot.end_of_arm.joints:
-        robot.stop()
-        raise click.ClickException(
-            f"This robot's end of arm has {robot.end_of_arm.joints}, not {gripper_joint}; "
-            + ("drop" if params.use_parallel_gripper else "add") + " --use_parallel_gripper"
-        )
+    # The gripper on the robot decides the tool, its kinematics and its default grasp offset.
+    detected_parallel = gripper == "parallel_gripper"
+    if params.use_parallel_gripper != detected_parallel:
+        if params.use_parallel_gripper:
+            click.secho(f"--use_parallel_gripper was given, but the robot has a {gripper}; using it.", fg="yellow")
+        params.use_parallel_gripper = detected_parallel
+    click.secho(f"Gripper: {gripper} ({params.tool_name}), grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
     robot_model = RobotModel(object_height, params.tool_name)
     receiver = ImageAndJointReceiver(robot_ip)
     env = RealStretch4Env(robot, receiver, params, robot_model.franka)
@@ -351,20 +568,13 @@ def main(robot_ip, object_height, object_name, max_steps, checkpoint, rerun, **k
             env.retargeter.last_target_tool_world, env.retargeter.stretch_tool_world(footprint, joints)
         )
 
-    click.secho("Moving Stretch 4 to the Franka's home pose...", fg="yellow")
-    env.move_to_franka_pose()
+    click.secho("Raising the lift and moving Stretch 4 to the Franka's home pose...", fg="yellow")
+    env.go_home()
     policy = load_policy(checkpoint)
     try:
-        interactive_session(
-            env,
-            policy,
-            build_instruction("pick", object_name),
-            params.execute_horizon,
-            params.execute_first_n,
-            max_steps,
-            reset=env.move_to_franka_pose,
-            on_step=on_step,
-        )
+        continuous_session(env, policy, params, max_steps, on_step)
+    except KeyboardInterrupt:
+        print()
     finally:
         env.stop_motion()
         unload_policy()

@@ -106,7 +106,7 @@ PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
     STRETCH_GRIPPER_TOOL: (-9.0 + 101, 21.0, 17.0),
-    PARALLEL_GRIPPER_TOOL: (4.0 + 33, 21.0, 17.0),
+    PARALLEL_GRIPPER_TOOL: (4.0 , 0, 17.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
 compared to the Robotiq's relative to its grasp_site, so the fingers line up with the Franka's."""
