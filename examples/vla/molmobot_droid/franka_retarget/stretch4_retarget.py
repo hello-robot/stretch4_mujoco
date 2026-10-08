@@ -526,7 +526,6 @@ class FrankaStretchRetargeter:
         self.last_target_tool_world = target_world
         goal = footprint_from_world @ target_world @ self.tool_correction_inv
         solution, clamped = solve_stretch_ik(self.stretch_kinematics, goal, seed, prefer_margin=self.at_start)
-        self.at_start = False
         reached = self.stretch_kinematics.forward(solution, STRETCH_TCP).homogeneous
         position_error = float(np.linalg.norm(reached[:3, 3] - goal[:3, 3]))
         rotation_error = _rotation_angle(reached[:3, :3].T @ goal[:3, :3])
@@ -544,6 +543,7 @@ class FrankaStretchRetargeter:
         clamped = clamped or abs(lift - solution.lift) > 1e-3 or abs(arm_target - arm) > 1e-3
         if clamped:
             self.ik_clamped += 1
+        self.at_start = False  # once a pose is reached; until then the next solve may still pick
 
         targets = StretchTargets(
             base_rotate_by=_wrap(solution.base_theta),
@@ -611,6 +611,11 @@ IK_EXACT_ROTATION = math.radians(0.5)
 """m, rad. Closer than this to the target counts as reaching it rather than being clamped."""
 
 
+MAX_STEP_JUMP = math.radians(45)
+"""Most the base rotation or any wrist joint may move for one policy step. A policy step moves
+each Franka joint 0.2 rad at most, so following it never needs more; a bigger change is the IK
+swapping to another way of reaching the same pose (pointing down, yaw + 180 with roll - 180)."""
+
 WRIST_LIMIT_MARGIN = 0.15
 """rad. Exact IK solutions with a wrist joint closer than this to a limit are passed over for
 ones that are not, so the next step has room to move."""
@@ -627,6 +632,11 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
     Of the exact solutions it prefers, in order:
       1. every wrist joint WRIST_LIMIT_MARGIN inside its limits;
       2. the least change from the current joints, so the wrist follows the Franka's smoothly.
+    Unless `prefer_margin`, only solutions within MAX_STEP_JUMP of the current base rotation and
+    wrist joints count: when the pose needs the wrist swung round to another configuration, the
+    closest pose reachable without that is used instead (clamped; solved with those joints
+    bounded to MAX_STEP_JUMP around where they are), so the wrist never flips.
+
     With `prefer_margin` (for a start pose, where there is no motion to keep smooth) it takes
     the one with the most room to every wrist limit instead, so the moves that follow have room
     before they run into one.
@@ -668,6 +678,10 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
             max_iter=300,
         )
         solution = StretchJointPositions.from_pinocchio_q(q)
+        # base rotation and the wrist: indices 2, 5, 6, 7 of [x, y, theta, lift, arm, yaw, pitch, roll]
+        jump = np.max(np.abs(solution.to_numpy()[[2, 5, 6, 7]] - current[[2, 5, 6, 7]]))
+        if not prefer_margin and jump > MAX_STEP_JUMP:
+            continue
         reached = kinematics.forward(solution, STRETCH_TCP)
         position_error = np.linalg.norm(reached.translation - target[:3, 3])
         rotation_error = _rotation_angle(reached.rotation.T @ target[:3, :3])
@@ -687,7 +701,28 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
             best, best_error = solution, error
     if exact:
         return min(exact, key=lambda pair: pair[0])[1], False
-    return best, True
+    if prefer_margin:
+        return best, True
+
+    # The closest the base and wrist get to the pose moving at most MAX_STEP_JUMP from where
+    # they are: the solver clips to its joint limits every iteration, so narrow those.
+    lower, upper = model.lowerPositionLimit.copy(), model.upperPositionLimit.copy()
+    start_q = seed.to_pinocchio_q(Stretch4IKModes.BASE_ROTATE)
+    try:
+        for index in (0, 3, 4, 5):  # base rotation, yaw, pitch, roll in [base, lift, arm, yaw, pitch, roll]
+            model.lowerPositionLimit[index] = max(lower[index], start_q[index] - MAX_STEP_JUMP)
+            model.upperPositionLimit[index] = min(upper[index], start_q[index] + MAX_STEP_JUMP)
+        q = kinematics._closed_loop_inverse_kinematics(
+            model, kinematics.data_ik, STRETCH_TCP, target_pose, q_guess=np.clip(start_q, model.lowerPositionLimit, model.upperPositionLimit), max_iter=300
+        )
+    finally:
+        model.lowerPositionLimit[:], model.upperPositionLimit[:] = lower, upper
+    bounded = StretchJointPositions.from_pinocchio_q(q)
+    reached = kinematics.forward(bounded, STRETCH_TCP)
+    error = np.linalg.norm(reached.translation - target[:3, 3]) + (
+        np.inf if _rotation_angle(reached.rotation.T @ target[:3, :3]) > MAX_CLAMPED_ROTATION_ERROR else 0
+    )
+    return (best if best is not None and best_error <= error else bounded), True
 
 
 def _rotation_angle(rotation: np.ndarray) -> float:

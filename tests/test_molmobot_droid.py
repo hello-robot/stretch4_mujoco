@@ -198,6 +198,7 @@ def test_franka_to_stretch_and_back():
     checked = 0
     for _ in range(60):
         q = np.array(checkpoint.FRANKA_HOME_QPOS) + rng.uniform(-0.3, 0.3, 7)
+        retargeter.at_start = True  # each pose is a new target, not a step of a motion
         targets = retargeter.franka_to_stretch(np.append(q, 0), pose.matrix(), StretchJoints(0.6, 0.1, 0, 0, 0, 1))
         if targets is None or targets.clamped:
             continue
@@ -212,6 +213,29 @@ def test_franka_to_stretch_and_back():
         np.testing.assert_allclose(retargeter.franka_kinematics.fk(state8[:7]), retargeter.franka_kinematics.fk(q), atol=1e-3)
         checked += 1
     assert checked > 20
+
+
+def test_wrist_never_swings_round_while_following_a_policy():
+    """A policy's small steps never make Stretch's base or wrist jump more than MAX_STEP_JUMP."""
+    from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import MAX_STEP_JUMP
+
+    pose, retargeter = make_retargeter(link0_height=0.6)
+    footprint = pose.matrix()
+    joints = StretchJoints(0.6, 0.1, 0, 0, 0, 1)
+    q = np.array(checkpoint.FRANKA_HOME_QPOS)
+    rng = np.random.default_rng(11)
+    for step in range(150):
+        if step:
+            q = np.clip(q + rng.uniform(-0.08, 0.08, 7), retargeter.franka_kinematics.lower, retargeter.franka_kinematics.upper)
+        targets = retargeter.franka_to_stretch(np.append(q, 0), footprint, joints)
+        if targets is None:
+            continue
+        if step:
+            moves = [targets.base_rotate_by, targets.wrist_yaw - joints.wrist_yaw,
+                     targets.wrist_pitch - joints.wrist_pitch, targets.wrist_roll - joints.wrist_roll]
+            assert max(abs(m) for m in moves) <= MAX_STEP_JUMP + 1e-6, f"step {step}: {np.degrees(moves).round(0)}"
+        footprint = footprint @ planar_transform(0, 0, targets.base_rotate_by)
+        joints = StretchJoints(targets.lift, targets.arm, targets.wrist_yaw, targets.wrist_pitch, targets.wrist_roll, 1)
 
 
 def test_grasp_offset_moves_stretch_but_not_the_franka_state():
