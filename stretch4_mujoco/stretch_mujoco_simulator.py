@@ -730,6 +730,37 @@ class StretchMujocoSimulator:
         """
         return self.data_proxies.get_status()
 
+    def watch_bodies(self, body_names: list[str]) -> None:
+        """
+        Ask the simulator to publish the world pose and contacts of these bodies, read back
+        with `pull_body_poses()` and `pull_body_contacts()`. Replaces any previous list.
+        Can be called before `start()`.
+        """
+        self.data_proxies.set_watched_bodies(body_names)
+
+    @require_connection
+    def pull_body_poses(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """
+        World pose of each body passed to `watch_bodies()`, as {name: (pos xyz, quat wxyz)}.
+        Bodies that are not in the model are left out.
+        """
+        return {
+            name: (state["pos"], state["quat"])
+            for name, state in self.data_proxies.get_body_states().items()
+        }
+
+    @require_connection
+    def pull_body_contacts(self) -> dict[str, list[str]]:
+        """
+        For each body passed to `watch_bodies()`, the root-body names of everything it is
+        touching, e.g. {"mug": ["stretch4", "room"]}. Geoms attached directly to the
+        worldbody report as "world".
+        """
+        return {
+            name: list(state["contacts"])
+            for name, state in self.data_proxies.get_body_states().items()
+        }
+
     @require_connection
     def pull_joint_limits(self) -> dict[Actuators, tuple[float, float]]:
         """

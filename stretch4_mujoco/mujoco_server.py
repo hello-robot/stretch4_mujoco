@@ -41,6 +41,7 @@ class MujocoServerProxies:
     _sensors: "DictProxy[str, StatusStretchSensors]"
     _joint_limits: "DictProxy[str, dict[Actuators, tuple[float, float]]]"
     _lidar_lidar_points: "DictProxy[str, dict[str, np.ndarray]]"
+    _body_states: "DictProxy[str, dict]"
 
     def __setattr__(self, name: str, value) -> None:
         try:
@@ -81,6 +82,18 @@ class MujocoServerProxies:
     def get_joint_limits(self) -> dict[Actuators, tuple[float, float]]:
         return self._joint_limits["val"]
 
+    def get_watched_bodies(self) -> list[str]:
+        return self._body_states.get("watched", [])
+
+    def set_watched_bodies(self, body_names: list[str]):
+        self._body_states["watched"] = list(body_names)
+
+    def get_body_states(self) -> dict[str, dict]:
+        return self._body_states.get("val", {})
+
+    def set_body_states(self, value: dict[str, dict]):
+        self._body_states["val"] = value
+
     def set_joint_limit(self, actuator: Actuators, min_max: tuple[float, float]):
         limits = self._joint_limits["val"]
         limits[actuator] = min_max
@@ -96,6 +109,7 @@ class MujocoServerProxies:
             _sensors=manager.dict({"val": StatusStretchSensors.default()}),
             _joint_limits=manager.dict({"val": {}}),
             _lidar_lidar_points=manager.dict({"val": {}}),
+            _body_states=manager.dict({"watched": [], "val": {}}),
         )
 
 
@@ -586,6 +600,10 @@ class MujocoServer:
         self.base_controller = BaseController(self)
 
         self.physics_fps_counter = FpsCounter()
+
+        self.body_states_hz = 30.0
+        self._last_body_states_time = -np.inf
+        self._watched_bodies: list[str] = []
 
         self._last_wall_time = time.perf_counter()
         self._last_sim_time = 0.0
@@ -1138,9 +1156,69 @@ class MujocoServer:
 
         self.data_proxies.set_status(new_status)
 
+        self._publish_body_states()
 
         self._last_wall_time = time.perf_counter()
         self._last_sim_time = self.mjdata.time
+
+    def _publish_body_states(self):
+        """
+        Publish the world pose and contacts of the bodies a client asked to watch with
+        `StretchMujocoSimulator.watch_bodies()`, at `body_states_hz`.
+
+        A watched body's contacts cover its whole subtree (so watching "stretch4" includes
+        the wheels and gripper) and are reported by the *root* body name of the other geom.
+        Contacts inside the subtree itself are left out.
+        """
+        if self.mjdata.time - self._last_body_states_time < 1.0 / self.body_states_hz:
+            return
+        self._last_body_states_time = self.mjdata.time
+
+        watched = self.data_proxies.get_watched_bodies()
+        if not watched:
+            return
+
+        if watched != self._watched_bodies:
+            self._watched_bodies = list(watched)
+            self._watched_body_ids = {}
+            for name in watched:
+                body_id = mujoco.mj_name2id(self.mjmodel, mujoco.mjtObj.mjOBJ_BODY, name)
+                if body_id != -1:
+                    self._watched_body_ids[body_id] = name
+            # Every body mapped to its nearest watched ancestor (itself included), or -1.
+            self._body_to_watched = np.full(self.mjmodel.nbody, -1)
+            for body_id in range(self.mjmodel.nbody):
+                ancestor = body_id
+                while ancestor not in self._watched_body_ids and ancestor != 0:
+                    ancestor = int(self.mjmodel.body_parentid[ancestor])
+                if ancestor in self._watched_body_ids:
+                    self._body_to_watched[body_id] = ancestor
+
+        contacts: dict[int, set[str]] = {body_id: set() for body_id in self._watched_body_ids}
+        for i in range(self.mjdata.ncon):
+            contact = self.mjdata.contact[i]
+            body1 = int(self.mjmodel.geom_bodyid[contact.geom1])
+            body2 = int(self.mjmodel.geom_bodyid[contact.geom2])
+            for this_body, other_body in ((body1, body2), (body2, body1)):
+                watched_id = self._body_to_watched[this_body]
+                if watched_id == -1 or self._body_to_watched[other_body] == watched_id:
+                    continue
+                other_root = int(self.mjmodel.body_rootid[other_body])
+                contacts[watched_id].add(
+                    mujoco.mj_id2name(self.mjmodel, mujoco.mjtObj.mjOBJ_BODY, other_root) or ""
+                )
+
+        self.data_proxies.set_body_states(
+            {
+                name: {
+                    "time": self.mjdata.time,
+                    "pos": self.mjdata.xpos[body_id].copy(),
+                    "quat": self.mjdata.xquat[body_id].copy(),  # wxyz
+                    "contacts": sorted(contacts[body_id]),
+                }
+                for body_id, name in self._watched_body_ids.items()
+            }
+        )
 
     def _to_real_gripper_range(self, pos: float) -> float:
         """
