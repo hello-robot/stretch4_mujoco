@@ -46,9 +46,11 @@ robot_settings_se4 = {
         },
         "wheel_diameter_m": 0.20,
         "base_radius_m": 0.174,
-        "wheel0_polarity": 1,
-        "wheel1_polarity": 1,
-        "wheel2_polarity": 1,
+        # Negative because the wheel joint axes follow the URDF, whose axles point
+        # opposite the direction H0's kinematics assumes. See mjcf_generator.py step 5.
+        "wheel0_polarity": -1,
+        "wheel1_polarity": -1,
+        "wheel2_polarity": -1,
     }
 }
 

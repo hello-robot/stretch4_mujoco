@@ -29,9 +29,6 @@ class StatusStretchCameras:
     cam_nav_rgb_se4_center: np.ndarray|None = None
     cam_nav_rgb_se4_center_low_rez: np.ndarray|None = None
 
-    cam_hemilidar_left: np.ndarray|None = None
-    cam_hemilidar_right: np.ndarray|None = None
-
     cam_gripper_se4_left_rgb: np.ndarray|None = None
     cam_gripper_se4_right_rgb: np.ndarray|None = None
     cam_gripper_se4_stereo_depth: np.ndarray|None = None
@@ -68,13 +65,7 @@ class StatusStretchCameras:
         Note: This get the values inside this dataclass; it does not poll from the simulator.
         """
         data:np.ndarray|None = None
-        if camera == StretchCameras.cam_hemilidar_left and self.cam_hemilidar_left is not None:
-            data = self.cam_hemilidar_left
-            data = get_depth_color_map(data) if use_depth_color_map else data
-        if camera == StretchCameras.cam_hemilidar_right and self.cam_hemilidar_right is not None:
-            data = self.cam_hemilidar_right
-            data = get_depth_color_map(data) if use_depth_color_map else data
-        elif camera == StretchCameras.cam_gripper_rgb and self.cam_gripper_rgb is not None:
+        if camera == StretchCameras.cam_gripper_rgb and self.cam_gripper_rgb is not None:
             data = self.cam_gripper_rgb
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_gripper_depth and self.cam_gripper_depth is not None:
@@ -162,12 +153,6 @@ class StatusStretchCameras:
             return
         if camera == StretchCameras.cam_nav_rgb_se4_center_low_rez:
             self.cam_nav_rgb_se4_center_low_rez = data
-            return
-        if camera == StretchCameras.cam_hemilidar_left:
-            self.cam_hemilidar_left = data
-            return
-        if camera == StretchCameras.cam_hemilidar_right:
-            self.cam_hemilidar_right = data
             return
         if camera == StretchCameras.cam_gripper_se4_left_rgb:
             self.cam_gripper_se4_left_rgb = data
