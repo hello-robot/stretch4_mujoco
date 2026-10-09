@@ -33,7 +33,8 @@ from examples.vla.molmobot_droid.droid import (
     FRANKA_HOME_QPOS,
     GHOST_GEOM_GROUP,
     ExoCamera,
-    FrankaGripperView,
+    FrankaOverlayView,
+    OverlayKind,
     FrankaDroidEnv,
     FrankaSpawn,
     PinholeRenderer,
@@ -485,7 +486,7 @@ class SceneMirror:
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
         self._renderers: dict[tuple[str, bool], PinholeRenderer] = {}
-        self._franka_gripper_views: dict[StretchCameras, FrankaGripperView] = {}
+        self._franka_views: dict[tuple, FrankaOverlayView] = {}
         self._ghost_joints = (
             [f"{stretch_scene.franka.prefix}fr3_joint{i + 1}" for i in range(7)]
             if stretch_scene.include_franka
@@ -521,20 +522,22 @@ class SceneMirror:
         mujoco.mj_kinematics(self.model, self.data)
         mujoco.mj_camlight(self.model, self.data)
 
-    def render_with_franka_gripper(self, camera: StretchCameras, driver_angle: float) -> np.ndarray:
+    def render_with_franka(self, camera: StretchCameras | str, driver_angle: float, kind: OverlayKind) -> np.ndarray:
         """
-        Stretch's gripper `camera` as the simulator renders it, but with Stretch's tool (all of it
-        from the wrist roll on) hidden and the ghost Franka's Robotiq fingers in their own
-        colours, open to `driver_angle`, shown instead: where the policy is told its hand is.
-        The ghost's arm and the Robotiq's housing stay hidden. Needs the ghost (`include_franka`),
-        posed by `set_ghost()`.
+        `camera` (one of Stretch's, as the simulator renders it, or one of the scene's own, like
+        DROID_EXO_IN_STRETCH_SCENE) with the ghost Franka, its Robotiq open to `driver_angle`, in
+        the Franka's own look in place of part of Stretch (`FrankaOverlayView`): the Robotiq's
+        fingers for Stretch's tool (`kind` "fingers", the gripper camera), or the whole Franka
+        for Stretch's arm ("franka", the exo views). Needs the ghost (`include_franka`), posed
+        by `set_ghost()`.
         """
         if not self._ghost_joints:
-            raise RuntimeError("Overlaying the Franka's gripper needs the ghost Franka (include_franka)")
-        if camera not in self._franka_gripper_views:
+            raise RuntimeError("Overlaying the Franka needs the ghost Franka (include_franka)")
+        key = (camera, kind)
+        if key not in self._franka_views:
             # The simulator runs its own copy of the model, so this changes only what is rendered here.
-            self._franka_gripper_views[camera] = FrankaGripperView(self.model, self.stretch_scene.franka, camera)
-        view = self._franka_gripper_views[camera]
+            self._franka_views[key] = FrankaOverlayView(self.model, self.stretch_scene.franka, camera, kind)
+        view = self._franka_views[key]
         view.pose_fingers(self.data, driver_angle)
         return view.render(self.data)
 
@@ -554,6 +557,6 @@ class SceneMirror:
         for renderer in self._renderers.values():
             renderer.close()
         self._renderers.clear()
-        for view in self._franka_gripper_views.values():
+        for view in self._franka_views.values():
             view.close()
-        self._franka_gripper_views.clear()
+        self._franka_views.clear()

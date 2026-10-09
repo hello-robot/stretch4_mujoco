@@ -22,8 +22,9 @@ Between instructions, `jog` moves the virtual Franka's joints and pedestal from 
 the robot follows (see `StretchStartPoseEditor` and KEYS_HELP); `home` or `reset` goes back to the
 start pose; `offset x y z [roll yaw pitch]` changes the grasp offset (mm, deg).
 
-With --overlay_franka_gripper, the policy's wrist view shows the Franka's Robotiq fingers where it
-is told its hand is, and Stretch's gripper painted out (see `RealGripperOverlay`).
+With --overlay_franka_gripper, the policy's views show the Franka where it is told its arm and
+hand are, and Stretch painted out: the Robotiq's fingers for Stretch's gripper in the wrist view,
+the whole Franka for Stretch's arm in the exo view (see `RealFrankaOverlay`).
 
 Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_real --robot_ip 10.0.0.12 --object-height 0.80 \\
@@ -55,9 +56,10 @@ from examples.vla.molmobot_droid.checkpoint import (
     unload_policy,
 )
 from examples.vla.molmobot_droid.droid import (
-    FrankaGripperView,
+    FrankaOverlayView,
     FrankaSpawn,
     Observation,
+    OverlayKind,
     RobotPose,
     add_franka_ghost,
     franka_link0_height_for_object,
@@ -443,50 +445,57 @@ class RobotModel:
         resize_franka_pedestal(self.model, self.franka, height)
 
 
-class RealGripperOverlay:
+class RealFrankaOverlay:
     """
-    --overlay_franka_gripper on the real robot: the gripper camera's image with the Robotiq's
-    fingers drawn where the policy is told its hand is, and the rest of Stretch's tool painted
-    out from the pixels around it. There is no scene to render what is behind the tool, as the
-    simulator's mirror does, and the camera is stretch4_mujoco's model of it, so this is only as
-    good as the robot's calibration matches that model.
+    --overlay_franka_gripper on the real robot, for one camera: its image with the Franka drawn
+    where the policy is told its arm and hand are, and the part of Stretch it stands in for
+    painted out from the pixels around it (`kind`, see `FrankaOverlayView`: the Robotiq's
+    fingers for the tool in the gripper camera, the whole Franka for the arm in the head
+    camera). There is no scene to render what is behind Stretch, as the simulator's mirror does,
+    and the camera is stretch4_mujoco's model of it, so this is only as good as the robot's
+    calibration matches that model.
 
     Renders from `RobotModel`'s Stretch and ghost on a `MjData` of its own: `LiveView`'s thread
     poses the other.
     """
 
     TOOL_MARGIN_PX = 9
-    """Stretch's tool mask is grown by this much before painting it out, for calibration error."""
+    """Stretch's mask is grown by this much before painting it out, for calibration error (at the
+    working size)."""
+
+    MAX_WORKING_SIZE_PX = 640
+    """Images are composited no bigger than this on their longer side: the policy sees 320x180,
+    and painting out the arm in a full 1920x1200 head image takes ~0.1 s."""
 
     OVERLAY_AMBIENT, OVERLAY_DIFFUSE = 0.4, 0.6
     """The headlight the Robotiq is rendered in."""
 
-    def __init__(self, robot_model: RobotModel, camera: StretchCameras):
+    def __init__(self, robot_model: RobotModel, camera: StretchCameras, kind: OverlayKind):
         self.robot_model = robot_model
         self.data = mujoco.MjData(robot_model.model)
-        self.view = FrankaGripperView(robot_model.model, robot_model.franka, camera)
+        self.view = FrankaOverlayView(robot_model.model, robot_model.franka, camera, kind)
         # The model has no lights of its own, and nothing else renders it.
         robot_model.model.vis.headlight.ambient = [self.OVERLAY_AMBIENT] * 3
         robot_model.model.vis.headlight.diffuse = [self.OVERLAY_DIFFUSE] * 3
         self._warned_aspect = False
 
     def apply(self, image: np.ndarray, world_from_footprint: np.ndarray, joints: StretchJoints, state8) -> np.ndarray:
+        """`image` with the Franka in place of Stretch's part, at most MAX_WORKING_SIZE_PX big."""
         self.robot_model.pose(world_from_footprint, joints, state8[:7], data=self.data)
         self.view.pose_fingers(self.data, state8[7])
         rgb = self.view.render(self.data)
-        fingers, tool = self.view.masks(self.data)
-        height, width = image.shape[:2]
+        if not self._warned_aspect and abs(rgb.shape[1] / rgb.shape[0] - image.shape[1] / image.shape[0]) > 0.01:
+            click.secho(f"The {self.view.kind} overlay's camera sends {image.shape[1]}x{image.shape[0]} images, not "
+                        f"the model's {rgb.shape[1]}x{rgb.shape[0]} aspect; the overlay is stretched to fit", fg="yellow")
+            self._warned_aspect = True
+        scale = min(1.0, self.MAX_WORKING_SIZE_PX / max(image.shape[:2]))
+        height, width = round(image.shape[0] * scale), round(image.shape[1] * scale)
+        if image.shape[:2] != (height, width):
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
         if rgb.shape[:2] != (height, width):
-            if not self._warned_aspect and abs(rgb.shape[1] / rgb.shape[0] - width / height) > 0.01:
-                click.secho(f"The gripper camera's {width}x{height} images are not the model's "
-                            f"{rgb.shape[1]}x{rgb.shape[0]} aspect; the overlay is stretched to fit", fg="yellow")
-                self._warned_aspect = True
             rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
-            fingers, tool = (
-                cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
-                for mask in (fingers, tool)
-            )
-        # All of the tool, under the fingers too: what is left of it would be painted outwards.
+        fingers, tool = self.view.masks(self.data, (width, height))
+        # All of Stretch's part, under the Franka too: what is left of it would be painted outwards.
         margin = np.ones((self.TOOL_MARGIN_PX, self.TOOL_MARGIN_PX), np.uint8)
         hole = cv2.dilate(tool.astype(np.uint8), margin) * 255
         out = cv2.inpaint(np.ascontiguousarray(image), hole, 5, cv2.INPAINT_TELEA)
@@ -512,8 +521,9 @@ class RealStretch4Env:
         """The Franka state the policy last saw; Rerun's ghost follows it."""
         self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         """The Franka pose `go_home()` goes to."""
-        self.gripper_overlay: RealGripperOverlay | None = None
-        """With --overlay_franka_gripper: what puts the Robotiq in the policy's wrist view."""
+        self.gripper_overlay: RealFrankaOverlay | None = None
+        self.exo_overlay: RealFrankaOverlay | None = None
+        """With --overlay_franka_gripper: what puts the Franka in the policy's wrist and exo views."""
         self.interrupted = lambda: False
         """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
         self.check_camera_sides()
@@ -564,11 +574,13 @@ class RealStretch4Env:
         footprint, joints = self._state(message)
         state8, _ = self.retargeter.stretch_to_franka(footprint, joints)
         self.last_state8 = state8
-        wrist = message["wrist_rgb"]
+        wrist, head = message["wrist_rgb"], message["head_rgb"]
         if self.gripper_overlay is not None:
             wrist = self.gripper_overlay.apply(wrist, footprint, joints, state8)
+        if self.exo_overlay is not None:
+            head = self.exo_overlay.apply(head, footprint, joints, state8)
         return Observation(
-            exo_rgb=prepare_exo(message["head_rgb"], self.params),
+            exo_rgb=prepare_exo(head, self.params),
             wrist_rgb=wrist_view(wrist),
             state8=state8,
             extra_cameras={"head_raw": message["head_rgb"], "gripper_raw": message["wrist_rgb"]},
@@ -829,7 +841,9 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
         env = RealStretch4Env(robot, receiver, params, robot_model.franka)
         env.start_q7 = start_q7
         if overlay_franka_gripper:
-            env.gripper_overlay = RealGripperOverlay(robot_model, stretch_cameras_to_use(params)[0])
+            gripper_camera, head_camera = stretch_cameras_to_use(params)
+            env.gripper_overlay = RealFrankaOverlay(robot_model, gripper_camera, "fingers")
+            env.exo_overlay = RealFrankaOverlay(robot_model, head_camera, "franka")
         offset = ",".join(f"{v:g}" for v in params.effective_grasp_offset_mm)
         click.echo(
             click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
@@ -838,7 +852,7 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
             + click.style("Motion   ", bold=True) + ("slow" if params.slow else "full speed")
             + (", waiting for each action to arrive" if params.wait_for_arrival else "")
             + f", {params.execute_first_n} of every {params.execute_horizon} predicted actions"
-            + ("\n" + click.style("Wrist    ", bold=True) + "the Franka's Robotiq overlaid" if overlay_franka_gripper else "")
+            + ("\n" + click.style("Overlay  ", bold=True) + "the Franka in the wrist and exo views" if overlay_franka_gripper else "")
         )
         if rerun:
             rerun_scene.init_rerun("MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"])
@@ -892,8 +906,9 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
             env.stop_motion()
         if live is not None:
             live.close()
-        if env is not None and env.gripper_overlay is not None:
-            env.gripper_overlay.close()
+        for overlay in (env.gripper_overlay, env.exo_overlay) if env is not None else ():
+            if overlay is not None:
+                overlay.close()
         unload_policy()
         receiver.close()
         robot.stop()
