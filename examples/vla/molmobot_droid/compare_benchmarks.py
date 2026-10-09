@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from examples.vla.molmobot_droid.checkpoint import POLICY_HZ
-from examples.vla.molmobot_droid.molmospaces.benchmark import episode_name
+from examples.vla.molmobot_droid.molmospaces.benchmark import episode_name, video_path
 
 SIDE_BY_SIDE_CAMERAS = ("grid", "scene")
 TILE_HEIGHT = 540
@@ -36,8 +36,12 @@ def load_run(run_dir: Path) -> dict:
 
 
 def episode_video(run: dict, index: int, camera: str) -> Path | None:
-    path = run["dir"] / f"{run['run_name']}_{episode_name(index)}_{camera}.mp4"
-    return path if path.exists() else None
+    prefix = f"{run['run_name']}_{episode_name(index)}"
+    # Runs from before grids moved to their own folder have them next to the other videos.
+    for path in (video_path(run["dir"], prefix, camera), run["dir"] / f"{prefix}_{camera}.mp4"):
+        if path.exists():
+            return path
+    return None
 
 
 def read_frames(path: Path) -> list[np.ndarray]:
