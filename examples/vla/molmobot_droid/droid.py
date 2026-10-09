@@ -570,15 +570,25 @@ def robotiq_linkage(steps: int = 26) -> tuple[list[str], np.ndarray, np.ndarray]
 
 
 @functools.cache
-def robotiq_visual_rgba() -> np.ndarray:
+def franka_visual_look() -> tuple[list[str], np.ndarray, list[str | None]]:
     """
-    The colours of the Robotiq's visual geoms (molmospaces' group 2) in model order, which are
-    the geoms `add_franka_ghost()` keeps and tints, so its own look can be put back. Its
-    materials are plain colours, without textures.
+    The look `add_franka_ghost()` tints away, for every geom it keeps, in model order: (their
+    bodies' names after the robot's prefix, their colours, their materials' names after the
+    prefix or None), from a standalone molmospaces Franka DROID.
     """
-    model = FrankaKinematics().model
-    geoms = [g for g in subtree_geoms(model, f"{FRANKA_PREFIX}gripper/base") if model.geom_group[g] == 2]
-    return np.array([model.mat_rgba[model.geom_matid[g]] if model.geom_matid[g] >= 0 else model.geom_rgba[g] for g in geoms])
+    spec = mujoco.MjSpec()
+    spawn = spawn_franka_droid(spec, RobotPose(0.0, 0.0, 0.0), FRANKA_PEDESTAL_HEIGHT, exo_camera=None)
+    model = spec.compile()
+    prefix = spawn.prefix
+    # The geoms add_franka_ghost() deletes: collision meshes doubling visual ones.
+    kept = [
+        g for g in subtree_geoms(model, spawn.base_name)
+        if not (model.geom_group[g] == 3 and (model.geom_contype[g] or model.geom_conaffinity[g]))
+    ]
+    bodies = [model.body(model.geom_bodyid[g]).name[len(prefix):] for g in kept]
+    rgba = np.array([model.mat_rgba[model.geom_matid[g]] if model.geom_matid[g] >= 0 else model.geom_rgba[g] for g in kept])
+    materials = [model.material(model.geom_matid[g]).name[len(prefix):] if model.geom_matid[g] >= 0 else None for g in kept]
+    return bodies, rgba, materials
 
 
 def subtree_geoms(model: mujoco.MjModel, body_name: str) -> list[int]:
@@ -604,35 +614,62 @@ def robotiq_joint_positions(driver_angle: float) -> dict[str, float]:
 STRETCH_TOOL_ROOT = "wrist_roll_link"
 """Everything of Stretch's from here on is its tool: the gripper, its cameras and fingers."""
 
+STRETCH_ARM_ROOT = "lift_link"
+"""Everything of Stretch's from here on is its arm: the lift carriage, the telescoping arm, the
+wrist and the tool. The base, the mast and the head stay."""
 
-class FrankaGripperView:
+OverlayKind = Literal["fingers", "franka"]
+
+
+class FrankaOverlayView:
     """
-    One of Stretch 4's gripper cameras in `model` (Stretch with a ghost Franka from
-    `add_franka_ghost()`), rendered with Stretch's tool hidden and the ghost's Robotiq fingers
-    shown instead, in the Robotiq's own colours: the Franka's gripper where the policy is told
-    its hand is. The ghost's arm and the Robotiq's housing stay hidden (Stretch's camera sits
-    where the housing would be; DROID's wrist camera, beside it, sees only the fingers).
+    A camera in `model` (Stretch with a ghost Franka from `add_franka_ghost()`), rendered with
+    part of Stretch hidden and the ghost shown instead in the Franka's own look, where the
+    policy is told its arm and hand are:
 
-    `model`'s geom groups and colours are changed only while rendering, and its camera is given
-    the intrinsics stretch4_mujoco gives `camera`.
+      fingers: Stretch's tool hidden, the Robotiq's fingers shown. For Stretch's gripper camera,
+          which sits where the Robotiq's housing would be (DROID's wrist camera, beside it, sees
+          only the fingers), so the housing and the arm stay hidden.
+      franka: Stretch's arm hidden (from the lift carriage on), all of the Franka shown, its
+          pedestal too. For the exo views: what the Franka DROID would show there.
+
+    `camera` is one of Stretch's (rendered as stretch4_mujoco renders it, fisheye included,
+    with its intrinsics given to `model`) or a camera of `model`'s own, rendered as is. `model`'s
+    geom groups, colours and materials are changed only while rendering.
     """
 
-    def __init__(self, model: mujoco.MjModel, franka: FrankaSpawn, camera: StretchCameras):
-        if camera.is_fisheye:
-            raise ValueError(f"{camera} is a fisheye; the gripper cameras are not")
-        self.model, self.franka = model, franka
-        self.camera_name = camera.camera_name_in_mjcf
-        apply_stretch_camera_settings(model, self.camera_name, camera)
-        self.renderer = StretchCameraRenderer(model, self.camera_name, camera)
-        self.tool = subtree_geoms(model, STRETCH_TOOL_ROOT)
-        base = f"{franka.prefix}gripper/base"
-        robotiq = subtree_geoms(model, base)
-        self.rgba = robotiq_visual_rgba()
-        if len(self.rgba) != len(robotiq):
-            raise RuntimeError(f"The ghost's Robotiq has {len(robotiq)} geoms, molmospaces' {len(self.rgba)}")
-        self.robotiq = robotiq
-        housing = model.body(base).id
-        self.fingers = [g for g in robotiq if model.geom_bodyid[g] != housing]
+    MASK_COLOUR = (1.0, 0.0, 1.0, 1.0)
+    MASK_THRESHOLD = 30
+    """Masks are where drawing the geoms in this flat colour changes the image from drawing none of
+    them, by more than this in some channel: segmentation cannot go through the fisheye's
+    stitched views."""
+
+    def __init__(self, model: mujoco.MjModel, franka: FrankaSpawn, camera: StretchCameras | str, kind: OverlayKind):
+        self.model, self.franka, self.kind = model, franka, kind
+        if isinstance(camera, StretchCameras):
+            name = camera.camera_name_in_mjcf
+            apply_stretch_camera_settings(model, name, camera)
+            self.renderer = StretchCameraRenderer(model, name, camera)
+        else:
+            size = tuple(int(v) for v in model.cam_resolution[model.camera(camera).id])
+            self.renderer = PinholeRenderer(model, camera, size)
+        self.hidden = subtree_geoms(model, STRETCH_TOOL_ROOT if kind == "fingers" else STRETCH_ARM_ROOT)
+        self.ghost = subtree_geoms(model, franka.base_name)
+        bodies, self.rgba, materials = franka_visual_look()
+        ghost_bodies = [model.body(model.geom_bodyid[g]).name[len(franka.prefix):] for g in self.ghost]
+        if ghost_bodies != bodies:
+            raise RuntimeError("The ghost Franka's geoms do not match molmospaces' Franka DROID's")
+        # The ghost's materials are gone from its geoms, but still in the model.
+        self.matid = np.array([
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, franka.prefix + name) if name else -1
+            for name in materials
+        ])
+        if kind == "fingers":
+            housing = model.body(f"{franka.prefix}gripper/base").id
+            gripper = set(subtree_geoms(model, f"{franka.prefix}gripper/base"))
+            self.shown = [g for g in self.ghost if g in gripper and model.geom_bodyid[g] != housing]
+        else:
+            self.shown = list(self.ghost)
 
     def pose_fingers(self, data: mujoco.MjData, driver_angle: float) -> None:
         """Open the ghost's Robotiq to `driver_angle` (the Franka state's last value) in `data`."""
@@ -642,39 +679,47 @@ class FrankaGripperView:
         mujoco.mj_camlight(self.model, data)
 
     @contextlib.contextmanager
-    def _showing(self, geoms: list[int]):
-        """Of Stretch's tool and the Robotiq, only `geoms` drawn (in a group the renderer draws,
-        the rest in the ghost's, which it does not), the Robotiq in its own colours."""
-        model, regrouped = self.model, self.tool + self.robotiq
-        groups, rgba = model.geom_group[regrouped].copy(), model.geom_rgba[self.robotiq].copy()
+    def _showing(self, geoms: list[int], flat: tuple | None = None):
+        """
+        Of Stretch's hidden part and the ghost, only `geoms` drawn (in a group the renderer
+        draws; the rest in the ghost's, which it does not), the ghost in the Franka's look, or
+        `geoms` all in the `flat` colour.
+        """
+        model, regrouped = self.model, self.hidden + self.ghost
+        saved = (model.geom_group[regrouped].copy(), model.geom_rgba[regrouped].copy(), model.geom_matid[regrouped].copy())
         model.geom_group[regrouped] = GHOST_GEOM_GROUP
         model.geom_group[geoms] = 0
-        model.geom_rgba[self.robotiq] = self.rgba
+        model.geom_rgba[self.ghost], model.geom_matid[self.ghost] = self.rgba, self.matid
+        if flat is not None:
+            model.geom_rgba[geoms], model.geom_matid[geoms] = flat, -1
         try:
             yield
         finally:
-            model.geom_group[regrouped], model.geom_rgba[self.robotiq] = groups, rgba
+            model.geom_group[regrouped], model.geom_rgba[regrouped], model.geom_matid[regrouped] = saved
 
     def render(self, data: mujoco.MjData) -> np.ndarray:
-        """The camera's image, with the Robotiq's fingers in place of Stretch's tool."""
-        with self._showing(self.fingers):
+        """The camera's image, with the Franka in place of Stretch's part."""
+        with self._showing(self.shown):
             return self.renderer.render(data)
 
-    def masks(self, data: mujoco.MjData) -> tuple[np.ndarray, np.ndarray]:
-        """(where the Robotiq's fingers are, where Stretch's tool is) in the camera's image."""
-        renderer = self.renderer.renderer
-        renderer.enable_segmentation_rendering()
-        try:
-            masks = []
-            for geoms in (self.fingers, self.tool):
-                with self._showing(geoms):
-                    renderer.update_scene(data, camera=self.camera_name)
-                    segmentation = renderer.render()
-                mask = np.isin(segmentation[..., 0], geoms) & (segmentation[..., 1] == mujoco.mjtObj.mjOBJ_GEOM)
-                # Turned upright as `render()` turns the image.
-                masks.append(np.ascontiguousarray(np.rot90(mask, self.renderer.camera.initial_camera_settings.rotate_number_of_times)))
-        finally:
-            renderer.disable_segmentation_rendering()
+    def masks(self, data: mujoco.MjData, size: tuple[int, int] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """
+        (where the Franka's shown geoms are, where Stretch's hidden part is) in the image, at
+        `size` (width, height) if given: smaller is quicker to compare.
+        """
+        import cv2
+
+        def render() -> np.ndarray:
+            image = self.renderer.render(data)
+            return image if size is None else cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+
+        with self._showing([]):
+            neither = render()
+        masks = []
+        for geoms in (self.shown, self.hidden):
+            with self._showing(geoms, flat=self.MASK_COLOUR):
+                image = render()
+            masks.append(cv2.absdiff(image, neither).max(axis=-1) > self.MASK_THRESHOLD)
         return tuple(masks)
 
     def close(self) -> None:
