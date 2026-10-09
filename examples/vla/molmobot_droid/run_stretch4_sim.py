@@ -15,6 +15,7 @@ Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --exo_camera center \\
         --head-crop droid --gripper_camera right --slow --grasp-offset-mm 0,0,10
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --custom_franka_start_pose
+    python -m examples.vla.molmobot_droid.run_stretch4_sim --overlay_franka_gripper
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from examples.vla.molmobot_droid import rerun_scene
 from examples.vla.molmobot_droid.checkpoint import build_instruction, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
+    OVERLAY_GRASP_OFFSET_MM,
     Stretch4SimEnv,
     custom_start_link0_height,
     custom_start_option,
@@ -37,6 +39,7 @@ from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import Stretc
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     STRETCH_ROOT_BODY,
     SceneMirror,
+    free_bodies,
     load_custom_scene,
     load_custom_scene_stretch4,
     virtual_franka_link0_height,
@@ -105,14 +108,47 @@ class StretchRerunLogger:
         rerun_scene.log_metrics(metrics)
 
 
+OVERLAY_WATCH_RADIUS = 2.0
+"""m. With --overlay_franka_gripper the wrist view is rendered in `SceneMirror`, which moves only
+the bodies the simulator reports: so it reports the free objects this close to the robot too."""
+
+
+def nearby_free_bodies(stretch_scene, radius: float = OVERLAY_WATCH_RADIUS) -> list[str]:
+    """The scene's free bodies (the objects that can move) within `radius` of the robot."""
+    import mujoco
+
+    model = stretch_scene.model
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    robot = np.array([stretch_scene.robot_pose.x, stretch_scene.robot_pose.y])
+    return [name for name in free_bodies(model) if np.linalg.norm(data.body(name).xpos[:2] - robot) <= radius]
+
+
 @click.command()
 @scene_options
 @retarget_options
 @include_franka_option
 @custom_start_option
+@click.option(
+    "--overlay_franka_gripper",
+    "--overlay-franka-gripper",
+    "overlay_franka_gripper",
+    is_flag=True,
+    help="Show the policy the Franka's Robotiq gripper instead of Stretch's in the wrist view: "
+    "Stretch's gripper camera re-rendered with Stretch's tool hidden and the Robotiq where the "
+    "policy is told its hand is (grasp offset included). Turns on --include_franka, and makes "
+    "the default grasp offset the overlay's: "
+    + ", ".join(f"{','.join(f'{v:g}' for v in o)} for {t[-3:].upper()}" for t, o in OVERLAY_GRASP_OFFSET_MM.items())
+    + ".",
+)
 def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, include_franka,
-         custom_franka_start_pose, **kwargs):
+         custom_franka_start_pose, overlay_franka_gripper, **kwargs):
     params = params_from_kwargs(kwargs)
+    include_franka = include_franka or overlay_franka_gripper  # the Robotiq is the ghost's
+    if overlay_franka_gripper and params.grasp_offset_mm is None:
+        params.grasp_offset_mm = OVERLAY_GRASP_OFFSET_MM.get(params.tool_name)
+    if overlay_franka_gripper:
+        click.secho(f"Grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
     scene = load_custom_scene(scene_id, object_type, object_index)
     click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
@@ -128,8 +164,12 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     if stretch_scene.removed_bodies:
         click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
     sim = spawn_stretch4(stretch_scene, params)
+    if overlay_franka_gripper:
+        watched = stretch_scene.watched_bodies
+        sim.watch_bodies(watched + [name for name in nearby_free_bodies(stretch_scene) if name not in watched])
     sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
     env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
+    env.overlay_franka_gripper = overlay_franka_gripper
     try:
         logger = None
         if rerun:
