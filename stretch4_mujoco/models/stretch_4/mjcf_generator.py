@@ -9,6 +9,10 @@ import yourdfpy
 from urdf2mjcf.convert import convert_urdf_to_mjcf
 from urdf2mjcf.model import ConversionMetadata
 
+# Mirror the URDF's wrist roll limits, [lower, upper] -> [-upper, -lower]. The
+# URDF's are the servo's mirrored, while the robot reports roll in the URDF's own
+# sign, so without the flip the sim cannot reach every roll the real robot can.
+FLIP_WRIST_ROLL_RANGE = True
 
 def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     """
@@ -319,6 +323,9 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             j.set("class", "wrist_pitch_stretch4")
         elif "wrist_roll_joint" in name:
             j.set("class", "wrist_roll_stretch4")
+            if FLIP_WRIST_ROLL_RANGE and j.get("range"):
+                lower, upper = map(float, j.get("range").split())
+                j.set("range", f"{-upper} {-lower}")
         elif "gripper_finger_left_joint" in name:
             j.set("class", "gripper_left_finger")
         elif "gripper_finger_right_joint" in name:
