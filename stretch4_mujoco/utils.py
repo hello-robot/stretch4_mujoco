@@ -268,6 +268,7 @@ class URDFmodel:
             "arm_l2_joint",
             "arm_l1_joint",
             "gripper_finger_left_joint",
+            "finger_left_joint",
             "head_pan_joint",
             "head_tilt_joint",
         ]:
@@ -311,6 +312,8 @@ class URDFmodel:
             lk_cfg["joint_gripper_finger_right"] = cfg["gripper"]
             lk_cfg["gripper_finger_left_joint"] = cfg["gripper"]
             lk_cfg["gripper_finger_right_joint"] = cfg["gripper"]
+            lk_cfg["finger_left_joint"] = cfg["gripper"]
+            lk_cfg["finger_right_joint"] = cfg["gripper"]
             
         valid_lk_cfg = {k: v for k, v in lk_cfg.items() if k in self.urdf.joint_map}
         self.urdf.update_cfg(valid_lk_cfg)

@@ -42,11 +42,6 @@ from pynput import keyboard
 
 from stretch4_mujoco import gamepad_joints
 from stretch4_mujoco.gamepad_control_mappings import TRIGGER_THRESHOLD, ControlMapping
-from stretch4_mujoco.gamepad_controller import (
-    ButtonPressCounter,
-    GamePadController,
-    JointEffortTracker,
-)
 from stretch4_mujoco.gamepad_enums import (
     GripperHandedness,
     GuardedContactSensitivity,
@@ -334,6 +329,12 @@ class GamepadTeleop:
         rate_hz: float | None = None,
         print_mapping_on_start: bool = True,
     ):
+        from stretch4_mujoco.gamepad_controller import (
+            ButtonPressCounter,
+            GamePadController,
+            JointEffortTracker,
+        )
+
         self.sim = sim
         self.robot = sim  # the mappings take the simulator where the robot takes a Robot
 
@@ -899,7 +900,7 @@ def _build_flying_gripper_controller(sim: StretchMujocoSimulator):
     from yourdfpy import urdf as ud
 
     out_dir = tempfile.mkdtemp(prefix="sim_gamepad_teleop_")
-    robot = ud.URDF.load(type(sim).get_urdf_path())
+    robot = ud.URDF.load(sim.urdf_path)
     urdf_path = make_planar_ik_urdf(
         robot, "sim_gamepad_teleop", out_dir, is_merge_arm=True, is_fixed_wrist=False
     )
