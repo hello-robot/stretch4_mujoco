@@ -2,8 +2,8 @@
 Run a MolmoSpaces benchmark with MolmoBot-DROID on the Franka DROID it was trained on: the
 baseline `run_benchmark_stretch4.py` is compared against (see `compare_benchmarks.py`).
 
-Writes to <out>/<run name>/: per-episode videos of every camera, the scene camera and a grid,
-`report.md` and `results.json`.
+Writes to <out>/<run name>/: per-episode videos of every camera and the scene camera, a grid of
+them with the instruction in `grid/`, `report.md` and `results.json`.
 
 Usage:
     python -m examples.vla.molmobot_droid.run_benchmark_franka
@@ -93,20 +93,23 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     )
                 finally:
                     env.close()
-                print_result(run.current, result)
+                print_result(run.current, result, out_dir)
                 run.record(result)
             successes = sum(r.success for r in run.results)
             click.secho(f"{successes}/{len(run.results)} succeeded. Report: {out_dir / 'report.md'}", fg="green")
+            click.secho(f"Grid videos: {(out_dir / bench.GRID_DIR).resolve().as_uri()}", fg="green")
     finally:
         unload_policy()
 
 
-def print_result(name: str, result) -> None:
+def print_result(name: str, result, out_dir: Path) -> None:
     click.secho(
         f"    {name}: {'SUCCESS' if result.success else 'fail'} after {result.steps} steps"
         + (f" ({result.error})" if result.error else ""),
         fg="green" if result.success else "red",
     )
+    if result.grid_video:
+        click.echo(f"    video: {(out_dir / result.grid_video).resolve().as_uri()}")
 
 
 if __name__ == "__main__":

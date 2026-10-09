@@ -6,8 +6,9 @@ same geometry it would on the Franka. Compare against `run_benchmark_franka.py` 
 `compare_benchmarks.py`.
 
 Writes to <out>/<run name>/: per-episode videos of every camera (the policy's two views,
-Stretch's raw head and gripper cameras, the scene camera) and a grid, `report.md`, and
-`results.json`. Retargeting counts (IK failures, clamped targets) are in the report.
+Stretch's raw head and gripper cameras, the scene camera), a grid of them with the instruction
+in `grid/` (each episode prints a link to its grid), `report.md`, and `results.json`.
+Retargeting counts (IK failures, clamped targets) are in the report.
 
 Usage:
     python -m examples.vla.molmobot_droid.run_benchmark_stretch4
@@ -107,10 +108,11 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     )
                 finally:
                     sim.stop()
-                print_result(run.current, result)
+                print_result(run.current, result, out_dir)
                 run.record(result)
             successes = sum(r.success for r in run.results)
             click.secho(f"{successes}/{len(run.results)} succeeded. Report: {out_dir / 'report.md'}", fg="green")
+            click.secho(f"Grid videos: {(out_dir / bench.GRID_DIR).resolve().as_uri()}", fg="green")
     finally:
         unload_policy()
 
