@@ -5,8 +5,9 @@ the Franka's base, and the virtual Franka is at the episode's height, so the pol
 same geometry it would on the Franka. Compare against `run_benchmark_franka.py` with
 `compare_benchmarks.py`. With --custom_franka_start_pose, the virtual Franka instead stands at
 the height and starts from the pose that puts Stretch's tool at the top of its reach. With
---overlay_franka_gripper, the policy's wrist view shows the Franka's Robotiq fingers instead of
-Stretch's gripper (as in `run_stretch4_sim.py`).
+--overlay_franka_gripper, the policy's views show the Franka instead of Stretch: the Robotiq's
+fingers for Stretch's gripper in the wrist view, the whole Franka for Stretch's arm in the exo
+view (as in `run_stretch4_sim.py`).
 
 Writes to <out>/<run name>/: per-episode videos of every camera (the policy's two views,
 Stretch's raw head and gripper cameras, the scene camera), a grid of them with the instruction

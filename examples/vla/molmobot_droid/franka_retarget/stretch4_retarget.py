@@ -287,9 +287,9 @@ def overlay_gripper_option(function):
         "--overlay-franka-gripper",
         "overlay_franka_gripper",
         is_flag=True,
-        help="Show the policy the Franka's Robotiq fingers instead of Stretch's gripper in the wrist "
-        "view, where it is told its hand is (grasp offset included), and default the grasp offset "
-        "to the overlay's: "
+        help="Show the policy the Franka instead of Stretch, where it is told its arm and hand are "
+        "(grasp offset included): the Robotiq's fingers for Stretch's gripper in the wrist view, the "
+        "whole Franka for Stretch's arm in the exo view. Defaults the grasp offset to the overlay's: "
         + ", ".join(f"{','.join(f'{v:g}' for v in o)} for {t[-3:].upper()}" for t, o in OVERLAY_GRASP_OFFSET_MM.items())
         + ".",
     )(function)
@@ -1024,8 +1024,9 @@ class Stretch4SimEnv:
         self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         """The Franka pose `reset()` goes back to."""
         self.overlay_franka_gripper = False
-        """Show the policy the Franka's Robotiq in place of Stretch's gripper in the wrist view
-        (`SceneMirror.render_with_franka_gripper()`; needs the ghost Franka)."""
+        """Show the policy the Franka in place of Stretch: the Robotiq's fingers for Stretch's
+        gripper in the wrist view, the whole Franka for Stretch's arm in the exo view
+        (`SceneMirror.render_with_franka()`; needs the ghost Franka)."""
 
     # -- state ------------------------------------------------------------
 
@@ -1065,15 +1066,24 @@ class Stretch4SimEnv:
         if self.params.exo_camera == "droid":
             from examples.vla.molmobot_droid.molmospaces.custom_scene import DROID_EXO_IN_STRETCH_SCENE
 
-            exo = self.mirror.render(DROID_EXO_IN_STRETCH_SCENE)
+            exo = (
+                self.mirror.render_with_franka(DROID_EXO_IN_STRETCH_SCENE, state8[7], "franka")
+                if self.overlay_franka_gripper
+                else self.mirror.render(DROID_EXO_IN_STRETCH_SCENE)
+            )
         else:
-            exo = prepare_exo(head, self.params)
+            if self.overlay_franka_gripper:
+                # The head camera with the Franka in place of Stretch's arm.
+                head_camera = stretch_cameras_to_use(self.params)[1]
+                exo = prepare_exo(self.mirror.render_with_franka(head_camera, state8[7], "franka"), self.params)
+            else:
+                exo = prepare_exo(head, self.params)
         extra = {"gripper_raw": gripper}
         if head is not None:
             extra["head_raw"] = head
         if self.overlay_franka_gripper:
             # The policy's wrist view with the Franka's gripper where it is told its hand is.
-            gripper = self.mirror.render_with_franka_gripper(stretch_cameras_to_use(self.params)[0], state8[7])
+            gripper = self.mirror.render_with_franka(stretch_cameras_to_use(self.params)[0], state8[7], "fingers")
         return Observation(exo_rgb=exo, wrist_rgb=wrist_view(gripper), state8=state8, extra_cameras=extra)
 
     def tool_error_m(self) -> float | None:
