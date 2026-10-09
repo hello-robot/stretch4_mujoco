@@ -55,8 +55,7 @@ from stretch4_mujoco.gamepad_enums import (
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 
-# Header constants, mirroring stretch4_body/core/gamepad_teleop.py
-STEP_SLEEP = 1 / 15
+STEP_SLEEP = 1 / 50
 
 # Button Hold Durations
 START_BUTTON_HOLD_TIME_S = 3
@@ -448,13 +447,13 @@ class GamepadTeleop:
             )
         if self.use_devices["eoa"]:
             self.wrist_yaw_command = gamepad_joints.CommandWristYaw(
-                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+                motion_profile=self.motion_profile.get_name()
             )
             self.wrist_pitch_command = gamepad_joints.CommandWristPitch(
-                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+                motion_profile=self.motion_profile.get_name()
             )
             self.wrist_roll_command = gamepad_joints.CommandWristRoll(
-                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+                motion_profile=self.motion_profile.get_name()
             )
         if self.use_devices["gripper"]:
             self.gripper = gamepad_joints.CommandStretchGripperPosition(

@@ -14,6 +14,18 @@ class CommandMove:
     actuator_name: str
     trigger: bool
     pos: float
+    # Per-command motion limits, in the actuator's ctrl units. `None` leaves the
+    # joint's profile on whatever `config.DEFAULT_MOTION_PROFILE` gave it, which is
+    # what a caller that passes no `v_m`/`a_m` gets on the robot too.
+    vel: float | None = None
+    accel: float | None = None
+
+
+@dataclass
+class CommandJointVelocity:
+    """A continuous jog, with the acceleration to ramp it at."""
+    vel: float
+    accel: float | None = None
 
 
 @dataclass
@@ -45,7 +57,7 @@ class StatusCommand:
 
     move_to: dict[str, CommandMove] = field(default_factory=dict)
     move_by: dict[str, CommandMove] = field(default_factory=dict)
-    joint_velocities: dict[str, float] = field(default_factory=dict)
+    joint_velocities: dict[str, CommandJointVelocity] = field(default_factory=dict)
     base_velocity: CommandBaseVelocity = field(default_factory=lambda:CommandBaseVelocity(0, 0,0, False))
     keyframe: CommandKeyframe = field(default_factory=lambda:CommandKeyframe("", False))
     coordinate_frame_arrows_viz: list[CommandCoordinateFrameArrowsViz] = field(default_factory=list)
@@ -62,11 +74,18 @@ class StatusCommand:
         self.move_to.pop(command.actuator_name, None)
         self.joint_velocities.pop(command.actuator_name, None)
 
-    def set_joint_velocity(self, actuator_name: str, v_m: float):
+    def set_joint_velocity(self, actuator_name: str, v_m: float, a_m: float | None = None):
         """Sends a joint velocity command and removes conflicting move_to and move_by commands."""
-        self.joint_velocities[actuator_name] = v_m
+        self.joint_velocities[actuator_name] = CommandJointVelocity(vel=v_m, accel=a_m)
         self.move_to.pop(actuator_name, None)
         self.move_by.pop(actuator_name, None)
+
+    def set_keyframe(self, command: CommandKeyframe):
+        """Sends a keyframe and drops every per-joint command it supersedes."""
+        self.keyframe = command
+        self.move_to.clear()
+        self.move_by.clear()
+        self.joint_velocities.clear()
 
     def set_base_velocity(self, command: CommandBaseVelocity):
         """Sends the velocity command and removes the move_to and move_by commands."""
