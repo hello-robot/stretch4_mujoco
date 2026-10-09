@@ -47,6 +47,7 @@ from examples.vla.molmobot_droid.droid import (
     FrankaKinematics,
     FrankaSpawn,
     Observation,
+    RobotPose,
     make_transform,
     pose_to_transform,
     rotz,
@@ -113,15 +114,16 @@ PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
     STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
-    # PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0.0),
-    PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
+    PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0.0),
+    # PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
 compared to the Robotiq's relative to its grasp_site, so the fingers line up with the Franka's."""
 
 OVERLAY_GRASP_OFFSET_MM = {
     STRETCH_GRIPPER_TOOL: (-9, 21.0, 17.0),
-    PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
+    # PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
+    PARALLEL_GRIPPER_TOOL: (4 + 15, -21.0, 0.0),
 }
 """Per tool, the grasp offset to default to with --overlay_franka_gripper (run_stretch4_sim): the
 one that puts the overlaid Robotiq's fingers where the tool's are in its gripper camera's view.
@@ -276,6 +278,28 @@ def custom_start_option(function):
         "puts Stretch's tool as high as Stretch can put it at that tilt (instead of the height "
         "molmospaces trains at for the object).",
     )(function)
+
+
+def overlay_gripper_option(function):
+    """--overlay_franka_gripper, for the Stretch 4 scripts (see `apply_overlay_grasp_offset()`)."""
+    return click.option(
+        "--overlay_franka_gripper",
+        "--overlay-franka-gripper",
+        "overlay_franka_gripper",
+        is_flag=True,
+        help="Show the policy the Franka's Robotiq fingers instead of Stretch's gripper in the wrist "
+        "view, where it is told its hand is (grasp offset included), and default the grasp offset "
+        "to the overlay's: "
+        + ", ".join(f"{','.join(f'{v:g}' for v in o)} for {t[-3:].upper()}" for t, o in OVERLAY_GRASP_OFFSET_MM.items())
+        + ".",
+    )(function)
+
+
+def apply_overlay_grasp_offset(params: RetargetParams) -> None:
+    """With --overlay_franka_gripper: OVERLAY_GRASP_OFFSET_MM's grasp offset, unless one was given.
+    Call it once the tool is known, before anything that depends on the offset."""
+    if params.grasp_offset_mm is None:
+        params.grasp_offset_mm = OVERLAY_GRASP_OFFSET_MM.get(params.tool_name)
 
 
 def retarget_options(function=None, *, gripper_option: bool = True):
@@ -521,6 +545,42 @@ def custom_start_link0_height(params: RetargetParams, floor_z: float) -> float:
     return floor_z + highest[2, 3] - tool[2, 3]
 
 
+def franka_yaw_for_start(params: RetargetParams, link0_height: float, start_q7, floor_z: float = 0.0) -> float:
+    """
+    The virtual Franka's yaw relative to Stretch's footprint (rad) that lets Stretch reach the
+    Franka's `start_q7` without turning its base.
+
+    Stretch's arm and tool sit off to the side of its footprint's centre, so with the Franka
+    facing the way Stretch does, the start pose has Stretch turn its base (~12-16 degrees). The
+    Franka is turned by minus that instead, about the footprint, where its `fr3_link0` stands:
+    the start pose relative to the Franka is the same, and so is Stretch's head relative to it
+    (the base had turned it by just as much), but nothing moves to get there.
+
+    Re-solved a few times, as the turned target can pick a slightly different wrist pose.
+    Returns 0 when Stretch cannot reach the start pose, which reaching it reports.
+    """
+    seed = StretchJoints(
+        lift=LIFT_RANGE[0] + SPAWN_LIFT_FRACTION * (LIFT_RANGE[1] - LIFT_RANGE[0]),
+        arm=SPAWN_ARM_EXTENSION,
+        wrist_yaw=0.0,
+        wrist_pitch=0.0,
+        wrist_roll=0.0,
+        gripper_open_fraction=1.0,
+    )
+    yaw = 0.0
+    for _ in range(5):
+        franka = FrankaSpawn("", RobotPose(0.0, 0.0, yaw), floor_z, floor_z, link0_height - floor_z, None, None, "")
+        targets = FrankaStretchRetargeter(franka, params).franka_to_stretch(
+            np.append(start_q7, 0.0), planar_transform(0.0, 0.0, 0.0, floor_z), seed
+        )
+        if targets is None:
+            return 0.0
+        if abs(targets.base_rotate_by) < MIN_BASE_ROTATION:
+            break
+        yaw -= targets.base_rotate_by
+    return _wrap(yaw)
+
+
 class FrankaStretchRetargeter:
     """
     Maps Franka joint actions to Stretch 4 joint targets and Stretch 4 joints back to the
@@ -551,6 +611,18 @@ class FrankaStretchRetargeter:
         """The next solve picks a start pose: most room to the wrist limits, not least motion."""
         self.last_targets: StretchTargets | None = None
         self.last_target_tool_world: np.ndarray | None = None
+
+    def set_grasp_offset(self, offset_mm, offset_deg=None) -> None:
+        """
+        Change the grasp offset (--grasp-offset-mm, and --grasp-offset-deg if given) from the next
+        step on, in `params` too. What was worked out from it at the start (the custom start
+        pose's pedestal, the Franka's yaw) stays as it was.
+        """
+        self.params.grasp_offset_mm = tuple(float(v) for v in offset_mm)
+        if offset_deg is not None:
+            self.params.grasp_offset_deg = tuple(float(v) for v in offset_deg)
+        self.tcp_offset = self.params.tcp_offset
+        self.tcp_offset_inv = np.linalg.inv(self.tcp_offset)
 
     # -- Franka -> Stretch --------------------------------------------------
 
@@ -700,9 +772,10 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
     closest pose reachable without that is used instead (clamped; solved with those joints
     bounded to MAX_STEP_JUMP around where they are), so the wrist never flips.
 
-    With `prefer_margin` (for a start pose, where there is no motion to keep smooth) it takes
-    the one with the most room to every wrist limit instead, so the moves that follow have room
-    before they run into one.
+    With `prefer_margin` (for a start pose, where there is no motion to keep smooth) it prefers
+    instead, of those WRIST_LIMIT_MARGIN inside the wrist limits, the one that turns the base the
+    least (none, for a Franka mounted by `franka_yaw_for_start()`), and then the one with the most
+    room to every wrist limit, so the moves that follow have room before they run into one.
 
     This is the solver behind `StretchKinematics.inverse_6dof_local()`, called directly because
     that keeps only exact solutions; for an unreachable target the closest one is wanted.
@@ -751,11 +824,12 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
         if position_error < IK_EXACT_POSITION and rotation_error < IK_EXACT_ROTATION:
             # q is [base, lift, arm, yaw, pitch, roll]; the wrist is the last three.
             margin = min(np.min(q[3:] - model.lowerPositionLimit[3:]), np.min(model.upperPositionLimit[3:] - q[3:]))
-            score = (
-                (-margin,)
-                if prefer_margin
-                else (margin < WRIST_LIMIT_MARGIN, float(np.linalg.norm(solution.to_numpy()[2:] - current[2:])))
-            )
+            if prefer_margin:
+                # A turn the base would skip anyway (MIN_BASE_ROTATION) counts as none.
+                turn = max(abs(_wrap(solution.base_theta)) - MIN_BASE_ROTATION, 0.0)
+                score = (margin < WRIST_LIMIT_MARGIN, turn, -margin)
+            else:
+                score = (margin < WRIST_LIMIT_MARGIN, float(np.linalg.norm(solution.to_numpy()[2:] - current[2:])))
             exact.append((score, solution))
             continue
         # Closest in position, among those not far off in orientation.
@@ -836,10 +910,7 @@ SPAWN_LIFT_FRACTION = 0.9
 """Stretch spawns with its lift this far up its travel, clear of table tops."""
 
 SPAWN_ARM_EXTENSION = 0.2
-"""m. Stretch spawns with its arm this far out, nearer where the Franka's start poses need it."""
-
-ARM_JOINTS = ("arm_l1_joint", "arm_l2_joint", "arm_l3_joint", "arm_l4_joint")
-"""The arm's telescoping joints in the MJCF, coupled to move together; `arm` drives their sum."""
+"""m. Stretch's arm goes this far out as it starts, nearer where the Franka's start poses need it."""
 
 
 def spawn_stretch4(stretch_scene, params: RetargetParams):
@@ -847,9 +918,9 @@ def spawn_stretch4(stretch_scene, params: RetargetParams):
     A `Stretch4MujocoSimulator` for a `custom_scene.Stretch4Scene` (not started), rendering only
     the cameras `params` needs and publishing the robot's and the target object's poses.
 
-    Stretch spawns with its lift SPAWN_LIFT_FRACTION up and its arm SPAWN_ARM_EXTENSION out (see
-    `spawn_with_arm_out()`): at the model's lift of 0 the gripper is often under a table, which
-    `start()`'s homing would then drive it up into.
+    Stretch spawns with its lift SPAWN_LIFT_FRACTION up, and homes its arm SPAWN_ARM_EXTENSION out
+    (see `spawn_with_arm_out()`): at the model's lift of 0 the gripper is often under a table,
+    which `start()`'s homing would then drive it up into.
     """
     from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
@@ -865,9 +936,13 @@ def spawn_stretch4(stretch_scene, params: RetargetParams):
 
 def spawn_with_arm_out(model, lift_fraction: float, arm_extension: float) -> None:
     """
-    Start Stretch's lift `lift_fraction` of the way up and its arm `arm_extension` (m) out, and
-    make the `home` keyframe that `Stretch4MujocoSimulator.start()` homes to hold them there.
-    The other joints keep the model's home pose.
+    Start Stretch's lift `lift_fraction` of the way up, and make the `home` keyframe that
+    `Stretch4MujocoSimulator.start()` homes to hold it there and put the arm `arm_extension` (m)
+    out. The other joints keep the model's home pose.
+
+    The arm starts retracted and homing extends it: spawned already out at a raised lift, the
+    robot settles onto the floor with its weight that far off centre, and its omni wheels let
+    the base twist (~8 degrees, and 2 cm aside), which the start pose then turns back.
     """
     import mujoco
 
@@ -875,10 +950,6 @@ def spawn_with_arm_out(model, lift_fraction: float, arm_extension: float) -> Non
     lift = low + lift_fraction * (high - low)
     home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     _start_slide_joint_at(model, "lift_joint", lift, home)
-    # The arm joints' equality couplings are relative to qpos0, so they still hold with every
-    # joint moved by the same amount.
-    for name in ARM_JOINTS:
-        _start_slide_joint_at(model, name, arm_extension / len(ARM_JOINTS), home)
     if home != -1:
         model.key_ctrl[home][model.actuator("lift").id] = lift
         model.key_ctrl[home][model.actuator("arm").id] = arm_extension
@@ -1004,6 +1075,14 @@ class Stretch4SimEnv:
             # The policy's wrist view with the Franka's gripper where it is told its hand is.
             gripper = self.mirror.render_with_franka_gripper(stretch_cameras_to_use(self.params)[0], state8[7])
         return Observation(exo_rgb=exo, wrist_rgb=wrist_view(gripper), state8=state8, extra_cameras=extra)
+
+    def tool_error_m(self) -> float | None:
+        """How far Stretch's tool is from where the policy wants it."""
+        target = self.retargeter.last_target_tool_world
+        if target is None:
+            return None
+        actual = self.retargeter.stretch_tool_world(self.world_from_footprint(), self.joints())
+        return float(np.linalg.norm(actual[:3, 3] - target[:3, 3]))
 
     def render_scene(self) -> np.ndarray:
         from examples.vla.molmobot_droid.molmospaces.custom_scene import SCENE_CAMERA

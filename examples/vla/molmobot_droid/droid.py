@@ -17,6 +17,7 @@ Height: molmospaces does not place the Franka relative to the floor. Its mocap b
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 from dataclasses import dataclass, field
@@ -598,6 +599,86 @@ def robotiq_joint_positions(driver_angle: float) -> dict[str, float]:
     """The Robotiq's joint positions (by name after the robot's prefix) at a driver joint angle."""
     names, drivers, table = robotiq_linkage()
     return {name: float(np.interp(driver_angle, drivers, table[:, i])) for i, name in enumerate(names)}
+
+
+STRETCH_TOOL_ROOT = "wrist_roll_link"
+"""Everything of Stretch's from here on is its tool: the gripper, its cameras and fingers."""
+
+
+class FrankaGripperView:
+    """
+    One of Stretch 4's gripper cameras in `model` (Stretch with a ghost Franka from
+    `add_franka_ghost()`), rendered with Stretch's tool hidden and the ghost's Robotiq fingers
+    shown instead, in the Robotiq's own colours: the Franka's gripper where the policy is told
+    its hand is. The ghost's arm and the Robotiq's housing stay hidden (Stretch's camera sits
+    where the housing would be; DROID's wrist camera, beside it, sees only the fingers).
+
+    `model`'s geom groups and colours are changed only while rendering, and its camera is given
+    the intrinsics stretch4_mujoco gives `camera`.
+    """
+
+    def __init__(self, model: mujoco.MjModel, franka: FrankaSpawn, camera: StretchCameras):
+        if camera.is_fisheye:
+            raise ValueError(f"{camera} is a fisheye; the gripper cameras are not")
+        self.model, self.franka = model, franka
+        self.camera_name = camera.camera_name_in_mjcf
+        apply_stretch_camera_settings(model, self.camera_name, camera)
+        self.renderer = StretchCameraRenderer(model, self.camera_name, camera)
+        self.tool = subtree_geoms(model, STRETCH_TOOL_ROOT)
+        base = f"{franka.prefix}gripper/base"
+        robotiq = subtree_geoms(model, base)
+        self.rgba = robotiq_visual_rgba()
+        if len(self.rgba) != len(robotiq):
+            raise RuntimeError(f"The ghost's Robotiq has {len(robotiq)} geoms, molmospaces' {len(self.rgba)}")
+        self.robotiq = robotiq
+        housing = model.body(base).id
+        self.fingers = [g for g in robotiq if model.geom_bodyid[g] != housing]
+
+    def pose_fingers(self, data: mujoco.MjData, driver_angle: float) -> None:
+        """Open the ghost's Robotiq to `driver_angle` (the Franka state's last value) in `data`."""
+        for name, value in robotiq_joint_positions(driver_angle).items():
+            data.joint(self.franka.prefix + name).qpos = value
+        mujoco.mj_kinematics(self.model, data)
+        mujoco.mj_camlight(self.model, data)
+
+    @contextlib.contextmanager
+    def _showing(self, geoms: list[int]):
+        """Of Stretch's tool and the Robotiq, only `geoms` drawn (in a group the renderer draws,
+        the rest in the ghost's, which it does not), the Robotiq in its own colours."""
+        model, regrouped = self.model, self.tool + self.robotiq
+        groups, rgba = model.geom_group[regrouped].copy(), model.geom_rgba[self.robotiq].copy()
+        model.geom_group[regrouped] = GHOST_GEOM_GROUP
+        model.geom_group[geoms] = 0
+        model.geom_rgba[self.robotiq] = self.rgba
+        try:
+            yield
+        finally:
+            model.geom_group[regrouped], model.geom_rgba[self.robotiq] = groups, rgba
+
+    def render(self, data: mujoco.MjData) -> np.ndarray:
+        """The camera's image, with the Robotiq's fingers in place of Stretch's tool."""
+        with self._showing(self.fingers):
+            return self.renderer.render(data)
+
+    def masks(self, data: mujoco.MjData) -> tuple[np.ndarray, np.ndarray]:
+        """(where the Robotiq's fingers are, where Stretch's tool is) in the camera's image."""
+        renderer = self.renderer.renderer
+        renderer.enable_segmentation_rendering()
+        try:
+            masks = []
+            for geoms in (self.fingers, self.tool):
+                with self._showing(geoms):
+                    renderer.update_scene(data, camera=self.camera_name)
+                    segmentation = renderer.render()
+                mask = np.isin(segmentation[..., 0], geoms) & (segmentation[..., 1] == mujoco.mjtObj.mjOBJ_GEOM)
+                # Turned upright as `render()` turns the image.
+                masks.append(np.ascontiguousarray(np.rot90(mask, self.renderer.camera.initial_camera_settings.rotate_number_of_times)))
+        finally:
+            renderer.disable_segmentation_rendering()
+        return tuple(masks)
+
+    def close(self) -> None:
+        self.renderer.close()
 
 
 # ---------------------------------------------------------------------------
