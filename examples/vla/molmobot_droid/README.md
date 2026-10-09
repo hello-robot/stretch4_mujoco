@@ -206,6 +206,23 @@ Success uses molmospaces' criteria:
 On Stretch 4, success reads object poses and contacts through `sim.watch_bodies()`,
 `pull_body_poses()` and `pull_body_contacts()`.
 
+### Trying start poses on the Franka
+
+`run_franka.py` keeps simulating between instructions, so the arm can be moved before the
+policy takes over:
+
+1. Run `python -m examples.vla.molmobot_droid.run_franka`.
+2. Type `jog` and use the arrow keys to change the start pose: left/right (or `1`-`7`) picks
+   a joint and up/down moves it. `[` and `]` halve or double the step, `g` opens or closes the
+   gripper, and `h` goes home. The cameras stream to Rerun while jogging.
+3. Press Enter. The pose is printed as a `set ...` line; paste it at the prompt later to return
+   to it.
+4. Type an instruction. Ctrl+C stops it.
+
+Other commands at the prompt: `pose` prints the arm's joints, `set q1 ... q7` (rad) and `home`
+jump the arm there, and `reset` resets the whole scene. In MuJoCo's viewer, the arm also
+follows its Control sliders, or, while paused (Space), its Joint sliders.
+
 ## Tests
 
 ```bash
