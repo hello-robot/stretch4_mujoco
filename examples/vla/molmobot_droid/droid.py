@@ -4,7 +4,8 @@ molmospaces' own robot model and spawn code so it matches training.
 
 - `spawn_franka_droid()` adds it to a scene `MjSpec`, with one of four exo cameras: the
   molmospaces DROID shoulder camera (`droid`), or a Stretch 4 head camera (`left`, `right`,
-  `center`) transplanted to the same place relative to the floor under the robot's footprint.
+  `center`) transplanted to the same place relative to the floor under the robot's footprint,
+  turning with joint 1 as it would with Stretch's base.
 - `add_franka_ghost()` adds a non-colliding, see-through copy for overlaying on Stretch 4.
 - `FrankaKinematics` is FK/IK of the arm alone, used for retargeting.
 - `FrankaDroidEnv` steps a compiled scene in-process, the way the policy was trained.
@@ -267,6 +268,10 @@ class FrankaSpawn:
         return f"{self.prefix}fr3_link0"
 
     @property
+    def link1_name(self) -> str:
+        return f"{self.prefix}fr3_link1"
+
+    @property
     def grasp_site_name(self) -> str:
         return f"{self.prefix}gripper/grasp_site"
 
@@ -305,7 +310,8 @@ def spawn_franka_droid(
         link0_height: world z of `fr3_link0`. See `franka_link0_height_for_object()`.
         exo_camera: `droid` adds molmospaces' DROID shoulder camera on `fr3_link0`; `left`,
             `right`, `center` add that Stretch 4 head camera at its pose relative to the floor
-            under `robot_pose`. Named `<prefix>exo_camera_1` either way.
+            under `robot_pose` (with joint 1 at 0), on `fr3_link1`, so it turns with joint 1
+            as it turns with Stretch's base. Named `<prefix>exo_camera_1` either way.
         floor_z: z of the floor under the robot.
         standing_on_floor: size the pedestal to reach the floor. Otherwise use molmospaces'
             0.58 m pedestal under a floating base, as the benchmarks do.
@@ -349,14 +355,15 @@ def spawn_franka_droid(
     elif exo_camera in HEAD_CAMERAS:
         stretch_camera = HEAD_CAMERAS[exo_camera]
         footprint_from_camera = stretch4_camera_poses()[stretch_camera.camera_name_in_mjcf]
-        # The mocap base sits at (x, y, base_z); express the camera in it.
-        base_from_camera = (
-            np.linalg.inv(robot_pose.matrix(base_z)) @ spawn.world_from_footprint @ footprint_from_camera
-        )
-        spec.body(spawn.base_name).add_camera(
+        # Express the camera in fr3_link1 as it is with joint 1 at 0. Joint 1 turns about
+        # fr3_link0's z, which stands over the footprint, as Stretch's base turns about it.
+        link1 = spec.body(spawn.link1_name)
+        world_from_link1 = spawn.world_from_link0 @ pose_to_transform(link1.pos, link1.quat)
+        link1_from_camera = np.linalg.inv(world_from_link1) @ spawn.world_from_footprint @ footprint_from_camera
+        link1.add_camera(
             name=spawn.exo_camera_name,
-            pos=base_from_camera[:3, 3].tolist(),
-            quat=mat_to_quat(base_from_camera[:3, :3]).tolist(),
+            pos=link1_from_camera[:3, 3].tolist(),
+            quat=mat_to_quat(link1_from_camera[:3, :3]).tolist(),
         )
     elif exo_camera is not None:
         raise ValueError(f"exo_camera must be one of {EXO_CAMERAS}, got '{exo_camera}'")
