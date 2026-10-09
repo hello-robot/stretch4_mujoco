@@ -7,8 +7,9 @@ thinks it is driving overlaid when --include_franka is given.
 
 Between instructions, the start pose can be changed at the prompt (see `StretchStartPoseEditor`):
 `jog` moves the virtual Franka's joints and pedestal with the keys and Stretch follows, `pose`
-prints them, `set q1 ... q7` (rad) and `home` move it there, `height <m>` sets the pedestal, and
-`reset` goes back to the start pose.
+prints them, `set q1 ... q7` (rad) moves it there, `height <m>` sets the pedestal, and `home` or
+`reset` goes back to the start pose, and `offset x y z [roll yaw pitch]` changes the grasp offset
+(mm, deg; `offset` alone prints it).
 
 Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_sim --scene-id procthor-10k/val/0 --object-type boiler
@@ -24,13 +25,15 @@ import click
 import numpy as np
 
 from examples.vla.molmobot_droid import rerun_scene
-from examples.vla.molmobot_droid.checkpoint import build_instruction, load_policy, unload_policy
+from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, build_instruction, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
-    OVERLAY_GRASP_OFFSET_MM,
     Stretch4SimEnv,
+    franka_yaw_for_start,
+    apply_overlay_grasp_offset,
     custom_start_link0_height,
     custom_start_option,
+    overlay_gripper_option,
     params_from_kwargs,
     retarget_options,
     spawn_stretch4,
@@ -124,49 +127,46 @@ def nearby_free_bodies(stretch_scene, radius: float = OVERLAY_WATCH_RADIUS) -> l
     return [name for name in free_bodies(model) if np.linalg.norm(data.body(name).xpos[:2] - robot) <= radius]
 
 
+def with_nearby_free_bodies(stretch_scene, watched: list[str]) -> list[str]:
+    """`watched`, and the free bodies near the robot, for --overlay_franka_gripper."""
+    return watched + [name for name in nearby_free_bodies(stretch_scene) if name not in watched]
+
+
 @click.command()
 @scene_options
 @retarget_options
 @include_franka_option
 @custom_start_option
-@click.option(
-    "--overlay_franka_gripper",
-    "--overlay-franka-gripper",
-    "overlay_franka_gripper",
-    is_flag=True,
-    help="Show the policy the Franka's Robotiq gripper instead of Stretch's in the wrist view: "
-    "Stretch's gripper camera re-rendered with Stretch's tool hidden and the Robotiq where the "
-    "policy is told its hand is (grasp offset included). Turns on --include_franka, and makes "
-    "the default grasp offset the overlay's: "
-    + ", ".join(f"{','.join(f'{v:g}' for v in o)} for {t[-3:].upper()}" for t, o in OVERLAY_GRASP_OFFSET_MM.items())
-    + ".",
-)
+@overlay_gripper_option
 def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, include_franka,
          custom_franka_start_pose, overlay_franka_gripper, **kwargs):
     params = params_from_kwargs(kwargs)
     include_franka = include_franka or overlay_franka_gripper  # the Robotiq is the ghost's
-    if overlay_franka_gripper and params.grasp_offset_mm is None:
-        params.grasp_offset_mm = OVERLAY_GRASP_OFFSET_MM.get(params.tool_name)
     if overlay_franka_gripper:
+        apply_overlay_grasp_offset(params)
         click.secho(f"Grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
     scene = load_custom_scene(scene_id, object_type, object_index)
     click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
-    link0_height = None
+    link0_height = virtual_franka_link0_height(scene)
+    start_q7 = np.array(FRANKA_HOME_QPOS)
     if custom_franka_start_pose:
         link0_height = custom_start_link0_height(params, scene.floor_z)
+        start_q7 = np.array(CUSTOM_START_QPOS)
         click.secho(f"Franka fr3_link0 at z={link0_height:.3f} (molmospaces would put it at "
                     f"{virtual_franka_link0_height(scene):.3f})", fg="green")
+    # Stretch spawns turned the way the start pose would turn its base, so it does not have to.
+    franka_yaw = franka_yaw_for_start(params, link0_height, start_q7, scene.floor_z)
     stretch_scene = load_custom_scene_stretch4(
-        scene, pose, include_franka=include_franka, tool_name=params.tool_name, link0_height=link0_height
+        scene, pose, include_franka=include_franka, tool_name=params.tool_name, link0_height=link0_height,
+        stretch_yaw=-franka_yaw,
     )
 
     if stretch_scene.removed_bodies:
         click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
     sim = spawn_stretch4(stretch_scene, params)
     if overlay_franka_gripper:
-        watched = stretch_scene.watched_bodies
-        sim.watch_bodies(watched + [name for name in nearby_free_bodies(stretch_scene) if name not in watched])
+        sim.watch_bodies(with_nearby_free_bodies(stretch_scene, stretch_scene.watched_bodies))
     sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
     env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
     env.overlay_franka_gripper = overlay_franka_gripper
@@ -179,8 +179,7 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
             logger = StretchRerunLogger(env)
         step_count = 0
 
-        if custom_franka_start_pose:
-            env.start_q7 = np.array(CUSTOM_START_QPOS)
+        env.start_q7 = start_q7
 
         def log_pose() -> None:
             """A Rerun step outside a rollout; rollout steps and these share the `step` timeline."""

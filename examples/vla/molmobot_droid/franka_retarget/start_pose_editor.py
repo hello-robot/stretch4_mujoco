@@ -14,7 +14,7 @@ from typing import Callable, ContextManager, Protocol
 import click
 import numpy as np
 
-from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, GRIPPER_CLOSED
+from examples.vla.molmobot_droid.checkpoint import GRIPPER_CLOSED
 
 
 class Keys(Protocol):
@@ -64,7 +64,8 @@ class StretchStartPoseEditor:
 
     COMMANDS = (
         "'jog' to move the virtual Franka and its pedestal with the arrow keys (Stretch follows), "
-        "'home' to send it home, 'pose', 'set q1 ... q7' (rad), 'height <m>' (pedestal)"
+        "'home' to send it to the start pose, 'pose', 'set q1 ... q7' (rad), 'height <m>' (pedestal), "
+        "'offset [x y z [roll yaw pitch]]' (grasp offset, mm and deg)"
     )
     PEDESTAL_RANGE = (0.1, 1.5)
 
@@ -98,7 +99,12 @@ class StretchStartPoseEditor:
 
     def pose_text(self, q7=None) -> str:
         q7 = self.franka_pose() if q7 is None else q7
-        return "set " + " ".join(f"{q:.4f}" for q in q7) + f"\nheight {self.pedestal_height:.3f}"
+        return "set " + " ".join(f"{q:.4f}" for q in q7) + f"\nheight {self.pedestal_height:.3f}\n" + self.offset_text()
+
+    def offset_text(self) -> str:
+        """The grasp offset, as the command that sets it."""
+        params = self.env.params
+        return "offset " + " ".join(f"{v:g}" for v in (*params.effective_grasp_offset_mm, *params.grasp_offset_deg))
 
     def move_to(self, q7) -> None:
         """Stretch to the Franka at `q7`, the way it goes to the start pose."""
@@ -108,14 +114,26 @@ class StretchStartPoseEditor:
             self.say("Stretch 4 cannot reach that Franka pose from here")
         self.on_move()
 
-    def follow(self, q7, gripper_closed: bool) -> str:
-        """One step of Stretch towards the Franka at `q7`, as for a policy action; how it went."""
+    SETTLE_STEPS = 3
+    SETTLE_TOLERANCE = 0.002
+    """m. A one-off move (`height`, `offset`) steps again, up to SETTLE_STEPS in all, while Stretch's
+    tool is further than this from its target: one step does not quite get there (the base
+    turns are the least exact), and no policy step follows to close the gap."""
+
+    def follow(self, q7, gripper_closed: bool, steps: int = 1) -> str:
+        """Up to `steps` steps of Stretch towards the Franka at `q7`, as for a policy action, until
+        its tool is within SETTLE_TOLERANCE of the target; how it went."""
         action = np.append(q7, GRIPPER_CLOSED if gripper_closed else 0.0)
-        targets = self.env.step(action)
-        self.on_move()
-        if targets is None:
-            return "out of Stretch's reach"
-        return f"Stretch {targets.tool_error_m * 1000:.0f} mm off" if targets.clamped else "Stretch on it"
+        for _ in range(steps):
+            targets = self.env.step(action)
+            self.on_move()
+            if targets is None:
+                return "out of Stretch's reach"
+            error = self.env.tool_error_m()
+            if error is not None and error <= self.SETTLE_TOLERANCE:
+                break
+        reach = f"Stretch {targets.tool_error_m * 1000:.0f} mm off" if targets.clamped else "Stretch on it"
+        return reach + (f", {error * 1000:.0f} mm from it" if error is not None and error > self.SETTLE_TOLERANCE else "")
 
     def set_pedestal_height(self, height: float) -> float:
         height = float(np.clip(height, *self.PEDESTAL_RANGE))
@@ -131,7 +149,7 @@ class StretchStartPoseEditor:
         if words[0] == "pose" and len(words) == 1:
             self.say(self.pose_text())
         elif words[0] == "home" and len(words) == 1:
-            self.move_to(FRANKA_HOME_QPOS)
+            self.move_to(self.env.start_q7)  # the Franka's home, or --custom_franka_start_pose's
         elif words[0] == "set" and len(words) == 8:
             try:
                 q7 = [float(w) for w in words[1:]]
@@ -146,7 +164,19 @@ class StretchStartPoseEditor:
                 return False
             q7 = self.franka_pose()
             height = self.set_pedestal_height(height)
-            self.say(f"height {height:.3f}: {self.follow(q7, bool(self.env._gripper_closed))}")
+            self.say(f"height {height:.3f}: {self.follow(q7, bool(self.env._gripper_closed), self.SETTLE_STEPS)}")
+        elif words[0] == "offset" and len(words) in (1, 4, 7):
+            if len(words) == 1:
+                self.say(self.offset_text())
+                return True
+            try:
+                values = [float(w) for w in words[1:]]
+            except ValueError:
+                return False
+            # The Franka stays where it is; Stretch's tool moves to the new offset from it.
+            q7 = self.franka_pose()
+            self.env.retargeter.set_grasp_offset(values[:3], values[3:] or None)
+            self.say(f"{self.offset_text()}: {self.follow(q7, bool(self.env._gripper_closed), self.SETTLE_STEPS)}")
         elif words[0] == "jog" and len(words) == 1:
             self.jog()
         else:
@@ -159,7 +189,7 @@ class StretchStartPoseEditor:
         """Move one Franka joint, or the pedestal, at a time from the keys until Enter, q or Esc."""
         self.say(
             "1-7 or left/right: joint (8: pedestal)   up/down or +/-: move   "
-            "[ ]: step size (deg, or cm for the pedestal)   g: gripper   h: home   Enter/q/Esc: done"
+            "[ ]: step size (deg, or cm for the pedestal)   g: gripper   h: start pose   Enter/q/Esc: done"
         )
         pedestal = 7  # the "joint" after the arm's 7
         joint, step = 0, 5.0
@@ -203,7 +233,7 @@ class StretchStartPoseEditor:
                         else:
                             target[joint] += sign * math.radians(step)
                     elif key == "h":
-                        target = np.array(FRANKA_HOME_QPOS, dtype=float)
+                        target = np.array(self.env.start_q7, dtype=float)
                     elif key == "g":
                         closed = not closed
                     else:

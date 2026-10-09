@@ -33,21 +33,17 @@ from examples.vla.molmobot_droid.droid import (
     FRANKA_HOME_QPOS,
     GHOST_GEOM_GROUP,
     ExoCamera,
+    FrankaGripperView,
     FrankaDroidEnv,
     FrankaSpawn,
     PinholeRenderer,
     RobotPose,
-    StretchCameraRenderer,
     add_franka_ghost,
-    apply_stretch_camera_settings,
     franka_link0_height_for_object,
     mat_to_quat,
     pose_to_transform,
     resize_franka_pedestal,
-    robotiq_joint_positions,
-    robotiq_visual_rgba,
     spawn_franka_droid,
-    subtree_geoms,
 )
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
@@ -55,8 +51,6 @@ SCENE_CAMERA = "scene_camera"
 SCENE_CAMERA_SIZE = (960, 540)
 DROID_EXO_IN_STRETCH_SCENE = "droid_exo_camera"
 STRETCH_ROOT_BODY = "stretch4"
-STRETCH_TOOL_ROOT = "wrist_roll_link"
-"""Everything of Stretch's from here on is its tool: the gripper, its cameras and fingers."""
 
 
 @dataclass
@@ -376,10 +370,12 @@ def load_custom_scene_stretch4(
     tool_name: str | None = None,
     link0_height: float | None = None,
     clear_footprint: bool = True,
+    stretch_yaw: float = 0.0,
 ) -> Stretch4Scene:
     """
     The scene with Stretch 4 standing at `robot_pose`, compiled for
-    `Stretch4MujocoSimulator(model=...)`.
+    `Stretch4MujocoSimulator(model=...)`. Stretch faces `stretch_yaw` (rad) to the left of
+    `robot_pose`'s heading, the Franka along it: see `franka_yaw_for_start()`.
 
     The retargeting Franka is virtual: its `fr3_link0` is at `robot_pose` and the training
     height for the target object. `include_franka` also puts it in the scene as a ghost (no
@@ -391,7 +387,9 @@ def load_custom_scene_stretch4(
     """
     removed: list[str] = []
     for _ in range(3):
-        stretch_scene = _build_stretch4_scene(scene, robot_pose, include_franka, tool_name, link0_height, removed)
+        stretch_scene = _build_stretch4_scene(
+            scene, robot_pose, include_franka, tool_name, link0_height, removed, stretch_yaw
+        )
         blocking = bodies_blocking_stretch(stretch_scene) if clear_footprint else []
         if not blocking:
             stretch_scene.removed_bodies = removed
@@ -431,13 +429,15 @@ def _build_stretch4_scene(
     tool_name: str | None,
     link0_height: float | None,
     removed: list[str],
+    stretch_yaw: float = 0.0,
 ) -> "Stretch4Scene":
     from examples.molmo_environment import add_stretch_to_scene
 
     spec = scene.load_spec()
     remove_objects(spec, removed)
+    stretch_pose = RobotPose(robot_pose.x, robot_pose.y, robot_pose.yaw + stretch_yaw)
     add_stretch_to_scene(
-        spec, pos=[robot_pose.x, robot_pose.y, scene.floor_z], quat=robot_pose.quat_wxyz, tool_name=tool_name
+        spec, pos=[robot_pose.x, robot_pose.y, scene.floor_z], quat=stretch_pose.quat_wxyz, tool_name=tool_name
     )
     height = link0_height if link0_height is not None else virtual_franka_link0_height(scene)
     if include_franka:
@@ -484,8 +484,8 @@ class SceneMirror:
         self.model = stretch_scene.model
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
-        self._renderers: dict[tuple[str, object], PinholeRenderer | StretchCameraRenderer] = {}
-        self._franka_gripper_views: dict[StretchCameras, tuple] = {}
+        self._renderers: dict[tuple[str, bool], PinholeRenderer] = {}
+        self._franka_gripper_views: dict[StretchCameras, FrankaGripperView] = {}
         self._ghost_joints = (
             [f"{stretch_scene.franka.prefix}fr3_joint{i + 1}" for i in range(7)]
             if stretch_scene.include_franka
@@ -532,41 +532,11 @@ class SceneMirror:
         if not self._ghost_joints:
             raise RuntimeError("Overlaying the Franka's gripper needs the ghost Franka (include_franka)")
         if camera not in self._franka_gripper_views:
-            self._franka_gripper_views[camera] = self._franka_gripper_view(camera)
-        renderer, geoms, groups, robotiq, rgba = self._franka_gripper_views[camera]
-        prefix = self.stretch_scene.franka.prefix
-        for name, value in robotiq_joint_positions(driver_angle).items():
-            self.data.joint(prefix + name).qpos = value
-        mujoco.mj_kinematics(self.model, self.data)
-        mujoco.mj_camlight(self.model, self.data)
-        model = self.model
-        saved_groups, saved_rgba = model.geom_group[geoms].copy(), model.geom_rgba[robotiq].copy()
-        model.geom_group[geoms], model.geom_rgba[robotiq] = groups, rgba
-        try:
-            return renderer.render(self.data)
-        finally:
-            model.geom_group[geoms], model.geom_rgba[robotiq] = saved_groups, saved_rgba
-
-    def _franka_gripper_view(self, camera: StretchCameras):
-        """(renderer, geoms to regroup, their groups for it, the Robotiq's geoms, their colours)."""
-        model, name = self.model, camera.camera_name_in_mjcf
-        # The simulator runs its own copy of the model, so this changes only what is rendered here.
-        apply_stretch_camera_settings(model, name, camera)
-        renderer = StretchCameraRenderer(model, name, camera)
-        self._renderers[(name, "franka_gripper")] = renderer
-        tool = subtree_geoms(model, STRETCH_TOOL_ROOT)
-        base = f"{self.stretch_scene.franka.prefix}gripper/base"
-        robotiq = subtree_geoms(model, base)
-        rgba = robotiq_visual_rgba()
-        if len(rgba) != len(robotiq):
-            raise RuntimeError(f"The ghost's Robotiq has {len(robotiq)} geoms, molmospaces' {len(rgba)}")
-        # Stretch's camera sits where the Robotiq's housing would be, so only its fingers are
-        # shown: what DROID's wrist camera, beside the housing, sees of it. Shown means in a
-        # group the renderer draws; hidden, in the ghost's, which it does not.
-        housing = model.body(base).id
-        fingers = [GHOST_GEOM_GROUP if model.geom_bodyid[g] == housing else 0 for g in robotiq]
-        groups = [GHOST_GEOM_GROUP] * len(tool) + fingers
-        return renderer, tool + robotiq, groups, robotiq, rgba
+            # The simulator runs its own copy of the model, so this changes only what is rendered here.
+            self._franka_gripper_views[camera] = FrankaGripperView(self.model, self.stretch_scene.franka, camera)
+        view = self._franka_gripper_views[camera]
+        view.pose_fingers(self.data, driver_angle)
+        return view.render(self.data)
 
     def render(self, camera: str, show_ghost: bool = False) -> np.ndarray:
         """
@@ -584,4 +554,6 @@ class SceneMirror:
         for renderer in self._renderers.values():
             renderer.close()
         self._renderers.clear()
+        for view in self._franka_gripper_views.values():
+            view.close()
         self._franka_gripper_views.clear()
