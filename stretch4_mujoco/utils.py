@@ -117,7 +117,7 @@ def H0_from_driving_dir(wheel_dia_m, base_radius, forward_dir):
     Vb = Twist velocity of the base frame (vx, vy, wz)
     https://control.ros.org/rolling/doc/ros2_controllers/doc/mobile_robot_kinematics.html#omnidirectional-wheeled-mobile-robots
     """
-    forwards = {"basquiat": 30.0, "basquiat+": 30, "calder": 30}
+    forwards = {"basquiat": 30.0, "basquiat+": 30, "calder": 30.0}
     gamma = forwards[forward_dir]
     h0 = np.array(
         [
@@ -522,7 +522,7 @@ def dataclass_from_dict(klass, dict_data: dict):
 
 
 def block_until_check_succeeds(
-    wait_timeout: float | None, check: Callable[[], bool], is_alive: Callable[[], bool]
+    wait_timeout: float | None, check: Callable[[], bool], is_alive: Callable[[], bool], time_fn: Callable[[], float] | None = None
 ) -> bool:
     """Blocks until the check callback succeeds"""
 
@@ -532,13 +532,15 @@ def block_until_check_succeeds(
                 return True
         return False
 
-    start_time = time.time()
+    t_fn = time_fn if time_fn is not None else time.time
+    start_time = t_fn()
 
-    while time.time() - start_time < wait_timeout:
+    while t_fn() - start_time < wait_timeout:
         if not is_alive():
             return False
         if check():
             return True
+        time.sleep(0.01)
 
     return False
 

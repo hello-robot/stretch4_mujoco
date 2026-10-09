@@ -45,23 +45,28 @@ class StatusCommand:
 
     move_to: dict[str, CommandMove] = field(default_factory=dict)
     move_by: dict[str, CommandMove] = field(default_factory=dict)
+    joint_velocities: dict[str, float] = field(default_factory=dict)
     base_velocity: CommandBaseVelocity = field(default_factory=lambda:CommandBaseVelocity(0, 0,0, False))
     keyframe: CommandKeyframe = field(default_factory=lambda:CommandKeyframe("", False))
     coordinate_frame_arrows_viz: list[CommandCoordinateFrameArrowsViz] = field(default_factory=list)
 
-
-
     def set_move_to(self, command: CommandMove):
-        """Sends a move_to command and removes the move_by command."""
+        """Sends a move_to command and removes conflicting move_by and joint_velocities commands."""
         self.move_to[command.actuator_name] = command
-
         self.move_by.pop(command.actuator_name, None)
+        self.joint_velocities.pop(command.actuator_name, None)
 
     def set_move_by(self, command: CommandMove):
-        """Sends a move_by command and removes the move_to command."""
+        """Sends a move_by command and removes conflicting move_to and joint_velocities commands."""
         self.move_by[command.actuator_name] = command
-
         self.move_to.pop(command.actuator_name, None)
+        self.joint_velocities.pop(command.actuator_name, None)
+
+    def set_joint_velocity(self, actuator_name: str, v_m: float):
+        """Sends a joint velocity command and removes conflicting move_to and move_by commands."""
+        self.joint_velocities[actuator_name] = v_m
+        self.move_to.pop(actuator_name, None)
+        self.move_by.pop(actuator_name, None)
 
     def set_base_velocity(self, command: CommandBaseVelocity):
         """Sends the velocity command and removes the move_to and move_by commands."""

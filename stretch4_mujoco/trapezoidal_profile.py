@@ -52,6 +52,10 @@ class TrapezoidalProfile:
         # Clamp velocity (safety)
         self.current_vel = max(-self.max_vel, min(self.max_vel, self.current_vel))
 
+        # Snap to zero if target is zero and we are close (prevents drift)
+        if self.target_vel == 0.0 and abs(self.current_vel) < 1e-4:
+            self.current_vel = 0.0
+
         # Update position
         self.current_pos += self.current_vel * dt
 

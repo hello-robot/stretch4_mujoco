@@ -40,9 +40,9 @@ class BaseController:
     is_clockwise: bool | None = None
 
     def __init__(self):
-        self.forward_velocity = 0.7
-        self.right_velocity = 0.7
-        self.clockwise_velocity = 1.0
+        self.forward_velocity = 0.2
+        self.right_velocity = 0.2
+        self.clockwise_velocity = 0.8
 
     def get_forward_velocity(self):
         if self.is_forward is None:
@@ -153,29 +153,29 @@ class KeyboardController:
         self.base_controller.handle_base_velocity(self.sim)
 
         if key == "u":
-            self.sim.lift.move_by(0.1)
+            self.sim.lift.set_velocity(0.10)
         elif key == "j":
-            self.sim.lift.move_by(-0.1)
+            self.sim.lift.set_velocity(-0.10)
         elif key == "h":
-            self.sim.arm.move_by(-0.05)
+            self.sim.arm.set_velocity(-0.08)
         elif key == "k":
-            self.sim.arm.move_by(0.05)
+            self.sim.arm.set_velocity(0.08)
         elif key == "o":
-            self.sim.end_of_arm.wrist_yaw.move_by(-0.2)
+            self.sim.end_of_arm.wrist_yaw.set_velocity(-0.3)
         elif key == "p":
-            self.sim.end_of_arm.wrist_yaw.move_by(0.2)
+            self.sim.end_of_arm.wrist_yaw.set_velocity(0.3)
         elif key == "c":
-            self.sim.end_of_arm.wrist_pitch.move_by(0.2)
+            self.sim.end_of_arm.wrist_pitch.set_velocity(0.3)
         elif key == "v":
-            self.sim.end_of_arm.wrist_pitch.move_by(-0.2)
+            self.sim.end_of_arm.wrist_pitch.set_velocity(-0.3)
         elif key == "t":
-            self.sim.end_of_arm.wrist_roll.move_by(0.2)
+            self.sim.end_of_arm.wrist_roll.set_velocity(0.3)
         elif key == "y":
-            self.sim.end_of_arm.wrist_roll.move_by(-0.2)
+            self.sim.end_of_arm.wrist_roll.set_velocity(-0.3)
         elif key == "n":
-            self.sim.end_of_arm.stretch_gripper.move_by(0.07)  # radians
+            self.sim.end_of_arm.stretch_gripper.set_velocity(0.2)
         elif key == "m":
-            self.sim.end_of_arm.stretch_gripper.move_by(-0.07)  # radians
+            self.sim.end_of_arm.stretch_gripper.set_velocity(-0.2)
         elif key == "l":
             pprint(self.sim.pull_status())
         elif key == ".":
@@ -196,6 +196,19 @@ class KeyboardController:
             self.base_controller.is_clockwise = None
 
         self.base_controller.handle_base_velocity(self.sim)
+
+        if key in ("u", "j"):
+            self.sim.lift.set_velocity(0.0)
+        elif key in ("h", "k"):
+            self.sim.arm.set_velocity(0.0)
+        elif key in ("o", "p"):
+            self.sim.end_of_arm.wrist_yaw.set_velocity(0.0)
+        elif key in ("c", "v"):
+            self.sim.end_of_arm.wrist_pitch.set_velocity(0.0)
+        elif key in ("t", "y"):
+            self.sim.end_of_arm.wrist_roll.set_velocity(0.0)
+        elif key in ("n", "m"):
+            self.sim.end_of_arm.stretch_gripper.set_velocity(0.0)
 
 
 @click.command()

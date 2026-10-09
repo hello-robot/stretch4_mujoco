@@ -19,10 +19,13 @@ class BaseStatus:
     theta:float
     x_vel:float
     theta_vel:float
+    active_translate_x: bool = False
+    active_translate_y: bool = False
+    active_rotate: bool = False
 
     @staticmethod
     def default():
-        return BaseStatus(0, 0, 0,0,0)
+        return BaseStatus(0, 0, 0, 0, 0, False, False, False)
 
 @dataclass
 class StatusStretchJoints:
