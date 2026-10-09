@@ -91,6 +91,13 @@ STEP_ARRIVAL_TIMEOUT = 3.0
 """s. A step moves each joint 0.2 rad at most, so this only runs out when something holds a
 joint back (a guarded contact), and then waiting longer does not help."""
 
+CUSTOM_START_JOINT6 = math.radians(125)
+"""The Franka's joint 6 in --custom_franka_start_pose, instead of home's 90 degrees. Every degree
+over 90 tilts the grasp a degree up from straight down: 125 points it 55 degrees below level."""
+
+CUSTOM_START_QPOS = (*FRANKA_HOME_QPOS[:5], CUSTOM_START_JOINT6, FRANKA_HOME_QPOS[6])
+"""--custom_franka_start_pose: the Franka's home pose with joint 6 at CUSTOM_START_JOINT6."""
+
 MAX_CLAMPED_POSITION_ERROR = 0.05
 MAX_CLAMPED_ROTATION_ERROR = math.radians(20)
 """How far from an unreachable target Stretch may go instead (m, rad); further is a failure."""
@@ -105,8 +112,8 @@ STRETCH_GRIPPER_TOOL = "eoa_wrist_dw4_tool_sg4"
 PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
-    STRETCH_GRIPPER_TOOL: (-9.0 + 101, 21.0, 17.0),
-    PARALLEL_GRIPPER_TOOL: (4.0 , 0, 17.0),
+    STRETCH_GRIPPER_TOOL: (-9.0, 21.0, 17.0),
+    PARALLEL_GRIPPER_TOOL: (4.0 , 21, 17.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
 compared to the Robotiq's relative to its grasp_site, so the fingers line up with the Franka's."""
@@ -245,6 +252,20 @@ def head_crop_option(function):
         show_default=True,
         help=f"droid: center-crop head images to the DROID exo camera's "
         f"{DROID_IMAGE_SIZE[0]}x{DROID_IMAGE_SIZE[1]} aspect, then resize to it.",
+    )(function)
+
+
+def custom_start_option(function):
+    """--custom_franka_start_pose, for the Stretch 4 scripts (see `custom_start_link0_height()`)."""
+    return click.option(
+        "--custom_franka_start_pose",
+        "--custom-franka-start-pose",
+        "custom_franka_start_pose",
+        is_flag=True,
+        help=f"Start the Franka at home with joint 6 at {math.degrees(CUSTOM_START_JOINT6):g} degrees "
+        "instead of 90 (the grasp tilted up from straight down), on a pedestal of the height that "
+        "puts Stretch's tool as high as Stretch can put it at that tilt (instead of the height "
+        "molmospaces trains at for the object).",
     )(function)
 
 
@@ -462,6 +483,25 @@ def stretch_kinematics():
         index = model.joints[model.getJointId("wrist_roll_joint")].idx_q
         model.lowerPositionLimit[index], model.upperPositionLimit[index] = WRIST_ROLL_RANGE
     return kinematics
+
+
+def custom_start_link0_height(params: RetargetParams, floor_z: float) -> float:
+    """
+    Where `fr3_link0` goes for --custom_franka_start_pose: the virtual Franka's pedestal lowered
+    (or raised) until, at CUSTOM_START_QPOS, Stretch's tool is as high as Stretch can put it, at
+    the wrist pitch that pose's tilt needs.
+    """
+    from stretch4_kinematics import StretchJointPositions
+
+    # In fr3_link0, which stands level over Stretch's footprint: only the heights differ.
+    tool = FrankaKinematics().fk(CUSTOM_START_QPOS) @ TCP_ALIGN @ params.tcp_offset
+    # Stretch's tool approaches along its x, and its wrist pitch is how far below level that
+    # points (pi/2 straight down). The yaw and roll turn it about the vertical and the approach,
+    # so leave its height alone.
+    pitch = math.asin(float(np.clip(-tool[2, 0], -1.0, 1.0)))
+    top = StretchJointPositions(0, 0, 0, LIFT_RANGE[1] - END_STOP_MARGIN, 0, 0, pitch, 0)
+    highest = stretch_kinematics().forward(top, STRETCH_TCP).homogeneous @ tool_tcp_correction(params.tool_name)
+    return floor_z + highest[2, 3] - tool[2, 3]
 
 
 class FrankaStretchRetargeter:
@@ -778,19 +818,25 @@ def stretch_cameras_to_use(params: RetargetParams):
 SPAWN_LIFT_FRACTION = 0.9
 """Stretch spawns with its lift this far up its travel, clear of table tops."""
 
+SPAWN_ARM_EXTENSION = 0.2
+"""m. Stretch spawns with its arm this far out, nearer where the Franka's start poses need it."""
+
+ARM_JOINTS = ("arm_l1_joint", "arm_l2_joint", "arm_l3_joint", "arm_l4_joint")
+"""The arm's telescoping joints in the MJCF, coupled to move together; `arm` drives their sum."""
+
 
 def spawn_stretch4(stretch_scene, params: RetargetParams):
     """
     A `Stretch4MujocoSimulator` for a `custom_scene.Stretch4Scene` (not started), rendering only
     the cameras `params` needs and publishing the robot's and the target object's poses.
 
-    Stretch spawns with its lift SPAWN_LIFT_FRACTION up (see `spawn_with_lift_raised()`): at the
-    model's lift of 0 the gripper is often under a table, which `start()`'s homing would then
-    drive it up into.
+    Stretch spawns with its lift SPAWN_LIFT_FRACTION up and its arm SPAWN_ARM_EXTENSION out (see
+    `spawn_with_arm_out()`): at the model's lift of 0 the gripper is often under a table, which
+    `start()`'s homing would then drive it up into.
     """
     from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
-    spawn_with_lift_raised(stretch_scene.model, SPAWN_LIFT_FRACTION)
+    spawn_with_arm_out(stretch_scene.model, SPAWN_LIFT_FRACTION, SPAWN_ARM_EXTENSION)
     sim = Stretch4MujocoSimulator(
         model=stretch_scene.model,
         cameras_to_use=stretch_cameras_to_use(params),
@@ -800,32 +846,46 @@ def spawn_stretch4(stretch_scene, params: RetargetParams):
     return sim
 
 
-def spawn_with_lift_raised(model, fraction: float) -> None:
+def spawn_with_arm_out(model, lift_fraction: float, arm_extension: float) -> None:
     """
-    Start Stretch's lift `fraction` of the way up, and make the `home` keyframe that
-    `Stretch4MujocoSimulator.start()` homes to hold it there. The other joints keep the model's
-    home pose.
-
-    MuJoCo places a slide joint's body at `body_pos + axis * (qpos - qpos0)`, so raising `qpos0`
-    alone would leave the carriage where it was while the joint reads higher. The lift link's
-    origin is moved up by the same amount, so the carriage is where its joint says.
+    Start Stretch's lift `lift_fraction` of the way up and its arm `arm_extension` (m) out, and
+    make the `home` keyframe that `Stretch4MujocoSimulator.start()` homes to hold them there.
+    The other joints keep the model's home pose.
     """
     import mujoco
 
-    joint = model.joint("lift_joint")
-    low, high = joint.range
-    lift = low + fraction * (high - low)
+    low, high = model.joint("lift_joint").range
+    lift = low + lift_fraction * (high - low)
+    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    _start_slide_joint_at(model, "lift_joint", lift, home)
+    # The arm joints' equality couplings are relative to qpos0, so they still hold with every
+    # joint moved by the same amount.
+    for name in ARM_JOINTS:
+        _start_slide_joint_at(model, name, arm_extension / len(ARM_JOINTS), home)
+    if home != -1:
+        model.key_ctrl[home][model.actuator("lift").id] = lift
+        model.key_ctrl[home][model.actuator("arm").id] = arm_extension
+
+
+def _start_slide_joint_at(model, name: str, value: float, home: int) -> None:
+    """
+    Start a slide joint at `value`, in the `home` keyframe too (if `home` is not -1).
+
+    MuJoCo places a slide joint's body at `body_pos + axis * (qpos - qpos0)`, so raising `qpos0`
+    alone would leave the link where it was while the joint reads higher. The link's origin is
+    moved along the axis by the same amount, so the link is where its joint says.
+    """
+    import mujoco
+
+    joint = model.joint(name)
     adr = joint.qposadr[0]
-    delta = lift - model.qpos0[adr]
     body = joint.bodyid[0]
     axis_in_parent = np.zeros(3)
     mujoco.mju_rotVecQuat(axis_in_parent, model.jnt_axis[joint.id], model.body_quat[body])
-    model.body_pos[body] += axis_in_parent * delta
-    model.qpos0[adr] = lift
-    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    model.body_pos[body] += axis_in_parent * (value - model.qpos0[adr])
+    model.qpos0[adr] = value
     if home != -1:
-        model.key_qpos[home][adr] = lift
-        model.key_ctrl[home][model.actuator("lift").id] = lift
+        model.key_qpos[home][adr] = value
 
 
 def sim_gripper_open_aperture() -> float:
@@ -873,6 +933,8 @@ class Stretch4SimEnv:
         self._gripper_closed: bool | None = None
         self.ik_converged = True
         self.reverse_ik_failures = 0
+        self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
+        """The Franka pose `reset()` goes back to."""
 
     # -- state ------------------------------------------------------------
 
@@ -997,8 +1059,8 @@ class Stretch4SimEnv:
         )
 
     def reset(self) -> None:
-        """Back to the Franka's home pose (Stretch's base stays where it is)."""
-        self.move_to_franka_pose(FRANKA_HOME_QPOS)
+        """Back to `start_q7`, the Franka's home pose unless set (Stretch's base stays where it is)."""
+        self.move_to_franka_pose(self.start_q7)
 
     def stats(self) -> dict[str, float]:
         return {

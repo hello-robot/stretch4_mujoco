@@ -41,6 +41,7 @@ from examples.vla.molmobot_droid.droid import (
     franka_link0_height_for_object,
     mat_to_quat,
     pose_to_transform,
+    resize_franka_pedestal,
     spawn_franka_droid,
 )
 
@@ -345,6 +346,19 @@ class Stretch4Scene:
     def watched_bodies(self) -> list[str]:
         """What to pass to `sim.watch_bodies()`: the robot and the target object."""
         return [STRETCH_ROOT_BODY, self.scene.object_name]
+
+    def set_franka_pedestal_height(self, height: float) -> None:
+        """
+        Raise or lower the virtual Franka to `fr3_link0` `height` above the floor: where it is
+        retargeted from, and in `model` (so `SceneMirror` renders it) the ghost and the DROID
+        exo camera on it. The simulator's own copy of the ghost stays where it was.
+        """
+        model, delta = self.model, height - self.franka.pedestal_height
+        if self.include_franka:
+            resize_franka_pedestal(model, self.franka, height)
+        else:
+            self.franka.pedestal_height = height
+        model.cam_pos[model.camera(DROID_EXO_IN_STRETCH_SCENE).id, 2] += delta
 
 
 def load_custom_scene_stretch4(

@@ -3,7 +3,8 @@ Run a MolmoSpaces benchmark with MolmoBot-DROID on Stretch 4 in simulation, reta
 Franka (`franka_retarget/stretch4_retarget.py`). Stretch's footprint goes where the episode puts
 the Franka's base, and the virtual Franka is at the episode's height, so the policy sees the
 same geometry it would on the Franka. Compare against `run_benchmark_franka.py` with
-`compare_benchmarks.py`.
+`compare_benchmarks.py`. With --custom_franka_start_pose, the virtual Franka instead stands at
+the height and starts from the pose that puts Stretch's tool at the top of its reach.
 
 Writes to <out>/<run name>/: per-episode videos of every camera (the policy's two views,
 Stretch's raw head and gripper cameras, the scene camera), a grid of them with the instruction
@@ -25,7 +26,10 @@ import click
 from examples.vla.molmobot_droid import rerun_scene
 from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    CUSTOM_START_QPOS,
     Stretch4SimEnv,
+    custom_start_link0_height,
+    custom_start_option,
     params_from_kwargs,
     retarget_options,
     spawn_stretch4,
@@ -40,16 +44,19 @@ from examples.vla.molmobot_droid.run_stretch4_sim import RERUN_CAMERAS, StretchR
 @benchmark_options
 @retarget_options
 @include_franka_option
+@custom_start_option
 @click.option("--rerun/--no-rerun", default=True, show_default=True)
 @click.option("--viewer", is_flag=True, help="Show stretch4_mujoco's viewer (default: headless).")
 def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, resume, list_only, include_franka,
-         rerun, viewer, **kwargs):
+         custom_franka_start_pose, rerun, viewer, **kwargs):
     if list_only:
         click.echo("\n".join(bench.list_benchmarks()))
         return
     params = params_from_kwargs(kwargs)
     benchmark_dir, selected = bench.load_episodes(benchmark, parse_episodes(episodes), max_episodes)
     flags = {**params.flags(), "include_franka": include_franka}
+    if custom_franka_start_pose:  # only when given, so earlier runs keep their names for --resume
+        flags["custom_franka_start_pose"] = True
     name = bench.run_name("stretch4", flags)
     out_dir = Path(out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -65,12 +72,18 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
             for index, episode in run.episodes():
                 setup = bench.episode_setup(episode)
                 click.secho(f"[{run.current}] {setup.scene.scene_id}: {setup.instruction}", fg="cyan")
+                if custom_franka_start_pose:
+                    link0_height = custom_start_link0_height(params, setup.scene.floor_z)
+                    start_q7 = CUSTOM_START_QPOS
+                else:
+                    link0_height = setup.link0_height
+                    start_q7 = setup.franka_init_qpos or FRANKA_HOME_QPOS
                 stretch_scene = load_custom_scene_stretch4(
                     setup.scene,
                     setup.robot_pose,
                     include_franka=include_franka,
                     tool_name=params.tool_name,
-                    link0_height=setup.link0_height,
+                    link0_height=link0_height,
                 )
                 if stretch_scene.removed_bodies:
                     click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
@@ -81,7 +94,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     bench.allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator
                     env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
                     try:
-                        env.move_to_franka_pose(setup.franka_init_qpos or FRANKA_HOME_QPOS)
+                        env.move_to_franka_pose(start_q7)
                         logger = None
                         if rerun:
                             rerun_scene.clear_scene()

@@ -19,7 +19,11 @@ Scenes, objects and benchmarks come straight from
 1. The models was trained on the Franka arm with the Robotiq gripper (7 + 1 DOF). There is the gripper camera biased downwards toward the fingertips, and an external workspace camera.
 1. Start pose matters in several ways:
   1. The model appears to expect the designated object for the Pick task to be placed in the center of the external workspace camera's image. https://drive.google.com/file/d/1666P8Ibm3BvpkZksR3lRXz-oTUEQ9aJr/view?usp=drive_link. The video they released also seems to corroborate this https://youtu.be/UQVX0iq67mo?si=vIu8OKx8puLBfobU&t=77. When using the cropped fisheye camera, it has no problem picking up the when it’s not in front of the base, but the object still has to be in the center of the exo camera view - the fisheye camera in this case: https://drive.google.com/file/d/1NYUDZv7g_yTa-e6K60OpQR6XdLgLtIZz/view?usp=drive_link 
-  1. If the gripper starts lower than the object or in a horizontal pick up pose, it seems unable to pick up the object: https://drive.google.com/file/d/1efDto5MsmVed2zsQwyd5vhXIxGuRHD7B/view?usp=drive_link 
+  1. If the gripper starts lower than the object or in a horizontal pick up pose, it seems unable to pick up the object: https://drive.google.com/file/d/1efDto5MsmVed2zsQwyd5vhXIxGuRHD7B/view?usp=drive_link A flipped wrist seems alright.
+  1. Flipping wrist by ~180 degrees is not good, especially if the exo camera can’t see the object:  https://drive.google.com/file/d/1_w4qASun-bhj37VMnFc6YTgwrRHu8FA4/view?usp=drive_link 
+  1. Pedestal z-height does not appear to affect performance https://drive.google.com/file/d/1nX413Xc9PtzQZiFrpdQP8TwSUiAtxY8J/view?usp=drive_link 
+ 
+
    
 
 ## The model
@@ -221,15 +225,19 @@ On Stretch 4, success reads object poses and contacts through `sim.watch_bodies(
 policy takes over:
 
 1. Run `python -m examples.vla.molmobot_droid.run_franka`.
-2. Type `jog` and use the arrow keys to change the start pose: left/right (or `1`-`7`) picks
-   a joint and up/down moves it. `[` and `]` halve or double the step, `g` opens or closes the
-   gripper, and `h` goes home. The cameras stream to Rerun while jogging.
-3. Press Enter. The pose is printed as a `set ...` line; paste it at the prompt later to return
-   to it.
+2. Type `jog` and use the arrow keys to change the start pose: left/right (or `1`-`8`) picks
+   a joint, or the pedestal after joint 7, and up/down moves it. `[` and `]` halve or double the
+   step (degrees, or cm for the pedestal), `g` opens or closes the gripper, and `h` goes home.
+   The cameras stream to Rerun while jogging.
+3. Press Enter. The pose is printed as `set ...` and `height ...` lines; paste them at the
+   prompt later to return to it.
 4. Type an instruction. Ctrl+C stops it.
 
-Other commands at the prompt: `pose` prints the arm's joints, `set q1 ... q7` (rad) and `home`
-jump the arm there, and `reset` resets the whole scene. In MuJoCo's viewer, the arm also
+Other commands at the prompt: `pose` prints the arm's joints and pedestal height,
+`set q1 ... q7` (rad) and `home` jump the arm there, `height <m>` sets the pedestal height
+(0.1–1.5 m), and `reset` resets the whole scene, keeping the pedestal height. A head exo camera
+(`--exo_camera left|right|center`) stays where it is when the pedestal moves; the `droid` one
+moves with the arm. In MuJoCo's viewer, the arm also
 follows its Control sliders, or, while paused (Space), its Joint sliders.
 
 ## Tests
