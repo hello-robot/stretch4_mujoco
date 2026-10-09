@@ -15,7 +15,11 @@ through stretch4_body's `RobotClient`; with --wait-for-arrival (the default) eac
 for the robot to stop moving.
 
 There is no scene to read the target's height from, so give it with --object-height: the
-virtual Franka stands where molmospaces would put it for an object at that height.
+virtual Franka stands where molmospaces would put it for an object at that height. Or, with
+--custom_franka_start_pose, at the height that starts Stretch's tool at the top of its reach.
+
+Between instructions, `jog` moves the virtual Franka's joints and pedestal from the keys, and
+the robot follows (see `StretchStartPoseEditor` and KEYS_HELP); `reset` goes back to the start pose.
 
 Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_real --robot_ip 10.0.0.12 --object-height 0.80 \\
@@ -24,6 +28,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import queue
@@ -51,8 +56,10 @@ from examples.vla.molmobot_droid.droid import (
     add_franka_ghost,
     franka_link0_height_for_object,
     mat_to_quat,
+    resize_franka_pedestal,
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    CUSTOM_START_QPOS,
     MIN_BASE_ROTATION,
     SLOW_FACTOR,
     SPAWN_LIFT_FRACTION,
@@ -61,12 +68,15 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     RetargetParams,
     StretchJoints,
     StretchTargets,
+    custom_start_link0_height,
+    custom_start_option,
     params_from_kwargs,
     planar_transform,
     prepare_exo,
     retarget_options,
     wrist_view,
 )
+from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
 from examples.vla.molmobot_droid.rollout import StepInfo, run_rollout
 
 IMAGE_PORT = 4409
@@ -85,7 +95,10 @@ DEFAULT_SPEEDS = {"lift": 0.3, "arm": 0.4, "wrist": 7.0, "base_rotate": 2.0}
 KEYS_HELP = (
     "  Type an instruction + Enter   run it (typing another while one runs switches to it)\n"
     "  Enter or Space                stop the robot where it is\n"
-    "  'home' + Enter                  raise the lift, go back to the start pose\n"
+    "  'reset' + Enter                 raise the lift, go back to the start pose\n"
+    "  'jog' + Enter                   move the virtual Franka's joints and pedestal with the keys\n"
+    "  'home' / 'set q1 ... q7' + Enter  raise the lift, go to the Franka's home pose / that one\n"
+    "  'pose' / 'height <m>' + Enter   print the Franka's joints and pedestal / set the pedestal\n"
     "  'quit' + Enter, or Ctrl+C       stop and exit"
 )
 
@@ -99,12 +112,15 @@ class Console:
     after it, events printed above it, and commands queued for the control loop as they are
     typed -- ("stop", None) the moment Enter or Space is pressed on an empty line, ("text",
     line) when a line is entered. Falls back to plain lines when stdin is not a terminal.
+
+    Inside `keys()`, every key press goes to `read()` instead (the `Keys` jogging takes).
     """
 
     PROMPT = click.style("› ", fg="cyan", bold=True)
 
     def __init__(self):
         self.queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        self._keys: queue.Queue[str] | None = None
         self._lock = threading.Lock()
         self._status = ""
         self._buffer = ""
@@ -150,18 +166,23 @@ class Console:
             self.queue.put(("text", "quit"))
             return
         while True:
-            char = os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
+            # A key press at a time: an arrow key's escape sequence arrives in one read.
+            chunk = os.read(sys.stdin.fileno(), 8).decode(errors="ignore")
             with self._lock:
-                if not char:
+                if not chunk:
                     self.queue.put(("text", "quit"))
                     return
-                if char in ("\n", "\r") or (char == " " and not self._buffer):
-                    text, self._buffer = self._buffer.strip(), ""
-                    self.queue.put(("text", text) if text else ("stop", None))
-                elif char in ("\x7f", "\b"):
-                    self._buffer = self._buffer[:-1]
-                elif char.isprintable():
-                    self._buffer += char
+                if self._keys is not None:
+                    self._keys.put(chunk)
+                    continue
+                for char in chunk:
+                    if char in ("\n", "\r") or (char == " " and not self._buffer):
+                        text, self._buffer = self._buffer.strip(), ""
+                        self.queue.put(("text", text) if text else ("stop", None))
+                    elif char in ("\x7f", "\b"):
+                        self._buffer = self._buffer[:-1]
+                    elif char.isprintable():
+                        self._buffer += char
                 self._render()
 
     def pending(self) -> bool:
@@ -169,6 +190,26 @@ class Console:
 
     def get(self) -> tuple[str, str | None]:
         return self.queue.get()
+
+    @contextlib.contextmanager
+    def keys(self):
+        """Every key press to `read()` until left, and `show()` on the status line."""
+        if self._terminal is None:
+            raise RuntimeError("Jogging needs a terminal")
+        with self._lock:
+            self._keys = queue.Queue()
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._keys = None
+            self.status("")
+
+    def read(self) -> str:
+        return self._keys.get()
+
+    def show(self, text: str) -> None:
+        self.status(text)
 
     def close(self) -> None:
         if self._terminal is not None:
@@ -334,13 +375,13 @@ class RobotModel:
     robot's joint states, for Rerun. Also where the virtual Franka stands for retargeting.
     """
 
-    def __init__(self, object_height: float, tool_name: str):
+    def __init__(self, link0_height: float, tool_name: str):
         from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
         spec = mujoco.MjSpec.from_file(Stretch4MujocoSimulator.get_robot_xml_path(tool_name))
         # The wheels' contact pairs name a geom "floor".
         spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[3, 3, 0.1])
-        self.franka = add_franka_ghost(spec, RobotPose(0.0, 0.0, 0.0), franka_link0_height_for_object(object_height))
+        self.franka = add_franka_ghost(spec, RobotPose(0.0, 0.0, 0.0), link0_height)
         self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
@@ -359,6 +400,11 @@ class RobotModel:
             data.joint(f"{self.franka.prefix}fr3_joint{i + 1}").qpos = value
         mujoco.mj_kinematics(self.model, data)
 
+    def set_franka_pedestal_height(self, height: float) -> None:
+        """Raise or lower the virtual Franka to `fr3_link0` `height` above the floor: where it is
+        retargeted from, and its ghost."""
+        resize_franka_pedestal(self.model, self.franka, height)
+
 
 class RealStretch4Env:
     """A real Stretch 4 driven by Franka actions; the real-robot counterpart of `Stretch4SimEnv`."""
@@ -373,6 +419,8 @@ class RealStretch4Env:
         self.last_message: dict = {}
         self.last_state8 = np.append(FRANKA_HOME_QPOS, 0.0)
         """The Franka state the policy last saw; Rerun's ghost follows it."""
+        self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
+        """The Franka pose `go_home()` goes to."""
         self.interrupted = lambda: False
         """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
         self.check_camera_sides()
@@ -498,16 +546,18 @@ class RealStretch4Env:
         footprint, joints = self._state(self.receiver.receive())
         targets = self.retargeter.franka_to_stretch(np.concatenate([franka_q7, [0.0]]), footprint, joints)
         if targets is None:
-            raise RuntimeError("Stretch 4 cannot reach the Franka's home pose; check --object-height")
+            raise RuntimeError("Stretch 4 cannot reach the Franka's start pose; check --object-height")
         self._gripper_closed = None
         self.send(targets)
         self.wait_for_arrival(30.0)
 
-    def go_home(self, franka_q7=FRANKA_HOME_QPOS) -> None:
+    def go_home(self, franka_q7=None) -> None:
         """
         Back to the start pose: the lift up to SPAWN_LIFT_FRACTION of its travel first, so the
-        gripper clears whatever it is over, then where the Franka at `franka_q7` has its tool.
+        gripper clears whatever it is over, then where the Franka at `franka_q7` (default
+        `start_q7`) has its tool.
         """
+        franka_q7 = self.start_q7 if franka_q7 is None else franka_q7
         self.stop_motion()
         _, joints = self._state(self.receiver.receive())
         high = LIFT_RANGE[0] + SPAWN_LIFT_FRACTION * (LIFT_RANGE[1] - LIFT_RANGE[0])
@@ -567,12 +617,29 @@ class LiveView:
         self._thread.join(timeout=1.0)
 
 
+def start_pose_command(editor: StretchStartPoseEditor, text: str, console: Console) -> bool:
+    """Run `text` if it is a start pose command (the editor's), and say whether it was."""
+    try:
+        return editor.handle_command(text)
+    except RuntimeError as error:  # e.g. jogging without a terminal
+        console.event(f"◆ {error}", "red")
+        return True
+    finally:
+        console.status("")
+
+
 def continuous_session(
-    env: RealStretch4Env, policy, params: RetargetParams, max_steps: int, on_step, console: Console
+    env: RealStretch4Env,
+    policy,
+    params: RetargetParams,
+    max_steps: int,
+    on_step,
+    console: Console,
+    editor: StretchStartPoseEditor,
 ) -> None:
     """
     The control loop: runs the current instruction until a key says otherwise (KEYS_HELP),
-    indefinitely unless `max_steps` > 0.
+    indefinitely unless `max_steps` > 0. The start pose commands go to `editor`.
     """
     env.interrupted = console.pending
     command = console.get()
@@ -584,14 +651,16 @@ def continuous_session(
             console.event("■ stopped", "yellow")
         elif text in ("quit", "exit", "q"):
             return
-        elif text == "home":
-            console.status(click.style("◆ going home", fg="yellow"))
+        elif text == "reset":
+            console.status(click.style("◆ going to the start pose", fg="yellow"))
             try:
                 env.go_home()
-                console.event("◆ home" if not console.pending() else "◆ home (interrupted)", "yellow")
+                console.event("◆ start pose" if not console.pending() else "◆ start pose (interrupted)", "yellow")
             except RuntimeError as error:
                 console.event(f"◆ {error}", "red")
             console.status("")
+        elif start_pose_command(editor, text, console):
+            pass
         else:
             console.event(f"▶ {text}", "green")
 
@@ -623,13 +692,15 @@ def continuous_session(
 @click.command()
 @click.option("--robot_ip", "--robot-ip", "robot_ip", required=True, help="Stretch 4's IP address.")
 @click.option("--object-height", type=float, default=0.80, show_default=True,
-              help="Height of the target object above the floor (m); sets the virtual Franka's height.")
+              help="Height of the target object above the floor (m); sets the virtual Franka's height "
+              "(not used with --custom_franka_start_pose).")
 @click.option("--max-steps", type=int, default=0, show_default=True,
               help="Stop an instruction after this many steps (15/s). 0: run until told otherwise.")
 @click.option("--checkpoint", default=None)
 @click.option("--rerun/--no-rerun", default=True, show_default=True)
 @retarget_options
-def main(robot_ip, object_height, max_steps, checkpoint, rerun, **kwargs):
+@custom_start_option
+def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_start_pose, **kwargs):
     params = params_from_kwargs(kwargs)
     if params.exo_camera == "droid":
         raise click.BadParameter("the real robot has no DROID exo camera; use left, right or center", param_hint="--exo_camera")
@@ -646,11 +717,18 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, **kwargs):
         if params.use_parallel_gripper:
             click.secho(f"--use_parallel_gripper was given, but the robot has a {gripper}; using it.", fg="yellow")
         params.use_parallel_gripper = detected_parallel
-    robot_model = RobotModel(object_height, params.tool_name)
+    if custom_franka_start_pose:
+        link0_height = custom_start_link0_height(params, floor_z=0.0)
+        click.secho(f"Virtual Franka's fr3_link0 at {link0_height:.3f} m, starting tilted", dim=True)
+    else:
+        link0_height = franka_link0_height_for_object(object_height)
+    robot_model = RobotModel(link0_height, params.tool_name)
     receiver = ImageAndJointReceiver(robot_ip)
     env = live = console = None
     try:
         env = RealStretch4Env(robot, receiver, params, robot_model.franka)
+        if custom_franka_start_pose:
+            env.start_q7 = np.array(CUSTOM_START_QPOS)
         offset = ",".join(f"{v:g}" for v in params.effective_grasp_offset_mm)
         click.echo(
             click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
@@ -672,26 +750,35 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, **kwargs):
             click.secho("Moving to the start pose...", dim=True)
             env.go_home()
         else:
-            click.secho("Staying put; type home when ready.", dim=True)
+            click.secho("Staying put; type reset when ready.", dim=True)
 
         click.echo("\n" + KEYS_HELP + "\n")
         console = Console()
         step_count = 0
 
-        def on_step(info: StepInfo) -> None:
+        def log_frame(observation: Observation) -> None:
+            """One Rerun step: rollout steps and start pose moves share the `step` timeline."""
             nonlocal step_count
             step_count += 1
             if not rerun:
                 return
             rerun_scene.set_step(step_count)
             rerun_scene.rr.set_time("time", timestamp=time.time())
-            rerun_scene.log_cameras({"exo": info.observation.exo_rgb, "wrist": info.observation.wrist_rgb})
+            rerun_scene.log_cameras({"exo": observation.exo_rgb, "wrist": observation.wrist_rgb})
             footprint, joints = env._state(env.last_message)
             rerun_scene.log_tool_poses(
                 env.retargeter.last_target_tool_world, env.retargeter.stretch_tool_world(footprint, joints)
             )
 
-        continuous_session(env, policy, params, max_steps, on_step, console)
+        editor = StretchStartPoseEditor(
+            env,
+            go_to=env.go_home,
+            set_pedestal_height=robot_model.set_franka_pedestal_height,
+            keys=console.keys,
+            say=console.event,
+            on_move=lambda: log_frame(env.observe()),
+        )
+        continuous_session(env, policy, params, max_steps, lambda info: log_frame(info.observation), console, editor)
     except KeyboardInterrupt:
         pass
     finally:

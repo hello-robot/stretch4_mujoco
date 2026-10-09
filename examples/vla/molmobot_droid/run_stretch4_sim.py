@@ -5,10 +5,16 @@ prompt and watch it in stretch4_mujoco's passive viewer and in Rerun: the policy
 Stretch's raw cameras, the scene camera and the house in 3D, with the ghost Franka the policy
 thinks it is driving overlaid when --include_franka is given.
 
+Between instructions, the start pose can be changed at the prompt (see `StretchStartPoseEditor`):
+`jog` moves the virtual Franka's joints and pedestal with the keys and Stretch follows, `pose`
+prints them, `set q1 ... q7` (rad) and `home` move it there, `height <m>` sets the pedestal, and
+`reset` goes back to the start pose.
+
 Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_sim --scene-id procthor-10k/val/0 --object-type boiler
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --exo_camera center \\
         --head-crop droid --gripper_camera right --slow --grasp-offset-mm 0,0,10
+    python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --custom_franka_start_pose
 """
 
 from __future__ import annotations
@@ -19,16 +25,21 @@ import numpy as np
 from examples.vla.molmobot_droid import rerun_scene
 from examples.vla.molmobot_droid.checkpoint import build_instruction, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    CUSTOM_START_QPOS,
     Stretch4SimEnv,
+    custom_start_link0_height,
+    custom_start_option,
     params_from_kwargs,
     retarget_options,
     spawn_stretch4,
 )
+from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     STRETCH_ROOT_BODY,
     SceneMirror,
     load_custom_scene,
     load_custom_scene_stretch4,
+    virtual_franka_link0_height,
 )
 from examples.vla.molmobot_droid.rollout import StepInfo, interactive_session
 from examples.vla.molmobot_droid.run_franka import resolve_pose, scene_options
@@ -58,17 +69,28 @@ class StretchRerunLogger:
             moving.append(stretch_scene.franka.base_name)
         self.scene = rerun_scene.RerunScene(env.mirror.model, env.mirror.data, moving)
 
-    def log(self, step: int, info: StepInfo) -> None:
-        env = self.env
+    def log_pose(self, step: int) -> None:
+        """Outside a rollout (the start pose, jogging): where the tool should be for the Franka,
+        and where it got to (if it could get there at all)."""
         rerun_scene.set_step(step)
+        self._log_scene(self.env.observe())
+
+    def _log_scene(self, observation) -> np.ndarray:
+        """The mirror scene, the cameras, and the target vs. actual tool; returns the actual."""
+        env = self.env
         self.scene.log(env.mirror.data)
-        observation = info.observation
         rerun_scene.log_cameras(
             {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, **observation.extra_cameras,
              "scene": env.render_scene()}
         )
         actual = env.retargeter.stretch_tool_world(env.world_from_footprint(), env.joints())
         rerun_scene.log_tool_poses(env.retargeter.last_target_tool_world, actual)
+        return actual
+
+    def log(self, step: int, info: StepInfo) -> None:
+        env = self.env
+        rerun_scene.set_step(step)
+        actual = self._log_scene(info.observation)
         targets = info.step_result
         metrics = {
             "gripper_command": info.action[7],
@@ -87,12 +109,21 @@ class StretchRerunLogger:
 @scene_options
 @retarget_options
 @include_franka_option
-def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, include_franka, **kwargs):
+@custom_start_option
+def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, include_franka,
+         custom_franka_start_pose, **kwargs):
     params = params_from_kwargs(kwargs)
     scene = load_custom_scene(scene_id, object_type, object_index)
     click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
-    stretch_scene = load_custom_scene_stretch4(scene, pose, include_franka=include_franka, tool_name=params.tool_name)
+    link0_height = None
+    if custom_franka_start_pose:
+        link0_height = custom_start_link0_height(params, scene.floor_z)
+        click.secho(f"Franka fr3_link0 at z={link0_height:.3f} (molmospaces would put it at "
+                    f"{virtual_franka_link0_height(scene):.3f})", fg="green")
+    stretch_scene = load_custom_scene_stretch4(
+        scene, pose, include_franka=include_franka, tool_name=params.tool_name, link0_height=link0_height
+    )
 
     if stretch_scene.removed_bodies:
         click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
@@ -100,9 +131,6 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
     env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
     try:
-        click.secho("Moving Stretch 4 to the Franka's home pose...", fg="yellow")
-        env.move_to_franka_pose()
-
         logger = None
         if rerun:
             rerun_scene.init_rerun("MolmoBot-DROID Stretch 4", RERUN_CAMERAS)
@@ -110,6 +138,30 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
             env.observe()  # poses the mirror
             logger = StretchRerunLogger(env)
         step_count = 0
+
+        if custom_franka_start_pose:
+            env.start_q7 = np.array(CUSTOM_START_QPOS)
+
+        def log_pose() -> None:
+            """A Rerun step outside a rollout; rollout steps and these share the `step` timeline."""
+            nonlocal step_count
+            if logger is not None:
+                step_count += 1
+                logger.log_pose(step_count)
+
+        def go_to_start() -> None:
+            """To the start pose, logging its tool target in Rerun even when Stretch cannot reach it."""
+            try:
+                env.reset()
+            finally:
+                log_pose()
+
+        click.secho("Moving Stretch 4 to the Franka's start pose...", fg="yellow")
+        go_to_start()
+        editor = StretchStartPoseEditor(
+            env, go_to=env.move_to_franka_pose, set_pedestal_height=stretch_scene.set_franka_pedestal_height,
+            on_move=log_pose,
+        )
 
         def on_step(info: StepInfo):
             nonlocal step_count
@@ -127,8 +179,10 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
             params.execute_horizon,
             params.execute_first_n,
             max_steps,
-            reset=env.reset,
+            reset=go_to_start,
             on_step=on_step,
+            handle_command=editor.handle_command,
+            extra_help=lambda: f"Start pose: {editor.COMMANDS}.",
         )
     finally:
         unload_policy()

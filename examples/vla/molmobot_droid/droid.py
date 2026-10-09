@@ -56,6 +56,8 @@ ROBOT_OBJECT_Z_OFFSET = -0.75
 FRANKA_PEDESTAL_HEIGHT = 0.58
 """molmospaces `FrankaRobotConfig.base_size[2]`."""
 
+MIN_PEDESTAL_HEIGHT = 0.05
+
 GHOST_RGBA = (0.3, 0.7, 1.0, 0.35)
 
 GHOST_GEOM_GROUP = 5
@@ -319,7 +321,7 @@ def spawn_franka_droid(
     from molmo_spaces.robots.franka import FrankaRobot
 
     pedestal = link0_height - floor_z if standing_on_floor else FRANKA_PEDESTAL_HEIGHT
-    if pedestal <= 0.05:
+    if pedestal <= MIN_PEDESTAL_HEIGHT:
         raise ValueError(f"fr3_link0 at z={link0_height:.3f} is not above the floor at {floor_z:.3f}")
     base_z = link0_height - pedestal
 
@@ -421,6 +423,24 @@ def add_franka_ghost(
     for camera in base.find_all("camera"):
         spec.delete(camera)
     return spawn
+
+
+def resize_franka_pedestal(model: mujoco.MjModel, spawn: FrankaSpawn, height: float) -> None:
+    """
+    Raise or lower a Franka's `fr3_link0` to `height` above its base, in `model` and `spawn`,
+    resizing the pedestal under it to match. Anything else that should follow is the caller's.
+    """
+    if height <= MIN_PEDESTAL_HEIGHT:
+        raise ValueError(f"The pedestal must be taller than {MIN_PEDESTAL_HEIGHT} m, got {height}")
+    # fr3_link0 hangs off the base at the top of the pedestal, the base's (first) box.
+    model.body_pos[model.body(spawn.link0_name).id, 2] += height - spawn.pedestal_height
+    base = model.body(spawn.base_name).id
+    geom = next(
+        g for g in range(model.ngeom) if model.geom_bodyid[g] == base and model.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX
+    )
+    model.geom_size[geom, 2] = model.geom_pos[geom, 2] = model.geom_aabb[geom, 5] = height / 2
+    model.geom_rbound[geom] = np.linalg.norm(model.geom_size[geom])
+    spawn.pedestal_height = height
 
 
 def _arm_joint_names(prefix: str) -> list[str]:
@@ -571,6 +591,20 @@ class FrankaDroidEnv:
         gripper.joint_pos = np.array([ROBOTIQ_DRIVER_OPEN, ROBOTIQ_DRIVER_OPEN])
         gripper.ctrl = [0.0]
         mujoco.mj_forward(self.model, self.data)
+        self.sync_viewer()
+
+    def set_pedestal_height(self, height: float) -> None:
+        """
+        Raise or lower `fr3_link0` by resizing the pedestal under it, in the model, so `reset()`
+        keeps it. A head exo camera stays where it was relative to the floor.
+        """
+        model = self.model
+        delta = height - self.spawn.pedestal_height
+        resize_franka_pedestal(model, self.spawn, height)
+        if self.spawn.exo_camera in HEAD_CAMERAS:
+            # It hangs off fr3_link1, whose z is the world's.
+            model.cam_pos[model.camera(self.spawn.exo_camera_name).id, 2] -= delta
+        mujoco.mj_forward(model, self.data)
         self.sync_viewer()
 
     @property

@@ -101,6 +101,8 @@ class StartPoseEditor:
     and moves the arm from the keyboard. Its `idle()` and `handle_command()` plug into
     `interactive_session()`.
 
+    `jog` and `height <m>` also raise or lower the pedestal under the arm.
+
     Viewer: while running, the arm follows its Control sliders; while paused (Space), its Joint
     sliders move it directly and its targets follow, so it stays put when unpaused.
 
@@ -109,10 +111,11 @@ class StartPoseEditor:
     """
 
     COMMANDS = (
-        "'jog' to move the arm with the arrow keys, 'home' to send it home, "
-        "'pose', 'set q1 ... q7' (rad)"
+        "'jog' to move the arm and its pedestal with the arrow keys, 'home' to send it home, "
+        "'pose', 'set q1 ... q7' (rad), 'height <m>' (pedestal)"
     )
     HZ = 60
+    PEDESTAL_RANGE = (0.1, 1.5)
 
     def __init__(self, env: FrankaDroidEnv, on_frame: Callable[[], None] | None = None):
         self.env = env
@@ -185,8 +188,17 @@ class StartPoseEditor:
                 self.arm.joint_vel = np.zeros(7)
                 mujoco.mj_forward(self.env.model, self.env.data)
 
+    def set_pedestal_height(self, height: float) -> float:
+        height = float(np.clip(height, *self.PEDESTAL_RANGE))
+        with self._lock:
+            self.env.set_pedestal_height(height)
+        return height
+
     def pose_text(self) -> str:
-        return "set " + " ".join(f"{q:.4f}" for q in self.arm.joint_pos)
+        return (
+            "set " + " ".join(f"{q:.4f}" for q in self.arm.joint_pos)
+            + f"\nheight {self.env.spawn.pedestal_height:.3f}"
+        )
 
     def handle_command(self, text: str) -> bool:
         words = text.replace(",", " ").split()
@@ -203,6 +215,12 @@ class StartPoseEditor:
                 return False
             self.set_arm(q7, jump=True)
             print(self.pose_text())
+        elif words[0] == "height" and len(words) == 2:
+            try:
+                height = float(words[1])
+            except ValueError:
+                return False
+            print(f"height {self.set_pedestal_height(height):.3f}")
         elif words[0] == "jog" and len(words) == 1:
             self.jog()
         else:
@@ -212,15 +230,16 @@ class StartPoseEditor:
     # -- keyboard jogging --------------------------------------------------
 
     def jog(self) -> None:
-        """Move one joint at a time from the terminal until Enter, q or Esc."""
+        """Move one joint, or the pedestal, at a time from the terminal until Enter, q or Esc."""
         import termios
         import tty
 
         print(
-            "1-7 or left/right: joint   up/down or +/-: move   [ ]: step size   "
-            "g: gripper   h: home   Enter/q/Esc: done"
+            "1-7 or left/right: joint (8: pedestal)   up/down or +/-: move   "
+            "[ ]: step size (deg, or cm for the pedestal)   g: gripper   h: home   Enter/q/Esc: done"
         )
-        joint, step_deg = 0, 5.0
+        pedestal = 7  # the "joint" after the arm's 7
+        joint, step = 0, 5.0
         target = self.arm.ctrl.copy()
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
@@ -232,7 +251,10 @@ class StartPoseEditor:
                     (f"[{math.degrees(q):7.1f}]" if i == joint else f" {math.degrees(q):7.1f} ")
                     for i, q in enumerate(target)
                 )
-                sys.stdout.write(f"\r\x1b[Kjoint {joint + 1}  step {step_deg:g} deg  target {q_deg}")
+                height = f"{self.env.spawn.pedestal_height:.2f} m"
+                height = f"[{height}]" if joint == pedestal else f" {height} "
+                name = "pedestal" if joint == pedestal else f"joint {joint + 1}"
+                sys.stdout.write(f"\r\x1b[K{name}  step {step:g}  target {q_deg}  pedestal {height}")
                 sys.stdout.flush()
 
                 if self.on_frame is not None:
@@ -244,20 +266,22 @@ class StartPoseEditor:
                 key = os.read(fd, 8).decode(errors="ignore")
                 if key in ("", "\n", "\r", "q", "\x1b"):
                     break
-                if len(key) == 1 and key in "1234567":
+                if len(key) == 1 and key in "12345678":
                     joint = int(key) - 1
                 elif key == "\x1b[C":
-                    joint = (joint + 1) % 7
+                    joint = (joint + 1) % 8
                 elif key == "\x1b[D":
-                    joint = (joint - 1) % 7
-                elif key in ("\x1b[A", "+", "="):
-                    target[joint] += math.radians(step_deg)
-                elif key in ("\x1b[B", "-", "_"):
-                    target[joint] -= math.radians(step_deg)
+                    joint = (joint - 1) % 8
+                elif key in ("\x1b[A", "+", "=", "\x1b[B", "-", "_"):
+                    sign = 1 if key in ("\x1b[A", "+", "=") else -1
+                    if joint == pedestal:
+                        self.set_pedestal_height(self.env.spawn.pedestal_height + sign * step / 100)
+                        continue
+                    target[joint] += sign * math.radians(step)
                 elif key == "]":
-                    step_deg = min(step_deg * 2, 45.0)
+                    step = min(step * 2, 45.0)
                 elif key == "[":
-                    step_deg = max(step_deg / 2, 0.25)
+                    step = max(step / 2, 0.25)
                 elif key == "h":
                     target = np.array(FRANKA_HOME_QPOS, dtype=float)
                 elif key == "g":
