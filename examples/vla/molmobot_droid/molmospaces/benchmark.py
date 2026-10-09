@@ -373,6 +373,7 @@ FLAG_ABBREVIATIONS = {
     "use_parallel_gripper": "pg",
     "include_franka": "ghost",
     "custom_franka_start_pose": "customstart",
+    "overlay_franka_gripper": "overlay",
 }
 """Short names for run names. `flags` dicts are keyed by the flags' command-line spelling."""
 
