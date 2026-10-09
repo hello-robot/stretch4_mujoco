@@ -14,6 +14,17 @@ viz, ...), and stop it on the way out:
     finally:
         teleop.stop()
 
+`GamepadTeleop` mirrors the real robot's `stretch4_body.core.gamepad_teleop`:
+the same two control mappings (JOINT_SPACE and FLYING_GRIPPER_IK, cycled with
+Y), the same joint command classes, and the same modifier buttons. The
+supporting modules are ports of their robot-side counterparts, kept close to the
+originals so they can be diffed:
+
+    gamepad_controller.py       <- stretch4_body/core/gamepad_controller.py
+    gamepad_enums.py            <- stretch4_body/core/gamepad_enums.py
+    gamepad_joints.py           <- stretch4_body/core/gamepad_joints.py
+    gamepad_control_mappings.py <- stretch4_body/core/gamepad_control_mappings.py
+
 See `examples/keyboard_teleop.py`, `examples/gamepad_teleop.py`, and
 `examples/molmo_environment.py` (--keyboard/--gamepad) for scripts built on
 top of these.
@@ -21,23 +32,35 @@ top of these.
 
 from __future__ import annotations
 
-import logging
-import math
 import threading
 import time
-from enum import Enum
+import traceback
+from typing import Callable
 
 import click
 from pynput import keyboard
 
-from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco import gamepad_joints
+from stretch4_mujoco.gamepad_control_mappings import TRIGGER_THRESHOLD, ControlMapping
 from stretch4_mujoco.gamepad_controller import (
     ButtonPressCounter,
     GamePadController,
     JointEffortTracker,
 )
+from stretch4_mujoco.gamepad_enums import (
+    GripperHandedness,
+    GuardedContactSensitivity,
+    MotionProfile,
+)
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
+
+# Header constants, mirroring stretch4_body/core/gamepad_teleop.py
+STEP_SLEEP = 1 / 15
+
+# Button Hold Durations
+START_BUTTON_HOLD_TIME_S = 3
+FN_BUTTON_DETECT_SPAN_S = 0.5
 
 KEYBOARD_HELP = """
        Keyboard Controls:
@@ -278,530 +301,626 @@ class KeyboardTeleop:
             self.sim.end_of_arm.stretch_gripper.set_velocity(0.0)
 
 
-class GripperHandedness(Enum):
-    LEFT = 0
-    RIGHT = 1
-
-    def move_to(self, sim: StretchMujocoSimulator):
-        """Moves the wrist to achieve this handedness."""
-        print(f"Moving wrist to {self.name}")
-
-        if self is GripperHandedness.RIGHT:
-            yaw_to = 0.0
-            pitch_to = 0.0
-            roll_to = 0.0
-            sim.end_of_arm.wrist_roll.move_to(roll_to)
-            sim.wait_until_at_setpoint(Actuators["wrist_roll"])
-            sim.end_of_arm.wrist_pitch.move_to(pitch_to)
-            sim.wait_until_at_setpoint(Actuators["wrist_pitch"])
-            sim.end_of_arm.wrist_yaw.move_to(yaw_to)
-            sim.wait_until_at_setpoint(Actuators["wrist_yaw"])
-        elif self is GripperHandedness.LEFT:
-            yaw_to = -math.pi
-            pitch_to = -math.pi
-            roll_to = math.pi
-            sim.end_of_arm.wrist_yaw.move_to(yaw_to)
-            sim.wait_until_at_setpoint(Actuators["wrist_yaw"])
-            sim.end_of_arm.wrist_pitch.move_to(pitch_to)
-            sim.wait_until_at_setpoint(Actuators["wrist_pitch"])
-            sim.end_of_arm.wrist_roll.move_to(roll_to)
-            sim.wait_until_at_setpoint(Actuators["wrist_roll"])
-        else:
-            raise NotImplementedError(f"No move_to defined for {self}")
-
-
-class MotionProfile(Enum):
-    SLOW = 1
-    DEFAULT = 2
-    FAST = 3
-    MAX = 4
-
-    def cycle(self, is_forward: bool):
-        index_offset = 1 if is_forward else -1
-        members = list(type(self))
-        index = members.index(self)
-        return members[(index + index_offset) % len(members)]
-
-    @property
-    def multiplier(self):
-        if self == MotionProfile.SLOW:
-            return 0.5
-        elif self == MotionProfile.DEFAULT:
-            return 1.5
-        elif self == MotionProfile.FAST:
-            return 2.5
-        elif self == MotionProfile.MAX:
-            return 3.0
-
-
-class ControlMapping(Enum):
-    OMNIBASE = 1
-    MANIPULATION = 2
-
-    def cycle(self, is_forward: bool):
-        index_offset = 1 if is_forward else -1
-        members = list(type(self))
-        index = members.index(self)
-        return members[(index + index_offset) % len(members)]
-
-    def do_motion(self, robot: "_GamepadRobotState", adapter: "GamepadTeleopAdapter"):
-        if self == ControlMapping.OMNIBASE:
-            return self._map_omnibase(robot, adapter)
-        elif self == ControlMapping.MANIPULATION:
-            return self._map_manipulation(robot, adapter)
-        else:
-            raise NotImplementedError(f"No controls callback for {self}")
-
-    def _map_omnibase(self, robot, adapter):
-        dxl_zero_vel_set_division_factor = 3
-        actuated_joints = {}
-        if adapter.use_devices.get("eoa"):
-            if adapter.controller_state.get("right_shoulder_button_pressed"):
-                adapter.wrist_yaw_command.command_button_to_motion(-1, robot)
-                actuated_joints["joint_wrist_yaw"] = 1
-            elif adapter.controller_state.get("left_shoulder_button_pressed"):
-                adapter.wrist_yaw_command.command_button_to_motion(1, robot)
-                actuated_joints["joint_wrist_yaw"] = -1
-            else:
-                if adapter._i % dxl_zero_vel_set_division_factor == 0:
-                    adapter.wrist_yaw_command.stop_motion(robot)
-            if adapter.controller_state.get("top_pad_pressed"):
-                cmd = 1 if adapter.gripper_handedness is GripperHandedness.RIGHT else -1
-                adapter.wrist_pitch_command.command_button_to_motion(cmd, robot)
-                actuated_joints["joint_wrist_pitch"] = cmd
-            elif adapter.controller_state.get("bottom_pad_pressed"):
-                cmd = -1 if adapter.gripper_handedness is GripperHandedness.RIGHT else 1
-                adapter.wrist_pitch_command.command_button_to_motion(cmd, robot)
-                actuated_joints["joint_wrist_pitch"] = cmd
-            else:
-                if adapter._i % dxl_zero_vel_set_division_factor == 0:
-                    adapter.wrist_pitch_command.stop_motion(robot)
-            if adapter.controller_state.get("left_pad_pressed"):
-                adapter.wrist_roll_command.command_button_to_motion(1, robot)
-                actuated_joints["joint_wrist_roll"] = -1
-            elif adapter.controller_state.get("right_pad_pressed"):
-                adapter.wrist_roll_command.command_button_to_motion(-1, robot)
-                actuated_joints["joint_wrist_roll"] = 1
-            else:
-                if adapter._i % dxl_zero_vel_set_division_factor == 0:
-                    adapter.wrist_roll_command.stop_motion(robot)
-
-        if adapter.use_devices.get("arm"):
-            cmd = adapter.controller_state.get("right_stick_x", 0) if adapter.use_arm_lift_mode else 0
-            adapter.arm_command.command_stick_to_motion(cmd, robot)
-            if abs(cmd) > 0.1:
-                actuated_joints["arm"] = cmd
-        if adapter.use_devices.get("lift"):
-            cmd = adapter.controller_state.get("right_stick_y", 0) if adapter.use_arm_lift_mode else 0
-            adapter.lift_command.command_stick_to_motion(cmd, robot)
-            if abs(cmd) > 0.1:
-                actuated_joints["lift"] = cmd
-        if adapter.use_devices.get("base"):
-            cmd_y = adapter.controller_state.get("left_stick_y", 0)
-            cmd_x = -adapter.controller_state.get("left_stick_x", 0)
-            cmd_t = (
-                -adapter.controller_state.get("right_stick_x", 0)
-                if not adapter.use_arm_lift_mode
-                else 0
-            )
-            adapter.base_command.command_stick_to_motion(cmd_y, cmd_x, cmd_t, robot)
-            if abs(cmd_y) > 0.1 or abs(cmd_x) > 0.1 or abs(cmd_t) > 0.1:
-                actuated_joints["base"] = cmd_x + cmd_y + cmd_t
-
-        if adapter.use_devices.get("gripper"):
-            if adapter.controller_state.get("right_button_pressed"):
-                adapter.gripper.open_gripper(robot)
-                actuated_joints[adapter.gripper.name] = 1
-            elif adapter.controller_state.get("bottom_button_pressed"):
-                adapter.gripper.close_gripper(robot)
-                actuated_joints[adapter.gripper.name] = -1
-            else:
-                adapter.gripper.stop_gripper(robot)
-
-        return actuated_joints
-
-    def _map_manipulation(self, robot, adapter):
-        adapter.precision_mode = adapter.controller_state.get("left_trigger_pulled", 0) > 0.9
-        adapter.use_arm_lift_mode = adapter.controller_state.get("right_trigger_pulled", 0) > 0.9
-
-        dxl_zero_vel_set_division_factor = 3
-
-        right_stick_x = adapter.controller_state.get("right_stick_x", 0)
-        right_stick_y = adapter.controller_state.get("right_stick_y", 0)
-
-        actuated_joints = {}
-        if adapter.use_devices.get("lift"):
-            if adapter.controller_state.get("top_pad_pressed"):
-                adapter.lift_command.command_button_to_motion(0.4, robot)
-                actuated_joints["lift"] = 0.4
-            elif adapter.controller_state.get("bottom_pad_pressed"):
-                adapter.lift_command.command_button_to_motion(-0.4, robot)
-                actuated_joints["lift"] = -0.4
-            else:
-                if adapter._i % dxl_zero_vel_set_division_factor == 0:
-                    adapter.lift_command.stop_motion(robot)
-
-        if adapter.use_devices.get("eoa") and adapter.use_arm_lift_mode:
-            adapter.base_command.stop_motion(robot)
-
-            if abs(right_stick_x) > 0.1:
-                adapter.wrist_yaw_command.command_stick_to_motion(right_stick_x, robot)
-                actuated_joints["joint_wrist_yaw"] = right_stick_x
-
-            if abs(right_stick_y) > 0.1:
-                handedness_inversion = (
-                    -1 if adapter.gripper_handedness is GripperHandedness.LEFT else 1
-                )
-                cmd = handedness_inversion * right_stick_y
-                adapter.wrist_pitch_command.command_stick_to_motion(cmd, robot)
-                actuated_joints["joint_wrist_pitch"] = right_stick_y
-
-            if adapter.controller_state.get("left_pad_pressed"):
-                adapter.wrist_roll_command.command_button_to_motion(1, robot)
-                actuated_joints["joint_wrist_roll"] = -1
-            elif adapter.controller_state.get("right_pad_pressed"):
-                adapter.wrist_roll_command.command_button_to_motion(-1, robot)
-                actuated_joints["joint_wrist_roll"] = 1
-            else:
-                if adapter._i % dxl_zero_vel_set_division_factor == 0:
-                    adapter.wrist_roll_command.stop_motion(robot)
-
-            if adapter.use_devices.get("arm"):
-                cmd = (
-                    adapter.controller_state.get("left_stick_y", 0)
-                    if adapter.use_arm_lift_mode
-                    else 0
-                )
-                adapter.arm_command.command_stick_to_motion(cmd, robot)
-                if abs(cmd) > 0.1:
-                    actuated_joints["arm"] = cmd
-
-        else:
-            if adapter.use_devices.get("arm"):
-                adapter.arm_command.stop_motion(robot)
-            if adapter.use_devices.get("eoa"):
-                adapter.wrist_yaw_command.stop_motion(robot)
-                adapter.wrist_pitch_command.stop_motion(robot)
-                adapter.wrist_roll_command.stop_motion(robot)
-
-            if adapter.use_devices.get("base"):
-                cmd_y = (
-                    adapter.controller_state.get("left_stick_y", 0)
-                    if not adapter.use_arm_lift_mode
-                    else 0
-                )
-                cmd_x = (
-                    -adapter.controller_state.get("left_stick_x", 0)
-                    if not adapter.use_arm_lift_mode
-                    else 0
-                )
-                cmd_t = (
-                    -adapter.controller_state.get("right_stick_x", 0)
-                    if not adapter.use_arm_lift_mode
-                    else 0
-                )
-                adapter.base_command.command_stick_to_motion(cmd_y, cmd_x, cmd_t, robot)
-                if abs(cmd_y) > 0.1 or abs(cmd_x) > 0.1 or abs(cmd_t) > 0.1:
-                    actuated_joints["base"] = cmd_x + cmd_y + cmd_t
-
-        if adapter.use_devices.get("gripper"):
-            if adapter.controller_state.get("right_button_pressed"):
-                adapter.gripper.open_gripper(robot)
-                actuated_joints[adapter.gripper.name] = 1
-            elif adapter.controller_state.get("bottom_button_pressed"):
-                adapter.gripper.close_gripper(robot)
-                actuated_joints[adapter.gripper.name] = -1
-            else:
-                adapter.gripper.stop_gripper(robot)
-
-        return actuated_joints
-
-
-def _get_subsystem_by_name(sim, name):
-    if name in ["lift", "arm"]:
-        return getattr(sim, name)
-    elif name in ["wrist_yaw", "wrist_pitch", "wrist_roll"]:
-        return getattr(sim.end_of_arm, name)
-    elif name == "gripper":
-        return sim.end_of_arm.stretch_gripper
-    elif name in ["head_pan", "head_tilt"]:
-        return getattr(sim.head, name) if hasattr(sim, "head") else None
-    return None
-
-
-class _MockCommand:
-    def __init__(self, sim, actuator_name, scale=1.0):
-        self.sim = sim
-        self.actuator_name = actuator_name
-        self.scale = scale
-        self.name = actuator_name
-
-    def command_button_to_motion(self, val, robot):
-        sub = _get_subsystem_by_name(self.sim, self.actuator_name)
-        if sub:
-            sub.move_by(val * self.scale * robot.precision_multiplier * robot.profile_multiplier)
-
-    def command_stick_to_motion(self, val, robot):
-        sub = _get_subsystem_by_name(self.sim, self.actuator_name)
-        if sub:
-            sub.move_by(val * self.scale * robot.precision_multiplier * robot.profile_multiplier)
-
-    def stop_motion(self, robot):
-        pass
-
-
-class _MockGripperCommand:
-    def __init__(self, sim):
-        self.sim = sim
-        self.name = "gripper"
-
-    def open_gripper(self, robot):
-        val = 0.07
-        self.sim.end_of_arm.stretch_gripper.move_by(val * robot.precision_multiplier)
-
-    def close_gripper(self, robot):
-        val = -0.07
-        self.sim.end_of_arm.stretch_gripper.move_by(val * robot.precision_multiplier)
-
-    def stop_gripper(self, robot):
-        pass
-
-
-class _MockBaseCommand:
-    def __init__(self, sim):
-        self.sim = sim
-        self.name = "base"
-
-    def command_stick_to_motion(self, cmd_y, cmd_x, cmd_t, robot):
-        if abs(cmd_x) < 0.001:
-            cmd_x = 0
-        if abs(cmd_y) < 0.001:
-            cmd_y = 0
-        if abs(cmd_t) < 0.001:
-            cmd_t = 0
-
-        velocity = 0.3  # m/s
-        angular_velocity = 1.0  # rad/s
-
-        v_x_linear = cmd_y * velocity * robot.precision_multiplier * robot.profile_multiplier
-        v_y_linear = cmd_x * velocity * robot.precision_multiplier * robot.profile_multiplier
-        omega = cmd_t * angular_velocity * robot.precision_multiplier * robot.profile_multiplier
-
-        if isinstance(self.sim, Stretch4MujocoSimulator):
-            self.sim.base.set_velocity(v_x_linear, v_y_linear, omega)
-        else:
-            self.sim.base.set_velocity(v_y_linear, 0.0, omega)
-
-    def stop_motion(self, robot):
-        self.sim.base.set_velocity(0.0, 0.0, 0.0)
-
-
-class GamepadTeleopAdapter:
-    def __init__(self, sim):
-        self._i = 0
-        self.use_devices = {"eoa": True, "arm": True, "lift": True, "base": True, "gripper": True}
-        self.gripper_handedness = GripperHandedness.RIGHT
-        self.use_arm_lift_mode = False
-        self.precision_mode = False
-        self.controller_state = {}
-
-        self.wrist_yaw_command = _MockCommand(sim, "wrist_yaw", 0.2)
-        self.wrist_pitch_command = _MockCommand(sim, "wrist_pitch", 0.2)
-        self.wrist_roll_command = _MockCommand(sim, "wrist_roll", 0.2)
-        self.arm_command = _MockCommand(sim, "arm", 0.05)
-        self.lift_command = _MockCommand(sim, "lift", 0.1)
-        self.base_command = _MockBaseCommand(sim)
-        self.gripper = _MockGripperCommand(sim)
-
-
-class _GamepadRobotState:
-    def __init__(self):
-        self.precision_multiplier = 1.0
-        self.profile_multiplier = 1.0
-
-
 class GamepadTeleop:
     """
-    Drives `sim` from an Xbox-style gamepad over `GamePadController`.
+    Drives `sim` from an Xbox-style gamepad, mirroring the real robot's
+    `stretch4_body.core.gamepad_teleop.GamePadTeleop`.
 
-    Once started, a background thread polls the gamepad state at `rate_hz`
-    and applies the same button/stick mapping as
-    `examples/gamepad_teleop.py`: MANIPULATION mapping by default (right
-    stick = wrist yaw/pitch, D-pad = lift, right trigger = arm/lift stick
-    mode), cycled to OMNIBASE with the select/back button. See
-    `examples/gamepad_teleop.py`'s module docstring-equivalent controls list
-    for the full mapping.
+    Both robot control mappings are available and are cycled with the Y button:
+
+    * `ControlMapping.JOINT_SPACE` (default) - direct joint control.
+    * `ControlMapping.FLYING_GRIPPER_IK` - IK-based Cartesian control of the gripper.
+
+    Print `teleop.control_mapping.description()` for the full button table of the
+    active mapping. Modifiers are the robot's:
+
+    * LT              - precision mode (scales every joint down)
+    * RT              - mapping-specific modifier (straight-line base, wrist roll, ...)
+    * Y               - cycle control mapping
+    * RT + A          - cycle motion profile (SLOW / MEDIUM / FAST)
+    * RT + B          - cycle contact-sensitivity profile (announced only; no-op in sim)
+    * RT + Back       - announce the current settings
+    * Hold Back 3s    - stow
+    * Hold Start 3s   - change gripper handedness (moves the wrist)
+    * Hold X 0.5s     - run `fn_button_command` (disabled unless `enable_fn_button` is set)
+    * Hold L3 / R3    - run `left_stick_button_fn` / `right_stick_button_fn` if assigned
+
+    Once started, a background thread polls the gamepad and steps the mapping at
+    `1 / STEP_SLEEP` Hz.
     """
 
     def __init__(
         self,
         sim: StretchMujocoSimulator,
-        use_head_joints: bool | None = None,
-        rate_hz: float = 15.0,
+        rate_hz: float | None = None,
+        print_mapping_on_start: bool = True,
     ):
         self.sim = sim
-        self.use_head_joints = (
-            use_head_joints if use_head_joints is not None else not isinstance(sim, Stretch4MujocoSimulator)
-        )
-        self._rate_hz = rate_hz
+        self.robot = sim  # the mappings take the simulator where the robot takes a Robot
 
-        self.gamepad = GamePadController()
-        self.mapping = ControlMapping.MANIPULATION
-        self.motion_profile = MotionProfile.DEFAULT
-        self.adapter = GamepadTeleopAdapter(sim)
-        self._robot = _GamepadRobotState()
-        self._dex_switch = False
+        self.motion_profile = MotionProfile.MEDIUM
+        self.gripper_handedness = GripperHandedness.RIGHT
+        self.control_mapping = ControlMapping.JOINT_SPACE
+        self.contact_sensitivity_profile = GuardedContactSensitivity.MEDIUM
 
-        self._select_button_counter = ButtonPressCounter("select_button_pressed")
-        self._start_button_counter = ButtonPressCounter("start_button_pressed")
-        self._top_button_counter = ButtonPressCounter("top_button_pressed")
-        self._left_button_counter = ButtonPressCounter("left_button_pressed")
+        self.gamepad_controller = GamePadController()
+        self.precision_mode = 0.0
+        self.use_arm_lift_mode = False
+        self.controller_state = self.gamepad_controller.get_state()
+        self.status = sim.pull_status()
 
-        self._effort_trackers = {
-            "joint_lift": JointEffortTracker("lift", pos_thresholds=[100.0, 200.0]),
-            "joint_arm": JointEffortTracker("arm", pos_thresholds=[50.0, 100.0]),
-            "joint_wrist_yaw": JointEffortTracker(
-                "eoa", pos_thresholds=[2.0, 5.0], joint_name="wrist_yaw"
-            ),
-            "joint_wrist_pitch": JointEffortTracker(
-                "eoa", pos_thresholds=[2.0, 5.0], joint_name="wrist_pitch"
-            ),
-            "joint_wrist_roll": JointEffortTracker(
-                "eoa", pos_thresholds=[2.0, 5.0], joint_name="wrist_roll"
-            ),
-            "gripper": JointEffortTracker("eoa", pos_thresholds=[5.0, 15.0], joint_name="gripper"),
+        self.sleep = STEP_SLEEP if rate_hz is None else 1.0 / rate_hz
+        self.print_mode = False
+        self.print_mapping_on_start = print_mapping_on_start
+        self._i = 0
+
+        # The robot reads these off its Device params; there is no robot config in sim.
+        self.enable_fn_button = False
+        self.fn_button_command: str | None = None
+        self.fn_button_detect_span = FN_BUTTON_DETECT_SPAN_S
+
+        self._last_fn_btn_press = None
+        self._last_left_stick_fn_btn_press = None
+        self._last_right_stick_fn_btn_press = None
+        self.start_button_counter = ButtonPressCounter("start_button_pressed")
+        self.top_button_counter = ButtonPressCounter("top_button_pressed")
+        self.bottom_button_counter = ButtonPressCounter("bottom_button_pressed")
+        self.right_button_counter = ButtonPressCounter("right_button_pressed")
+        self.select_button_counter = ButtonPressCounter("select_button_pressed")
+        self.gripper = None
+
+        self.gripper_name = "stretch_gripper"
+        self.use_devices = {
+            "arm": True,
+            "eoa": True,
+            "lift": True,
+            "base": True,
+            "gripper": True,
         }
+
+        self.effort_trackers = {
+            "lift": JointEffortTracker(
+                "lift", pos_thresholds=[34.0, 45.0], neg_thresholds=[25.0, 35.0]
+            ),
+            "arm": JointEffortTracker(
+                "arm", pos_thresholds=[10.0, 20.0], neg_thresholds=[10.0, 20.0]
+            ),
+            "wrist_yaw_joint": JointEffortTracker(
+                "eoa",
+                pos_thresholds=[3.0, 10.0],
+                neg_thresholds=[3.0, 10.0],
+                joint_name="wrist_yaw",
+            ),
+            "wrist_pitch_joint": JointEffortTracker(
+                "eoa",
+                pos_thresholds=[3.0, 10.0],
+                neg_thresholds=[3.0, 10.0],
+                joint_name="wrist_pitch",
+            ),
+            "wrist_roll_joint": JointEffortTracker(
+                "eoa",
+                pos_thresholds=[3.0, 10.0],
+                neg_thresholds=[3.0, 10.0],
+                joint_name="wrist_roll",
+            ),
+            self.gripper_name: JointEffortTracker(
+                "eoa",
+                pos_thresholds=[5.0, 20.0],
+                neg_thresholds=[5.0, 20.0],
+                joint_name=self.gripper_name,
+            ),
+        }
+
+        self.lock = threading.Lock()
+
+        self.left_stick_button_fn: Callable | None = None
+        self.right_stick_button_fn: Callable | None = None
+        self.currently_stowing = False
+
+        self._flying_gripper_controller = None
+
+        self.contact_sensitivity_profile.apply(self.sim)
+
+        self.set_joint_command()
 
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
+    @property
+    def flying_gripper_controller(self):
+        """The IK controller is built lazily: generating the planar-IK URDF and loading
+        pinocchio takes a few seconds, and JOINT_SPACE never needs it."""
+        if self._flying_gripper_controller is None:
+            self._flying_gripper_controller = _build_flying_gripper_controller(self.sim)
+        return self._flying_gripper_controller
+
+    def set_joint_command(self):
+        self.base_command = gamepad_joints.CommandBase(
+            motion_profile=self.motion_profile.get_name(),
+            motion_profile_angular=self.motion_profile.get_one_lower_speed().get_name(),
+        )
+        self.lift_command = gamepad_joints.CommandLift(
+            motion_profile=self.motion_profile.get_name()
+        )
+        if self.use_devices["arm"]:
+            self.arm_command = gamepad_joints.CommandArm(
+                motion_profile=self.motion_profile.get_name()
+            )
+        if self.use_devices["eoa"]:
+            self.wrist_yaw_command = gamepad_joints.CommandWristYaw(
+                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+            )
+            self.wrist_pitch_command = gamepad_joints.CommandWristPitch(
+                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+            )
+            self.wrist_roll_command = gamepad_joints.CommandWristRoll(
+                motion_profile=self.motion_profile.get_name(), dt=self.sleep
+            )
+        if self.use_devices["gripper"]:
+            self.gripper = gamepad_joints.CommandStretchGripperPosition(
+                motion_profile=self.motion_profile.get_name()
+            )
+
+    # --- Settings cycling -------------------------------------------------
+
+    def cycle_motion_profile(self):
+        self.motion_profile = self.motion_profile.cycle(is_forward=True)
+
+        print(f"Switched to {self.motion_profile.name} motion_profile.")
+
+        self.motion_profile.play_sound_file()
+        duration = 150 * self.motion_profile.value
+        self.gamepad_controller.vibrate(
+            duration_ms=duration, strong_magnitude=1.0, weak_magnitude=1.0
+        )
+        self.set_joint_command()
+
+    def cycle_mapping(self):
+        next_mapping = self.control_mapping.cycle(is_forward=True)
+
+        if next_mapping == ControlMapping.FLYING_GRIPPER_IK:
+            # Warm the IK controller up so the first frame is not a multi-second stall,
+            # and stay on the current mapping if this robot model has no IK URDF.
+            try:
+                self.flying_gripper_controller
+            except Exception as e:
+                print(f"Cannot switch to {next_mapping.name}: {e}")
+                self.gamepad_controller.vibrate(
+                    duration_ms=400, strong_magnitude=1.0, weak_magnitude=1.0
+                )
+                return
+
+        self.control_mapping = next_mapping
+
+        print(f"Switched to {self.control_mapping.name} gamepad mapping.")
+
+        self.control_mapping.play_sound_file()
+        if self.control_mapping == ControlMapping.FLYING_GRIPPER_IK:
+            self.gamepad_controller.vibrate_sequence(
+                sequence_ms=[150, 100, 150],
+                strong_magnitude=1.0,
+                weak_magnitude=1.0,
+                tag="mapping_fg",
+                cooldown=0.0,
+            )
+        else:
+            self.gamepad_controller.vibrate(
+                duration_ms=300, strong_magnitude=1.0, weak_magnitude=1.0
+            )
+
+    def cycle_contact_sensitivity_profile(self):
+        self.contact_sensitivity_profile = self.contact_sensitivity_profile.cycle(is_forward=True)
+
+        print(f"Switched to {self.contact_sensitivity_profile.name} contact_sensitivity_profile.")
+
+        self.contact_sensitivity_profile.play_sound_file()
+        duration = 150 * self.contact_sensitivity_profile.value
+        self.gamepad_controller.vibrate(
+            duration_ms=duration, strong_magnitude=1.0, weak_magnitude=1.0
+        )
+        self.contact_sensitivity_profile.apply(self.sim)
+
+    def _handle_vibration(self, actuated_joints):
+        """
+        Handle effort-based vibration feedback for the gamepad controller.
+
+        Not called by `do_motion()`, matching the robot, where it is commented out.
+        """
+        for joint_id, tracker in self.effort_trackers.items():
+            is_actuated = joint_id in actuated_joints
+            tracker.step(self.status, is_actuated, actuated_joints.get(joint_id, 0))
+
+            if not is_actuated:
+                continue
+
+            def trigger_vibrate(effort, j_id=joint_id, t=tracker):
+                strong_mag = 1.0
+                weak_mag = 1.0
+                try:
+                    thresholds = t.pos_thresholds if t.last_direction >= 0 else t.neg_thresholds
+                    min_e, max_e = thresholds
+                    abs_effort = abs(effort)
+                    if max_e > min_e:
+                        fraction = min(1.0, max(0.0, (abs_effort - min_e) / (max_e - min_e)))
+                        strong_mag = 0.2 + 0.8 * fraction
+                        weak_mag = strong_mag
+                except Exception:
+                    pass
+
+                self.gamepad_controller.vibrate_sequence(
+                    sequence_ms=[100, 50, 100],
+                    strong_magnitude=strong_mag,
+                    weak_magnitude=weak_mag,
+                    tag=f"effort_{j_id}",
+                    cooldown=0.1,
+                )
+
+            tracker.trigger_on_hold(0.25, trigger_vibrate)
+
+    # --- Control loop -----------------------------------------------------
+
+    def do_motion(self, state=None, robot=None):
+        """
+        This method should be called in the control loop (mainloop())
+
+        Parameters
+        ----------
+        state : Dict
+            Override the gamepad controller state providing custom state,
+            check out GamePadController.get_state()
+        robot : StretchMujocoSimulator
+            Valid simulator instance
+
+        Returns
+        -------
+        Whether the robot was commanded to do some motion
+        """
+        if not robot:
+            robot = self.sim
+        self._i = self._i + 1
+        self._update_state(state)
+        self._update_modes()
+        with self.lock:
+            if self.currently_stowing:  # No control during stowing
+                return False
+
+            if self.controller_state is None:  # No control if gamepad not being controlled
+                return False
+
+            self.status = robot.pull_status()
+
+            self.manage_start_button(robot)
+
+            # Regular control
+            if self.gamepad_controller.is_gamepad_active or state:
+                self.manage_fn_button(robot, self.controller_state["left_button_pressed"])
+
+                self.precision_mode = self.controller_state["left_trigger_pulled"]
+                self.use_arm_lift_mode = (
+                    self.controller_state["right_trigger_pulled"] > TRIGGER_THRESHOLD
+                )
+
+                actuated_joints = self.control_mapping.do_motion(robot, self)
+
+                if actuated_joints:
+                    if self.status.is_self_colliding:
+                        self.gamepad_controller.vibrate_sequence(
+                            sequence_ms=[150, 100, 200],
+                            strong_magnitude=1.0,
+                            weak_magnitude=1.0,
+                            tag="collision",
+                            cooldown=1.0,
+                        )
+
+                    # if self.precision_mode:
+                    #     self._handle_vibration(actuated_joints)
+
+                self.manage_settings_buttons(robot)
+
+                self.manage_left_stick_fn_button(self.controller_state["left_stick_button_pressed"])
+                self.manage_right_stick_fn_button(
+                    self.controller_state["right_stick_button_pressed"]
+                )
+            else:
+                self._safety_stop(robot)
+        return True
+
+    def _update_state(self, state=None):
+        with self.lock:
+            self.controller_state = state if state else self.gamepad_controller.get_state()
+
+    def _update_modes(self):
+        if self.use_devices["arm"]:
+            self.arm_command.precision_mode = self.precision_mode
+        self.lift_command.precision_mode = self.precision_mode
+        self.base_command.precision_mode = self.precision_mode
+        if self.use_devices["gripper"]:
+            self.gripper.precision_mode = self.precision_mode
+        if self.use_devices["eoa"]:
+            self.wrist_pitch_command.precision_mode = self.precision_mode
+            self.wrist_roll_command.precision_mode = self.precision_mode
+            self.wrist_yaw_command.precision_mode = self.precision_mode
+
+    # --- Buttons ----------------------------------------------------------
+
+    def manage_settings_buttons(self, robot):
+        """
+        Manage settings and mode switching.
+        """
+        rt_pulled = self.controller_state.get("right_trigger_pulled", 0.0) > TRIGGER_THRESHOLD
+
+        self.top_button_counter.step(self.controller_state)
+        self.bottom_button_counter.step(self.controller_state)
+        self.right_button_counter.step(self.controller_state)
+        self.select_button_counter.step(self.controller_state)
+
+        def on_top_tap():
+            self.cycle_mapping()
+
+        self.top_button_counter.trigger_on_tap(on_top_tap)
+
+        def on_bottom_tap():
+            if rt_pulled:
+                self.cycle_motion_profile()
+
+        self.bottom_button_counter.trigger_on_tap(on_bottom_tap)
+
+        def on_right_tap():
+            if rt_pulled:
+                self.cycle_contact_sensitivity_profile()
+
+        self.right_button_counter.trigger_on_tap(on_right_tap)
+
+        def on_select_tap():
+            if rt_pulled:
+                self.gripper_handedness.play_sound_file()
+                self.motion_profile.play_sound_file()
+                self.contact_sensitivity_profile.play_sound_file()
+                self.control_mapping.play_sound_file()
+
+        self.select_button_counter.trigger_on_tap(on_select_tap)
+
+        def on_select_hold():
+            self.stow_robot()
+
+        self.select_button_counter.trigger_on_hold(START_BUTTON_HOLD_TIME_S, on_select_hold)
+
+    def manage_start_button(self, robot):
+        """
+        Manage the state of the Start button.
+
+        The robot homes on a Start tap when uncalibrated; a simulated robot is always
+        homed, so only the hold behaviour applies: holding Start for
+        START_BUTTON_HOLD_TIME_S (3s) changes gripper handedness with motion.
+        """
+        self.start_button_counter.step(self.controller_state)
+
+        if not self.currently_stowing:
+            """If the user holds the start button, it will do the automatic handedness
+            change motion"""
+            self.start_button_counter.trigger_on_hold(
+                START_BUTTON_HOLD_TIME_S,
+                lambda: self.change_gripper_handedness(robot, do_motion=True),
+            )
+
+    def change_gripper_handedness(self, robot, *, do_motion: bool):
+        """
+        Change the gripper handedness (Left/Right).
+
+        Args:
+            robot (StretchMujocoSimulator): Valid simulator instance.
+            do_motion (bool): If True, the wrist will physically move to the new orientation.
+        """
+        if not self.use_devices["eoa"]:
+            print("No eoa device")
+            return
+
+        if self.use_devices["lift"] and self.status.lift.pos <= 0.35:
+            print("Lift too low for handedness change")
+            self.gamepad_controller.vibrate(
+                duration_ms=400, strong_magnitude=1.0, weak_magnitude=1.0
+            )
+            return
+
+        print("Switching gripper handedness")
+
+        if self.gripper_handedness == GripperHandedness.RIGHT:
+            self.gripper_handedness = GripperHandedness.LEFT
+        else:
+            self.gripper_handedness = GripperHandedness.RIGHT
+
+        self.gripper_handedness.play_sound_file()
+        duration = 150 * (self.gripper_handedness.value + 1)
+        self.gamepad_controller.vibrate(
+            duration_ms=duration, strong_magnitude=1.0, weak_magnitude=1.0
+        )
+
+        if do_motion:
+            self.gripper_handedness.move_to(robot)
+
+    def manage_left_stick_fn_button(self, button_state):
+        """
+        Trigger custom user function for left stick button press.
+
+        The function is executed if the button is held for `fn_button_detect_span`.
+        """
+        if self.left_stick_button_fn is None:
+            return
+
+        if button_state:
+            if not self._last_left_stick_fn_btn_press:
+                self._last_left_stick_fn_btn_press = time.time()
+
+            if time.time() - self._last_left_stick_fn_btn_press >= self.fn_button_detect_span:
+                click.secho("Executing Left Stick Custom Function", fg="green", bold=True)
+                self.left_stick_button_fn()
+                self._last_left_stick_fn_btn_press = None
+        else:
+            self._last_left_stick_fn_btn_press = None
+
+    def manage_right_stick_fn_button(self, button_state):
+        """
+        Trigger custom user function for right stick button press.
+
+        The function is executed if the button is held for `fn_button_detect_span`.
+        """
+        if self.right_stick_button_fn is None:
+            return
+
+        if button_state:
+            if not self._last_right_stick_fn_btn_press:
+                self._last_right_stick_fn_btn_press = time.time()
+
+            if time.time() - self._last_right_stick_fn_btn_press >= self.fn_button_detect_span:
+                click.secho("Executing Right Stick Custom Function", fg="green", bold=True)
+                self.right_stick_button_fn()
+                self._last_right_stick_fn_btn_press = None
+        else:
+            self._last_right_stick_fn_btn_press = None
+
+    def manage_fn_button(self, robot, button_state):
+        """
+        Detect function button press (X / left button).
+
+        Executes `fn_button_command` in a detached shell if the button is held for
+        FN_BUTTON_DETECT_SPAN_S. Disabled by default: set `enable_fn_button` and
+        `fn_button_command` to use it.
+        """
+        if self.enable_fn_button:
+            if button_state:
+                if not self._last_fn_btn_press:
+                    self._last_fn_btn_press = time.time()
+
+                if time.time() - self._last_fn_btn_press >= FN_BUTTON_DETECT_SPAN_S:
+                    self._last_fn_btn_press = None
+                    click.secho(
+                        f"Executing Function command: {self.fn_button_command}",
+                        fg="green",
+                        bold=True,
+                    )
+                    self._execute_fn_cmd()
+            else:
+                self._last_fn_btn_press = None
+
+    def _execute_fn_cmd(self):
+        if self.fn_button_command:
+            execute_command_non_blocking(self.fn_button_command)
+
+    def _safety_stop(self, robot):
+        """
+        Stop all robot motions.
+
+        This is called when the gamepad is inactive or no input is detected to ensure
+        the robot doesn't drift or continue moving.
+        """
+        if self.use_devices["eoa"]:
+            self.wrist_yaw_command.command_button_to_motion(0, robot)
+            self.wrist_pitch_command.command_button_to_motion(0, robot)
+            self.wrist_roll_command.command_button_to_motion(0, robot)
+        if self.use_devices["arm"]:
+            self.arm_command.command_stick_to_motion(0, robot)
+        if self.use_devices["lift"]:
+            self.lift_command.command_stick_to_motion(0, robot)
+        if self.use_devices["base"]:
+            self.base_command.command_stick_to_motion(0, 0, 0, robot)
+
+    def stow_robot(self):
+        """
+        Stow the robot to a safe position.
+        """
+        self.currently_stowing = True
+        try:
+            self._safety_stop(self.sim)
+            self.sim.stow()
+        finally:
+            self.currently_stowing = False
+
+    # --- Threading --------------------------------------------------------
+
+    def step_mainloop(self, robot=None):
+        """
+        Execute a single step of the main control loop.
+        """
+        if not robot:
+            robot = self.sim
+        self.do_motion(robot=robot)
+        time.sleep(self.sleep)
+
+    def mainloop(self):
+        """
+        Run the main control loop until the simulator stops.
+        """
+        try:
+            while self.sim.is_running() and not self._stop_event.is_set():
+                self.step_mainloop()
+        except (KeyboardInterrupt, SystemExit):
+            self.stop()
+        except Exception:
+            traceback.print_exc()
+            self.stop()
+
     def start(self):
+        """Start the gamepad controller and run the control loop on a background thread."""
         self._stop_event.clear()
-        self.gamepad.start()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self.gamepad_controller.startup()
+        if self.print_mapping_on_start:
+            print(self.control_mapping.description())
+        self._thread = threading.Thread(target=self.mainloop, daemon=True)
         self._thread.start()
 
     def stop(self):
+        """
+        Stop the control loop and the gamepad controller.
+        """
         self._stop_event.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=1.0)
             self._thread = None
-        self.gamepad.stop()
+        self.gamepad_controller.stop()
 
-    def _change_mapping(self):
-        self.mapping = self.mapping.cycle(is_forward=True)
-        print(f"Switched mapping to {self.mapping.name}")
-        self.gamepad.vibrate(duration_ms=150, strong_magnitude=1.0, weak_magnitude=1.0)
+    # Kept for symmetry with the robot's attribute name.
+    @property
+    def gamepad(self):
+        return self.gamepad_controller
 
-    def _change_handedness(self):
-        self.adapter.gripper_handedness = (
-            GripperHandedness.LEFT
-            if self.adapter.gripper_handedness == GripperHandedness.RIGHT
-            else GripperHandedness.RIGHT
+
+def _build_flying_gripper_controller(sim: StretchMujocoSimulator):
+    """Builds the same `KinematicController` the robot uses, from a planar-IK URDF
+    generated for the simulated robot model."""
+    import tempfile
+
+    if not isinstance(sim, Stretch4MujocoSimulator):
+        raise NotImplementedError(
+            "FLYING_GRIPPER_IK needs the Stretch 4 planar-IK URDF; it is not available "
+            f"for {type(sim).__name__}."
         )
-        self.adapter.gripper_handedness.move_to(self.sim)
-        duration = 150 * (self.adapter.gripper_handedness.value + 1)
-        self.gamepad.vibrate(duration_ms=duration, strong_magnitude=1.0, weak_magnitude=1.0)
 
-    def _change_motion_profile(self):
-        self.motion_profile = self.motion_profile.cycle(is_forward=True)
-        print(f"Switched motion profile to {self.motion_profile.name}")
-        duration = 150 * self.motion_profile.value
-        self.gamepad.vibrate(duration_ms=duration, strong_magnitude=1.0, weak_magnitude=1.0)
+    from stretch4_flying_gripper.kinematic_controller import KinematicController
+    from stretch4_urdf import make_planar_ik_urdf
+    from yourdfpy import urdf as ud
 
-    def _toggle_dex_switch(self):
-        self._dex_switch = not self._dex_switch
-        print(f"Setting dex_switch to {self._dex_switch}")
+    out_dir = tempfile.mkdtemp(prefix="sim_gamepad_teleop_")
+    robot = ud.URDF.load(type(sim).get_urdf_path())
+    urdf_path = make_planar_ik_urdf(
+        robot, "sim_gamepad_teleop", out_dir, is_merge_arm=True, is_fixed_wrist=False
+    )
+    print(f"Flying gripper IK URDF: {urdf_path}")
+    return KinematicController(urdf_path)
 
-    def _loop(self):
-        period = 1.0 / self._rate_hz
-        while not self._stop_event.is_set() and self.sim.is_running():
-            start = time.perf_counter()
-            gamepad_state = self.gamepad.get_state()
 
-            self._robot.precision_multiplier = 1.0 - 0.75 * gamepad_state.get(
-                "left_trigger_pulled", 0.0
-            )
-            self.adapter.controller_state = gamepad_state.copy()
-            self.adapter._i += 1
+def execute_command_non_blocking(command):
+    import os
+    import subprocess
 
-            # Use back_button_pressed if it's pressed as fallback for select
-            if gamepad_state.get("back_button_pressed", False):
-                gamepad_state["select_button_pressed"] = True
-
-            self._select_button_counter.step(gamepad_state)
-            self._start_button_counter.step(gamepad_state)
-            self._top_button_counter.step(gamepad_state)
-            self._left_button_counter.step(gamepad_state)
-
-            self._select_button_counter.trigger_on_tap(self._change_mapping)
-            self._start_button_counter.trigger_on_tap(self._change_handedness)
-            self._top_button_counter.trigger_on_tap(self._change_motion_profile)
-
-            if self.use_head_joints:
-                self._left_button_counter.trigger_on_tap(self._toggle_dex_switch)
-
-                if self._dex_switch and hasattr(self.sim, "head"):
-                    if gamepad_state.get("bottom_pad_pressed"):
-                        self.sim.head.head_tilt.move_by(1 * 0.2 * self._robot.precision_multiplier)
-                    elif gamepad_state.get("top_pad_pressed"):
-                        self.sim.head.head_tilt.move_by(-1 * 0.2 * self._robot.precision_multiplier)
-
-                    if gamepad_state.get("left_pad_pressed"):
-                        self.sim.head.head_pan.move_by(1 * 0.2 * self._robot.precision_multiplier)
-                    elif gamepad_state.get("right_pad_pressed"):
-                        self.sim.head.head_pan.move_by(-1 * 0.2 * self._robot.precision_multiplier)
-
-                    self.adapter.controller_state["bottom_pad_pressed"] = False
-                    self.adapter.controller_state["top_pad_pressed"] = False
-                    self.adapter.controller_state["left_pad_pressed"] = False
-                    self.adapter.controller_state["right_pad_pressed"] = False
-
-            self._robot.profile_multiplier = self.motion_profile.multiplier
-
-            actuated_joints = self.mapping.do_motion(self._robot, self.adapter)
-
-            status = self.sim.pull_status()
-            if status.is_self_colliding:
-                self.gamepad.vibrate_sequence(
-                    sequence_ms=[150, 100, 200],
-                    strong_magnitude=0.5,
-                    weak_magnitude=1.0,
-                    tag="collision",
-                    cooldown=2.0,
-                )
-
-            if actuated_joints and self.adapter.precision_mode:
-                for joint_id, tracker in self._effort_trackers.items():
-                    direction = actuated_joints.get(joint_id, 0)
-                    is_actuated = direction != 0
-
-                    tracker.step(status, is_actuated, direction)
-                    tracker.trigger_on_hold(0.1, self._make_vibrate_callback(joint_id, tracker))
-
-            elapsed = time.perf_counter() - start
-            if elapsed < period:
-                time.sleep(period - elapsed)
-
-    def _make_vibrate_callback(self, joint_id, tracker):
-        def trigger_vibrate(effort):
-            try:
-                abs_effort = abs(effort)
-                max_e = tracker.pos_thresholds[1] if tracker.last_direction >= 0 else tracker.neg_thresholds[1]
-                min_e = tracker.pos_thresholds[0] if tracker.last_direction >= 0 else tracker.neg_thresholds[0]
-                if max_e > min_e:
-                    fraction = min(1.0, max(0.0, (abs_effort - min_e) / (max_e - min_e)))
-                else:
-                    fraction = 1.0 if abs_effort >= min_e else 0.0
-
-                self.gamepad.vibrate(
-                    duration_ms=100,
-                    strong_magnitude=fraction,
-                    weak_magnitude=fraction,
-                    tag=f"effort_{joint_id}",
-                    cooldown=0.25,
-                )
-            except Exception as e:
-                logging.error(f"Got error {e}", exc_info=True)
-
-        return trigger_vibrate
+    try:
+        # Use subprocess.Popen to start the command in a separate process that won't get
+        # killed when the main process is killed
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setpgrp,  # Detach the child process from the parent
+        )
+    except Exception as e:
+        print(f"An error occurred: {e}")
