@@ -19,7 +19,7 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 import mujoco
 import numpy as np
@@ -527,6 +527,7 @@ class FrankaDroidEnv:
     A compiled scene with a Franka DROID in it, stepped in this process at the policy's rate.
 
     `launch_viewer()` opens MuJoCo's passive viewer, kept in sync on every `step()`.
+    `prepare_exo`, if set, is applied to the exo image in `observe()` (e.g. a head-camera crop).
     """
 
     def __init__(self, model: mujoco.MjModel, spawn: FrankaSpawn, scene_camera: str | None = None):
@@ -538,6 +539,7 @@ class FrankaDroidEnv:
         self.view = FrankaDroidRobotView(self.data, spawn.prefix)
         self.n_substeps = max(1, round(POLICY_DT / model.opt.timestep))
         self.viewer = None
+        self.prepare_exo: Callable[[np.ndarray], np.ndarray] | None = None
 
         if spawn.exo_camera in HEAD_CAMERAS:
             apply_stretch_camera_settings(model, spawn.exo_camera_name, HEAD_CAMERAS[spawn.exo_camera])
@@ -576,8 +578,9 @@ class FrankaDroidEnv:
         return np.concatenate([arm, gripper[:1]]).astype(float)
 
     def observe(self) -> Observation:
+        exo_rgb = self.exo_renderer.render(self.data)
         return Observation(
-            exo_rgb=self.exo_renderer.render(self.data),
+            exo_rgb=self.prepare_exo(exo_rgb) if self.prepare_exo is not None else exo_rgb,
             wrist_rgb=self.wrist_renderer.render(self.data),
             state8=self.state8,
         )

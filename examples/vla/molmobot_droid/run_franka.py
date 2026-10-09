@@ -40,8 +40,13 @@ from examples.vla.molmobot_droid.checkpoint import (
     load_policy,
     unload_policy,
 )
-from examples.vla.molmobot_droid.droid import FrankaDroidEnv, Observation, RobotPose
-from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import execution_options, exo_camera_option
+from examples.vla.molmobot_droid.droid import HEAD_CAMERAS, FrankaDroidEnv, Observation, RobotPose
+from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    execution_options,
+    exo_camera_option,
+    head_crop_option,
+    to_droid_frame,
+)
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     load_custom_scene,
     free_bodies,
@@ -275,8 +280,9 @@ class StartPoseEditor:
 @click.command()
 @scene_options
 @exo_camera_option("droid")
+@head_crop_option
 @execution_options
-def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, exo_camera,
+def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, exo_camera, head_crop,
          execute_horizon, execute_first_n):
     if not 1 <= execute_first_n <= execute_horizon:
         raise click.BadParameter("need 1 <= --execute-horizon-do-only-first-n-steps <= --execute-horizon")
@@ -284,6 +290,8 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
     env = load_custom_scene_franka_droid(scene, pose, exo_camera=exo_camera)
+    if exo_camera in HEAD_CAMERAS and head_crop == "droid":
+        env.prepare_exo = to_droid_frame
     env.launch_viewer()
 
     logger = None
