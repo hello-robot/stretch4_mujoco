@@ -14,6 +14,14 @@ Stretch 4 is always built and simulated by this repository's `stretch4_mujoco` l
 Scenes, objects and benchmarks come straight from
 [MolmoSpaces](https://github.com/allenai/molmospaces).
 
+## General notes about working the MolmoBot-DROID
+
+1. The models was trained on the Franka arm with the Robotiq gripper (7 + 1 DOF). There is the gripper camera biased downwards toward the fingertips, and an external workspace camera.
+1. Start pose matters in several ways:
+  1. The model appears to expect the designated object for the Pick task to be placed in the center of the external workspace camera's image. https://drive.google.com/file/d/1666P8Ibm3BvpkZksR3lRXz-oTUEQ9aJr/view?usp=drive_link. The video they released also seems to corroborate this https://youtu.be/UQVX0iq67mo?si=vIu8OKx8puLBfobU&t=77. When using the cropped fisheye camera, it has no problem picking up the when it’s not in front of the base, but the object still has to be in the center of the exo camera view - the fisheye camera in this case: https://drive.google.com/file/d/1NYUDZv7g_yTa-e6K60OpQR6XdLgLtIZz/view?usp=drive_link 
+  1. If the gripper starts lower than the object or in a horizontal pick up pose, it seems unable to pick up the object: https://drive.google.com/file/d/1efDto5MsmVed2zsQwyd5vhXIxGuRHD7B/view?usp=drive_link 
+   
+
 ## The model
 
 | | |
@@ -89,7 +97,8 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
   `base_footprint`, facing the same way. Its height is the training height for the target
   object.
   - The head cameras transplanted onto the Franka (`--exo_camera left|right|center`) sit at the
-    same place relative to that floor point.
+    same place relative to that floor point, with joint 1 at 0. They hang off `fr3_link1`, so
+    they turn with joint 1 the way Stretch's head turns with its base.
   - Note that `base_link` in Stretch's model is 0.028 m above `base_footprint`. The footprint is
     the reference.
 - **Degrees of freedom.** IK solves 6 DOF for a 6-D pose: base rotation, lift, arm, and wrist
