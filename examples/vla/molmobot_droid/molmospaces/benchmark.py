@@ -8,8 +8,9 @@ robot's base pose and starting arm, and the instruction. Scenes are rebuilt from
 `custom_scene`, and success uses molmospaces' criteria (see `PickSuccess`), checked through
 `env.body_pose()` / `env.body_contacts()` so that it works for either robot.
 
-Every episode writes one video per camera, the scene camera, and a grid of all of them;
-the run writes `report.md` and `results.json`. File names start with `run_name()`: the robot
+Every episode writes one video per camera, the scene camera, and a grid of all of them with
+the instruction on it (in `grid/`, linked from the report); the run writes `report.md` and
+`results.json`. File names start with `run_name()`: the robot
 and the flags, joined with underscores.
 """
 
@@ -239,24 +240,37 @@ def make_judge(setup: EpisodeSetup) -> SuccessJudge:
 # ---------------------------------------------------------------------------
 
 
+GRID_DIR = "grid"
+"""Subfolder of a run directory holding the grid videos, so they are easy to find."""
+
+
+def video_path(out_dir: Path, prefix: str, camera: str) -> Path:
+    """Where `EpisodeRecorder` writes `camera`'s video: grids go in `GRID_DIR`."""
+    name = f"{prefix}_{camera}.mp4"
+    return out_dir / GRID_DIR / name if camera == "grid" else out_dir / name
+
+
 class EpisodeRecorder:
     """
     Streams one mp4 per camera, plus a grid of all of them, at the policy rate. Frames are
-    written as they come, so an episode never holds its video in memory.
+    written as they come, so an episode never holds its video in memory. The grid puts the
+    scene camera large on the left, the other cameras beside it, and `title` (the instruction)
+    across the top.
     """
 
     GRID_TILE_HEIGHT = 360
 
-    def __init__(self, out_dir: Path, prefix: str, fps: float = POLICY_HZ):
+    def __init__(self, out_dir: Path, prefix: str, fps: float = POLICY_HZ, title: str = ""):
         self.out_dir = out_dir
         self.prefix = prefix
         self.fps = fps
+        self.title = title
         self._writers: dict[str, object] = {}
         self._grid_size: tuple[int, int] | None = None
-        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / GRID_DIR).mkdir(parents=True, exist_ok=True)
 
     def path(self, camera: str) -> Path:
-        return self.out_dir / f"{self.prefix}_{camera}.mp4"
+        return video_path(self.out_dir, self.prefix, camera)
 
     def _writer(self, camera: str):
         import imageio.v2 as imageio
@@ -274,16 +288,21 @@ class EpisodeRecorder:
         self._writer("grid").append_data(self._grid(frames))
 
     def _grid(self, frames: dict[str, np.ndarray]) -> np.ndarray:
-        height = self.GRID_TILE_HEIGHT
-        tiles = []
-        for name, frame in frames.items():
-            tile = cv2.resize(frame, (max(2, round(frame.shape[1] * height / frame.shape[0])), height))
-            cv2.putText(tile, name, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            tiles.append(tile)
-        columns = math.ceil(math.sqrt(len(tiles)))
-        rows = [tiles[i : i + columns] for i in range(0, len(tiles), columns)]
-        width = max(sum(t.shape[1] for t in row) for row in rows)
-        grid = np.vstack([_pad_width(np.hstack(row), width) for row in rows])
+        frames = dict(frames)
+        scene = frames.pop("scene", None)
+        tiles = [_labelled_tile(frame, name, self.GRID_TILE_HEIGHT) for name, frame in frames.items()]
+        grid = None
+        if tiles:
+            # Beside the scene, the other cameras go in two rows, so the scene is two tiles tall.
+            columns = math.ceil(len(tiles) / 2) if scene is not None else math.ceil(math.sqrt(len(tiles)))
+            rows = [tiles[i : i + columns] for i in range(0, len(tiles), columns)]
+            width = max(sum(t.shape[1] for t in row) for row in rows)
+            grid = np.vstack([_pad_width(np.hstack(row), width) for row in rows])
+        if scene is not None:
+            big = _labelled_tile(scene, "scene", grid.shape[0] if grid is not None else 2 * self.GRID_TILE_HEIGHT)
+            grid = big if grid is None else np.hstack([big, grid])
+        if self.title:
+            grid = np.vstack([_text_banner(self.title, grid.shape[1]), grid])
         # Every frame of a video must be the same size; the first one fixes it.
         if self._grid_size is None:
             self._grid_size = (grid.shape[1] - grid.shape[1] % 8, grid.shape[0] - grid.shape[0] % 8)
@@ -306,6 +325,30 @@ def _pad_to_block(frame: np.ndarray, block: int = 8) -> np.ndarray:
 
 def _pad_width(image: np.ndarray, width: int) -> np.ndarray:
     return np.pad(image, ((0, 0), (0, width - image.shape[1]), (0, 0)))
+
+
+def _labelled_tile(frame: np.ndarray, name: str, height: int) -> np.ndarray:
+    tile = cv2.resize(frame, (max(2, round(frame.shape[1] * height / frame.shape[0])), height))
+    cv2.putText(tile, name, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return tile
+
+
+def _text_banner(text: str, width: int, scale: float = 0.9, thickness: int = 2) -> np.ndarray:
+    """White text on black, wrapped to `width`."""
+    font, margin = cv2.FONT_HERSHEY_SIMPLEX, 12
+    lines: list[str] = []
+    for word in text.split():
+        candidate = f"{lines[-1]} {word}" if lines else word
+        if lines and cv2.getTextSize(candidate, font, scale, thickness)[0][0] <= width - 2 * margin:
+            lines[-1] = candidate
+        else:
+            lines.append(word)
+    line_height = cv2.getTextSize("Ag", font, scale, thickness)[0][1] + 14
+    banner = np.zeros((line_height * len(lines) + margin, width, 3), dtype=np.uint8)
+    for i, line in enumerate(lines):
+        cv2.putText(banner, line, (margin, margin + line_height * (i + 1) - 10), font, scale, (255, 255, 255),
+                    thickness, cv2.LINE_AA)
+    return banner
 
 
 def recording_frames(observation: Observation, scene: np.ndarray | None) -> dict[str, np.ndarray]:
@@ -356,7 +399,12 @@ class EpisodeResult:
     mean_inference_seconds: float = 0.0
     metrics: dict = field(default_factory=dict)
     videos: list[str] = field(default_factory=list)
+    """Relative to the run directory."""
     error: str | None = None
+
+    @property
+    def grid_video(self) -> str | None:
+        return next((v for v in self.videos if v.endswith("_grid.mp4")), None)
 
 
 def run_episode(
@@ -375,7 +423,7 @@ def run_episode(
     """Run one episode on an already built env, recording it, and judge it."""
     result = EpisodeResult(index, setup.scene.scene_id, setup.scene.object_name, setup.instruction)
     judge = make_judge(setup)
-    recorder = EpisodeRecorder(out_dir, f"{prefix}_{episode_name(index)}")
+    recorder = EpisodeRecorder(out_dir, f"{prefix}_{episode_name(index)}", title=setup.instruction)
     latest: dict[str, object] = {"success": False, "metrics": {}}
 
     def step_callback(info: StepInfo) -> bool:
@@ -400,7 +448,7 @@ def run_episode(
         result.error = f"{type(error).__name__}: {error}"
         traceback.print_exc()
     finally:
-        result.videos = [str(p.name) for p in recorder.close()]
+        result.videos = [p.relative_to(out_dir).as_posix() for p in recorder.close()]
 
     result.success = bool(latest["success"])
     result.metrics = dict(latest["metrics"])
@@ -479,18 +527,24 @@ def write_report(
         "",
         "## Episodes",
         "",
-        "| # | Scene | Instruction | Success | Steps | Queries | s/query | Wall s | "
+        "| # | Scene | Instruction | Success | Video | Steps | Queries | s/query | Wall s | "
         + " | ".join(metric_names)
         + " | Error |",
-        "|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
+        "|---|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
     ]
     for r in results:
         metrics = " | ".join(_format(r.metrics.get(m, "")) for m in metric_names)
         lines.append(
-            f"| {r.index} | {r.scene_id} | {r.instruction} | {'yes' if r.success else 'no'} | {r.steps} | "
+            f"| {r.index} | {r.scene_id} | {r.instruction} | {'yes' if r.success else 'no'} | "
+            f"{f'[grid]({r.grid_video})' if r.grid_video else ''} | {r.steps} | "
             f"{r.queries} | {r.mean_inference_seconds:.2f} | {r.wall_seconds:.0f} | {metrics} | {r.error or ''} |"
         )
-    lines += ["", "Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `_grid.mp4` with every camera.", ""]
+    lines += [
+        "",
+        f"Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `{GRID_DIR}/<run>_ep<#>_grid.mp4` with every "
+        "camera and the instruction.",
+        "",
+    ]
     path = out_dir / "report.md"
     path.write_text("\n".join(lines))
     return path
