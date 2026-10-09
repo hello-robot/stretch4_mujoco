@@ -235,6 +235,19 @@ def exo_camera_option(default: str):
     )
 
 
+def head_crop_option(function):
+    return click.option(
+        "--head-crop",
+        "--head_crop",
+        "head_crop",
+        type=click.Choice(HEAD_CROPS),
+        default="droid",
+        show_default=True,
+        help=f"droid: center-crop head images to the DROID exo camera's "
+        f"{DROID_IMAGE_SIZE[0]}x{DROID_IMAGE_SIZE[1]} aspect, then resize to it.",
+    )(function)
+
+
 def retarget_options(function):
     """Every `RetargetParams` flag, for the Stretch 4 scripts."""
     options = [
@@ -245,14 +258,7 @@ def retarget_options(function):
             show_default=True,
             help="Wait for Stretch to reach each action before executing the next.",
         ),
-        click.option(
-            "--head-crop",
-            type=click.Choice(HEAD_CROPS),
-            default="droid",
-            show_default=True,
-            help=f"droid: center-crop head images to the DROID exo camera's "
-            f"{DROID_IMAGE_SIZE[0]}x{DROID_IMAGE_SIZE[1]} aspect, then resize to it.",
-        ),
+        head_crop_option,
         execution_options,
         click.option(
             "--use_parallel_gripper",
