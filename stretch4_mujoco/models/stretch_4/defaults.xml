@@ -44,7 +44,12 @@
       </default>
 
       <default class="wrist">
-        <general forcerange="-400 400" />
+        <!-- 4 N.m at the joint: a 2 N.m rated servo through the 2:1 reduction.
+             Inherited by wrist_yaw/pitch/roll; the finger classes below set
+             their own. This was 400 N.m, which let the wrist out-muscle the
+             whole robot -- it reached 51.5 N.m against a counter, against the
+             ~50 N.m its own weight holds it down with, and flipped it. -->
+        <general forcerange="-4 4" />
         <joint axis="0 0 1" damping="1" />
         <position kp="10" />
         <default class="wrist_yaw">
