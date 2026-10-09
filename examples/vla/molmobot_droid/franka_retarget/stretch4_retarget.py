@@ -112,11 +112,20 @@ STRETCH_GRIPPER_TOOL = "eoa_wrist_dw4_tool_sg4"
 PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
-    STRETCH_GRIPPER_TOOL: (-9.0, 21.0, 17.0),
-    PARALLEL_GRIPPER_TOOL: (4.0 , 21, 17.0),
+    STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
+    # PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0.0),
+    PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
 compared to the Robotiq's relative to its grasp_site, so the fingers line up with the Franka's."""
+
+OVERLAY_GRASP_OFFSET_MM = {
+    STRETCH_GRIPPER_TOOL: (-9, 21.0, 17.0),
+    PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
+}
+"""Per tool, the grasp offset to default to with --overlay_franka_gripper (run_stretch4_sim): the
+one that puts the overlaid Robotiq's fingers where the tool's are in its gripper camera's view.
+A tool not listed keeps DEFAULT_GRASP_OFFSET_MM."""
 
 
 @dataclass
@@ -269,8 +278,13 @@ def custom_start_option(function):
     )(function)
 
 
-def retarget_options(function):
-    """Every `RetargetParams` flag, for the Stretch 4 scripts."""
+def retarget_options(function=None, *, gripper_option: bool = True):
+    """
+    Every `RetargetParams` flag, for the Stretch 4 scripts. Without `gripper_option` there is
+    no --use_parallel_gripper (the real robot reports its gripper).
+    """
+    if function is None:
+        return lambda f: retarget_options(f, gripper_option=gripper_option)
     options = [
         click.option("--slow", is_flag=True, help="Run every joint at 20% of its default speed."),
         click.option(
@@ -281,13 +295,6 @@ def retarget_options(function):
         ),
         head_crop_option,
         execution_options,
-        click.option(
-            "--use_parallel_gripper",
-            "--use-parallel-gripper",
-            "use_parallel_gripper",
-            is_flag=True,
-            help="Stretch 4 with the parallel jaw gripper (PG4) instead of the Stretch gripper (SG4).",
-        ),
         click.option(
             "--grasp-offset-mm",
             default=None,
@@ -317,6 +324,16 @@ def retarget_options(function):
             help="Which gripper camera stands in for the Franka's wrist camera.",
         ),
     ]
+    if gripper_option:
+        options.append(
+            click.option(
+                "--use_parallel_gripper",
+                "--use-parallel-gripper",
+                "use_parallel_gripper",
+                is_flag=True,
+                help="Stretch 4 with the parallel jaw gripper (PG4) instead of the Stretch gripper (SG4).",
+            )
+        )
     for option in reversed(options):
         function = option(function)
     return function
@@ -334,7 +351,7 @@ def params_from_kwargs(kwargs: dict) -> RetargetParams:
         grasp_offset_deg=kwargs.pop("grasp_offset_deg"),
         exo_camera=kwargs.pop("exo_camera"),
         gripper_camera=kwargs.pop("gripper_camera"),
-        use_parallel_gripper=kwargs.pop("use_parallel_gripper"),
+        use_parallel_gripper=kwargs.pop("use_parallel_gripper", False),
     )
 
 
@@ -935,6 +952,9 @@ class Stretch4SimEnv:
         self.reverse_ik_failures = 0
         self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         """The Franka pose `reset()` goes back to."""
+        self.overlay_franka_gripper = False
+        """Show the policy the Franka's Robotiq in place of Stretch's gripper in the wrist view
+        (`SceneMirror.render_with_franka_gripper()`; needs the ghost Franka)."""
 
     # -- state ------------------------------------------------------------
 
@@ -980,6 +1000,9 @@ class Stretch4SimEnv:
         extra = {"gripper_raw": gripper}
         if head is not None:
             extra["head_raw"] = head
+        if self.overlay_franka_gripper:
+            # The policy's wrist view with the Franka's gripper where it is told its hand is.
+            gripper = self.mirror.render_with_franka_gripper(stretch_cameras_to_use(self.params)[0], state8[7])
         return Observation(exo_rgb=exo, wrist_rgb=wrist_view(gripper), state8=state8, extra_cameras=extra)
 
     def render_scene(self) -> np.ndarray:

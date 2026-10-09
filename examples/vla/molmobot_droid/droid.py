@@ -28,6 +28,8 @@ import numpy as np
 from examples.vla.molmobot_droid.checkpoint import (
     DROID_IMAGE_SIZE,
     FRANKA_HOME_QPOS,
+    GRIPPER_CLOSED,
+    GRIPPER_OPEN,
     POLICY_DT,
     ROBOTIQ_DRIVER_OPEN,
 )
@@ -533,6 +535,69 @@ class FrankaKinematics:
             q = np.clip(q + dq, self.lower, self.upper)
         self._set(q)
         return q, False
+
+
+@functools.cache
+def robotiq_linkage(steps: int = 26) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """
+    The Robotiq 2F-85's joint positions across its travel: (joint names after the robot's
+    prefix, the left driver joint's angle at each of `steps` openings, each opening's joint
+    positions in that order). Interpolate on the driver angle to pose the fingers kinematically.
+
+    The fingers are four-bar linkages closed by equality constraints, which only the physics
+    solves, so the gripper's own actuator is stepped through its range on a standalone
+    molmospaces Franka, arm held at home and gravity off.
+    """
+    model = FrankaKinematics().model
+    data = mujoco.MjData(model)
+    model.opt.gravity[:] = 0
+    prefix = f"{FRANKA_PREFIX}gripper/"
+    names = [model.joint(j).name for j in range(model.njnt) if model.joint(j).name.startswith(prefix)]
+    qpos_adr = [model.joint(name).qposadr[0] for name in names]
+    driver = model.joint(f"{prefix}left_driver_joint").qposadr[0]
+    arm = [model.joint(name).qposadr[0] for name in _arm_joint_names(FRANKA_PREFIX)]
+    actuator = model.actuator(f"{prefix}fingers_actuator").id
+    data.qpos[arm] = data.ctrl[: len(arm)] = FRANKA_HOME_QPOS
+    drivers, table = [], []
+    for ctrl in np.linspace(GRIPPER_OPEN, GRIPPER_CLOSED, steps):
+        data.ctrl[actuator] = ctrl
+        for _ in range(1500):
+            mujoco.mj_step(model, data)
+        drivers.append(data.qpos[driver])
+        table.append(data.qpos[qpos_adr].copy())
+    return [name[len(FRANKA_PREFIX):] for name in names], np.array(drivers), np.array(table)
+
+
+@functools.cache
+def robotiq_visual_rgba() -> np.ndarray:
+    """
+    The colours of the Robotiq's visual geoms (molmospaces' group 2) in model order, which are
+    the geoms `add_franka_ghost()` keeps and tints, so its own look can be put back. Its
+    materials are plain colours, without textures.
+    """
+    model = FrankaKinematics().model
+    geoms = [g for g in subtree_geoms(model, f"{FRANKA_PREFIX}gripper/base") if model.geom_group[g] == 2]
+    return np.array([model.mat_rgba[model.geom_matid[g]] if model.geom_matid[g] >= 0 else model.geom_rgba[g] for g in geoms])
+
+
+def subtree_geoms(model: mujoco.MjModel, body_name: str) -> list[int]:
+    """The geoms of a body and of every body under it, in model order."""
+    root = model.body(body_name).id
+
+    def under(body: int) -> bool:
+        while body:
+            if body == root:
+                return True
+            body = int(model.body_parentid[body])
+        return False
+
+    return [g for g in range(model.ngeom) if under(int(model.geom_bodyid[g]))]
+
+
+def robotiq_joint_positions(driver_angle: float) -> dict[str, float]:
+    """The Robotiq's joint positions (by name after the robot's prefix) at a driver joint angle."""
+    names, drivers, table = robotiq_linkage()
+    return {name: float(np.interp(driver_angle, drivers, table[:, i])) for i, name in enumerate(names)}
 
 
 # ---------------------------------------------------------------------------

@@ -698,7 +698,7 @@ def continuous_session(
               help="Stop an instruction after this many steps (15/s). 0: run until told otherwise.")
 @click.option("--checkpoint", default=None)
 @click.option("--rerun/--no-rerun", default=True, show_default=True)
-@retarget_options
+@retarget_options(gripper_option=False)
 @custom_start_option
 def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_start_pose, **kwargs):
     params = params_from_kwargs(kwargs)
@@ -712,11 +712,7 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
         raise click.ClickException("Home the robot first")
 
     # The gripper on the robot decides the tool, its kinematics and its default grasp offset.
-    detected_parallel = gripper == "parallel_gripper"
-    if params.use_parallel_gripper != detected_parallel:
-        if params.use_parallel_gripper:
-            click.secho(f"--use_parallel_gripper was given, but the robot has a {gripper}; using it.", fg="yellow")
-        params.use_parallel_gripper = detected_parallel
+    params.use_parallel_gripper = gripper == "parallel_gripper"
     if custom_franka_start_pose:
         link0_height = custom_start_link0_height(params, floor_z=0.0)
         click.secho(f"Virtual Franka's fr3_link0 at {link0_height:.3f} m, starting tilted", dim=True)
