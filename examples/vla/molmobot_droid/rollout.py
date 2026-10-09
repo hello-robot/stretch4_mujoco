@@ -9,9 +9,10 @@ and `stretch4_retarget.Stretch4SimEnv` here, the real robot in `run_stretch4_rea
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Callable, ContextManager, Protocol
 
 import numpy as np
 
@@ -128,28 +129,45 @@ def interactive_session(
     max_steps: int,
     reset: Callable[[], None],
     on_step: Callable[[StepInfo], bool | None] | None = None,
+    handle_command: Callable[[str], bool] | None = None,
+    idle: Callable[[], ContextManager] | None = None,
+    extra_help: Callable[[], str] | None = None,
 ) -> None:
     """
     Prompt for instructions and run each until `max_steps`, `on_step` returns True, or Ctrl+C.
     `reset` puts the robot back at its start pose ("reset" at the prompt); "quit" exits.
+
+    `handle_command` sees every other line first and returns True if it was a command rather
+    than an instruction. `idle()` is entered while the prompt (and any command) runs, and left
+    before each rollout: a sim can keep running there. `extra_help()` is printed under the
+    usage line, which is shown at the start and after every rollout.
     """
     stop = StopFlag()
     stop.install()
-    print(
-        "\nType an instruction and press Enter (empty for "
-        f"\"{default_instruction}\"), 'reset' to restart the robot, or 'quit'."
-    )
+
+    def show_help() -> None:
+        print(
+            "\nType an instruction and press Enter (empty for "
+            f"\"{default_instruction}\"), 'reset' to restart the robot, or 'quit'."
+        )
+        if extra_help is not None:
+            print(extra_help())
+
+    show_help()
     while True:
-        try:
-            text = input("instruction> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if text in ("quit", "exit", "q"):
-            return
-        if text == "reset":
-            reset()
-            continue
+        with idle() if idle is not None else contextlib.nullcontext():
+            try:
+                text = input("instruction> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if text in ("quit", "exit", "q"):
+                return
+            if text == "reset":
+                reset()
+                continue
+            if handle_command is not None and handle_command(text):
+                continue
         instruction = text or default_instruction
         stop.clear()
         result = run_rollout(
@@ -160,3 +178,4 @@ def interactive_session(
             f"{result.steps} steps, {result.queries} queries ({inference:.2f} s each), "
             f"{result.wall_seconds:.0f} s" + (" -- stopped by success check" if result.stopped_by_callback else "")
         )
+        show_help()
