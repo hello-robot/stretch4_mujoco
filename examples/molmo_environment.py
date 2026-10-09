@@ -346,7 +346,7 @@ def resolve_molmospaces_scene(dataset: str, split: str, house_index: int, varian
     except ImportError as e:
         raise click.ClickException(
             "MolmoSpaces is not installed, so --dataset cannot be resolved. Either install it\n"
-            '  pip install "molmospaces[mujoco] @ git+https://github.com/allenai/molmospaces.git"\n'
+            '  pip install ".[molmo]"\n'
             "or point --scene at a scene XML on disk."
         ) from e
 
