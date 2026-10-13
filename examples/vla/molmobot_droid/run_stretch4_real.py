@@ -121,6 +121,14 @@ KEYS_HELP = (
 MOTION_SUBSYSTEMS = ["arm", "lift", "omnibase", "end_of_arm"]
 LIFT_RANGE = (0.0, 1.2)
 
+SETTLED_TOLERANCE_M = 0.002
+SETTLED_TOLERANCE_RAD = math.radians(1.0)
+"""How close a message's joint state has to be to the robot's status for it to count as taken
+after the robot stopped (see `RealStretch4Env.receive_settled()`)."""
+
+SETTLED_TIMEOUT = 1.0
+"""s. How long to wait for such a message before using the newest one anyway."""
+
 
 class Console:
     """
@@ -527,6 +535,8 @@ class RealStretch4Env:
         """With --overlay_franka_gripper: what puts the Franka in the policy's wrist and exo views."""
         self.interrupted = lambda: False
         """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
+        self.stale_observations = 0
+        """Observations no message after the robot stopped arrived in time for (`receive_settled()`)."""
         self.check_camera_sides()
 
     def check_camera_sides(self) -> None:
@@ -569,8 +579,40 @@ class RealStretch4Env:
         )
         return world_from_footprint, joints
 
+    def receive_settled(self) -> dict:
+        """
+        The next message whose joint state is where the robot is now, not where it was.
+
+        A message's images and joint state were captured some way back (exposure, the
+        publisher, encoding, the network), so the first one after a step can show the robot
+        partway through it. At --slow that is a few mm; at full speed it can be most of the
+        step, and the policy, told the arm has not moved, pushes it further. Waits up to
+        SETTLED_TIMEOUT, counting a timeout in `stale_observations`.
+        """
+        deadline = time.monotonic() + SETTLED_TIMEOUT
+        while True:
+            message = self.receiver.receive()
+            if self._matches_status(message["closest_joint_state"]):
+                return message
+            if time.monotonic() > deadline:
+                self.stale_observations += 1
+                return message
+
+    def _matches_status(self, state: dict) -> bool:
+        self.robot.pull_status()
+        status = self.robot.status
+        off_m = max(
+            abs(state["lift"]["height"] - status["lift"]["pos"]), abs(state["arm"]["extension"] - status["arm"]["pos"])
+        )
+        off_rad = max(
+            abs(state[joint]["angle"] - status["end_of_arm"][joint]["pos"])
+            for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll")
+        )
+        return off_m <= SETTLED_TOLERANCE_M and off_rad <= SETTLED_TOLERANCE_RAD
+
     def observe(self) -> Observation:
-        message = self.receiver.receive()
+        # Without --wait-for-arrival the robot is still moving, and no message would match.
+        message = self.receive_settled() if self.params.wait_for_arrival else self.receiver.receive()
         self.last_message = message
         footprint, joints = self._state(message)
         state8, _ = self.retargeter.stretch_to_franka(footprint, joints)
@@ -788,6 +830,7 @@ def continuous_session(
                         f"  step {info.step}"
                         + (f" · tool {error * 1000:.0f} mm off" if error is not None else "")
                         + (f" · {env.retargeter.ik_failures} unreachable" if env.retargeter.ik_failures else "")
+                        + (f" · {env.stale_observations} stale" if env.stale_observations else "")
                         + "  · Enter/Space stops",
                         dim=True,
                     )
