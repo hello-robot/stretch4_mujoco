@@ -491,7 +491,7 @@ def main(
         cameras_to_use=cameras_to_use,
         camera_hz=10.0 if lidar else 30.0,
     )
-    sim.start(headless=headless)
+    sim.start(headless=headless, viewer_look_at_body="stretch4")
 
     if lidar or ((imagery or show_metrics) and not opencv):
         # With --opencv the frames go to OpenCV windows, so Rerun shouldn't lay

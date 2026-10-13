@@ -6,6 +6,7 @@ from typing import Callable
 import numpy as np
 
 from stretch4_mujoco import config, utils
+from stretch4_mujoco.fisheye_renderer import FisheyeRenderer
 
 
 class StretchCameras(Enum):
@@ -156,6 +157,31 @@ class StretchCameras(Enum):
         raise NotImplementedError(f"Camera {self} is_depth is not implemented")
 
     @property
+    def is_fisheye(self) -> bool:
+        """Whether this camera is rendered through `fisheye_renderer`.
+
+        Only the two head cameras are. The centre camera carries distortion
+        parameters as well, but its frames are left as MuJoCo rendered them.
+        """
+        return self in [
+            StretchCameras.cam_nav_rgb_se4_left,
+            StretchCameras.cam_nav_rgb_se4_right,
+        ] and self.initial_camera_settings.distortion_params is not None
+
+    def create_fisheye_renderer(self) -> FisheyeRenderer:
+        """A `FisheyeRenderer` for this camera's calibration."""
+        settings = self.initial_camera_settings
+        if not self.is_fisheye or settings.image_circle_radius_px is None:
+            raise NotImplementedError(f"Camera {self} is not a fisheye camera")
+
+        fx, fy = settings.focal
+        cx, cy = settings.optical_center
+        return FisheyeRenderer(
+            fx, fy, cx, cy, settings.distortion_params, settings.width, settings.height,
+            settings.image_circle_radius_px,
+        )
+
+    @property
     def post_processing_callback(self) -> Callable[[np.ndarray], np.ndarray] | None:
 
         if self == StretchCameras.cam_gripper_depth or self == StretchCameras.cam_gripper_se4_stereo_depth:
@@ -163,19 +189,6 @@ class StretchCameras(Enum):
 
         if self == StretchCameras.cam_d435i_depth:
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["d435i"])
-
-        if self in [
-            StretchCameras.cam_nav_rgb_se4_left,
-            StretchCameras.cam_nav_rgb_se4_right,
-        ]:
-            settings = self.initial_camera_settings
-            if settings.distortion_params is not None:
-                fx, fy = settings.focal
-                cx, cy = settings.optical_center
-                distortion_params = settings.distortion_params
-                return lambda render: utils.apply_fisheye_distortion(
-                    render, fx, fy, cx, cy, distortion_params
-                )
 
         if not self.is_depth:
             return None
@@ -244,6 +257,7 @@ class StretchCameras(Enum):
                     -0.005848339151583135,
                     0.0007940458582321494,
                 ),
+                image_circle_radius_px=825,  # measured on SE4 head_left frames
                 rotate_number_of_times=1,
             )
         if self == StretchCameras.cam_nav_rgb_se4_right:
@@ -269,6 +283,7 @@ class StretchCameras(Enum):
                     -0.005205105236511768,
                     0.0004939891505609986,
                 ),
+                image_circle_radius_px=825,  # measured on SE4 head_left frames, same lens
                 rotate_number_of_times=-1,
             )
         if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
@@ -379,6 +394,8 @@ class CameraSettings:
     """Specify this if they are available. Zeros will be used in `get_distortion_params_d()` otherwise."""
     optical_center_px: tuple[float, float] | None = None
     """Optional (cx, cy) optical center in pixels."""
+    image_circle_radius_px: float | None = None
+    """For a fisheye lens, the radius of the image circle around the optical center. Everything past it is black."""
     rotate_number_of_times: int = 0
     """Number of times to rotate the image (because the sensor is mounted rotated)"""
 
