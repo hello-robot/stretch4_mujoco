@@ -1,0 +1,64 @@
+name: Test Simulation on Ubuntu 24.04, Windows and MacOS
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-matrix:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras
+          uv pip install -e .
+
+      - name: Install Linux Headless OpenGL / Mesa dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-dev \
+            libgl1 \
+            libglx-mesa0 \
+            libgl1-mesa-dri \
+            libegl1 \
+            libosmesa6 \
+            libglib2.0-0 \
+            libsm6 \
+            libxext6 \
+            libxrender-dev \
+            xvfb
+
+      - name: Run test suite (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a uv run pytest tests/
+        env:
+          MUJOCO_GL: egl
+          PYOPENGL_PLATFORM: egl
+
+      - name: Run test suite (Windows & macOS)
+        if: runner.os != 'Linux'
+        run: uv run pytest tests/
