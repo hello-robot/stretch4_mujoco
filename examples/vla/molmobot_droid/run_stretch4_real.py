@@ -41,6 +41,7 @@ import queue
 import sys
 import threading
 import time
+from typing import Callable
 
 import click
 import cv2
@@ -693,10 +694,14 @@ class LiveView:
     Logs the robot's raw cameras and pose (and the ghost Franka at the state the policy last
     saw) to Rerun at `hz`, on its own thread, from the first message on -- whether or not an
     instruction is running.
+
+    On the `time` timeline, and on `step` at `step()`, the step the policy's views were last
+    logged at: Rerun keeps the time per thread, so without it this thread's logs would be on no
+    `step` at all, and gone when replaying by step.
     """
 
-    def __init__(self, env: RealStretch4Env, robot_model: RobotModel, hz: float = 10.0):
-        self.env, self.robot_model, self.period = env, robot_model, 1.0 / hz
+    def __init__(self, env: RealStretch4Env, robot_model: RobotModel, step: Callable[[], int], hz: float = 10.0):
+        self.env, self.robot_model, self.step, self.period = env, robot_model, step, 1.0 / hz
         _, message = env.receiver.latest()
         robot_model.pose(*self._robot_state(message or env.receiver.receive()))
         self.scene = rerun_scene.RerunScene(robot_model.model, robot_model.data, ["stretch4", robot_model.franka.base_name])
@@ -715,6 +720,7 @@ class LiveView:
             if message is not None and count != last:
                 last = count
                 rerun_scene.rr.set_time("time", timestamp=time.time())
+                rerun_scene.set_step(self.step())
                 rerun_scene.log_cameras({"head_raw": message["head_rgb"], "gripper_raw": message["wrist_rgb"]})
                 self.robot_model.pose(*self._robot_state(message))
                 self.scene.log(self.robot_model.data)
@@ -854,15 +860,14 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
             + f", {params.execute_first_n} of every {params.execute_horizon} predicted actions"
             + ("\n" + click.style("Overlay  ", bold=True) + "the Franka in the wrist and exo views" if overlay_franka_gripper else "")
         )
+        step_count = 0
         if rerun:
             rerun_scene.init_rerun("MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"])
-            live = LiveView(env, robot_model)
+            live = LiveView(env, robot_model, step=lambda: step_count)
             click.secho("Rerun is showing the cameras live.", dim=True)
 
         click.secho("Loading MolmoBot-DROID...", dim=True)
         policy = load_policy(checkpoint)
-
-        step_count = 0
 
         def log_frame(observation: Observation) -> None:
             """One Rerun step: rollout steps and start pose moves share the `step` timeline."""
