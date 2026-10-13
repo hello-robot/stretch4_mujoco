@@ -23,3 +23,6 @@ MUJOCO_LOG.TXT
 # Temp runtime XML
 stretch_temp_abs.xml
 .DS_Store
+
+# Generated motion profile plots from tests/test_movement.py
+tests/motion_profile_plots/

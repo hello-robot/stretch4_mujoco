@@ -536,8 +536,7 @@ class GamePadController:
         self.zero_state_sent_counter = 6
         self.STOP_FRAME_COUNT = 5
 
-        # Threading attributes natively managed
-        self.thread_rate_hz = 25.0
+        self.thread_rate_hz = 100.0
         self.thread = None
         self.thread_shutdown_flag = threading.Event()
 

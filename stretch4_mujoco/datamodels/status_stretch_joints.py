@@ -1,5 +1,5 @@
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from stretch4_mujoco.utils import dataclass_from_dict
 
 @dataclass
@@ -44,6 +44,8 @@ class StatusStretchJoints:
     gripper_left_finger: PositionVelocity
     gripper_right_finger: PositionVelocity
     is_self_colliding: bool = False
+    actuators_in_motion: list[str] = field(default_factory=list)
+    """MJCF actuator names whose motion profile is still ramping."""
 
     def __getitem__(self, name:str):
         """For backward compatibility: allows access with the square brackets []"""

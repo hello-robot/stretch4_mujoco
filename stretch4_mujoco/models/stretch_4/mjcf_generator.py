@@ -294,34 +294,17 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             if geom.get("class") != "visualgeom":
                 geom.set("class", "rubber")
 
-    # Add compliant passive joints to fingertips to allow surface alignment
     for body in worldbody.findall(".//body"):
         name = body.get("name", "")
         if name in ["gripper_fingertip_right_link", "gripper_fingertip_left_link"]:
-            ET.SubElement(
-                body,
-                "joint",
-                name=f"{name}_compliant_x",
-                type="hinge",
-                axis="1 0 0",
-                stiffness="0.1",
-                damping="0.002",
-                springref="0",
-                limited="true",
-                range="-0.15 0.15",
-            )
-            ET.SubElement(
-                body,
-                "joint",
-                name=f"{name}_compliant_y",
-                type="hinge",
-                axis="0 1 0",
-                stiffness="0.1",
-                damping="0.002",
-                springref="0",
-                limited="true",
-                range="-0.15 0.15",
-            )
+            for axis_name, axis in (("x", "1 0 0"), ("y", "0 1 0")):
+                ET.SubElement(
+                    body,
+                    "joint",
+                    name=f"{name}_compliant_{axis_name}",
+                    axis=axis,
+                    **{"class": "fingertip_compliance"},
+                )
 
     # 12. Update Joint Classes
     for j in worldbody.findall(".//joint"):
@@ -350,7 +333,7 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     tree = ET.ElementTree(new_root)
     tree.write(out_mjcf_path, encoding="unicode", xml_declaration=True)
 
-    # Inject ctrlrange into actuator_sensor.xml based on the extracted joint ranges
+    # Inject ctrlrange into actuator_sensor.xml based on the extracted joint ranges.
     try:
         import os
 

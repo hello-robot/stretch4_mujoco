@@ -61,6 +61,11 @@ class MujocoServerPassive(MujocoServer):
 
         self.viewer._opt.flags[mujoco._enums.mjtVisFlag.mjVIS_RANGEFINDER] = False # Disables the lidar yellow lines.
 
+        if self.viewer_track_body is not None:
+            self._track_body_with_viewer_camera(self.viewer, self.viewer_track_body)
+        elif self.viewer_look_at_body is not None:
+            self._point_free_camera_at_body(self.viewer, self.viewer_look_at_body)
+
         with self.viewer as viewer:
             physics_thread = threading.Thread(
                 target=self._physics_loop,
@@ -135,6 +140,119 @@ class MujocoServerPassive(MujocoServer):
 
 
     @override
+    def _track_body_with_viewer_camera(
+        self,
+        viewer,
+        body_name: str,
+        distance: float = 2.5,
+        azimuth: float = 135.0,
+        elevation: float = -20.0,
+    ) -> None:
+        """
+        Point the viewer camera at a body and keep it there as the body moves.
+
+        Mujoco's default free camera frames the whole model, which is fine for a
+        robot on its own but useless in a large scene: in a procthor house the
+        robot is a few pixels somewhere in a floorplan, and the house is not
+        centred on the origin, so it may not even be on screen.
+
+        A tracking camera follows the body instead. Orbiting, panning and zooming
+        still work -- `azimuth`, `elevation` and `distance` only set where the
+        camera starts.
+
+        The camera follows the body's *position* but keeps a fixed world heading:
+        it does not swing round as the robot turns, so the default three-quarter
+        view is only a three-quarter view at the pose the robot spawns in. That
+        is deliberate -- a camera that yaws with the base is unpleasant to watch
+        -- but it does mean you may want to orbit once after the robot has
+        driven somewhere.
+
+        Note that Mujoco tracks the *root* of the named body's kinematic tree,
+        not the body itself: `mjv_updateCamera` sets the camera's lookat to
+        `subtree_com[body_rootid[trackbodyid]]`. For a robot that means its
+        overall centre of mass, whichever of its bodies is named here.
+
+        Args:
+            viewer: the passive viewer handle.
+            body_name: body to follow. A missing name is a warning, not an
+                error -- an unframed camera is a much smaller problem than a
+                simulator that refuses to start.
+            distance: initial camera distance from the body, in metres.
+            azimuth: initial horizontal camera angle, in degrees.
+            elevation: initial vertical camera angle, in degrees. Negative looks
+                down at the robot.
+        """
+        body_id = mujoco._functions.mj_name2id(
+            self.mjmodel, mujoco._enums.mjtObj.mjOBJ_BODY, body_name
+        )
+        if body_id == -1:
+            click.secho(
+                f"Viewer camera cannot follow body {body_name!r}: no such body in the scene. "
+                "Leaving the camera at Mujoco's default framing.",
+                fg="yellow",
+            )
+            return
+
+        viewer.cam.type = mujoco._enums.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.trackbodyid = body_id
+        viewer.cam.distance = distance
+        viewer.cam.azimuth = azimuth
+        viewer.cam.elevation = elevation
+
+    def _point_free_camera_at_body(
+        self,
+        viewer,
+        body_name: str,
+        distance: float = 2.5,
+        azimuth: float = 135.0,
+        elevation: float = -20.0,
+    ) -> None:
+        """
+        Aim the viewer's free camera at a body once, at startup.
+
+        Solves the same problem as `_track_body_with_viewer_camera()` -- a robot a
+        few pixels across somewhere in a house that is not centred on the origin --
+        while leaving a plain free camera behind. That is the difference worth
+        knowing: a tracking camera keeps rewriting `lookat` from the body's
+        position every frame, so panning away from the robot is impossible, and the
+        robot can never leave the centre of the picture. A free camera aimed once
+        does what the mouse says from then on, and the robot drives around inside
+        the shot.
+
+        The point aimed at is the same one a tracking camera would follow: the
+        centre of mass of the named body's kinematic subtree (`mjv_updateCamera`
+        uses `subtree_com[body_rootid[trackbodyid]]`), which for a robot sits
+        around its middle rather than down at the floor where its root body is.
+
+        Args:
+            viewer: the passive viewer handle.
+            body_name: body to aim at. A missing name is a warning, not an error --
+                an unframed camera is a much smaller problem than a simulator that
+                refuses to start.
+            distance: camera distance from the body, in metres.
+            azimuth: horizontal camera angle, in degrees.
+            elevation: vertical camera angle, in degrees. Negative looks down at
+                the robot.
+        """
+        body_id = mujoco._functions.mj_name2id(
+            self.mjmodel, mujoco._enums.mjtObj.mjOBJ_BODY, body_name
+        )
+        if body_id == -1:
+            click.secho(
+                f"Viewer camera cannot be aimed at body {body_name!r}: no such body in the "
+                "scene. Leaving the camera at Mujoco's default framing.",
+                fg="yellow",
+            )
+            return
+
+        viewer.cam.type = mujoco._enums.mjtCamera.mjCAMERA_FREE
+        viewer.cam.fixedcamid = -1
+        viewer.cam.trackbodyid = -1
+        viewer.cam.lookat[:] = self.mjdata.subtree_com[self.mjmodel.body_rootid[body_id]]
+        viewer.cam.distance = distance
+        viewer.cam.azimuth = azimuth
+        viewer.cam.elevation = elevation
+
     def _add_axes_to_user_scn(self,
                             user_scn,
                             origin: np.ndarray,
