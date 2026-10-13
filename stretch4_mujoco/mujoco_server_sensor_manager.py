@@ -72,6 +72,7 @@ class NativeMjLidar:
             bodyexclude=self.bodyexclude,
             geomid=_geomid,
             dist=self._dist,
+            normal=None,
             nray=n_rays,
             cutoff=self.cutoff_dist,
         )
@@ -108,6 +109,14 @@ class MujocoServerSensorManagerSync:
         self.time_start = time.perf_counter()
 
         self.sensor_lock = threading.Lock()
+
+        # Scratch MjData that the lidar ray casting runs against. Tracing 64k
+        # rays takes ~50ms, and in the passive viewer the lock guarding mjdata
+        # is the viewer lock -- the same one the 100Hz physics thread needs
+        # every step. Holding it that long starves physics badly enough to drop
+        # the sim to a fraction of realtime, so instead mjdata is snapshotted
+        # into here under the lock (~0.01ms) and the rays are traced outside it.
+        self._lidar_scratch_data = mujoco.MjData(self.mujoco_server.mjmodel)
 
         self.lidar_sensor_names = StretchSensors.get_sensor_names_from_mjmodel(
             self.mujoco_server.mjmodel, StretchSensors.base_lidar
@@ -217,13 +226,20 @@ class MujocoServerSensorManagerSync:
 
         self.sensor_fps_counter.tick()
 
-    def pull_lidar_points(self, in_world_frame: bool = True) -> dict[str, np.ndarray]:
+    def pull_lidar_points(
+        self, in_world_frame: bool = True, data: "mujoco.MjData | None" = None
+    ) -> dict[str, np.ndarray]:
         """
         Traces rays for lidars and returns hit points.
+
+        Pass `data` to trace against a snapshot of mjdata rather than the live
+        one, so the caller can release the physics lock first -- see
+        `_lidar_scratch_data`.
         """
         results = {}
         model = self.mujoco_server.mjmodel
-        data = self.mujoco_server.mjdata
+        if data is None:
+            data = self.mujoco_server.mjdata
 
         for site_name, wrapper in self.lidar_wrappers.items():
             wrapper.trace_rays(data, self.lidar_theta, self.lidar_phi, site_name=site_name)
@@ -317,8 +333,19 @@ class MujocoServerSensorManagerSync:
             self.mujoco_server.data_proxies.set_sensors(sensor_status)
 
             if self.lidar_wrappers:
-                lidar_pts = self.pull_lidar_points(in_world_frame=True)
-                self.mujoco_server.data_proxies.set_lidar_points(lidar_pts)
+                # Cheap memcpy so the expensive ray casting below can run with
+                # the physics lock released, see `_lidar_scratch_data`.
+                mujoco.mj_copyData(
+                    self._lidar_scratch_data,
+                    self.mujoco_server.mjmodel,
+                    self.mujoco_server.mjdata,
+                )
+
+        if self.lidar_wrappers:
+            lidar_pts = self.pull_lidar_points(
+                in_world_frame=True, data=self._lidar_scratch_data
+            )
+            self.mujoco_server.data_proxies.set_lidar_points(lidar_pts)
 
 
 class MujocoServerSensorManagerThreaded(MujocoServerSensorManagerSync):
