@@ -120,7 +120,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                         env.move_to_franka_pose(start_q7)
                         logger = None
                         if rerun:
-                            rerun_scene.clear_scene()
+                            rerun_scene.new_recording(f"{run.current} {setup.scene.scene_id}: {setup.instruction}")
                             env.observe()
                             logger = StretchRerunLogger(env)
 
