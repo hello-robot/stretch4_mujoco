@@ -81,7 +81,7 @@ ARM_RANGE = (0.0, 0.52)
 
 LIFT_RANGE = (0.0, 1.2)
 
-END_STOP_MARGIN = 0.005
+END_STOP_MARGIN = 0.002
 """m. Lift and arm targets stay this far inside their travel: driven into an end stop, a joint
 pushes on it and trips its guarded contact."""
 
@@ -114,7 +114,7 @@ PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
     STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
-    PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0.0),
+    PARALLEL_GRIPPER_TOOL: (4.0 , 0.0, 17.0),
     # PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
