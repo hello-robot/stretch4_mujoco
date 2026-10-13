@@ -20,6 +20,10 @@ SCENE_PATH = "world/scene"
 CAMERAS_PATH = "cameras"
 
 
+_session: dict = {}
+"""The app, the blueprint and whether a viewer was spawned, for `new_recording()`."""
+
+
 def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True) -> None:
     """
     The scene camera, when there is one, is the big view; the 3D scene sits in the column with
@@ -37,21 +41,30 @@ def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True) -> No
     column = ([rrb.Spatial3DView(origin="world", name="3D scene")] if big else []) + [
         rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in camera_names if name != big
     ]
-    rr.send_blueprint(
-        rrb.Blueprint(
-            rrb.Horizontal(
-                main_view,
-                rrb.Vertical(*column, rrb.TimeSeriesView(origin="metrics", name="Metrics")),
-                column_shares=[3, 2],
-            ),
-            collapse_panels=True,
-        )
+    blueprint = rrb.Blueprint(
+        rrb.Horizontal(
+            main_view,
+            rrb.Vertical(*column, rrb.TimeSeriesView(origin="metrics", name="Metrics")),
+            column_shares=[3, 2],
+        ),
+        collapse_panels=True,
     )
+    rr.send_blueprint(blueprint)
+    _session.update(app_name=app_name, blueprint=blueprint, spawned=spawn)
 
 
-def clear_scene() -> None:
-    """Forget the last scene entirely, static geometry included (between benchmark episodes)."""
-    rr.log("world", rr.Clear(recursive=True), static=True)
+def new_recording(name: str) -> None:
+    """
+    Log to a fresh recording from now on, in the same viewer and with the same layout (one per
+    benchmark episode, `name`d in the viewer's list): each keeps its own static scene geometry,
+    so an earlier one still replays with its scene, where clearing and relogging one recording's
+    would have replaced it.
+    """
+    recording = rr.RecordingStream(_session["app_name"], make_default=True)
+    if _session["spawned"]:
+        recording.connect_grpc()
+    rr.send_recording_name(name, recording=recording)
+    rr.send_blueprint(_session["blueprint"], recording=recording)
 
 
 class RerunScene:
