@@ -33,6 +33,11 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 )
 @click.option("--show_metrics", is_flag=True, help="Print the sim-to-real time ratio to the cli.")
 @click.option("--use_stretch_3", type=bool, is_flag=True, help="Use Stretch 3")
+@click.option(
+    "--parallel_gripper",
+    is_flag=True,
+    help="Use the parallel gripper (PG4) instead of the standard Stretch 4 gripper (SG4).",
+)
 def main(
     scene_xml_path: str | None,
     select_env: bool,
@@ -41,7 +46,12 @@ def main(
     opencv: bool,
     show_metrics: bool,
     use_stretch_3: bool,
+    parallel_gripper: bool,
 ):
+    if parallel_gripper and use_stretch_3:
+        raise click.UsageError("--parallel_gripper is only available on Stretch 4.")
+
+    tool_name = Stretch4MujocoSimulator.PARALLEL_GRIPPER_TOOL_NAME if parallel_gripper else None
 
     rerun_logger = RerunLogger()
 
@@ -67,7 +77,7 @@ def main(
         from stretch4_mujoco.robocasa_gen import model_generation_wizard
 
         model, xml, objects_info = model_generation_wizard(
-            stretch_xml_absolute=simulator_class.get_robot_xml_path()
+            stretch_xml_absolute=simulator_class.get_robot_xml_path(tool_name)
         )
 
     rate = 30.0
@@ -77,6 +87,7 @@ def main(
         scene_xml_path=scene_xml_path,
         cameras_to_use=cameras_to_use,
         camera_hz=rate,
+        tool_name=tool_name,
     )
 
     teleop = None

@@ -30,7 +30,6 @@
       <geom name="room" pos="0 0 0" type="mesh" mesh="room" rgba="1 1 1 1" euler="-.0 0 3.14" material="MatWall"/>
       <geom name="floor" pos="0 0 0.001" size="3 2.5 .1" conaffinity="1" contype="4" type="plane" material="MatPlane"/>
       <geom name="lamp" pos="2.604 2.1 1.65" type="cylinder" size=".3 .2" rgba="2 1.6 0 .6" group="1"/>
-      <light directional='false' diffuse='1 0.8 0' specular='1 1 1' pos='2.604 2.1 1.5' dir='1 1 1' exponent="1" castshadow="false"/>
 
     </body>
   </worldbody>

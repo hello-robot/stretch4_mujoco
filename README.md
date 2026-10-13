@@ -41,9 +41,9 @@ To exit, press `Ctrl+C` in the terminal.
 
 source .venv/bin/activate
 
-# When `libpython3.10.dylib` is missing, run:
+# When `libpython3.12.dylib` is missing, run:
 PYTHON_LIB_DIR=$(python3 -c 'from distutils.sysconfig import get_config_var; print(get_config_var("LIBDIR"))')
-ln -s "$PYTHON_LIB_DIR/libpython3.10.dylib" ./.venv/lib/libpython3.10.dylib
+ln -s "$PYTHON_LIB_DIR/libpython3.12.dylib" ./.venv/lib/libpython3.12.dylib
 
 # When `libz.1.dylib` is missing, run:
 export DYLD_LIBRARY_PATH=/usr/lib:$DYLD_LIBRARY_PATH
