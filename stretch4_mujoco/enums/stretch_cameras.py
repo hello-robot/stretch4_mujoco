@@ -35,11 +35,6 @@ class StretchCameras(Enum):
     cam_nav_rgb_se4_center_low_rez = 8
     """The low resolution (1280x965) wide-angle RGB camera in the head for Stretch 4."""
 
-    cam_hemilidar_left = 12
-    """Left hemispherical lidar."""
-    cam_hemilidar_right = 13
-    """Right hemispherical lidar."""
-
     cam_gripper_se4_left_rgb = 14
     """RGB camera in the wrist for SE4."""
     cam_gripper_se4_right_rgb = 15
@@ -62,16 +57,7 @@ class StretchCameras(Enum):
         """
         Returns all the available cameras to stretch 4.
         """
-        return [
-            StretchCameras.cam_gripper_se4_left_rgb,
-            StretchCameras.cam_gripper_se4_right_rgb,
-            StretchCameras.cam_gripper_se4_stereo_depth,
-            StretchCameras.cam_nav_rgb_se4_left,
-            StretchCameras.cam_nav_rgb_se4_right,
-            StretchCameras.cam_nav_rgb_se4_center,
-            StretchCameras.cam_hemilidar_left,
-            StretchCameras.cam_hemilidar_right,
-        ]
+        return [StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb, StretchCameras.cam_gripper_se4_stereo_depth, StretchCameras.cam_nav_rgb_se4_left,StretchCameras.cam_nav_rgb_se4_right,StretchCameras.cam_nav_rgb_se4_center,]
 
     @staticmethod
     def none() -> list["StretchCameras"]:
@@ -116,7 +102,17 @@ class StretchCameras(Enum):
         """
         Returns the Depth camera's only
         """
-        return [StretchCameras.cam_gripper_se4_stereo_depth,StretchCameras.cam_hemilidar_left,StretchCameras.cam_hemilidar_right,]
+        return [StretchCameras.cam_gripper_se4_stereo_depth]
+
+    @property
+    def target_hz(self) -> float:
+        """
+        Returns the target frame rate (Hz) for this camera.
+        Center camera runs at 10 Hz; left and right nav cameras run at 30 Hz.
+        """
+        if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb, StretchCameras.cam_d435i_rgb, StretchCameras.cam_d435i_depth]:
+            return 10.0
+        return 30.0
 
     @property
     def camera_name_in_mjcf(self) -> str:
@@ -136,10 +132,6 @@ class StretchCameras(Enum):
             return "camera_right_link"
         if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb_se4_center_low_rez]:
             return "camera_center_link"
-        if self == StretchCameras.cam_hemilidar_left:
-            return "cam_hemilidar_left"
-        if self == StretchCameras.cam_hemilidar_right:
-            return "cam_hemilidar_right"
         if self == StretchCameras.cam_gripper_se4_left_rgb:
             return "gripper_camera_left_rgb"
         if self == StretchCameras.cam_gripper_se4_right_rgb:
@@ -169,7 +161,7 @@ class StretchCameras(Enum):
         if self == StretchCameras.cam_gripper_depth or self == StretchCameras.cam_gripper_se4_stereo_depth:
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["gripper"])
 
-        if self == StretchCameras.cam_d435i_depth or self in StretchCameras.hemispherical_lidars():
+        if self == StretchCameras.cam_d435i_depth:
             return lambda render: utils.limit_depth_distance(render, config.depth_limits["d435i"])
 
         if self in [
@@ -190,51 +182,8 @@ class StretchCameras(Enum):
 
         raise NotImplementedError(f"Camera {self} post_processing_callback is not implemented")
 
-    @staticmethod
-    def left_lidar():
-        return [
-            StretchCameras.cam_hemilidar_left,
-        ]
-    @staticmethod
-    def right_lidar():
-        return [
-            StretchCameras.cam_hemilidar_right,
-        ]
-
-    @staticmethod
-    def hemispherical_lidars():
-        return StretchCameras.left_lidar() + StretchCameras.right_lidar()
-
     @property
     def initial_camera_settings(self):
-
-        if self in StretchCameras.hemispherical_lidars():
-            """
-            We are trying to emulate a hemispherical lidar that generated 1,152,000 pts/s.
-            A height of 340 with an FOV of 160 degrees in both directions should generate
-            approximately 115,600 pts/frame or 1,156,000 pts/s.
-            """
-            field_of_view_vertical_in_degrees=160
-            field_of_view_horizontal_in_degrees = 160
-
-            vfov_rad = np.radians(field_of_view_vertical_in_degrees)
-            hfov_rad = np.radians(field_of_view_horizontal_in_degrees)
-
-            aspect_ratio = np.tan(hfov_rad / 2) / np.tan(vfov_rad / 2)
-            height = 340
-            width = height * aspect_ratio
-            width = int(width)
-
-            # Compute fx and fy using pinhole model
-            fx = width / (2 * np.tan(hfov_rad / 2))
-            fy = height / (2 * np.tan(vfov_rad / 2))
-
-            return CameraSettings(
-                field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
-                focal=(fx, fy),
-                width=width,
-                height=height,
-            )
 
         if self in [StretchCameras.cam_gripper_rgb, StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb]:
             return CameraSettings(

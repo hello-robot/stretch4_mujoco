@@ -28,8 +28,7 @@ def main(
         raise NotImplementedError("3D Lidar is only supported in Stretch4MujocoSimulator. Do not use the --use_stretch_3 flag.")
 
     if lidar3d:
-        cameras_to_use += StretchCameras.hemispherical_lidars()
-        rerun_logger.init_pointcloud_viz()
+        rerun_logger.init_pointcloud_viz(use_stretch_3)
 
     sim = stretch4_mujoco.StretchMujocoSimulator(scene_xml_path,cameras_to_use=cameras_to_use) if use_stretch_3 else stretch4_mujoco.Stretch4MujocoSimulator(scene_xml_path, cameras_to_use=cameras_to_use)
 
@@ -43,7 +42,7 @@ def main(
                 cv2.imshow(camera.name, camera_data.get_camera_data(camera))
 
             if lidar3d:
-                rerun_logger.update_pointcloud_viz(sim.pull_hemi_lidar_points(in_world_frame=True), "world/lidar_points")
+                rerun_logger.update_pointcloud_viz(sim.pull_lidar_points(), "world/lidar_points")
 
             cv2.waitKey(10)
 

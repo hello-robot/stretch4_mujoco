@@ -17,8 +17,7 @@ dependencies = [
     "pynput>=1.8.1",
     "rerun-sdk>=0.23.1",
     "yourdfpy",
-    "urdf2mjcf>=0.2.39"
-
+    "urdf2mjcf>=0.2.39",
 ]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},

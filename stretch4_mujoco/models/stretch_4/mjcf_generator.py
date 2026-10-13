@@ -134,17 +134,41 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             
         ET.SubElement(base_body, "site", name="imu", size="0.01", pos="0 0 0")
 
-    # 5. Replace wheels with omniwheels and include omniwheels.xml
-    parent_map = {c: p for p in worldbody.iter() for c in p}
-    for old_name in ["wheel_0_link", "wheel_1_link", "wheel_2_link"]:
-        w_body = find_body(old_name)
-        if w_body is not None:
-            p = parent_map.get(w_body)
-            if p is not None:
-                p.remove(w_body)
+    # 5. Turn the URDF's rolling wheels into omniwheels.
+    # Placement and inertials are kept exactly as urdf2mjcf derived them from the
+    # URDF, so they cannot drift out of sync with it. Only what a URDF cannot
+    # express is overridden here: the omnidirectional contact model (the
+    # 'omniwheel_collision' capsule, whose anisotropic friction is what lets the
+    # wheel slide sideways) and the joint names the actuators/sensors drive.
+    omniwheels = [
+        # (URDF link, MuJoCo body/geom name, joint name)
+        ("wheel_0_link", "left_wheel_link", "left_wheel_joint"),
+        ("wheel_1_link", "back_wheel_link", "back_wheel_joint"),
+        ("wheel_2_link", "right_wheel_link", "right_wheel_joint"),
+    ]
+    for urdf_link, wheel_name, joint_name in omniwheels:
+        w_body = find_body(urdf_link)
+        if w_body is None:
+            raise ValueError(f"Expected wheel link '{urdf_link}' in the URDF-derived MJCF.")
 
-    if base_body is not None:
-        ET.SubElement(base_body, "include", file="omniwheels.xml")
+        w_body.set("name", wheel_name)
+
+        joints = w_body.findall("joint")
+        if len(joints) != 1:
+            raise ValueError(
+                f"Expected exactly one joint on '{urdf_link}', found {len(joints)}."
+            )
+        joints[0].set("name", joint_name)
+        # Left classless on purpose: the wheel joints have always run on MuJoCo's
+        # default dynamics rather than the 'wheel' class defaults in defaults.xml.
+        joints[0].attrib.pop("class", None)
+
+        # Swap the URDF's rigid wheel mesh collision for the omniwheel capsule. The
+        # geom takes the body's name because contact.xml pairs it against the floor.
+        for geom in w_body.findall("geom"):
+            if geom.get("class") == "collision":
+                w_body.remove(geom)
+        ET.SubElement(w_body, "geom", name=wheel_name, **{"class": "omniwheel_collision"})
 
     # 6. Add lidars, cameras, and laser dynamically from URDF
     urdf = yourdfpy.URDF.load(urdf_path)
@@ -169,12 +193,19 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     T_opt_cam[:3, :3] = Rotation.from_euler('xyz', [180, 0, 0], degrees=True).as_matrix()
     
     if head is not None:
-        # Hemispherical lidars
-        pos_l, quat_l = get_cam_pos_quat("lidar_left_link", "head_link", post_rotation=T_opt_cam)
-        ET.SubElement(head, "camera", name="cam_hemilidar_left", pos=pos_l, quat=quat_l)
+        lidar_left_body = find_body("lidar_left_link")
+        if lidar_left_body is not None:
+            ET.SubElement(lidar_left_body, "site", name="lidar_left", pos="0 0 0", quat="1 0 0 0")
+        else:
+            pos_l, quat_l = get_cam_pos_quat("lidar_left_link", "head_link")
+            ET.SubElement(head, "site", name="lidar_left", pos=pos_l, quat=quat_l)
 
-        pos_r, quat_r = get_cam_pos_quat("lidar_right_link", "head_link", post_rotation=T_opt_cam)
-        ET.SubElement(head, "camera", name="cam_hemilidar_right", pos=pos_r, quat=quat_r)
+        lidar_right_body = find_body("lidar_right_link")
+        if lidar_right_body is not None:
+            ET.SubElement(lidar_right_body, "site", name="lidar_right", pos="0 0 0", quat="1 0 0 0")
+        else:
+            pos_r, quat_r = get_cam_pos_quat("lidar_right_link", "head_link")
+            ET.SubElement(head, "site", name="lidar_right", pos=pos_r, quat=quat_r)
 
         # Wide angle cameras
         # Right Camera

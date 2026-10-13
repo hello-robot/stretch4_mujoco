@@ -41,6 +41,9 @@ class MujocoServerCameraManagerSync:
 
         self.camera_lock = threading.Lock()
 
+        self.camera_last_render_time: dict[StretchCameras, float] = {}
+        self.cached_camera_data: dict[StretchCameras, np.ndarray] = {}
+
     def close(self):
         """
         Clean up renderer resources
@@ -79,17 +82,25 @@ class MujocoServerCameraManagerSync:
     def _pull_camera_data(self):
         """
         Render a scene at each camera using the simulator and populate the imagery dictionary with the raw image pixels and camera params.
+        Per-camera rates: Center camera runs at 10 Hz; Left/Right nav cameras run at 30 Hz.
         """
         new_imagery = StatusStretchCameras.default()
         new_imagery.time = self.mujoco_server.mjdata.time
         new_imagery.fps = self.camera_fps_counter.fps
 
+        now = time.perf_counter()
         for camera, renderer in self.camera_renderers.items():
-            (_, data) = self._render_camera(renderer, camera)
-            new_imagery.set_camera_data(camera, data)
+            target_interval = 1.0 / camera.target_hz
+            last_time = self.camera_last_render_time.get(camera, 0.0)
+            if now - last_time >= target_interval - 0.002:
+                (_, data) = self._render_camera(renderer, camera)
+                self.cached_camera_data[camera] = data
+                self.camera_last_render_time[camera] = now
+            else:
+                data = self.cached_camera_data.get(camera)
 
-        # new_imagery.cam_gripper_K = self.get_camera_params(StretchCameras.cam_gripper_rgb)
-        # new_imagery.cam_d435i_K = self.get_camera_params(StretchCameras.cam_d435i_rgb)
+            if data is not None:
+                new_imagery.set_camera_data(camera, data)
 
         self.mujoco_server.data_proxies.set_cameras(new_imagery)
 
