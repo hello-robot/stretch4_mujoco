@@ -11,9 +11,6 @@ Differences from the robot-side file:
 
 * Joint state is read off a `StatusStretchJoints` snapshot (`gamepad_teleop.status`)
   rather than off `robot.<joint>.status` dicts.
-* `wrist_roll` command signs are handled inside `CommandWristRoll` (the URDF roll
-  axis is mirrored relative to the servo's), so `_map_joint_space` flips the
-  shoulder-button roll direction to compensate.
 """
 
 from __future__ import annotations
@@ -275,11 +272,9 @@ class ControlMapping(Enum):
                 if rt_pulled:
                     cmd_roll = 0.0
                     if state.get("left_shoulder_button_pressed"):
-                        # Signs are flipped relative to the robot because the URDF roll axis
-                        # is mirrored; CommandWristRoll applies the matching correction.
-                        cmd_roll = 1.0
-                    elif state.get("right_shoulder_button_pressed"):
                         cmd_roll = -1.0
+                    elif state.get("right_shoulder_button_pressed"):
+                        cmd_roll = 1.0
 
                     if cmd_roll != 0:
                         gamepad_teleop.wrist_roll_command.command_button_to_motion(cmd_roll, robot)

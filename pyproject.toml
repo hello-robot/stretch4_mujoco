@@ -65,3 +65,6 @@ jupyter = [
 molmo = [
     "molmo-spaces[mujoco]",
 ]
+digital-twin = [
+    "hello-robot-stretch4-body",
+]

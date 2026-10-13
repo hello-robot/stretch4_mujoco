@@ -77,6 +77,20 @@ Control Stretch in simulation using any xbox type gamepad (read through pygame/S
 uv run examples/gamepad_teleop.py
 ```
 
+[Digital twin](./examples/digital_twin.py)
+
+Mirror motion between the sim and a real Stretch 4 over the network. Commands issued in sim are
+forwarded to the robot as the same `RobotClient` command, and the robot's joint status is followed
+back into the sim, so moving either side moves the other.
+
+```
+uv pip install -e ".[digital-twin]"
+uv run examples/digital_twin.py --robot_ip 192.168.1.10
+```
+
+Use `--controller sim` or `--controller robot` to mirror in one direction only (the default is
+`bidirectional`), and `--joints` to limit which joint groups are mirrored.
+
 [Velocity Control](./examples/velocity_control.py)
 
 Demonstrate base and joint velocity control with `set_velocity()`

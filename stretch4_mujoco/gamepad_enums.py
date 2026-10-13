@@ -115,10 +115,7 @@ class GripperHandedness(Enum):
         elif self is GripperHandedness.LEFT:
             yaw_to = math.pi
             pitch_to = math.pi
-            # The URDF/MJCF wrist_roll axis is mirrored relative to the robot's servo
-            # convention (URDF range [-4.276, 1.135] vs servo range [-1.135, 4.276]),
-            # so the robot's +pi is -pi here. See CommandWristRoll in gamepad_joints.py.
-            roll_to = -math.pi
+            roll_to = math.pi
         else:
             raise NotImplementedError(f"No move_to defined for {self}")
 

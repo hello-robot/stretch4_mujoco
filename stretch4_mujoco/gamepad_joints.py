@@ -105,13 +105,6 @@ ROBOT_PARAMS = {
 # position deltas for the position-controlled sim joints.
 DEFAULT_STEP_SLEEP = 1 / 15
 
-# The URDF (and therefore MJCF) wrist_roll axis is mirrored relative to the robot's
-# servo convention: the URDF limits are [-4.276, 1.135] where the servo's are
-# [-1.135, 4.276]. Applying this sign to roll commands keeps LB/RB rolling the
-# gripper the same way it does on the robot.
-WRIST_ROLL_SIM_SIGN = -1.0
-
-
 def map_to_range(value, new_min, new_max):
     # Ensure value is between 0 and 1
     value = max(0, min(1, value))
@@ -336,13 +329,7 @@ class CommandWristPitch(CommandFeetechJoint):
 
 
 class CommandWristRoll(CommandFeetechJoint):
-    """Wrist Roll motion command class.
-
-    Commands are in URDF/MJCF sign convention, which is mirrored relative to the
-    robot's servo convention (see WRIST_ROLL_SIM_SIGN). Callers that port a
-    robot-side sign - `_map_joint_space` - flip it; the IK mapping already works
-    in URDF space and does not.
-    """
+    """Wrist Roll motion command class."""
 
     def __init__(
         self,
