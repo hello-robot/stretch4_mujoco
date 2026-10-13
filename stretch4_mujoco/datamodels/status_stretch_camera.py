@@ -27,6 +27,7 @@ class StatusStretchCameras:
     cam_nav_rgb_se4_left: np.ndarray|None = None
     cam_nav_rgb_se4_right: np.ndarray|None = None
     cam_nav_rgb_se4_center: np.ndarray|None = None
+    cam_nav_rgb_se4_center_low_rez: np.ndarray|None = None
 
     cam_hemilidar_left: np.ndarray|None = None
     cam_hemilidar_right: np.ndarray|None = None
@@ -109,6 +110,11 @@ class StatusStretchCameras:
             rotate_num = camera.initial_camera_settings.rotate_number_of_times
             data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
+        elif camera == StretchCameras.cam_nav_rgb_se4_center_low_rez and self.cam_nav_rgb_se4_center_low_rez is not None:
+            data = self.cam_nav_rgb_se4_center_low_rez
+            rotate_num = camera.initial_camera_settings.rotate_number_of_times
+            data = np.rot90(data, rotate_num) if auto_rotate and rotate_num != 0 else data
+            data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_gripper_se4_left_rgb and self.cam_gripper_se4_left_rgb is not None:
             data = self.cam_gripper_se4_left_rgb
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
@@ -153,6 +159,9 @@ class StatusStretchCameras:
             return
         if camera == StretchCameras.cam_nav_rgb_se4_center:
             self.cam_nav_rgb_se4_center = data
+            return
+        if camera == StretchCameras.cam_nav_rgb_se4_center_low_rez:
+            self.cam_nav_rgb_se4_center_low_rez = data
             return
         if camera == StretchCameras.cam_hemilidar_left:
             self.cam_hemilidar_left = data

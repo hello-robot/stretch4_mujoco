@@ -233,7 +233,7 @@ def main(
 
     simulator_class = StretchMujocoSimulator if use_stretch_3 else Stretch4MujocoSimulator
 
-    cameras_to_use = simulator_class.get_rgb_cameras() if imagery else []
+    cameras_to_use = simulator_class.get_all_cameras() if imagery else []
 
     if lidar3d and not simulator_class is Stretch4MujocoSimulator:
         raise NotImplementedError("3D Lidar is only supported in Stretch4MujocoSimulator.")
@@ -241,10 +241,12 @@ def main(
 
     use_imagery = len(cameras_to_use) > 0
 
+    if lidar3d or use_imagery:
+        rerun_logger.init_rerun(use_stretch_3)
+
     if lidar3d:
         estimate_pointcloud_density()
         cameras_to_use += StretchCameras.hemispherical_lidars()
-        rerun_logger.init_pointcloud_viz()
         
     model = None
 
@@ -297,7 +299,7 @@ def main(
                 print(f"{sim.pull_status().sim_to_real_time_ratio_msg}")
 
             if use_imagery:
-                show_camera_feeds_sync(sim, False)
+                rerun_logger.update_camera_images(sim.pull_camera_data())
 
             if lidar3d:
                 rerun_logger.update_pointcloud_viz(
