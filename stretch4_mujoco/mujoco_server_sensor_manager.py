@@ -2,6 +2,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 import numpy as np
+import mujoco
 
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
@@ -66,6 +67,26 @@ class MujocoServerSensorManagerSync:
 
         self.sensor_fps_counter.tick()
 
+    def _compute_lidar_rays(self) -> np.ndarray:
+        model = self.mujoco_server.mjmodel
+        data = self.mujoco_server.mjdata
+        geom_id = np.zeros(1, dtype=np.int32)
+        ranges = []
+        for i in range(360):
+            site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"lidar{i:03d}")
+            if site_id == -1:
+                site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"lidar_{i}")
+            if site_id != -1:
+                pnt = data.site_xpos[site_id]
+                vec = data.site_xmat[site_id].reshape(3, 3)[:, 2]
+                dist = mujoco.mj_ray(model, data, pnt, vec, None, 1, -1, geom_id)
+                if dist < 0 or dist > 10.0:
+                    dist = 10.0
+                ranges.append(dist)
+            else:
+                ranges.append(10.0)
+        return np.array(ranges)
+
     def _pull_sensor_data(self):
         """
         Pull data from the simulator.
@@ -77,13 +98,16 @@ class MujocoServerSensorManagerSync:
         for sensor in self.sensors_to_use:
             data: np.ndarray
             if sensor == StretchSensors.base_lidar:
-                data = np.array(
-                    [
-                        data
-                        for lidar_name in self.lidar_sensor_names
-                        for data in self.mujoco_server.mjdata.sensor(lidar_name).data
-                    ]
-                )
+                if self.lidar_sensor_names:
+                    data = np.array(
+                        [
+                            d
+                            for lidar_name in self.lidar_sensor_names
+                            for d in self.mujoco_server.mjdata.sensor(lidar_name).data
+                        ]
+                    )
+                else:
+                    data = self._compute_lidar_rays()
             else:
                 data = self.mujoco_server.mjdata.sensor(sensor.name).data
 
@@ -128,7 +152,7 @@ class MujocoServerSensorManagerThreaded(MujocoServerSensorManagerSync):
         while not self.mujoco_server._is_requested_to_stop():
 
             if not self.is_ready_to_pull_sensor_data(is_sleep_until_ready=True):
-                return
+                continue
 
             self._pull_sensor_data()
 

@@ -210,6 +210,7 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
             wait_timeout=timeout,
             check=lambda: check_if_moved() == False,
             is_alive=self.is_running,
+            time_fn=lambda: self.pull_status().time,
         ):
             if timeout is not None:
                 click.secho(

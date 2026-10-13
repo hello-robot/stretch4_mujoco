@@ -574,8 +574,8 @@ class MockBaseCommand:
         if abs(cmd_t) < 0.001:
             cmd_t = 0
 
-        velocity = 1.0  # m/s
-        angular_velocity = 3.0  # rad/s
+        velocity = 0.3  # m/s
+        angular_velocity = 1.0  # rad/s
 
         v_x_linear = cmd_y * velocity * robot.precision_multiplier * robot.profile_multiplier
         v_y_linear = cmd_x * velocity * robot.precision_multiplier * robot.profile_multiplier

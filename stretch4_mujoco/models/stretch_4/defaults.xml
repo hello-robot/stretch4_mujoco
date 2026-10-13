@@ -12,15 +12,15 @@
       <general biastype="affine" />
 
       <default class="wheel">
-        <joint axis="0 0 1" armature="0.01" damping="0.1" frictionloss="0" limited="false" />
-        <velocity kv="1" gear="6" />
-        <position kp="500" forcerange="-25.0 25.0"/>
+        <joint axis="0 0 1" armature="0.01" damping="0.01" frictionloss="0.01" limited="false" />
+        <velocity kv="1" gear="6" forcerange="-100 100" />
+        <position kp="1" gear="6" forcerange="-100 100"/>
       </default>
       <default class="lift">
         <joint damping="50" stiffness="0.03" armature="0.01" frictionloss="1.5" />
-        <general gainprm="500" biasprm="0 -1000 -100" forcerange="-200 200" />
+        <general gainprm="2500" biasprm="0 -1000 -100" forcerange="-200 200" />
         <default class="lift_stretch4">
-          <general gainprm="500" biasprm="0 -1000 -100" forcerange="-200 200" />
+          <general gainprm="2500" biasprm="0 -1000 -100" forcerange="-200 200" />
         </default>
       </default>
       <default class="telescope">
@@ -88,7 +88,7 @@
 
         <default class="omniwheel_collision">
             <geom type="capsule" size="0.1 0.01" pos="0 0 0" euler="0 0 0"
-                  friction="0.8 0.05 0.001" contype="6" conaffinity="4"/>
+                  condim="6" friction="0.05 0.8 0.001" contype="6" conaffinity="4"/>
         </default>
       </default>
     </default>

@@ -1,8 +1,8 @@
 <mujoco model="stretch actuator_sensor">
     <actuator>
-      <position name="back_wheel_vel" joint="back_wheel_joint" class="wheel"/>
-      <position name="right_wheel_vel" joint="right_wheel_joint" class="wheel"/>
-      <position name="left_wheel_vel" joint="left_wheel_joint" class="wheel"/>
+      <velocity name="back_wheel_vel" joint="back_wheel_joint" class="wheel"/>
+      <velocity name="right_wheel_vel" joint="right_wheel_joint" class="wheel"/>
+      <velocity name="left_wheel_vel" joint="left_wheel_joint" class="wheel"/>
 
       <position name="lift" joint="lift_joint" class="lift_stretch4" />
       <position name="arm" tendon="extend" class="telescope" />
@@ -16,7 +16,6 @@
   <sensor>
     <gyro name="base_gyro" site="imu" />
     <accelerometer name="base_accel" site="imu" />
-    <rangefinder name="base_lidar" site="lidar" cutoff="10.0"/>
   </sensor>
 
 </mujoco>
