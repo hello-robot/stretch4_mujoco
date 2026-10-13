@@ -7,7 +7,6 @@ from examples.camera_feeds import show_camera_feeds_sync
 from examples.rerun_utils import RerunLogger
 from examples.laser_scan import show_laser_scan
 from stretch4_mujoco import StretchMujocoSimulator
-from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.sim_teleop import GamepadTeleop
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
@@ -17,12 +16,16 @@ from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 @click.option("--scene-xml-path", type=str, default=None, help="Path to the scene xml file")
 @click.option("--select_env", is_flag=True, help="Interactively select an environment")
 @click.option("--headless", is_flag=True, help="Run in headless mode")
-@click.option("--imagery", is_flag=True, help="Show all the cameras' imagery")
 @click.option(
-    "--lidar",
-    is_flag=True,
+    "--imagery/--no_imagery",
+    default=True,
+    help="Show all the cameras' imagery. On by default; pass --no_imagery to skip rendering them.",
+)
+@click.option(
+    "--lidar/--no_lidar",
+    default=True,
     help="Show the lidar scan: a 3D point cloud in Rerun for Stretch4MujocoSimulator, "
-    "or a 2D scan in Matplotlib for Stretch3.",
+    "or a 2D scan in Matplotlib for Stretch3. On by default; pass --no_lidar to skip it.",
 )
 @click.option(
     "--opencv",
@@ -45,7 +48,7 @@ def main(
 
     simulator_class = StretchMujocoSimulator if use_stretch_3 else Stretch4MujocoSimulator
 
-    cameras_to_use = simulator_class.get_rgb_cameras() if imagery else  [StretchCameras.cam_gripper_rgb]
+    cameras_to_use = simulator_class.get_rgb_cameras() if imagery else []
 
     show_lidar_3d = lidar and simulator_class is Stretch4MujocoSimulator
     show_lidar_2d = lidar and not show_lidar_3d
