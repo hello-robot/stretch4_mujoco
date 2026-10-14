@@ -173,7 +173,7 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     try:
         logger = None
         if rerun:
-            rerun_scene.init_rerun("MolmoBot-DROID Stretch 4", RERUN_CAMERAS)
+            rerun_scene.init_rerun("MolmoBot-DROID Stretch 4", RERUN_CAMERAS, main_cameras=["exo", "wrist"])
             rerun_scene.set_step(0)
             env.observe()  # poses the mirror
             logger = StretchRerunLogger(env)

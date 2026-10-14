@@ -221,6 +221,10 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         if data.cam_nav_rgb_se4_center_low_rez is not None:
             data.cam_nav_rgb_se4_center = data.cam_nav_rgb_se4_center_low_rez
             data.cam_nav_rgb_se4_center_low_rez = None
+            # Its render time too, or `get_camera_time()` falls back to the newest camera's.
+            low_rez_time = data.camera_times.pop(StretchCameras.cam_nav_rgb_se4_center_low_rez.name, None)
+            if low_rez_time is not None:
+                data.camera_times[StretchCameras.cam_nav_rgb_se4_center.name] = low_rez_time
         return data
 
     def is_reached_set_position(self, actuator: str | Actuators, position_tolerance: float = 0.05):

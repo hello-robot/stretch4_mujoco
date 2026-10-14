@@ -991,7 +991,8 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         step_count = 0
         if rerun:
             rerun_scene.init_rerun(
-                "MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True
+                "MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True,
+                main_cameras=["exo", "wrist"],
             )
             live = LiveView(env, robot_model, step=lambda: step_count)
             click.secho("Rerun is showing the cameras live.", dim=True)
