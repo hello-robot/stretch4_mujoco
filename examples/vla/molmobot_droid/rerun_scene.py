@@ -18,16 +18,17 @@ from examples.digital_twin import RerunMujocoRobot
 
 SCENE_PATH = "world/scene"
 CAMERAS_PATH = "cameras"
+LOG_PATH = "log"
 
 
 _session: dict = {}
 """The app, the blueprint and whether a viewer was spawned, for `new_recording()`."""
 
 
-def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True) -> None:
+def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True, text_log: bool = False) -> None:
     """
     The scene camera, when there is one, is the big view; the 3D scene sits in the column with
-    the other cameras and the metrics.
+    the other cameras and the metrics, and with `text_log`, the messages under LOG_PATH.
     """
     rr.init(app_name, spawn=False)
     if spawn:
@@ -44,7 +45,11 @@ def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True) -> No
     blueprint = rrb.Blueprint(
         rrb.Horizontal(
             main_view,
-            rrb.Vertical(*column, rrb.TimeSeriesView(origin="metrics", name="Metrics")),
+            rrb.Vertical(
+                *column,
+                rrb.TimeSeriesView(origin="metrics", name="Metrics"),
+                *([rrb.TextLogView(origin=LOG_PATH, name="Log")] if text_log else []),
+            ),
             column_shares=[3, 2],
         ),
         collapse_panels=True,
@@ -129,6 +134,11 @@ def log_tool_poses(target_world: np.ndarray | None, actual_world: np.ndarray | N
 def log_metrics(values: dict[str, float]) -> None:
     for name, value in values.items():
         rr.log(f"metrics/{name}", rr.Scalars(float(value)))
+
+
+def log_text(path: str, text: str, level: str = "INFO") -> None:
+    """A message, at `path` under LOG_PATH for `init_rerun(text_log=True)`'s view to show it."""
+    rr.log(path, rr.TextLog(text, level=level))
 
 
 def _has_body(model: mujoco.MjModel, name: str) -> bool:
