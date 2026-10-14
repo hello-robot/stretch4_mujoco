@@ -22,6 +22,11 @@ Between instructions, `jog` moves the virtual Franka's joints and pedestal from 
 the robot follows (see `StretchStartPoseEditor` and KEYS_HELP); `home` or `reset` goes back to the
 start pose; `offset x y z [roll yaw pitch]` changes the grasp offset (mm, deg).
 
+Where Stretch's wrist cannot turn the tool as far as the Franka's grasp needs, it goes there
+turned less (see `FrankaStretchRetargeter.franka_to_stretch`); an action it cannot follow at all
+leaves it where it is, and --recover-after of those in a row send it back to the start pose. Both
+are printed, and logged to Rerun under RETARGET_LOG.
+
 With --overlay_franka_gripper, the policy's views show the Franka where it is told its arm and
 hand are, and Stretch painted out: the Robotiq's fingers for Stretch's gripper in the wrist view,
 the whole Franka for Stretch's arm in the exo view (see `RealFrankaOverlay`).
@@ -75,6 +80,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     SPAWN_LIFT_FRACTION,
     STEP_ARRIVAL_TIMEOUT,
     FrankaStretchRetargeter,
+    ReachMiss,
     RetargetParams,
     StretchJoints,
     StretchTargets,
@@ -128,6 +134,12 @@ after the robot stopped (see `RealStretch4Env.receive_settled()`)."""
 
 SETTLED_TIMEOUT = 1.0
 """s. How long to wait for such a message before using the newest one anyway."""
+
+DEFAULT_RECOVER_AFTER = 10
+"""Unreachable steps in a row before going back to the start pose (--recover-after)."""
+
+RETARGET_LOG = f"{rerun_scene.LOG_PATH}/retarget"
+"""Rerun entity the actions Stretch could not follow are logged under, one per step."""
 
 
 class Console:
@@ -537,6 +549,14 @@ class RealStretch4Env:
         """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
         self.stale_observations = 0
         """Observations no message after the robot stopped arrived in time for (`receive_settled()`)."""
+        self.say: Callable[[str, str | None], None] = lambda message, color=None: click.secho(message, fg=color)
+        """Where `recover()` reports (the console's events while it runs)."""
+        self.recover_after = DEFAULT_RECOVER_AFTER
+        """Unreachable steps in a row before `recover()`; 0 never."""
+        self.unreachable_streak = 0
+        self.recoveries = 0
+        self.last_miss: ReachMiss | None = None
+        """Why the last step's action was twisted or unreachable (`FrankaStretchRetargeter.last_miss`)."""
         self.check_camera_sides()
 
     def check_camera_sides(self) -> None:
@@ -658,6 +678,11 @@ class RealStretch4Env:
         # From where the robot is now: the base turns by a relative amount.
         footprint, joints = self._state({"closest_joint_state": self.live_joint_state()})
         targets = self.retargeter.franka_to_stretch(action8, footprint, joints)
+        self.last_miss = self.retargeter.last_miss
+        self.unreachable_streak = 0 if targets is not None else self.unreachable_streak + 1
+        if self.recover_after and self.unreachable_streak >= self.recover_after:
+            self.recover()
+            return None
         start = time.monotonic()
         if targets is not None:
             self.send(targets)
@@ -715,22 +740,23 @@ class RealStretch4Env:
         footprint, joints = self._state(self.last_message)
         return float(np.linalg.norm(self.retargeter.stretch_tool_world(footprint, joints)[:3, 3] - target[:3, 3]))
 
-    def move_to_franka_pose(self, franka_q7=FRANKA_HOME_QPOS) -> None:
+    def move_to_franka_pose(self, franka_q7=FRANKA_HOME_QPOS, gripper_closed: bool = False) -> None:
         self.retargeter.reset()
         self.retargeter.franka_seed = np.asarray(franka_q7, dtype=float)
         footprint, joints = self._state(self.receiver.receive())
-        targets = self.retargeter.franka_to_stretch(np.concatenate([franka_q7, [0.0]]), footprint, joints)
+        gripper = GRIPPER_CLOSED if gripper_closed else 0.0
+        targets = self.retargeter.franka_to_stretch(np.concatenate([franka_q7, [gripper]]), footprint, joints)
         if targets is None:
             raise RuntimeError("Stretch 4 cannot reach the Franka's start pose; check --object-height")
         self._gripper_closed = None
         self.send(targets)
         self.wait_for_arrival(30.0)
 
-    def go_home(self, franka_q7=None) -> None:
+    def go_home(self, franka_q7=None, keep_gripper: bool = False) -> None:
         """
         Back to the start pose: the lift up to SPAWN_LIFT_FRACTION of its travel first, so the
         gripper clears whatever it is over, then where the Franka at `franka_q7` (default
-        `start_q7`) has its tool.
+        `start_q7`) has its tool. The gripper opens, unless `keep_gripper`.
         """
         franka_q7 = self.start_q7 if franka_q7 is None else franka_q7
         self.stop_motion()
@@ -741,7 +767,25 @@ class RealStretch4Env:
             self.robot.push_command()
             if not self.wait_for_arrival(15.0):
                 return
-        self.move_to_franka_pose(franka_q7)
+        self.move_to_franka_pose(franka_q7, gripper_closed=keep_gripper and bool(self._gripper_closed))
+
+    def recover(self) -> None:
+        """
+        Stretch has not been able to follow `recover_after` actions in a row (its wrist against
+        its limits, most likely, with the policy pushing on): back to the start pose, which
+        leaves the wrist the most room, with the gripper as it is, for the policy to carry on
+        from. The retargeting counts carry on too.
+        """
+        self.say(f"↺ {self.unreachable_streak} unreachable steps in a row; back to the start pose, gripper kept", "yellow")
+        self.unreachable_streak = 0
+        self.recoveries += 1
+        retargeter = self.retargeter
+        counts = retargeter.ik_failures, retargeter.ik_clamped, retargeter.ik_twisted
+        try:
+            self.go_home(keep_gripper=True)
+        except RuntimeError as error:
+            self.say(f"↺ {error}", "red")
+        retargeter.ik_failures, retargeter.ik_clamped, retargeter.ik_twisted = counts
 
     def stop_motion(self) -> None:
         """Hold every joint where it is now."""
@@ -820,8 +864,11 @@ def continuous_session(
     """
     The control loop: runs the current instruction until a key says otherwise (KEYS_HELP),
     indefinitely unless `max_steps` > 0. The start pose commands go to `editor`.
+
+    Every action Stretch cannot follow is printed, and the first of a run of twisted ones.
     """
     env.interrupted = console.pending
+    env.say = console.event
     command = console.get()
     while True:
         kind, text = command
@@ -844,16 +891,26 @@ def continuous_session(
             pass
         else:
             console.event(f"▶ {text}", "green")
+            twisting = False
 
             def step(info: StepInfo) -> None:
+                nonlocal twisting
                 on_step(info)
+                miss = env.last_miss
+                if miss is not None and (miss.kind == "unreachable" or not twisting):
+                    color = "red" if miss.kind == "unreachable" else "yellow"
+                    console.event(f"  step {info.step}: {miss.describe()}", color)
+                twisting = miss is not None and miss.kind == "twisted"
                 error = env.tool_error_m()
+                retargeter = env.retargeter
                 console.status(
                     click.style(f"▶ {text}", fg="green")
                     + click.style(
                         f"  step {info.step}"
                         + (f" · tool {error * 1000:.0f} mm off" if error is not None else "")
-                        + (f" · {env.retargeter.ik_failures} unreachable" if env.retargeter.ik_failures else "")
+                        + (f" · {retargeter.ik_twisted} twisted" if retargeter.ik_twisted else "")
+                        + (f" · {retargeter.ik_failures} unreachable" if retargeter.ik_failures else "")
+                        + (f" · {env.recoveries} recovered" if env.recoveries else "")
                         + (f" · {env.stale_observations} stale" if env.stale_observations else "")
                         + "  · Enter/Space stops",
                         dim=True,
@@ -878,13 +935,16 @@ def continuous_session(
               "(not used with --custom_franka_start_pose).")
 @click.option("--max-steps", type=int, default=0, show_default=True,
               help="Stop an instruction after this many steps (15/s). 0: run until told otherwise.")
+@click.option("--recover-after", type=int, default=DEFAULT_RECOVER_AFTER, show_default=True,
+              help="After this many actions in a row Stretch cannot follow, go back to the start pose "
+              "(gripper kept) and carry on. 0: never.")
 @click.option("--checkpoint", default=None)
 @click.option("--rerun/--no-rerun", default=True, show_default=True)
 @retarget_options(gripper_option=False)
 @custom_start_option
 @overlay_gripper_option
-def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_start_pose, overlay_franka_gripper,
-         **kwargs):
+def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, custom_franka_start_pose,
+         overlay_franka_gripper, **kwargs):
     params = params_from_kwargs(kwargs)
     if params.exo_camera == "droid":
         raise click.BadParameter("the real robot has no DROID exo camera; use left, right or center", param_hint="--exo_camera")
@@ -913,6 +973,7 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
     try:
         env = RealStretch4Env(robot, receiver, params, robot_model.franka)
         env.start_q7 = start_q7
+        env.recover_after = recover_after
         if overlay_franka_gripper:
             gripper_camera, head_camera = stretch_cameras_to_use(params)
             env.gripper_overlay = RealFrankaOverlay(robot_model, gripper_camera, "fingers")
@@ -929,7 +990,9 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
         )
         step_count = 0
         if rerun:
-            rerun_scene.init_rerun("MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"])
+            rerun_scene.init_rerun(
+                "MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True
+            )
             live = LiveView(env, robot_model, step=lambda: step_count)
             click.secho("Rerun is showing the cameras live.", dim=True)
 
@@ -950,6 +1013,14 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
                 env.retargeter.last_target_tool_world, env.retargeter.stretch_tool_world(footprint, joints)
             )
 
+        def log_step(info: StepInfo) -> None:
+            log_frame(info.observation)
+            miss = env.last_miss
+            if rerun and miss is not None:
+                rerun_scene.log_text(
+                    f"{RETARGET_LOG}/{miss.kind}", miss.describe(), "ERROR" if miss.kind == "unreachable" else "WARN"
+                )
+
         if click.confirm(click.style("Raise the lift and move Stretch 4 to the start pose?", bold=True), default=True):
             click.secho("Moving to the start pose...", dim=True)
             env.go_home()
@@ -967,7 +1038,7 @@ def main(robot_ip, object_height, max_steps, checkpoint, rerun, custom_franka_st
             say=console.event,
             on_move=lambda: log_frame(env.observe()),
         )
-        continuous_session(env, policy, params, max_steps, lambda info: log_frame(info.observation), console, editor)
+        continuous_session(env, policy, params, max_steps, log_step, console, editor)
     except KeyboardInterrupt:
         pass
     finally:

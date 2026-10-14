@@ -103,6 +103,20 @@ MAX_CLAMPED_POSITION_ERROR = 0.05
 MAX_CLAMPED_ROTATION_ERROR = math.radians(20)
 """How far from an unreachable target Stretch may go instead (m, rad); further is a failure."""
 
+MAX_TWIST = math.radians(60)
+TWIST_SEARCH_STEP = math.radians(10)
+TWIST_BISECTIONS = 3
+MAX_TWISTED_ROTATION_ERROR = math.radians(5)
+"""When the wrist cannot turn the tool as far about its approach axis as the Franka's grasp
+needs (yaw and roll at their limits), Stretch takes the target with the least twist about that
+axis it can reach, up to MAX_TWIST: searched TWIST_SEARCH_STEP at a time either way, then
+narrowed by bisection to TWIST_SEARCH_STEP / 2**TWIST_BISECTIONS. Reaching a twisted target is
+getting within MAX_CLAMPED_POSITION_ERROR and MAX_TWISTED_ROTATION_ERROR of it (at the top of
+the lift, say, it is out of reach in height too)."""
+
+AT_LIMIT_TOLERANCE = (0.005, 0.005, math.radians(2), math.radians(2), math.radians(2))
+"""m, m, rad, rad, rad. How close lift, arm, wrist yaw, pitch and roll are to a limit to count as at it."""
+
 
 # ---------------------------------------------------------------------------
 # Parameters and CLI flags
@@ -448,6 +462,38 @@ class StretchTargets:
     tool_error_m: float = 0.0
 
 
+@dataclass
+class ReachMiss:
+    """
+    A Franka action Stretch could not follow within MAX_CLAMPED_*: "twisted" when it goes to the
+    target twisted `twist_rad` about the tool's approach axis instead, "unreachable" when it
+    does not move at all.
+    """
+
+    kind: str
+    position_error_m: float
+    rotation_error_rad: float
+    """Of the closest pose found without twisting."""
+    twist_rad: float
+    at_limits: dict[str, float]
+    """The closest pose's joints at a limit (AT_LIMIT_TOLERANCE): name -> position (m or rad)."""
+    arm_out_of_range: bool
+
+    def describe(self) -> str:
+        limits = ", ".join(
+            f"{name} {value * 1000:.0f} mm" if name in ("lift", "arm") else f"{name} {math.degrees(value):.0f}°"
+            for name, value in self.at_limits.items()
+        )
+        closest = (
+            f"closest {math.degrees(self.rotation_error_rad):.0f}° / {self.position_error_m * 1000:.0f} mm off"
+            + (", arm out of range" if self.arm_out_of_range else "")
+            + (f"; at limits: {limits}" if limits else "")
+        )
+        if self.kind == "twisted":
+            return f"twisted {math.degrees(self.twist_rad):+.0f}° about the approach ({closest})"
+        return f"unreachable ({closest})"
+
+
 @functools.cache
 def measure_arm_offset() -> float:
     """
@@ -607,6 +653,10 @@ class FrankaStretchRetargeter:
         self.last_state_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         self.ik_failures = 0
         self.ik_clamped = 0
+        self.ik_twisted = 0
+        """Of `ik_clamped`, the targets Stretch reached only twisted about the approach axis."""
+        self.last_miss: ReachMiss | None = None
+        """Why the last `franka_to_stretch()` was twisted or unreachable; None if it was neither."""
         self.at_start = True
         """The next solve picks a start pose: most room to the wrist limits, not least motion."""
         self.last_targets: StretchTargets | None = None
@@ -641,11 +691,18 @@ class FrankaStretchRetargeter:
 
         Out of reach (Stretch's lift tops out ~0.12 m below a Franka TCP pointing down from
         1.2 m, for one), the closest pose within MAX_CLAMPED_* is used and counted in
-        `ik_clamped`. Returns None, counted in `ik_failures`, if there is none.
+        `ik_clamped`. Where that is too far off in orientation, because the wrist cannot turn the
+        tool as far about its approach axis as the grasp needs, the target twisted the least
+        about that axis that Stretch reaches exactly is used instead (`twist_to_reach()`),
+        counted in `ik_clamped` and `ik_twisted`: the tool goes where the policy wants it,
+        turned less, and the Franka state the policy sees shows its wrist stopped, as at a joint
+        limit. Returns None, counted in `ik_failures`, if neither works. Either way `last_miss`
+        says why.
         """
         from stretch4_kinematics import StretchJointPositions
 
         self.franka_seed = np.asarray(action8[:7], dtype=float)
+        self.last_miss = None
         footprint_from_world = np.linalg.inv(world_from_footprint)
         seed = StretchJointPositions(
             base_x=0.0,
@@ -661,17 +718,31 @@ class FrankaStretchRetargeter:
         self.last_target_tool_world = target_world
         goal = footprint_from_world @ target_world @ self.tool_correction_inv
         solution, clamped = solve_stretch_ik(self.stretch_kinematics, goal, seed, prefer_margin=self.at_start)
-        reached = self.stretch_kinematics.forward(solution, STRETCH_TCP).homogeneous
-        position_error = float(np.linalg.norm(reached[:3, 3] - goal[:3, 3]))
-        rotation_error = _rotation_angle(reached[:3, :3].T @ goal[:3, :3])
+        position_error, rotation_error = self._reach_error(solution, goal)
         arm = solution.arm + self.arm_offset
-        if (
-            position_error > MAX_CLAMPED_POSITION_ERROR
-            or rotation_error > MAX_CLAMPED_ROTATION_ERROR
-            or not ARM_RANGE[0] - 1e-3 <= arm <= ARM_RANGE[1] + 1e-3
-        ):
-            self.ik_failures += 1
-            return None
+        arm_out_of_range = not ARM_RANGE[0] - 1e-3 <= arm <= ARM_RANGE[1] + 1e-3
+        if position_error > MAX_CLAMPED_POSITION_ERROR or rotation_error > MAX_CLAMPED_ROTATION_ERROR or arm_out_of_range:
+            twisted = (
+                self.twist_to_reach(footprint_from_world @ target_world, seed)
+                if rotation_error > MAX_CLAMPED_ROTATION_ERROR
+                else None
+            )
+            self.last_miss = ReachMiss(
+                kind="unreachable" if twisted is None else "twisted",
+                position_error_m=position_error,
+                rotation_error_rad=rotation_error,
+                twist_rad=0.0 if twisted is None else twisted[0],
+                at_limits=self._at_limits(solution),
+                arm_out_of_range=arm_out_of_range,
+            )
+            if twisted is None:
+                self.ik_failures += 1
+                return None
+            solution = twisted[1]
+            position_error, _ = self._reach_error(solution, goal)
+            arm = solution.arm + self.arm_offset
+            clamped = True
+            self.ik_twisted += 1
         lift = float(np.clip(solution.lift, LIFT_RANGE[0] + END_STOP_MARGIN, LIFT_RANGE[1] - END_STOP_MARGIN))
         arm_target = float(np.clip(arm, ARM_RANGE[0] + END_STOP_MARGIN, ARM_RANGE[1] - END_STOP_MARGIN))
         # Held off an end stop by more than a hair is not reaching the target either.
@@ -693,6 +764,62 @@ class FrankaStretchRetargeter:
         )
         self.last_targets = targets
         return targets
+
+    def twist_to_reach(self, target: np.ndarray, seed):
+        """
+        (twist, solution): the smallest twist (rad) about the tool's approach axis (its x) up to
+        MAX_TWIST that Stretch reaches `target` (the tool's pose in the current footprint frame)
+        with (see MAX_TWISTED_ROTATION_ERROR), and the IK solution for it. None if there is none.
+        """
+
+        def solve(twist: float):
+            twisted = target @ make_transform(_rotx(twist), [0.0, 0.0, 0.0]) @ self.tool_correction_inv
+            solution, _ = solve_stretch_ik(self.stretch_kinematics, twisted, seed, prefer_margin=self.at_start)
+            position_error, rotation_error = self._reach_error(solution, twisted)
+            arm = solution.arm + self.arm_offset
+            reached = (
+                position_error <= MAX_CLAMPED_POSITION_ERROR
+                and rotation_error <= MAX_TWISTED_ROTATION_ERROR
+                and ARM_RANGE[0] - 1e-3 <= arm <= ARM_RANGE[1] + 1e-3
+            )
+            return solution if reached else None
+
+        for step in range(1, round(MAX_TWIST / TWIST_SEARCH_STEP) + 1):
+            for sign in (1.0, -1.0):
+                solution = solve(sign * step * TWIST_SEARCH_STEP)
+                if solution is None:
+                    continue
+                # Narrow it down between the last twist that did not reach and this one.
+                short, enough = (step - 1) * TWIST_SEARCH_STEP, step * TWIST_SEARCH_STEP
+                for _ in range(TWIST_BISECTIONS):
+                    middle = (short + enough) / 2
+                    reached = solve(sign * middle)
+                    if reached is None:
+                        short = middle
+                    else:
+                        enough, solution = middle, reached
+                return sign * enough, solution
+        return None
+
+    def _reach_error(self, solution, goal: np.ndarray) -> tuple[float, float]:
+        """(m, rad) from where `solution` puts the IK model's TCP to `goal`."""
+        reached = self.stretch_kinematics.forward(solution, STRETCH_TCP).homogeneous
+        return float(np.linalg.norm(reached[:3, 3] - goal[:3, 3])), _rotation_angle(reached[:3, :3].T @ goal[:3, :3])
+
+    def _at_limits(self, solution) -> dict[str, float]:
+        """The lift, arm and wrist joints `solution` has at a limit (see ReachMiss.at_limits)."""
+        from stretch4_kinematics import Stretch4IKModes
+
+        model = self.stretch_kinematics.model_ik
+        q = solution.to_pinocchio_q(Stretch4IKModes.BASE_ROTATE)
+        # q is [base, lift, arm, yaw, pitch, roll]; the arm on the IK model's travel.
+        names = ("lift", "arm", "wrist_yaw", "wrist_pitch", "wrist_roll")
+        offsets = (0.0, self.arm_offset, 0.0, 0.0, 0.0)
+        return {
+            name: float(q[i] + offset)
+            for i, name, offset, tolerance in zip(range(1, 6), names, offsets, AT_LIMIT_TOLERANCE)
+            if q[i] - model.lowerPositionLimit[i] < tolerance or model.upperPositionLimit[i] - q[i] < tolerance
+        }
 
     # -- Stretch -> Franka --------------------------------------------------
 
@@ -736,6 +863,8 @@ class FrankaStretchRetargeter:
         self.last_state_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         self.ik_failures = 0
         self.ik_clamped = 0
+        self.ik_twisted = 0
+        self.last_miss = None
         self.at_start = True
         self.last_targets = None
         self.last_target_tool_world = None
@@ -989,6 +1118,15 @@ SIM_GRIPPER_CLOSED = 0.0
 the position actuators squeeze it in proportion to how far they are held open."""
 
 
+BODY_STATES_PERIOD = 1.0 / 30.0
+"""s of simulated time. How often stretch4_mujoco publishes the watched bodies' poses
+(`MujocoServer.body_states_hz`)."""
+
+FRESH_OBSERVATION_TIMEOUT = 1.0
+"""s. How long `Stretch4SimEnv.observe()` waits for camera frames and body poses from after it
+was called before using what there is."""
+
+
 def joint_speed(actuator: str, params: RetargetParams) -> float | None:
     """The velocity to command an actuator at: its default, or 20% of it with --slow."""
     from stretch4_mujoco.config import get_actuator_motion_limits
@@ -1021,6 +1159,8 @@ class Stretch4SimEnv:
         self._gripper_closed: bool | None = None
         self.ik_converged = True
         self.reverse_ik_failures = 0
+        self.stale_observations = 0
+        """Observations no frames or poses from after `observe()` was called arrived in time for."""
         self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         """The Franka pose `reset()` goes back to."""
         self.overlay_franka_gripper = False
@@ -1045,15 +1185,41 @@ class Stretch4SimEnv:
             gripper_open_fraction=float(np.clip(status.gripper.pos / self.gripper_open, 0, 1)),
         )
 
-    def camera_images(self) -> tuple[np.ndarray | None, np.ndarray]:
-        """(head image or None, gripper image), RGB and upright, as the simulator renders them."""
-        cameras = self.sim.pull_camera_data()
+    def fresh_camera_data(self):
+        """
+        The simulator's camera data once every camera in use has rendered, and the watched
+        bodies' poses been published, since now: both lag the joint status, which is current.
+        The cameras render at their own rate on their own thread, the poses go out every
+        BODY_STATES_PERIOD. Taken at once after a step, a frame can be from partway through it
+        (with --wait-for-arrival at full speed, most of it), and the policy, shown the arm
+        short of where it is, pushes it further. Waits up to FRESH_OBSERVATION_TIMEOUT,
+        counting a timeout in `stale_observations`.
+        """
+        since = self.sim.pull_status().time
+        cameras = stretch_cameras_to_use(self.params)
+        deadline = time.monotonic() + FRESH_OBSERVATION_TIMEOUT
+        while True:
+            # The status first: it is cheap, and the frames cannot be newer than it.
+            if self.sim.pull_status().time >= since + BODY_STATES_PERIOD:
+                data = self.sim.pull_camera_data()
+                if all(data.get_camera_time(camera) >= since for camera in cameras):
+                    return data
+            if not self.sim.is_running() or time.monotonic() > deadline:
+                self.stale_observations += 1
+                return self.sim.pull_camera_data()
+            time.sleep(0.005)
+
+    def camera_images(self, cameras=None) -> tuple[np.ndarray | None, np.ndarray]:
+        """(head image or None, gripper image), RGB and upright, as the simulator renders them,
+        from `cameras` (default: the newest camera data)."""
+        cameras = cameras or self.sim.pull_camera_data()
         gripper_camera, *head = stretch_cameras_to_use(self.params)
         gripper = cameras.get_camera_data(gripper_camera, auto_correct_rgb=False)
         head_image = cameras.get_camera_data(head[0], auto_correct_rgb=False) if head else None
         return head_image, gripper
 
     def observe(self) -> Observation:
+        cameras = self.fresh_camera_data()
         status = self.sim.pull_status()
         poses = self.sim.pull_body_poses()
         footprint = planar_from_pose(*poses["stretch4"], self.stretch_scene.scene.floor_z)
@@ -1062,7 +1228,7 @@ class Stretch4SimEnv:
         self.mirror.update(status, poses)
         self.mirror.set_ghost(state8[:7])
 
-        head, gripper = self.camera_images()
+        head, gripper = self.camera_images(cameras)
         if self.params.exo_camera == "droid":
             from examples.vla.molmobot_droid.molmospaces.custom_scene import DROID_EXO_IN_STRETCH_SCENE
 
@@ -1160,7 +1326,7 @@ class Stretch4SimEnv:
             if self._arrived(targets) or time.monotonic() > deadline:
                 break
         self.retargeter.ik_failures = self.retargeter.ik_clamped = 0
-        self.reverse_ik_failures = 0
+        self.reverse_ik_failures = self.stale_observations = 0
         return targets
 
     def _arrived(self, targets: StretchTargets, tolerance: float = 0.02) -> bool:
@@ -1179,6 +1345,7 @@ class Stretch4SimEnv:
             "ik_failures": float(self.retargeter.ik_failures),
             "ik_clamped": float(self.retargeter.ik_clamped),
             "reverse_ik_failures": float(self.reverse_ik_failures),
+            "stale_observations": float(self.stale_observations),
             "furniture_removed": float(len(self.stretch_scene.removed_bodies)),
         }
 
