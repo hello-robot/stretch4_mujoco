@@ -90,6 +90,9 @@ The first run downloads:
 
 ## Retargeting (`franka_retarget/stretch4_retarget.py`)
 
+Diagrams of the retargeting and of the two Stretch 4 runners are in
+[`franka_retarget/README.md`](franka_retarget/README.md).
+
 ```
 Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> world
    ──TCP_ALIGN · grasp offset──> where Stretch's grasp_center_link should be
@@ -110,7 +113,10 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
 - **Out of reach.**
   - When Stretch cannot reach a target, the closest pose within 5 cm / 20° is used and counted
     as `ik_clamped`.
-  - Beyond that it holds still and the step counts as an `ik_failure`.
+  - More than 20° off, it takes the target turned the least it needs (up to 60°) about the
+    tool's approach axis, keeping the position (`ik_twisted`).
+  - Beyond that it holds still and the step counts as an `ik_failure`. On the real robot,
+    `--recover-after` of those in a row (default 10) send it back to the start pose.
   - The common case is the Franka's home pose over a tall counter. Stretch's lift tops out
     about 0.12 m short of a downward-pointing Franka TCP there.
 - **Back to the Franka.** Stretch's tool pose, with the grasp offset taken back out, goes
@@ -142,7 +148,8 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
   - After that, IK takes the exact solution closest to the current joints, keeping 0.15 rad
     clear of a wrist limit where it can.
   - Where the Franka's grasp needs more roll than Stretch's 245°, Stretch goes to the closest
-    pose within 5 cm / 20° (`ik_clamped`), or holds (`ik_failure`).
+    pose within 5 cm / 20° (`ik_clamped`), then to the grasp turned less (`ik_twisted`), or
+    holds (`ik_failure`).
 - **Parallel gripper.**
   - IK always runs on stretch4_kinematics' Stretch-gripper model. Its PG4 support is only on an
     unpublished branch.
