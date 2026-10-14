@@ -592,27 +592,50 @@ class RealStretch4Env:
         deadline = time.monotonic() + SETTLED_TIMEOUT
         while True:
             message = self.receiver.receive()
-            if self._matches_status(message["closest_joint_state"]):
+            if self._matches(message["closest_joint_state"], self.live_joint_state()):
                 return message
             if time.monotonic() > deadline:
                 self.stale_observations += 1
                 return message
 
-    def _matches_status(self, state: dict) -> bool:
-        self.robot.pull_status()
-        status = self.robot.status
+    @staticmethod
+    def _matches(state: dict, live: dict) -> bool:
         off_m = max(
-            abs(state["lift"]["height"] - status["lift"]["pos"]), abs(state["arm"]["extension"] - status["arm"]["pos"])
+            abs(state["lift"]["height"] - live["lift"]["height"]),
+            abs(state["arm"]["extension"] - live["arm"]["extension"]),
         )
         off_rad = max(
-            abs(state[joint]["angle"] - status["end_of_arm"][joint]["pos"])
-            for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll")
+            abs(state[joint]["angle"] - live[joint]["angle"]) for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll")
         )
         return off_m <= SETTLED_TOLERANCE_M and off_rad <= SETTLED_TOLERANCE_RAD
+
+    def live_joint_state(self) -> dict:
+        """
+        The robot's joints now, read from its status, in the form of a message's
+        `closest_joint_state` (which the publisher builds from the same status).
+        """
+        self.robot.pull_status()
+        status = self.robot.status
+        eoa = status["end_of_arm"]
+        if "parallel_gripper" in eoa:
+            gripper = {"pos_mm": eoa["parallel_gripper"].get("pos_mm", 0.0)}
+        else:
+            gripper = {"pos_pct": eoa.get("stretch_gripper", {}).get("pos_pct", 0.0)}
+        return {
+            "lift": {"height": status["lift"]["pos"]},
+            "arm": {"extension": status["arm"]["pos"]},
+            **{joint: {"angle": eoa[joint]["pos"]} for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll")},
+            "gripper": gripper,
+            "base_odometry": {key: status["base"][key] for key in ("x", "y", "theta")},
+        }
 
     def observe(self) -> Observation:
         # Without --wait-for-arrival the robot is still moving, and no message would match.
         message = self.receive_settled() if self.params.wait_for_arrival else self.receiver.receive()
+        # The images are as old as the pipeline makes them, but the joints need not be: moving,
+        # the message's are an image's latency behind, and the policy would start each chunk,
+        # and limit_joint_delta() each action, from a little way back along the motion.
+        message = {**message, "closest_joint_state": self.live_joint_state()}
         self.last_message = message
         footprint, joints = self._state(message)
         state8, _ = self.retargeter.stretch_to_franka(footprint, joints)
@@ -632,7 +655,8 @@ class RealStretch4Env:
     # -- acting -------------------------------------------------------------
 
     def step(self, action8: np.ndarray) -> StretchTargets | None:
-        footprint, joints = self._state(self.receiver.receive())
+        # From where the robot is now: the base turns by a relative amount.
+        footprint, joints = self._state({"closest_joint_state": self.live_joint_state()})
         targets = self.retargeter.franka_to_stretch(action8, footprint, joints)
         start = time.monotonic()
         if targets is not None:
