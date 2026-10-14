@@ -25,10 +25,19 @@ _session: dict = {}
 """The app, the blueprint and whether a viewer was spawned, for `new_recording()`."""
 
 
-def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True, text_log: bool = False) -> None:
+def init_rerun(
+    app_name: str,
+    camera_names: list[str],
+    spawn: bool = True,
+    text_log: bool = False,
+    main_cameras: list[str] | None = None,
+) -> None:
     """
     The scene camera, when there is one, is the big view; the 3D scene sits in the column with
     the other cameras and the metrics, and with `text_log`, the messages under LOG_PATH.
+
+    With `main_cameras`, that layout is the Diagnostics tab, and the tab shown first is the 3D
+    scene with only those cameras beside it.
     """
     rr.init(app_name, spawn=False)
     if spawn:
@@ -42,18 +51,25 @@ def init_rerun(app_name: str, camera_names: list[str], spawn: bool = True, text_
     column = ([rrb.Spatial3DView(origin="world", name="3D scene")] if big else []) + [
         rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in camera_names if name != big
     ]
-    blueprint = rrb.Blueprint(
-        rrb.Horizontal(
-            main_view,
-            rrb.Vertical(
-                *column,
-                rrb.TimeSeriesView(origin="metrics", name="Metrics"),
-                *([rrb.TextLogView(origin=LOG_PATH, name="Log")] if text_log else []),
-            ),
-            column_shares=[3, 2],
+    layout = rrb.Horizontal(
+        main_view,
+        rrb.Vertical(
+            *column,
+            rrb.TimeSeriesView(origin="metrics", name="Metrics"),
+            *([rrb.TextLogView(origin=LOG_PATH, name="Log")] if text_log else []),
         ),
-        collapse_panels=True,
+        column_shares=[3, 2],
+        name="Diagnostics",
     )
+    if main_cameras:
+        main = rrb.Horizontal(
+            rrb.Spatial3DView(origin="world", name="3D scene"),
+            rrb.Vertical(*[rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in main_cameras]),
+            column_shares=[3, 2],
+            name="Main",
+        )
+        layout = rrb.Tabs(main, layout, active_tab=0)
+    blueprint = rrb.Blueprint(layout, collapse_panels=True)
     rr.send_blueprint(blueprint)
     _session.update(app_name=app_name, blueprint=blueprint, spawned=spawn)
 
