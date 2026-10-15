@@ -8,9 +8,11 @@ instruction runs, the policy's views and the ghost Franka it is retargeted from.
 
 On the robot, run the image + joint-state publisher from stretch4_compliant_gripper first:
 
-    python send_gripper_and_head_images_with_joint_states.py -r --head_camera left --wrist_camera left --wrist_resolution 400
+    python send_gripper_and_head_images_with_joint_states.py -r --head_camera left,right --wrist_camera left --wrist_resolution 400
 
-with its head and wrist camera sides matching --exo_camera and --gripper_camera. Commands go
+with both head fisheyes, and its wrist camera side matching --gripper_camera. The policy's exo
+view is the head fisheye on the side the tool is toward (see `head_camera_for_tool()`), so
+--exo_camera is not used. Commands go
 through stretch4_body's `RobotClient`; with --wait-for-arrival (the default) each action waits
 for the robot to stop moving.
 
@@ -62,6 +64,7 @@ from examples.vla.molmobot_droid.checkpoint import (
     unload_policy,
 )
 from examples.vla.molmobot_droid.droid import (
+    HEAD_CAMERAS,
     FrankaOverlayView,
     FrankaSpawn,
     Observation,
@@ -140,6 +143,9 @@ DEFAULT_RECOVER_AFTER = 10
 
 RETARGET_LOG = f"{rerun_scene.LOG_PATH}/retarget"
 """Rerun entity the actions Stretch could not follow are logged under, one per step."""
+
+HEAD_SIDES = ("left", "right")
+"""The head fisheyes the publisher has to send (--head_camera left,right)."""
 
 
 class Console:
@@ -334,6 +340,20 @@ def rotate_head_image_to_upright(image: np.ndarray, head_camera_side: str) -> np
     return image
 
 
+def head_camera_for_tool(tool_facing: str | None, tool_side: str | None) -> str:
+    """
+    The head fisheye the policy's exo view comes from, by stretch4_body's `end_of_arm` status
+    (see its get_tool_facing() and get_tool_side()): the side the tool points toward, or,
+    pointing ahead, the side of the arm it is on; right when that is the centre too, or the
+    status has neither.
+    """
+    if tool_facing in HEAD_SIDES:
+        return tool_facing
+    if tool_side in HEAD_SIDES:
+        return tool_side
+    return "right"
+
+
 def _decode(message: dict, *keys: str) -> np.ndarray | None:
     """The first image present under `keys` (JPEG bytes or raw BGR), as RGB."""
     for key in keys:
@@ -349,7 +369,9 @@ class ImageAndJointReceiver:
     """
     Subscribes to the robot's synced wrist + head frames and joint states on a thread, as
     recv_gripper_and_head_images_with_joint_states.py does, keeping only the newest message,
-    decoded. `receive()` waits for the next one; `latest()` does not wait.
+    decoded: `head_rgbs` has each head fisheye the publisher sends, upright, by side (a side
+    missing from a message keeps its last frame). `receive()` waits for the next one; `latest()`
+    does not wait.
     """
 
     def __init__(self, robot_ip: str, port: int = IMAGE_PORT):
@@ -363,6 +385,7 @@ class ImageAndJointReceiver:
         self.socket.setsockopt(zmq.CONFLATE, 1)
         self.socket.connect(f"tcp://{robot_ip}:{port}")
         self._message: dict | None = None
+        self._heads: dict[str, np.ndarray] = {}
         self._count = 0
         self._new = threading.Condition()
         self._running = True
@@ -377,10 +400,17 @@ class ImageAndJointReceiver:
             message["wrist_rgb"] = _decode(
                 message, "wrist_color_image_compressed", "wrist_color_image", "color_image_compressed", "color_image"
             )
-            head = _decode(message, "head_color_image_compressed", "head_color_image")
-            message["head_rgb"] = (
-                rotate_head_image_to_upright(head, message.get("head_camera_side", "")) if head is not None else None
-            )
+            primary = message.get("head_camera_side", "")
+            heads = dict(self._heads)
+            for side in message.get("head_camera_sides") or [primary]:
+                # The first side is under the unprefixed keys too: an older publisher's only ones.
+                keys = [f"head_{side}_color_image_compressed", f"head_{side}_color_image"]
+                if side == primary:
+                    keys += ["head_color_image_compressed", "head_color_image"]
+                head = _decode(message, *keys)
+                if head is not None:
+                    heads[side] = rotate_head_image_to_upright(head, side)
+            message["head_rgbs"] = self._heads = heads
             with self._new:
                 self._message, self._count = message, self._count + 1
                 self._new.notify_all()
@@ -543,8 +573,11 @@ class RealStretch4Env:
         self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         """The Franka pose `go_home()` goes to."""
         self.gripper_overlay: RealFrankaOverlay | None = None
-        self.exo_overlay: RealFrankaOverlay | None = None
-        """With --overlay_franka_gripper: what puts the Franka in the policy's wrist and exo views."""
+        self.exo_overlays: dict[str, RealFrankaOverlay] = {}
+        """With --overlay_franka_gripper: what puts the Franka in the policy's wrist view, and in
+        its exo view from each head fisheye."""
+        self.exo_side = "right"
+        """The head fisheye the policy's exo view comes from (`update_exo_side()`)."""
         self.interrupted = lambda: False
         """Polled while waiting on the robot; True cuts the wait short (a key was pressed)."""
         self.stale_observations = 0
@@ -561,15 +594,26 @@ class RealStretch4Env:
 
     def check_camera_sides(self) -> None:
         message = self.receiver.receive()
-        sides = {"head": message.get("head_camera_side"), "wrist": message.get("wrist_camera_side")}
-        if self.params.exo_camera != sides["head"] or self.params.gripper_camera != sides["wrist"]:
+        heads, wrist = sorted(message["head_rgbs"]), message.get("wrist_camera_side")
+        if heads != sorted(HEAD_SIDES) or self.params.gripper_camera != wrist:
             raise click.ClickException(
-                f"The robot publishes head={sides['head']}, wrist={sides['wrist']}; run with "
-                f"--exo_camera {sides['head']} --gripper_camera {sides['wrist']} or restart its publisher"
+                f"The robot publishes head={','.join(heads) or 'none'}, wrist={wrist}; restart its publisher "
+                f"with --head_camera {','.join(HEAD_SIDES)} --wrist_camera {self.params.gripper_camera}"
             )
-        if message["head_rgb"] is None:
-            raise click.ClickException("The robot is not publishing a head image")
         self._state(message)  # fixes the odometry origin: the world frame is where we start
+        self.robot.pull_status()
+        self.update_exo_side(quiet=True)
+
+    def update_exo_side(self, quiet: bool = False) -> str:
+        """Point `exo_side` at the head fisheye the tool is toward now, from the status last
+        pulled, saying so when it changes (unless `quiet`)."""
+        eoa = self.robot.status["end_of_arm"]
+        facing, side = eoa.get("tool_facing"), eoa.get("tool_side")
+        exo_side = head_camera_for_tool(facing, side)
+        if exo_side != self.exo_side and not quiet:
+            self.say(f"◐ exo view from the {exo_side} head camera (tool facing {facing}, on the {side})")
+        self.exo_side = exo_side
+        return exo_side
 
     # -- state ------------------------------------------------------------
 
@@ -660,16 +704,17 @@ class RealStretch4Env:
         footprint, joints = self._state(message)
         state8, _ = self.retargeter.stretch_to_franka(footprint, joints)
         self.last_state8 = state8
-        wrist, head = message["wrist_rgb"], message["head_rgb"]
+        side = self.update_exo_side()  # from the status live_joint_state() pulled
+        wrist, head = message["wrist_rgb"], message["head_rgbs"][side]
         if self.gripper_overlay is not None:
             wrist = self.gripper_overlay.apply(wrist, footprint, joints, state8)
-        if self.exo_overlay is not None:
-            head = self.exo_overlay.apply(head, footprint, joints, state8)
+        if side in self.exo_overlays:
+            head = self.exo_overlays[side].apply(head, footprint, joints, state8)
         return Observation(
             exo_rgb=prepare_exo(head, self.params),
             wrist_rgb=wrist_view(wrist),
             state8=state8,
-            extra_cameras={"head_raw": message["head_rgb"], "gripper_raw": message["wrist_rgb"]},
+            extra_cameras={"head_raw": message["head_rgbs"][side], "gripper_raw": message["wrist_rgb"]},
         )
 
     # -- acting -------------------------------------------------------------
@@ -831,7 +876,8 @@ class LiveView:
                 last = count
                 rerun_scene.rr.set_time("time", timestamp=time.time())
                 rerun_scene.set_step(self.step())
-                rerun_scene.log_cameras({"head_raw": message["head_rgb"], "gripper_raw": message["wrist_rgb"]})
+                head = message["head_rgbs"].get(self.env.exo_side)
+                rerun_scene.log_cameras({"head_raw": head, "gripper_raw": message["wrist_rgb"]})
                 self.robot_model.pose(*self._robot_state(message))
                 self.scene.log(self.robot_model.data)
             time.sleep(self.period)
@@ -947,7 +993,8 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
          overlay_franka_gripper, **kwargs):
     params = params_from_kwargs(kwargs)
     if params.exo_camera == "droid":
-        raise click.BadParameter("the real robot has no DROID exo camera; use left, right or center", param_hint="--exo_camera")
+        raise click.BadParameter("the real robot has no DROID exo camera; its exo view is the head camera on the "
+                                 "tool's side", param_hint="--exo_camera")
 
     click.secho(f"Connecting to Stretch 4 at {robot_ip}...", dim=True)
     robot, gripper = connect(robot_ip)
@@ -975,13 +1022,13 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         env.start_q7 = start_q7
         env.recover_after = recover_after
         if overlay_franka_gripper:
-            gripper_camera, head_camera = stretch_cameras_to_use(params)
+            gripper_camera = stretch_cameras_to_use(params)[0]
             env.gripper_overlay = RealFrankaOverlay(robot_model, gripper_camera, "fingers")
-            env.exo_overlay = RealFrankaOverlay(robot_model, head_camera, "franka")
+            env.exo_overlays = {side: RealFrankaOverlay(robot_model, HEAD_CAMERAS[side], "franka") for side in HEAD_SIDES}
         offset = ",".join(f"{v:g}" for v in params.effective_grasp_offset_mm)
         click.echo(
             click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
-            + click.style("Cameras  ", bold=True) + f"head {params.exo_camera}, gripper {params.gripper_camera}"
+            + click.style("Cameras  ", bold=True) + f"head on the tool's side (now {env.exo_side}), gripper {params.gripper_camera}"
             + (" (head cropped to DROID)" if params.head_crop == "droid" else "") + "\n"
             + click.style("Motion   ", bold=True) + ("slow" if params.slow else "full speed")
             + (", waiting for each action to arrive" if params.wait_for_arrival else "")
@@ -1050,7 +1097,7 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
             env.stop_motion()
         if live is not None:
             live.close()
-        for overlay in (env.gripper_overlay, env.exo_overlay) if env is not None else ():
+        for overlay in (env.gripper_overlay, *env.exo_overlays.values()) if env is not None else ():
             if overlay is not None:
                 overlay.close()
         unload_policy()
