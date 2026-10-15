@@ -12,7 +12,7 @@ and that mapping Stretch back gives the Franka's TCP again.
 
 Rerun opens a viewer when there is a display; set RERUN_SAVE=<file.rrd> to record instead.
 
-    python -m pytest examples/vla/molmobot_droid/franka_retarget/test_retargetting.py -s
+    python -m pytest examples/vla/molmobot_droid/franka_retarget/test/test_retargetting.py -s
 
 (`conftest.py` next to this file works around the repo root being a package named
 stretch4_mujoco.)
