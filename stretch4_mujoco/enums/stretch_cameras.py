@@ -222,7 +222,7 @@ class StretchCameras(Enum):
             fy = 396.9339904785156
             cx = 313.5003967285156
             cy = 214.98081970214844
-            field_of_view_vertical = 2 * np.arctan(width / (2 * fx))
+            field_of_view_vertical = 2 * np.arctan(height / (2 * fy))
             field_of_view_vertical_in_degrees = np.degrees(field_of_view_vertical)
             return CameraSettings(
                 field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
