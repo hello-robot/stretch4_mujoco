@@ -198,7 +198,7 @@ class StretchCameras(Enum):
     @property
     def initial_camera_settings(self):
 
-        if self in [StretchCameras.cam_gripper_rgb, StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb]:
+        if self == StretchCameras.cam_gripper_rgb:
             return CameraSettings(
                 field_of_view_vertical_in_degrees=58,  # from spec
                 focal=(242.56, 242.34),  # from calibration on SE3-3044
@@ -208,10 +208,33 @@ class StretchCameras(Enum):
                 sensor_resolution=(1280, 720),  # from ov9782 spec
                 # sensor_pixel_size_micrometers=3.0 # from ov9782 spec
             )
-
-        if self in [StretchCameras.cam_gripper_depth, StretchCameras.cam_gripper_se4_stereo_depth]:
+        
+        if self == StretchCameras.cam_gripper_depth:
             # Stereo camera, we just use a depth camera camera in mujoco:
             return StretchCameras.cam_gripper_rgb.initial_camera_settings
+
+
+        if self in [StretchCameras.cam_gripper_se4_left_rgb, StretchCameras.cam_gripper_se4_right_rgb]:
+            # from a real Luxonis-SR camera
+            width = 640
+            height = 400
+            fx = 396.84320068359375 
+            fy = 396.9339904785156
+            cx = 313.5003967285156
+            cy = 214.98081970214844
+            field_of_view_vertical = 2 * np.arctan(width / (2 * fx))
+            field_of_view_vertical_in_degrees = np.degrees(field_of_view_vertical)
+            return CameraSettings(
+                field_of_view_vertical_in_degrees=field_of_view_vertical_in_degrees,
+                focal=(fx, fy),
+                optical_center_px=(cx, cy),
+                width=width,
+                height=height
+            )
+
+        if self ==  StretchCameras.cam_gripper_se4_stereo_depth:
+            # Stereo camera, we just use a depth camera camera in mujoco:
+            return StretchCameras.cam_gripper_se4_left_rgb.initial_camera_settings
 
         if self == StretchCameras.cam_d435i_rgb:
             return CameraSettings(
