@@ -22,7 +22,7 @@ LOG_PATH = "log"
 
 
 _session: dict = {}
-"""The app, the blueprint and whether a viewer was spawned, for `new_recording()`."""
+"""The app, `init_rerun()`'s layout and whether a viewer was spawned, for `new_recording()`."""
 
 
 def init_rerun(
@@ -31,6 +31,7 @@ def init_rerun(
     spawn: bool = True,
     text_log: bool = False,
     main_cameras: list[str] | None = None,
+    eye: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> None:
     """
     The scene camera, when there is one, is the big view; the 3D scene sits in the column with
@@ -38,17 +39,34 @@ def init_rerun(
 
     With `main_cameras`, that layout is the Diagnostics tab, and the tab shown first is the 3D
     scene with only those cameras beside it.
+
+    `eye` (position, look target, in the world frame) is where the 3D scene views start, e.g.
+    `scene_camera_pose()`, instead of zoomed out on everything logged.
     """
     rr.init(app_name, spawn=False)
     if spawn:
         rr.spawn(memory_limit="5GB")
-    big = "scene" if "scene" in camera_names else None
-    main_view = (
-        rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{big}", name=big)
-        if big
-        else rrb.Spatial3DView(origin="world", name="3D scene")
+    _session.update(
+        app_name=app_name, spawned=spawn, camera_names=camera_names, text_log=text_log, main_cameras=main_cameras
     )
-    column = ([rrb.Spatial3DView(origin="world", name="3D scene")] if big else []) + [
+    rr.send_blueprint(_blueprint(eye))
+
+
+def _blueprint(eye: tuple[np.ndarray, np.ndarray] | None) -> rrb.Blueprint:
+    """`init_rerun()`'s layout, its 3D scene views starting at `eye`."""
+    camera_names, main_cameras = _session["camera_names"], _session["main_cameras"]
+    eye_controls = (
+        rrb.EyeControls3D(kind=rrb.Eye3DKind.Orbital, position=eye[0], look_target=eye[1], eye_up=[0, 0, 1])
+        if eye is not None
+        else None
+    )
+
+    def scene_3d() -> rrb.Spatial3DView:
+        return rrb.Spatial3DView(origin="world", name="3D scene", eye_controls=eye_controls)
+
+    big = "scene" if "scene" in camera_names else None
+    main_view = rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{big}", name=big) if big else scene_3d()
+    column = ([scene_3d()] if big else []) + [
         rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in camera_names if name != big
     ]
     layout = rrb.Horizontal(
@@ -56,36 +74,34 @@ def init_rerun(
         rrb.Vertical(
             *column,
             rrb.TimeSeriesView(origin="metrics", name="Metrics"),
-            *([rrb.TextLogView(origin=LOG_PATH, name="Log")] if text_log else []),
+            *([rrb.TextLogView(origin=LOG_PATH, name="Log")] if _session["text_log"] else []),
         ),
         column_shares=[3, 2],
         name="Diagnostics",
     )
     if main_cameras:
         main = rrb.Horizontal(
-            rrb.Spatial3DView(origin="world", name="3D scene"),
+            scene_3d(),
             rrb.Vertical(*[rrb.Spatial2DView(origin=f"{CAMERAS_PATH}/{name}", name=name) for name in main_cameras]),
             column_shares=[3, 2],
             name="Main",
         )
         layout = rrb.Tabs(main, layout, active_tab=0)
-    blueprint = rrb.Blueprint(layout, collapse_panels=True)
-    rr.send_blueprint(blueprint)
-    _session.update(app_name=app_name, blueprint=blueprint, spawned=spawn)
+    return rrb.Blueprint(layout, collapse_panels=True)
 
 
-def new_recording(name: str) -> None:
+def new_recording(name: str, eye: tuple[np.ndarray, np.ndarray] | None = None) -> None:
     """
     Log to a fresh recording from now on, in the same viewer and with the same layout (one per
-    benchmark episode, `name`d in the viewer's list): each keeps its own static scene geometry,
-    so an earlier one still replays with its scene, where clearing and relogging one recording's
-    would have replaced it.
+    benchmark episode, `name`d in the viewer's list), its 3D scene starting at `eye` (see
+    `init_rerun()`): each keeps its own static scene geometry, so an earlier one still replays
+    with its scene, where clearing and relogging one recording's would have replaced it.
     """
     recording = rr.RecordingStream(_session["app_name"], make_default=True)
     if _session["spawned"]:
         recording.connect_grpc()
     rr.send_recording_name(name, recording=recording)
-    rr.send_blueprint(_session["blueprint"], recording=recording)
+    rr.send_blueprint(_blueprint(eye), recording=recording)
 
 
 class RerunScene:
