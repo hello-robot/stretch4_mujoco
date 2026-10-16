@@ -41,6 +41,7 @@ import click
 from pynput import keyboard
 
 from stretch4_mujoco import gamepad_joints
+from stretch4_mujoco.enums.led_ring import LED_RING_DEFAULT_RGBA, LedRingAnimation
 from stretch4_mujoco.gamepad_control_mappings import TRIGGER_THRESHOLD, ControlMapping
 from stretch4_mujoco.gamepad_enums import (
     GripperHandedness,
@@ -71,12 +72,62 @@ ctrl + (shift) + (: Disable keyboard input
 ctrl + (shift) + @: Increase base velocity
 ctrl + (shift) + !: Decrease base velocity
 L : Print status
+I : Set EYE colour (opens a prompt)
 . : Stop
 ====================================="""
 
 
 def print_keyboard_help() -> None:
     click.secho(KEYBOARD_HELP, fg="yellow")
+
+
+#: Named colours the eye prompt accepts, beyond "#rrggbb" and "r,g,b".
+LED_RING_COLOURS: dict[str, tuple[float, float, float]] = {
+    "violet": LED_RING_DEFAULT_RGBA[:3],
+    "white": (1.0, 1.0, 1.0),
+    "red": (1.0, 0.10, 0.10),
+    "orange": (1.0, 0.45, 0.0),
+    "yellow": (1.0, 0.85, 0.10),
+    "green": (0.10, 0.90, 0.35),
+    "cyan": (0.0, 0.85, 0.95),
+    "blue": (0.15, 0.40, 1.0),
+    "magenta": (1.0, 0.10, 0.70),
+}
+
+
+def parse_led_colour(text: str) -> tuple[float, float, float]:
+    """Read one of the named colours, "#rrggbb", or "r,g,b" in 0..1.
+
+    Raises ValueError with a readable message, which the prompt shows.
+    """
+    text = text.strip().lower()
+    if text in LED_RING_COLOURS:
+        return LED_RING_COLOURS[text]
+
+    if text.startswith("#"):
+        digits = text[1:]
+        if len(digits) != 6:
+            raise ValueError(f"{text!r} is not a #rrggbb colour")
+        try:
+            r, g, b = (int(digits[i : i + 2], 16) / 255 for i in (0, 2, 4))
+        except ValueError:
+            raise ValueError(f"{text!r} is not a #rrggbb colour") from None
+        return r, g, b
+
+    parts = text.replace(",", " ").split()
+    if len(parts) == 3:
+        try:
+            rgb = tuple(float(v) for v in parts)
+        except ValueError:
+            raise ValueError(f"{text!r} is not three numbers") from None
+        if not all(0.0 <= v <= 1.0 for v in rgb):
+            raise ValueError("r, g and b must each be between 0 and 1")
+        return rgb[0], rgb[1], rgb[2]
+
+    raise ValueError(
+        f"{text!r} is not a colour name, #rrggbb, or r,g,b. "
+        f"Names: {', '.join(LED_RING_COLOURS)}"
+    )
 
 
 class _KeyboardBaseVelocity:
@@ -152,6 +203,12 @@ class KeyboardTeleop:
 
         self.is_keyboard_control_active = True  # when false, disable kbd commands
         self.ctrl_pressed = False
+        # Set while the eye-colour prompt owns the terminal, so the repeating
+        # key loop does not open a second one underneath it.
+        self._led_prompt_open = False
+        # Last colour set from the prompt, so answering it blank can genuinely
+        # keep the colour while changing only the animation.
+        self._led_colour: tuple[float, float, float] = LED_RING_DEFAULT_RGBA[:3]
 
         self._listener: keyboard.Listener | None = None
         self._thread: threading.Thread | None = None
@@ -208,8 +265,90 @@ class KeyboardTeleop:
         if isinstance(key, keyboard.KeyCode):
             self.keyboard_control_release(key.char)
 
+    def _release_held_keys(self):
+        """Stop whatever the currently held keys were driving."""
+        for key in list(self.key_buffer):
+            if isinstance(key, keyboard.KeyCode):
+                self.keyboard_control_release(key.char)
+        self.key_buffer.clear()
+
+    def prompt_led_ring(self):
+        """Ask on the terminal for a new eye colour and apply it.
+
+        Blocks the teleop loop while it runs, which is what we want: the robot
+        is stopped first so it is not still driving while the user types, and
+        keyboard control is suspended so the typed characters are not also
+        read as teleop commands.
+        """
+        if self._led_prompt_open:
+            return
+        if not hasattr(self.sim, "set_led_ring"):
+            click.secho("This robot has no eye LEDs (Stretch 4 only).", fg="yellow")
+            return
+
+        self._led_prompt_open = True
+        was_active = self.is_keyboard_control_active
+        self._release_held_keys()
+        self.is_keyboard_control_active = False
+        try:
+            click.secho(
+                "\nEye colour: " + ", ".join(LED_RING_COLOURS) + ", #rrggbb, or r,g,b",
+                fg="yellow",
+            )
+            colour = self._led_colour
+            while True:
+                answer = input(f"  colour (blank keeps {self._led_colour}): ").strip()
+                if not answer:
+                    break
+                try:
+                    colour = parse_led_colour(answer)
+                    break
+                except ValueError as error:
+                    click.secho(f"  {error}", fg="red")
+
+            animations = [a.value for a in LedRingAnimation]
+            animation = LedRingAnimation.solid
+            while True:
+                answer = input(f"  animation {'/'.join(animations)} [solid]: ").strip().lower()
+                if not answer:
+                    break
+                if answer in animations:
+                    animation = LedRingAnimation(answer)
+                    break
+                click.secho(f"  {answer!r} is not one of {', '.join(animations)}", fg="red")
+
+            period_s = 2.0
+            if animation in (LedRingAnimation.pulse, LedRingAnimation.blink):
+                while True:
+                    answer = input("  period in seconds [2.0]: ").strip()
+                    if not answer:
+                        break
+                    try:
+                        period_s = float(answer)
+                        if period_s <= 0:
+                            raise ValueError
+                        break
+                    except ValueError:
+                        click.secho("  period must be a positive number", fg="red")
+
+            self.sim.set_led_ring(color=colour, animation=animation, period_s=period_s)
+            self._led_colour = colour
+            shown = ", ".join(f"{v:.2f}" for v in colour)
+            click.secho(f"Eyes set to [{shown}] {animation.value}", fg="green")
+        except (EOFError, KeyboardInterrupt):
+            click.secho("\nEye colour unchanged.", fg="yellow")
+        finally:
+            self.key_buffer.clear()
+            self._led_prompt_open = False
+            self.is_keyboard_control_active = was_active
+
     def keyboard_control(self, key: str | None):
         from pprint import pprint
+
+        # The help advertises the bindings in upper case, and caps lock or a
+        # stray shift shouldn't swallow a command, so match either case. The
+        # ctrl combos below are shifted punctuation, which lower() leaves be.
+        key = key.lower() if key else key
 
         if self.ctrl_pressed:
             if key == ")":
@@ -262,10 +401,13 @@ class KeyboardTeleop:
             self.sim.end_of_arm.stretch_gripper.set_velocity(-0.2)
         elif key == "l":
             pprint(self.sim.pull_status())
+        elif key == "i":
+            self.prompt_led_ring()
         elif key == ".":
             self.sim.stop()
 
     def keyboard_control_release(self, key: str | None):
+        key = key.lower() if key else key
         if key == "w":
             self.base_velocity.is_forward = None
         elif key == "s":
