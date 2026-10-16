@@ -1210,6 +1210,9 @@ class Stretch4SimEnv:
         """Show the policy the Franka in place of Stretch: the Robotiq's fingers for Stretch's
         gripper in the wrist view, the whole Franka for Stretch's arm in the exo view
         (`SceneMirror.render_with_franka()`; needs the ghost Franka)."""
+        self.use_franka_gripper_camera = False
+        """Show the policy the ghost Franka's own wrist camera, with Stretch hidden, for its wrist
+        view instead of Stretch's gripper camera (needs the ghost Franka, with its wrist camera)."""
         self.head_follows_tool = False
         """The exo view from the side head fisheye the tool is toward (`head_camera_for_tool()`),
         as on the real robot, rather than --exo_camera's. Needs the simulator rendering both
@@ -1321,6 +1324,12 @@ class Stretch4SimEnv:
         extra = {"gripper_raw": gripper}
         if head is not None:
             extra["head_raw"] = head
+        if self.use_franka_gripper_camera:
+            # The Franka's wrist camera renders at DROID_IMAGE_SIZE already, as in `FrankaDroidEnv`.
+            wrist = self.mirror.render_with_franka(
+                self.stretch_scene.franka.wrist_camera_name, state8[7], "franka_alone"
+            )
+            return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=extra)
         if self.overlay_franka_gripper:
             # The policy's wrist view with the Franka's gripper where it is told its hand is.
             gripper = self.mirror.render_with_franka(self.cameras()[0], state8[7], "fingers")
