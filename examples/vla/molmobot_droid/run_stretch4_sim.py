@@ -52,6 +52,7 @@ from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     free_bodies,
     load_custom_scene,
     load_custom_scene_stretch4,
+    scene_camera_pose,
     virtual_franka_link0_height,
 )
 from examples.vla.molmobot_droid.rollout import StepInfo
@@ -178,6 +179,9 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
 
     if stretch_scene.removed_bodies:
         click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
+    if stretch_scene.backed_off:
+        click.secho(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
+                    f"rests on: --robot-pose {stretch_scene.robot_pose}", fg="yellow")
     # As on the real robot, the exo view follows the tool between the side head fisheyes.
     head_follows_tool = params.exo_camera in HEAD_SIDES
     sim = spawn_stretch4(stretch_scene, params, both_head_sides=head_follows_tool)
@@ -203,7 +207,8 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
         if rerun:
             franka_cameras = list(FRANKA_WRIST_CAMERAS) if include_franka else []
             rerun_scene.init_rerun(
-                "MolmoBot-DROID Stretch 4", RERUN_CAMERAS + franka_cameras, main_cameras=["exo", "wrist", *franka_cameras]
+                "MolmoBot-DROID Stretch 4", RERUN_CAMERAS + franka_cameras, main_cameras=["exo", "wrist", *franka_cameras],
+                eye=scene_camera_pose(stretch_scene.robot_pose, scene.object_pos),
             )
             rerun_scene.set_step(0)
             env.observe()  # poses the mirror

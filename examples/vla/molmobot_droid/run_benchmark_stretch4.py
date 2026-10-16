@@ -108,6 +108,9 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                 )
                 if stretch_scene.removed_bodies:
                     click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
+                if stretch_scene.backed_off:
+                    click.secho(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
+                                f"rests on: --robot-pose {stretch_scene.robot_pose}", fg="yellow")
                 sim = spawn_stretch4(stretch_scene, params)
                 watched = stretch_scene.watched_bodies + bench.make_judge(setup).bodies
                 sim.watch_bodies(with_nearby_free_bodies(stretch_scene, watched) if overlay_franka_gripper else watched)
