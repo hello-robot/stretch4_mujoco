@@ -119,7 +119,7 @@ def ensure_fleet_directory(tool_name: str | None = None, rewrite: bool = False) 
     if fleet_path and fleet_id and not (rewrite and is_nominal_fleet_directory()):
         return Path(fleet_path) / fleet_id
 
-    model_name, _, default_tool = Stretch4MujocoSimulator.get_default_model_batch_tool_names()
+    model_name, batch_name, default_tool = Stretch4MujocoSimulator.get_default_model_batch_tool_names()
     tool_name = tool_name or default_tool
     directory = NOMINAL_FLEET_PATH / NOMINAL_FLEET_ID
     directory.mkdir(parents=True, exist_ok=True)
@@ -129,11 +129,14 @@ def ensure_fleet_directory(tool_name: str | None = None, rewrite: bool = False) 
     # moment anything configures logging.
     (NOMINAL_FLEET_PATH / "log" / "stretch_body_logger").mkdir(parents=True, exist_ok=True)
 
-    # Only `robot.model_name` and `robot.tool` are load-bearing: the first picks
+    # `robot.model_name` and `robot.tool` are load-bearing: the first picks
     # the `robot_params_<model>` module the nominal parameters come from, the
-    # second the end of arm expanded out of it. Everything else in a real
-    # configuration file is this robot's calibration, which is exactly what a
-    # stand-in cannot invent.
+    # second the end of arm expanded out of it. `robot.batch_name` is what
+    # stretch4_body looks the URDF up by (`stretch4_urdf.get_urdf()`, e.g. for
+    # end_of_arm's `get_wrist_tool_geometry()`): the simulator's own, so it reads
+    # the robot the simulator models. Everything else in a real configuration
+    # file is this robot's calibration, which is exactly what a stand-in cannot
+    # invent.
     (directory / "stretch_configuration_params.yaml").write_text(
         "# Written by examples/digital_twin.py: ensure_fleet_directory().\n"
         "# A stand-in for a real robot's fleet directory: nominal parameters for\n"
@@ -141,7 +144,7 @@ def ensure_fleet_directory(tool_name: str | None = None, rewrite: bool = False) 
         "robot:\n"
         f"  model_name: {model_name}\n"
         f"  tool: {tool_name}\n"
-        "  batch_name: nominal\n"
+        f"  batch_name: {batch_name}\n"
         "  serial_no: nominal\n"
     )
     # Read second and overlaid on the above, so the user half of the parameters

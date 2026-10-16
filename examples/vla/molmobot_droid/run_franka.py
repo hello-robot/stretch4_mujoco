@@ -9,10 +9,16 @@ Between instructions the sim keeps running, so the start pose can be changed fir
 - at the prompt, `jog` moves joints with the keys, `pose` prints the arm's joint positions,
   `set q1 ... q7` (rad) jumps the arm there, and `home` jumps it to the home pose.
 
+`--use_stretch4_gripper sg4|pg4` and `--use_stretch4_gripper_camera` put Stretch 4's gripper and
+gripper camera on the Franka in place of the Robotiq and DROID's wrist camera, mounted on its
+flange as they are on Stretch 4's wrist (see `franka_retarget/stretch4_hardware_on_franka.py`):
+to see how the policy copes with them on the robot it was trained on.
+
 Usage:
     python -m examples.vla.molmobot_droid.run_franka --scene-id procthor-10k/val/0 --object-type mug
     python -m examples.vla.molmobot_droid.run_franka --robot-pose 5.85,7.57,-1.571 --exo_camera center \\
         --execute-horizon 8 --execute-horizon-do-only-first-n-steps 2
+    python -m examples.vla.molmobot_droid.run_franka --use_stretch4_gripper pg4 --use_stretch4_gripper_camera
 """
 
 from __future__ import annotations
@@ -41,11 +47,13 @@ from examples.vla.molmobot_droid.checkpoint import (
     unload_policy,
 )
 from examples.vla.molmobot_droid.droid import HEAD_CAMERAS, FrankaDroidEnv, Observation, RobotPose
+from examples.vla.molmobot_droid.franka_retarget.stretch4_hardware_on_franka import STRETCH4_GRIPPERS
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     execution_options,
     exo_camera_option,
     head_crop_option,
     to_droid_frame,
+    wrist_view,
 )
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     load_custom_scene,
@@ -306,16 +314,44 @@ class StartPoseEditor:
 @exo_camera_option("droid")
 @head_crop_option
 @execution_options
+@click.option(
+    "--use_stretch4_gripper",
+    "--use-stretch4-gripper",
+    "use_stretch4_gripper",
+    type=click.Choice(tuple(STRETCH4_GRIPPERS)),
+    default=None,
+    help="Put Stretch 4's gripper (SG4) or parallel gripper (PG4) on the Franka in place of the Robotiq, "
+    "its quick connect on the Franka's flange. Its grasp center ends up 235 mm (SG4) or 167 mm (PG4) from "
+    "the flange, against the Robotiq's 155 mm. Its fingers are driven and reported to the policy in the "
+    "Robotiq's units.",
+)
+@click.option(
+    "--use_stretch4_gripper_camera",
+    "--use-stretch4-gripper-camera",
+    "use_stretch4_gripper_camera",
+    is_flag=True,
+    help="Use Stretch 4's left gripper camera as the wrist camera instead of DROID's, mounted where it is on "
+    "Stretch 4 relative to the tool's quick connect, with the quick connect's place on the flange (with the "
+    "Robotiq too), and DROID-framed as retargeting frames it.",
+)
 def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, exo_camera, head_crop,
-         execute_horizon, execute_first_n):
+         execute_horizon, execute_first_n, use_stretch4_gripper, use_stretch4_gripper_camera):
     if not 1 <= execute_first_n <= execute_horizon:
         raise click.BadParameter("need 1 <= --execute-horizon-do-only-first-n-steps <= --execute-horizon")
     scene = load_custom_scene(scene_id, object_type, object_index)
     click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
-    env = load_custom_scene_franka_droid(scene, pose, exo_camera=exo_camera)
+    env = load_custom_scene_franka_droid(
+        scene,
+        pose,
+        exo_camera=exo_camera,
+        stretch4_gripper=use_stretch4_gripper,
+        stretch4_gripper_camera=use_stretch4_gripper_camera,
+    )
     if exo_camera in HEAD_CAMERAS and head_crop == "droid":
         env.prepare_exo = to_droid_frame
+    if use_stretch4_gripper_camera:
+        env.prepare_wrist = wrist_view
     env.launch_viewer()
 
     logger = None

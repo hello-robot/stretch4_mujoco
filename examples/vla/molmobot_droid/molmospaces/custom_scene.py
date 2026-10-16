@@ -38,6 +38,7 @@ from examples.vla.molmobot_droid.droid import (
     FrankaDroidEnv,
     FrankaSpawn,
     PinholeRenderer,
+    STRETCH_ROOT,
     RobotPose,
     add_franka_ghost,
     franka_link0_height_for_object,
@@ -51,7 +52,7 @@ from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 SCENE_CAMERA = "scene_camera"
 SCENE_CAMERA_SIZE = (960, 540)
 DROID_EXO_IN_STRETCH_SCENE = "droid_exo_camera"
-STRETCH_ROOT_BODY = "stretch4"
+STRETCH_ROOT_BODY = STRETCH_ROOT
 
 
 @dataclass
@@ -309,12 +310,17 @@ def load_custom_scene_franka_droid(
     exo_camera: ExoCamera = "droid",
     link0_height: float | None = None,
     standing_on_floor: bool = True,
+    stretch4_gripper: str | None = None,
+    stretch4_gripper_camera: bool = False,
 ) -> FrankaDroidEnv:
     """
     The scene with a Franka DROID at `robot_pose`, ready to step in-process.
 
     `link0_height` defaults to the training placement for the target object. Benchmarks pass
     their own and `standing_on_floor=False`, to keep molmospaces' floating 0.58 m pedestal.
+    `stretch4_gripper` ("sg4", "pg4") and `stretch4_gripper_camera` put Stretch 4's gripper and
+    gripper camera on it in place of the Robotiq and DROID's wrist camera (see
+    `stretch4_hardware_on_franka`).
     """
     spec = scene.load_spec()
     spawn = spawn_franka_droid(
@@ -325,6 +331,10 @@ def load_custom_scene_franka_droid(
         floor_z=scene.floor_z,
         standing_on_floor=standing_on_floor,
     )
+    if stretch4_gripper is not None or stretch4_gripper_camera:
+        from examples.vla.molmobot_droid.franka_retarget.stretch4_hardware_on_franka import put_stretch4_hardware_on
+
+        put_stretch4_hardware_on(spec, spawn, stretch4_gripper, stretch4_gripper_camera)
     add_scene_camera(spec, robot_pose, scene.object_pos)
     return FrankaDroidEnv(spec.compile(), spawn, scene_camera=SCENE_CAMERA)
 
@@ -442,7 +452,7 @@ def _build_stretch4_scene(
     )
     height = link0_height if link0_height is not None else virtual_franka_link0_height(scene)
     if include_franka:
-        franka = add_franka_ghost(spec, robot_pose, height, floor_z=scene.floor_z)
+        franka = add_franka_ghost(spec, robot_pose, height, floor_z=scene.floor_z, keep_wrist_camera=True)
     else:
         franka = FrankaSpawn(
             prefix="ghost_franka/",
@@ -528,8 +538,9 @@ class SceneMirror:
         DROID_EXO_IN_STRETCH_SCENE) with the ghost Franka, its Robotiq open to `driver_angle`, in
         the Franka's own look in place of part of Stretch (`FrankaOverlayView`): the Robotiq's
         fingers for Stretch's tool (`kind` "fingers", the gripper camera), or the whole Franka
-        for Stretch's arm ("franka", the exo views). Needs the ghost (`include_franka`), posed
-        by `set_ghost()`.
+        for Stretch's arm ("franka", the exo views), beside all of Stretch
+        ("franka_with_stretch") or in place of all of it ("franka_alone"). Needs the ghost
+        (`include_franka`), posed by `set_ghost()`.
         """
         if not self._ghost_joints:
             raise RuntimeError("Overlaying the Franka needs the ghost Franka (include_franka)")
