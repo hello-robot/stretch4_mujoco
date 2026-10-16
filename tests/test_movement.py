@@ -400,6 +400,18 @@ def assert_base_twist(
     assert np.isclose(base.x_vel, vx, atol=xy_tol), f"Reported x_vel={base.x_vel:.4f}, commanded {vx:.4f}"
     assert np.isclose(base.y_vel, vy, atol=xy_tol), f"Reported y_vel={base.y_vel:.4f}, commanded {vy:.4f}"
     assert np.isclose(base.theta_vel, w, atol=w_tol), f"Reported theta_vel={base.theta_vel:.4f}, commanded {w:.4f}"
+    
+def settle(sim, duration_s=0.5):
+    """Lets a commanded motion ramp down to rest, measured in *sim* time.
+
+    The server paces physics against the wall clock and falls behind under load,
+    so a `time.sleep()` here buys however much sim time the machine can afford --
+    on a loaded CI runner, roughly a tenth of what it buys on a workstation. The
+    base needs ~0.3 s of sim time to decelerate, and sampling the pose before
+    that leaves the coast to land in the *next* move's measurement, where it
+    reads as transverse drift rather than as the overrun it is.
+    """
+    wait_for_sim_time(sim, duration_s)
 
 
 def get_perf_str(sim):
@@ -489,7 +501,7 @@ def run_movement_tests(
         wait_for_sim_time(sim, 4.0)
         assert_base_twist(sim, 0.20, 0.0, 0.0)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_x = sim.base.status.x
         end_y = sim.base.status.y
         end_th = sim.base.status.theta
@@ -518,7 +530,7 @@ def run_movement_tests(
         wait_for_sim_time(sim, 3.0)
         assert_base_twist(sim, 0.0, 0.20, 0.0)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_x = sim.base.status.x
         end_y = sim.base.status.y
         end_th = sim.base.status.theta
@@ -547,7 +559,7 @@ def run_movement_tests(
         wait_for_sim_time(sim, 3.0)
         assert_base_twist(sim, 0.15, 0.15, 0.0)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_x = sim.base.status.x
         end_y = sim.base.status.y
         end_th = sim.base.status.theta
@@ -577,7 +589,7 @@ def run_movement_tests(
         wait_for_sim_time(sim, 3.0)
         assert_base_twist(sim, 0.0, 0.0, 0.50)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_x = sim.base.status.x
         end_y = sim.base.status.y
         end_th = sim.base.status.theta
@@ -620,7 +632,7 @@ def run_movement_tests(
         sim.arm.set_velocity(v_arm)
         wait_for_sim_time(sim, 2.0)
         sim.arm.set_velocity(0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_arm = sim.arm.status.pos
         disp_arm = end_arm - start_arm
         click.secho(
@@ -655,7 +667,7 @@ def run_movement_tests(
         sim.lift.set_velocity(v_lift)
         wait_for_sim_time(sim, 1.5)
         sim.lift.set_velocity(0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_lift = sim.lift.status.pos
         disp_lift = end_lift - start_lift
         click.secho(
@@ -690,7 +702,7 @@ def run_movement_tests(
         sim.end_of_arm.wrist_yaw.set_velocity(v_yaw)
         wait_for_sim_time(sim, 1.0)
         sim.end_of_arm.wrist_yaw.set_velocity(0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_yaw = sim.end_of_arm.wrist_yaw.status.pos
         disp_yaw = end_yaw - start_yaw
         click.secho(
@@ -725,7 +737,7 @@ def run_movement_tests(
         sim.end_of_arm.wrist_pitch.set_velocity(v_pitch)
         wait_for_sim_time(sim, 1.0)
         sim.end_of_arm.wrist_pitch.set_velocity(0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_pitch = sim.end_of_arm.wrist_pitch.status.pos
         disp_pitch = end_pitch - start_pitch
         click.secho(
@@ -760,7 +772,7 @@ def run_movement_tests(
         sim.end_of_arm.wrist_roll.set_velocity(v_roll)
         wait_for_sim_time(sim, 1.0)
         sim.end_of_arm.wrist_roll.set_velocity(0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_roll = sim.end_of_arm.wrist_roll.status.pos
         disp_roll = end_roll - start_roll
         click.secho(
@@ -794,7 +806,7 @@ def run_movement_tests(
         sim.end_of_arm.stretch_gripper.set_velocity(-0.10)
         wait_for_sim_time(sim, 1.0)
         sim.end_of_arm.stretch_gripper.set_velocity(0.0)
-        time.sleep(0.5)
+        settle(sim)
         end_grip = sim.end_of_arm.stretch_gripper.status.pos
         disp_grip = end_grip - start_grip
         click.secho(
