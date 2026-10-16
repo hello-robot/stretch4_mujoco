@@ -27,7 +27,13 @@ from stretch4_mujoco.mujoco_server_camera_manager import (
     MujocoServerCameraManagerThreaded,
     MujocoServerCameraManagerSync,
 )
-from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity, CommandMove, StatusCommand
+from stretch4_mujoco.datamodels.status_command import (
+    CommandBaseVelocity,
+    CommandLedRing,
+    CommandMove,
+    StatusCommand,
+)
+from stretch4_mujoco.enums.led_ring import LED_RING_MATERIAL, LedRingAnimation
 from stretch4_mujoco.mujoco_server_sensor_manager import MujocoServerSensorManagerThreaded
 import stretch4_mujoco.utils as utils
 from stretch4_mujoco.utils import FpsCounter, change_start_pose, H0_from_driving_dir, inverse_3x3_matrix, rotation_3x3_matrix
@@ -575,6 +581,21 @@ class MujocoServer:
         )
 
         self._base_in_pos_motion = False
+
+        # Stretch 4's head LED rings share one material, so recolouring it
+        # drives both. Models without the rings (Stretch 3, bare scenes) just
+        # leave this at -1 and the LED commands become no-ops.
+        self._led_ring_matid = mujoco.mj_name2id(
+            self.mjmodel, mujoco.mjtObj.mjOBJ_MATERIAL, LED_RING_MATERIAL
+        )
+        self._led_ring = CommandLedRing(
+            rgba=tuple(self.mjmodel.mat_rgba[self._led_ring_matid])
+            if self._led_ring_matid != -1
+            else (0.0, 0.0, 0.0, 1.0),
+            animation=LedRingAnimation.solid,
+            period_s=2.0,
+            trigger=False,
+        )
 
         self.viewer_track_body = viewer_track_body
         self.viewer_look_at_body = viewer_look_at_body
@@ -1277,6 +1298,13 @@ class MujocoServer:
             modified = True
             self.base_controller.push_command(command_status.base_velocity)
 
+        # led_ring
+        if command_status.led_ring is not None and command_status.led_ring.trigger:
+            command_status.led_ring.trigger = False
+            modified = True
+            self._led_ring = command_status.led_ring
+        self._update_led_ring()
+
         # keyframe
         if command_status.keyframe is not None and command_status.keyframe.trigger:
             command_status.keyframe.trigger = False
@@ -1288,6 +1316,32 @@ class MujocoServer:
 
         if modified:
             self.data_proxies.set_command(command_status)
+
+    def _update_led_ring(self) -> None:
+        """Drive the head LED rings' material from the current command.
+
+        Called every control step, so an animation advances with sim time
+        rather than wall time and stays in step with a paused or stepped sim.
+        """
+        if self._led_ring_matid == -1:
+            return
+
+        cmd = self._led_ring
+        r, g, b, a = cmd.rgba
+        period = max(cmd.period_s, 1e-6)
+        phase = (self.mjdata.time % period) / period
+
+        if cmd.animation == LedRingAnimation.off:
+            level = 0.0
+        elif cmd.animation == LedRingAnimation.pulse:
+            # Raised cosine: full brightness once per period, never negative.
+            level = 0.5 * (1.0 - np.cos(2.0 * np.pi * phase))
+        elif cmd.animation == LedRingAnimation.blink:
+            level = 1.0 if phase < 0.5 else 0.0
+        else:
+            level = 1.0
+
+        self.mjmodel.mat_rgba[self._led_ring_matid] = (r * level, g * level, b * level, a)
 
     def _to_sim_gripper_range(self, pos: float) -> float:
         """

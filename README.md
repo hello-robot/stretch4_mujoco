@@ -127,6 +127,7 @@ Use the Stretch4MujocoSimulator class to:
 - read joint states
 - read camera imagery
 - read 2D and 3D LiDAR point clouds
+- set the colour and animation of the head LED rings
 
 Try the code below using `uv run ipython`. For advanced Mujoco users, the class also exposes the `mjModel` and `mjData`. See the [official Mujoco documentation](https://mujoco.readthedocs.io/en/stable/python.html).
 
@@ -168,6 +169,13 @@ if __name__ == "__main__":
     lidar_data = sim.pull_lidar_points()
     pprint(lidar_data["left"])
     pprint(lidar_data["right"])
+
+    # Head LED rings
+    from stretch4_mujoco.enums.led_ring import LedRingAnimation
+    sim.set_led_ring((0.0, 1.0, 0.4))                                   # solid green
+    sim.set_led_ring((1.0, 0.6, 0.0), LedRingAnimation.pulse, period_s=1.5)
+    sim.set_led_ring(animation=LedRingAnimation.off)
+    sim.set_led_ring()                                                  # back to the default violet
 
     # Kills simulation process
     sim.stop()
