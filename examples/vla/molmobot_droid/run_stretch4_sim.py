@@ -6,7 +6,8 @@ press Enter, and Stretch works on it until told otherwise, as `run_stretch4_real
 start pose. Watch it in stretch4_mujoco's passive viewer and in Rerun: the policy's views,
 Stretch's raw cameras, the scene camera and the house in 3D, with the ghost Franka the policy
 thinks it is driving overlaid, and its wrist camera's view with and without Stretch in it, when
---include_franka is given.
+--include_franka is given. With --use_franka_gripper_camera the policy's wrist view is that
+camera without Stretch in it, instead of Stretch's gripper camera.
 
 With --exo_camera left or right (the default), the policy's exo view is the head fisheye on the
 side the tool is toward, as on the real robot (see `head_camera_for_tool()`).
@@ -22,6 +23,7 @@ Usage:
         --head-crop droid --gripper_camera right --slow --grasp-offset-mm 0,0,10
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --custom_franka_start_pose
     python -m examples.vla.molmobot_droid.run_stretch4_sim --overlay_franka_gripper
+    python -m examples.vla.molmobot_droid.run_stretch4_sim --use_franka_gripper_camera
 """
 
 from __future__ import annotations
@@ -74,6 +76,17 @@ def include_franka_option(function):
         is_flag=True,
         help="Overlay the Franka the policy is driving: see-through and non-colliding, static at "
         "its home pose in the MuJoCo viewer, moving in Rerun and the scene camera.",
+    )(function)
+
+
+def franka_gripper_camera_option(function):
+    return click.option(
+        "--use_franka_gripper_camera",
+        "--use-franka-gripper-camera",
+        "use_franka_gripper_camera",
+        is_flag=True,
+        help="Feed the policy the ghost Franka's wrist camera, with Stretch hidden, for its wrist "
+        "view instead of Stretch's gripper camera. Implies --include_franka.",
     )(function)
 
 
@@ -154,10 +167,12 @@ def with_nearby_free_bodies(stretch_scene, watched: list[str]) -> list[str]:
 @include_franka_option
 @custom_start_option
 @overlay_gripper_option
+@franka_gripper_camera_option
 def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, include_franka,
-         custom_franka_start_pose, overlay_franka_gripper, **kwargs):
+         custom_franka_start_pose, overlay_franka_gripper, use_franka_gripper_camera, **kwargs):
     params = params_from_kwargs(kwargs)
-    include_franka = include_franka or overlay_franka_gripper  # the Robotiq is the ghost's
+    # The Robotiq and the Franka's wrist camera are the ghost's.
+    include_franka = include_franka or overlay_franka_gripper or use_franka_gripper_camera
     if overlay_franka_gripper:
         apply_overlay_grasp_offset(params)
         click.secho(f"Grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
@@ -192,6 +207,7 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator, leaving this waiting on the console
     env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
     env.overlay_franka_gripper = overlay_franka_gripper
+    env.use_franka_gripper_camera = use_franka_gripper_camera
     env.head_follows_tool = head_follows_tool
     console = None
 
