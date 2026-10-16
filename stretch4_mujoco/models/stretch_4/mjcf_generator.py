@@ -7,6 +7,11 @@ from scipy.spatial.transform import Rotation
 import yourdfpy
 
 from stretch4_mujoco.enums.led_ring import LED_RING_MATERIAL, LED_RING_MESH
+from stretch4_mujoco.enums.line_sensor import (
+    LINE_SENSOR_EMITTER_OFFSET,
+    NUM_LINE_SENSORS,
+    line_sensor_site_name,
+)
 from stretch4_mujoco.models.stretch_4 import head_texture
 from urdf2mjcf.convert import convert_urdf_to_mjcf
 from urdf2mjcf.model import ConversionMetadata
@@ -272,6 +277,20 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
         laser = ET.SubElement(base_body, "body", name="laser", pos="0.0 0.0 0.2", quat="0 0 0 1")
         rep = ET.SubElement(laser, "replicate", count="360", euler="0 0 0.0174533")
         ET.SubElement(rep, "site", name="lidar", zaxis="1 0 0")
+
+    # 6b. Line sensors are ray cast from a site at each emitter. The site keeps
+    # its link's axes: x along the boresight, pitched down, and y across the fan.
+    for i in range(NUM_LINE_SENSORS):
+        line_sensor_body = find_body(f"line_sensor_{i}_link")
+        if line_sensor_body is None:
+            raise ValueError(f"Expected 'line_sensor_{i}_link' in the URDF-derived MJCF.")
+        ET.SubElement(
+            line_sensor_body,
+            "site",
+            name=line_sensor_site_name(i),
+            pos=" ".join(str(v) for v in LINE_SENSOR_EMITTER_OFFSET),
+            quat="1 0 0 0",
+        )
 
     # 7. Encapsulate gripper camera in gripper_camera_link
     gripper_cam = find_body("gripper_camera_link")

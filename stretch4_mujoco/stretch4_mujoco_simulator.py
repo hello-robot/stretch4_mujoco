@@ -401,3 +401,22 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
         Traces rays and computes point clouds from the simulated lidars.
         """
         return self.data_proxies.get_lidar_points()
+
+    @require_connection
+    def pull_line_sensor_points(self) -> dict[str, np.ndarray]:
+        """
+        Where each of the six base line sensors hit, keyed `sensor_0` ... `sensor_5`
+        (clockwise from robot forward), as (N, 3) points in the base_footprint frame.
+
+        Only bins that measured a distance are included. For the per-bin ranges
+        and status codes the real robot reports, use `pull_sensor_data()` and its
+        `line_sensor_ranges`/`line_sensor_codes`.
+        """
+        sensors = self.data_proxies.get_sensors()
+        if sensors.line_sensor_points is None:
+            return {}
+
+        return {
+            f"sensor_{i}": points[~np.isnan(points[:, 0])]
+            for i, points in enumerate(sensors.line_sensor_points)
+        }

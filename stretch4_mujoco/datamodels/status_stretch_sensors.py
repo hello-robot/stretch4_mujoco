@@ -33,6 +33,18 @@ class StatusStretchSensors:
         if self.base_quat is None:
             return 0.0
         return gravity_tilt_from_quaternion(self.base_quat)
+    
+    # The six base line sensors, see `enums/line_sensor.py`. Each is
+    # (NUM_LINE_SENSORS, LINE_SENSOR_NUM_BINS), indexed [sensor, bin], with bin 0
+    # on the left of the fan looking out from the sensor, like the real robot.
+    #: Depth along each sensor's boresight, in metres. NaN wherever the bin
+    #: holds a status code rather than a distance -- read `line_sensor_codes`.
+    line_sensor_ranges: np.ndarray | None = None
+    #: `LineSensorCode` per bin, the authority on what a bin carries.
+    line_sensor_codes: np.ndarray | None = None
+    #: Where each bin hit, (..., 3), in the robot's base_footprint frame. NaN
+    #: wherever the range is.
+    line_sensor_points: np.ndarray | None = None
 
     def get_data(self, sensor: StretchSensors) -> np.ndarray:
         """
@@ -50,6 +62,8 @@ class StatusStretchSensors:
             data = self.base_quat
         elif sensor == StretchSensors.base_lidar:
             data = self.lidar
+        elif sensor == StretchSensors.line_sensors:
+            data = self.line_sensor_ranges
 
         if data is None:
             raise ValueError(f"Tried to get {sensor} data, but it is empty.")
@@ -74,6 +88,9 @@ class StatusStretchSensors:
             return
         if sensor == StretchSensors.base_lidar:
             self.lidar = value
+            return
+        if sensor == StretchSensors.line_sensors:
+            self.line_sensor_ranges = value
             return
 
         raise NotImplementedError(f"Sensor {sensor} is not implemented")
