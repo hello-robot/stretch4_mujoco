@@ -10,11 +10,10 @@ import stretch4_mujoco.utils as utils
 from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity, CommandLedRing
 from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
 from stretch4_mujoco.enums.actuators import Actuators
-from stretch4_mujoco.enums.led_ring import LedRingAnimation
+from stretch4_mujoco.enums.led_ring import LED_RING_DEFAULT_RGBA, LedRingAnimation
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 from stretch4_mujoco.utils import block_until_check_succeeds, require_connection
-from stretch4_mujoco.models.stretch_4.head_texture import LED_RING_DEFAULT_RGBA
 
 
 

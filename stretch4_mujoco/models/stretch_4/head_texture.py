@@ -29,6 +29,8 @@ import numpy as np
 import trimesh
 from PIL import Image
 
+from stretch4_mujoco.enums.led_ring import LED_RING_DEFAULT_RGBA
+
 # The head sensors whose positions the decals are placed from.
 SENSOR_LINKS = (
     "camera_left_link",
@@ -75,8 +77,6 @@ LED_RING_STANDOFF = 0.0006
 LED_RING_SEGMENTS = 64
 LED_RING_LINKS = ("camera_left_link", "camera_right_link")
 
-# Hello Robot's default head colour, sampled from the real robot's rings.
-LED_RING_DEFAULT_RGBA = (0.76, 0.42, 0.95, 1.0)
 # The spherical cap's silhouette in this projection reaches 36 mm; past that
 # the mesh blends back into the shell, which stays white.
 DOME_R = 0.036
