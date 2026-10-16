@@ -276,16 +276,25 @@ def look_at(position, target) -> np.ndarray:
     return mat_to_quat(np.column_stack([right, up, -forward]))
 
 
-def add_scene_camera(
-    spec: mujoco.MjSpec, robot_pose: RobotPose, target, name: str = SCENE_CAMERA
-) -> None:
-    """A fixed third-person camera behind and to the left of the robot, looking at the target."""
+def scene_camera_pose(robot_pose: RobotPose, target) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Where the scene camera is, behind and to the left of the robot, and the point it looks at,
+    halfway between the robot and the target at the target's height.
+    """
     offset = np.array([-1.0, 1.0, 0.0])
     c, s = math.cos(robot_pose.yaw), math.sin(robot_pose.yaw)
     position = np.array(
         [robot_pose.x + c * offset[0] - s * offset[1], robot_pose.y + s * offset[0] + c * offset[1], target[2] + 0.9]
     )
     look_target = (np.array([robot_pose.x, robot_pose.y, target[2]]) + np.asarray(target)) / 2
+    return position, look_target
+
+
+def add_scene_camera(
+    spec: mujoco.MjSpec, robot_pose: RobotPose, target, name: str = SCENE_CAMERA
+) -> None:
+    """A fixed third-person camera behind and to the left of the robot, looking at the target."""
+    position, look_target = scene_camera_pose(robot_pose, target)
     spec.worldbody.add_camera(
         name=name,
         pos=position.tolist(),
@@ -354,6 +363,8 @@ class Stretch4Scene:
     include_franka: bool
     removed_bodies: list[str] = field(default_factory=list)
     """Furniture taken out because Stretch 4 would have spawned inside it."""
+    backed_off: float = 0.0
+    """How far (m) `robot_pose` was moved away from the target so Stretch 4 clears what it rests on."""
 
     @property
     def watched_bodies(self) -> list[str]:
@@ -394,19 +405,68 @@ def load_custom_scene_stretch4(
 
     `clear_footprint` removes furniture Stretch 4 would spawn inside (see
     `bodies_blocking_stretch()`): benchmark episodes place the Franka's pedestal, which is a
-    mocap body that static furniture never pushes on, where chairs can be.
+    mocap body that static furniture never pushes on, where chairs can be. What the target
+    rests on cannot be removed, so if Stretch would spawn inside that (its footprint and
+    stowed arm are wider than the Franka's pedestal), `robot_pose`, the Franka with it, is
+    moved straight away from the target until it clears (see `support_back_off()`).
     """
     removed: list[str] = []
-    for _ in range(3):
-        stretch_scene = _build_stretch4_scene(
-            scene, robot_pose, include_franka, tool_name, link0_height, removed, stretch_yaw
-        )
-        blocking = bodies_blocking_stretch(stretch_scene) if clear_footprint else []
-        if not blocking:
-            stretch_scene.removed_bodies = removed
+    pose, backed_off = robot_pose, 0.0
+    for _ in range(4):
+        stretch_scene = _build_stretch4_scene(scene, pose, include_franka, tool_name, link0_height, removed, stretch_yaw)
+        if not clear_footprint:
             return stretch_scene
-        removed += blocking
-    raise RuntimeError(f"Stretch 4 still collides with the scene at {robot_pose} after removing {removed}")
+        blocking = bodies_blocking_stretch(stretch_scene)
+        if blocking:
+            removed += blocking
+            continue
+        back_off = support_back_off(stretch_scene)
+        if back_off == 0.0:
+            stretch_scene.removed_bodies = removed
+            stretch_scene.backed_off = backed_off
+            return stretch_scene
+        pose, backed_off = moved_away_from(pose, scene.object_pos, back_off), backed_off + back_off
+    raise RuntimeError(f"Stretch 4 still collides with the scene at {pose} after removing {removed}")
+
+
+def moved_away_from(pose: RobotPose, target, distance: float) -> RobotPose:
+    """`pose` moved `distance` (m) horizontally straight away from `target`, still facing the same way."""
+    away = np.array([pose.x - target[0], pose.y - target[1]])
+    norm = np.linalg.norm(away)
+    away = away / norm if norm > 1e-6 else -np.array([math.cos(pose.yaw), math.sin(pose.yaw)])
+    return RobotPose(pose.x + distance * away[0], pose.y + distance * away[1], pose.yaw)
+
+
+def support_back_off(stretch_scene: "Stretch4Scene", step: float = 0.01, max_distance: float = 0.3) -> float:
+    """
+    How far (m, in `step`s) Stretch 4 has to move straight away from the target so that,
+    standing at its home pose, it touches neither the target nor what the target rests on:
+    0 if it already does not.
+    """
+    model = stretch_scene.model
+    data = mujoco.MjData(model)
+    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if home != -1:
+        mujoco.mj_resetDataKeyframe(model, data, home)
+    mujoco.mj_forward(model, data)
+
+    from examples.vla.molmobot_droid.droid import contacts_of_subtree
+
+    target = stretch_scene.scene.object_name
+    supports = {target, *contacts_of_subtree(model, data, model.body(target).id)} - {"world"}
+    root = model.body(STRETCH_ROOT_BODY)
+    adr = model.jnt_qposadr[root.jntadr[0]]
+    start = data.qpos[adr : adr + 2].copy()
+    pose = stretch_scene.robot_pose
+    for k in range(int(round(max_distance / step)) + 1):
+        moved = moved_away_from(pose, stretch_scene.scene.object_pos, k * step)
+        data.qpos[adr : adr + 2] = start + [moved.x - pose.x, moved.y - pose.y]
+        mujoco.mj_forward(model, data)
+        if not supports.intersection(contacts_of_subtree(model, data, root.id)):
+            return k * step
+    raise RuntimeError(
+        f"Stretch 4 at {pose} still touches {sorted(supports)} {max_distance} m further from the target"
+    )
 
 
 def bodies_blocking_stretch(stretch_scene: "Stretch4Scene") -> list[str]:
