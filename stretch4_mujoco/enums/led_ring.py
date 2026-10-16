@@ -5,6 +5,9 @@ from enum import Enum
 LED_RING_MESH = "led_ring"
 LED_RING_MATERIAL = "led_ring"
 
+#: Hello Robot's default head colour, sampled from the real robot's rings.
+LED_RING_DEFAULT_RGBA = (0.76, 0.42, 0.95, 1.0)
+
 
 class LedRingAnimation(str, Enum):
     """How the LED rings around Stretch 4's head cameras are driven.

@@ -65,6 +65,9 @@ These variables ensure that MuJoCo and any associated rendering libraries utiliz
 
 [Keyboard teleop](./examples/keyboard_teleop.py)
 
+Drive Stretch from the keyboard. The controls are printed on startup; press `I` to set the eye
+colour and animation from a prompt.
+
 ```
 uv run examples/keyboard_teleop.py
 ```
