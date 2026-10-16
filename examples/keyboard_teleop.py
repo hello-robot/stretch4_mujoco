@@ -130,7 +130,11 @@ def main(
 
             if show_lidar_3d:
                 rerun_logger.update_pointcloud_viz(
-                    sim.pull_lidar_points(), "world/lidar_points"
+                    {
+                        **sim.pull_lidar_points(),
+                        **{f"line_{name}": points for name, points in sim.pull_line_sensor_points().items()},
+                    },
+                    "world/lidar_points"
                 )
 
             if show_lidar_2d:
