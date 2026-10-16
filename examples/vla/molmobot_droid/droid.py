@@ -262,6 +262,11 @@ class FrankaSpawn:
     exo_camera: str | None
     exo_camera_name: str | None
     wrist_camera_name: str
+    stretch_tool: str | None = None
+    """The Stretch 4 tool in place of the Robotiq, if any (`put_stretch4_hardware_on()`)."""
+    wrist_stretch_camera: StretchCameras | None = None
+    """The Stretch 4 camera `wrist_camera_name` is (`Stretch4GripperCameraRenderer` renders it),
+    or None for DROID's wrist camera."""
 
     @property
     def base_name(self) -> str:
@@ -384,6 +389,7 @@ def add_franka_ghost(
     floor_z: float = 0.0,
     prefix: str = "ghost_franka/",
     rgba=GHOST_RGBA,
+    keep_wrist_camera: bool = False,
 ) -> FrankaSpawn:
     """
     Add a see-through Franka that nothing collides with, for overlaying on Stretch 4.
@@ -392,7 +398,7 @@ def add_franka_ghost(
     springs carry it to `arm_qpos` and hold it there. (Starting it there instead would mean
     changing `qpos0`, which MuJoCo also takes as the joints' zero.) Its geoms are in
     GHOST_GEOM_GROUP: in MuJoCo's viewer, turn that group on (key 5, or Rendering > Geom groups)
-    to see it.
+    to see it. Its cameras are removed, but for its wrist camera with `keep_wrist_camera`.
     """
     spawn = spawn_franka_droid(
         spec, robot_pose, link0_height, exo_camera=None, floor_z=floor_z, prefix=prefix
@@ -424,7 +430,8 @@ def add_franka_ghost(
         joint.stiffness = 200.0
         joint.damping = 20.0
     for camera in base.find_all("camera"):
-        spec.delete(camera)
+        if not (keep_wrist_camera and camera.name == spawn.wrist_camera_name):
+            spec.delete(camera)
     return spawn
 
 
@@ -618,7 +625,17 @@ STRETCH_ARM_ROOT = "lift_link"
 """Everything of Stretch's from here on is its arm: the lift carriage, the telescoping arm, the
 wrist and the tool. The base, the mast and the head stay."""
 
-OverlayKind = Literal["fingers", "franka"]
+STRETCH_ROOT = "stretch4"
+"""Stretch 4's root body: everything of Stretch's."""
+
+OverlayKind = Literal["fingers", "franka", "franka_with_stretch", "franka_alone"]
+
+_OVERLAY_HIDDEN_ROOT: dict[str, str | None] = {
+    "fingers": STRETCH_TOOL_ROOT,
+    "franka": STRETCH_ARM_ROOT,
+    "franka_with_stretch": None,
+    "franka_alone": STRETCH_ROOT,
+}
 
 
 class FrankaOverlayView:
@@ -632,6 +649,9 @@ class FrankaOverlayView:
           only the fingers), so the housing and the arm stay hidden.
       franka: Stretch's arm hidden (from the lift carriage on), all of the Franka shown, its
           pedestal too. For the exo views: what the Franka DROID would show there.
+      franka_with_stretch: all of the Franka shown, and all of Stretch.
+      franka_alone: all of the Franka shown, none of Stretch: what a camera would see with the
+          Franka in Stretch's place.
 
     `camera` is one of Stretch's (rendered as stretch4_mujoco renders it, fisheye included,
     with its intrinsics given to `model`) or a camera of `model`'s own, rendered as is. `model`'s
@@ -653,7 +673,8 @@ class FrankaOverlayView:
         else:
             size = tuple(int(v) for v in model.cam_resolution[model.camera(camera).id])
             self.renderer = PinholeRenderer(model, camera, size)
-        self.hidden = subtree_geoms(model, STRETCH_TOOL_ROOT if kind == "fingers" else STRETCH_ARM_ROOT)
+        hidden_root = _OVERLAY_HIDDEN_ROOT[kind]
+        self.hidden = subtree_geoms(model, hidden_root) if hidden_root else []
         self.ghost = subtree_geoms(model, franka.base_name)
         bodies, self.rgba, materials = franka_visual_look()
         ghost_bodies = [model.body(model.geom_bodyid[g]).name[len(franka.prefix):] for g in self.ghost]
@@ -745,7 +766,11 @@ class FrankaDroidEnv:
     A compiled scene with a Franka DROID in it, stepped in this process at the policy's rate.
 
     `launch_viewer()` opens MuJoCo's passive viewer, kept in sync on every `step()`.
-    `prepare_exo`, if set, is applied to the exo image in `observe()` (e.g. a head-camera crop).
+    `prepare_exo` and `prepare_wrist`, if set, are applied to the exo and wrist images in
+    `observe()` (e.g. a head-camera crop).
+
+    With a Stretch 4 tool in place of the Robotiq (`spawn.stretch_tool`), `view`'s gripper
+    drives and reads it in the Robotiq's units.
     """
 
     def __init__(self, model: mujoco.MjModel, spawn: FrankaSpawn, scene_camera: str | None = None):
@@ -754,10 +779,18 @@ class FrankaDroidEnv:
         self.model = model
         self.data = mujoco.MjData(model)
         self.spawn = spawn
-        self.view = FrankaDroidRobotView(self.data, spawn.prefix)
+        if spawn.stretch_tool is not None:
+            from examples.vla.molmobot_droid.franka_retarget.stretch4_hardware_on_franka import (
+                FrankaStretch4ToolRobotView,
+            )
+
+            self.view = FrankaStretch4ToolRobotView(self.data, spawn.prefix, spawn.stretch_tool)
+        else:
+            self.view = FrankaDroidRobotView(self.data, spawn.prefix)
         self.n_substeps = max(1, round(POLICY_DT / model.opt.timestep))
         self.viewer = None
         self.prepare_exo: Callable[[np.ndarray], np.ndarray] | None = None
+        self.prepare_wrist: Callable[[np.ndarray], np.ndarray] | None = None
 
         if spawn.exo_camera in HEAD_CAMERAS:
             apply_stretch_camera_settings(model, spawn.exo_camera_name, HEAD_CAMERAS[spawn.exo_camera])
@@ -766,7 +799,14 @@ class FrankaDroidEnv:
             )
         else:
             self.exo_renderer = PinholeRenderer(model, spawn.exo_camera_name, DROID_IMAGE_SIZE)
-        self.wrist_renderer = PinholeRenderer(model, spawn.wrist_camera_name, DROID_IMAGE_SIZE)
+        if spawn.wrist_stretch_camera is not None:
+            from examples.vla.molmobot_droid.franka_retarget.stretch4_hardware_on_franka import (
+                Stretch4GripperCameraRenderer,
+            )
+
+            self.wrist_renderer = Stretch4GripperCameraRenderer(model, spawn)
+        else:
+            self.wrist_renderer = PinholeRenderer(model, spawn.wrist_camera_name, DROID_IMAGE_SIZE)
         self.scene_renderer = (
             PinholeRenderer(model, scene_camera, (960, 540)) if scene_camera else None
         )
@@ -811,9 +851,10 @@ class FrankaDroidEnv:
 
     def observe(self) -> Observation:
         exo_rgb = self.exo_renderer.render(self.data)
+        wrist_rgb = self.wrist_renderer.render(self.data)
         return Observation(
             exo_rgb=self.prepare_exo(exo_rgb) if self.prepare_exo is not None else exo_rgb,
-            wrist_rgb=self.wrist_renderer.render(self.data),
+            wrist_rgb=self.prepare_wrist(wrist_rgb) if self.prepare_wrist is not None else wrist_rgb,
             state8=self.state8,
         )
 
