@@ -10,13 +10,15 @@ and `stretch4_retarget.Stretch4SimEnv` here, the real robot in `run_stretch4_rea
 from __future__ import annotations
 
 import contextlib
+import select
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable, ContextManager, Protocol
 
 import numpy as np
 
-from examples.vla.molmobot_droid.checkpoint import MolmoBotDroidPolicy, limit_joint_delta
+from examples.vla.molmobot_droid.checkpoint import POLICY_DT, MolmoBotDroidPolicy, limit_joint_delta
 from examples.vla.molmobot_droid.droid import Observation
 
 
@@ -120,6 +122,24 @@ class StopFlag:
         self.stop_requested = False
 
 
+def read_line(prompt: str, while_waiting: Callable[[], None] | None = None) -> str:
+    """`input(prompt)`, calling `while_waiting()` every POLICY_DT until a line comes."""
+    if while_waiting is None:
+        return input(prompt)
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    next_call = time.perf_counter()
+    while True:
+        if not select.select([sys.stdin], [], [], max(0.0, next_call - time.perf_counter()))[0]:
+            while_waiting()
+            next_call = max(next_call + POLICY_DT, time.perf_counter())
+            continue
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line
+
+
 def interactive_session(
     env: RobotEnv,
     policy: MolmoBotDroidPolicy,
@@ -132,6 +152,7 @@ def interactive_session(
     handle_command: Callable[[str], bool] | None = None,
     idle: Callable[[], ContextManager] | None = None,
     extra_help: Callable[[], str] | None = None,
+    while_waiting: Callable[[], None] | None = None,
 ) -> None:
     """
     Prompt for instructions and run each until `max_steps`, `on_step` returns True, or Ctrl+C.
@@ -140,7 +161,9 @@ def interactive_session(
     `handle_command` sees every other line first and returns True if it was a command rather
     than an instruction. `idle()` is entered while the prompt (and any command) runs, and left
     before each rollout: a sim can keep running there. `extra_help()` is printed under the
-    usage line, which is shown at the start and after every rollout.
+    usage line, which is shown at the start and after every rollout. `while_waiting()` is
+    called on this thread at the policy's rate while the prompt waits for a line, e.g. to log
+    the cameras.
     """
     stop = StopFlag()
     stop.install()
@@ -157,7 +180,7 @@ def interactive_session(
     while True:
         with idle() if idle is not None else contextlib.nullcontext():
             try:
-                text = input("instruction> ").strip()
+                text = read_line("instruction> ", while_waiting).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return
