@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import select
 import sys
 import threading
 from typing import Callable
@@ -89,9 +90,16 @@ class Console:
             self.queue.put(("text", "quit"))
             return
         while True:
+            # Woken now and then to see whether close() was called, so the thread ends with it.
+            if not select.select([sys.stdin], [], [], 0.1)[0]:
+                if self._terminal is None:
+                    return
+                continue
             # A key press at a time: an arrow key's escape sequence arrives in one read.
             chunk = os.read(sys.stdin.fileno(), 8).decode(errors="ignore")
             with self._lock:
+                if self._terminal is None:
+                    return
                 if not chunk:
                     self.queue.put(("text", "quit"))
                     return

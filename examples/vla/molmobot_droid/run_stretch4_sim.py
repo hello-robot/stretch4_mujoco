@@ -46,6 +46,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     spawn_stretch4,
 )
 from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
+from examples.vla.molmobot_droid.molmospaces.benchmark import allow_ctrl_c
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     STRETCH_ROOT_BODY,
     SceneMirror,
@@ -188,6 +189,7 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     if overlay_franka_gripper:
         sim.watch_bodies(with_nearby_free_bodies(stretch_scene, stretch_scene.watched_bodies))
     sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
+    allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator, leaving this waiting on the console
     env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
     env.overlay_franka_gripper = overlay_franka_gripper
     env.head_follows_tool = head_follows_tool

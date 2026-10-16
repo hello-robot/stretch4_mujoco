@@ -310,3 +310,10 @@ def unload_policy() -> None:
     if _loaded is not None:
         _loaded.close()
         _loaded = None
+    # Loading's progress bars start tqdm's monitor thread, which `Stretch4MujocoSimulator.stop()`
+    # would otherwise wait 10 s on before giving up.
+    from tqdm import tqdm
+
+    if tqdm.monitor is not None:
+        tqdm.monitor.exit()
+        tqdm.monitor = None
