@@ -369,10 +369,16 @@ def generate(stl_path, obj_path, png_path, sensors, ring_obj_path=None):
     # DOME first: a cap face can also face forward, and the cap wins.
     for link in ("lidar_left_link", "lidar_right_link"):
         rows[_cap_faces(mesh, sensors[link])] = DOME
+    # Depth is judged by the face's frontmost vertex, not its centroid. The
+    # plate's lower edge is spanned by a few large transition triangles whose
+    # centroids sit behind the cut even though the triangles reach the plate;
+    # dropping those whole into SHELL is what used to chew wedges out of the
+    # bottom of the face plate.
+    reach = mesh.triangles[:, :, 0].max(axis=1)
     face = (
         (rows == SHELL)
         & (mesh.face_normals[:, 0] > FRONT_COS)
-        & (centres[:, 0] > mesh.bounds[1][0] - FRONT_DEPTH)
+        & (reach > mesh.bounds[1][0] - FRONT_DEPTH)
     )
     rows[face] = FACE
 
