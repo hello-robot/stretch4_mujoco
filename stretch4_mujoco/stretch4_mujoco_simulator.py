@@ -7,12 +7,14 @@ from mujoco._structs import MjModel
 from stretch4_urdf import get_urdf
 
 import stretch4_mujoco.utils as utils
-from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity
+from stretch4_mujoco.datamodels.status_command import CommandBaseVelocity, CommandLedRing
 from stretch4_mujoco.datamodels.status_stretch_camera import StatusStretchCameras
 from stretch4_mujoco.enums.actuators import Actuators
+from stretch4_mujoco.enums.led_ring import LedRingAnimation
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.stretch_mujoco_simulator import StretchMujocoSimulator
 from stretch4_mujoco.utils import block_until_check_succeeds, require_connection
+from stretch4_mujoco.models.stretch_4.head_texture import LED_RING_DEFAULT_RGBA
 
 
 
@@ -93,6 +95,50 @@ class Stretch4MujocoSimulator(StretchMujocoSimulator):
 
         self.T_base_left = self.urdf_model.get_transform(joint_positions, "lidar_left_link")
         self.T_base_right = self.urdf_model.get_transform(joint_positions, "lidar_right_link")
+
+    @require_connection
+    def set_led_ring(
+        self,
+        color: tuple[float, float, float] | None = None,
+        animation: LedRingAnimation | str = LedRingAnimation.solid,
+        period_s: float = 2.0,
+        alpha: float = 1.0,
+    ) -> None:
+        """
+        Set the colour and animation of the LED rings around the head cameras.
+
+        The rings are purely visual -- nothing in the physics reads them.
+
+        Args:
+            color: (r, g, b) in 0..1. None keeps the robot's default violet.
+            animation: `LedRingAnimation.solid` holds the colour,
+                `pulse` fades it in and out, `blink` switches it on and off,
+                and `off` turns the rings dark.
+            period_s: seconds for one cycle of `pulse` or `blink`, in sim time.
+            alpha: opacity of the rings, 0..1.
+
+        Example::
+
+            sim.set_led_ring((0.0, 1.0, 0.4), LedRingAnimation.pulse, period_s=1.5)
+        """
+        if color is None:
+            color = LED_RING_DEFAULT_RGBA[:3]
+        if len(color) != 3:
+            raise ValueError(f"color must be (r, g, b), got {color!r}")
+        if period_s <= 0:
+            raise ValueError(f"period_s must be positive, got {period_s}")
+
+        with self._command_lock:
+            command = self.data_proxies.get_command()
+            command.set_led_ring(
+                CommandLedRing(
+                    rgba=(float(color[0]), float(color[1]), float(color[2]), float(alpha)),
+                    animation=LedRingAnimation(animation).value,
+                    period_s=float(period_s),
+                    trigger=True,
+                )
+            )
+            self.data_proxies.set_command(command)
 
     @staticmethod
     def get_scene_xml_path() -> str:
