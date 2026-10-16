@@ -6,6 +6,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 import mujoco
 
+from stretch4_mujoco.enums.line_sensor import (
+    LINE_SENSOR_MAX_RANGE_M,
+    LINE_SENSOR_FOV_DEG,
+    LINE_SENSOR_NUM_BINS,
+    NUM_LINE_SENSORS,
+    LineSensorCode,
+    line_sensor_site_name,
+)
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
 from stretch4_mujoco.datamodels.status_stretch_sensors import StatusStretchSensors
 from stretch4_mujoco.utils import FpsCounter
@@ -87,6 +95,96 @@ class NativeMjLidar:
         return self._dist if self._dist is not None else np.empty(0)
 
 
+class NativeMjLineSensors:
+    """
+    Ray casts the six base line sensors with `mujoco.mj_multiRay`.
+
+    Each sensor fans `LINE_SENSOR_NUM_BINS` rays across `LINE_SENSOR_FOV_DEG`
+    in the plane of its site's x (boresight) and y (across the fan) axes. Like
+    the real sensor, a bin reports depth along the boresight, not ray length,
+    so a flat floor reads the same range in every bin.
+    """
+
+    def __init__(
+        self,
+        mj_model: mujoco.MjModel,
+        geomgroup: np.ndarray,
+        bodyexclude: int,
+        max_range: float = LINE_SENSOR_MAX_RANGE_M,
+        cutoff_dist: float = 5.0,
+    ):
+        self.mj_model = mj_model
+        self.geomgroup = geomgroup
+        self.bodyexclude = bodyexclude
+        self.max_range = max_range
+        self.cutoff_dist = cutoff_dist
+
+        self.site_ids = [
+            mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, line_sensor_site_name(i))
+            for i in range(NUM_LINE_SENSORS)
+        ]
+        if -1 in self.site_ids:
+            raise ValueError("The model is missing a line sensor site.")
+
+        # Bin 0 is the left edge of the fan (+y), as the real robot orders them.
+        half_fov = np.deg2rad(LINE_SENSOR_FOV_DEG) / 2
+        fan_angles = np.linspace(half_fov, -half_fov, LINE_SENSOR_NUM_BINS)
+        self._cos_fan = np.cos(fan_angles)
+        self._local_vecs = np.stack(
+            (self._cos_fan, np.sin(fan_angles), np.zeros(LINE_SENSOR_NUM_BINS)), axis=-1
+        )
+
+        self._dist = np.zeros(LINE_SENSOR_NUM_BINS, dtype=np.float64)
+        self._geomid = np.zeros(LINE_SENSOR_NUM_BINS, dtype=np.int32)
+
+    def trace(
+        self, mj_data: mujoco.MjData, root_body_id: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns `(ranges, codes, points)`, see the `line_sensor_*` fields of
+        `StatusStretchSensors`. Points are expressed in `root_body_id`'s frame.
+        """
+        shape = (NUM_LINE_SENSORS, LINE_SENSOR_NUM_BINS)
+        ranges = np.full(shape, np.nan)
+        codes = np.full(shape, LineSensorCode.valid, dtype=np.uint8)
+        points = np.full((*shape, 3), np.nan)
+
+        root_pos = mj_data.xpos[root_body_id]
+        root_mat = mj_data.xmat[root_body_id].reshape(3, 3)
+
+        for i, site_id in enumerate(self.site_ids):
+            site_pos = mj_data.site_xpos[site_id]
+            world_vecs = self._local_vecs @ mj_data.site_xmat[site_id].reshape(3, 3).T
+
+            mujoco.mj_multiRay(
+                m=self.mj_model,
+                d=mj_data,
+                pnt=site_pos.astype(np.float64).reshape(3, 1),
+                vec=world_vecs.flatten(),
+                geomgroup=self.geomgroup,
+                flg_static=1,
+                bodyexclude=self.bodyexclude,
+                geomid=self._geomid,
+                dist=self._dist,
+                normal=None,
+                nray=LINE_SENSOR_NUM_BINS,
+                cutoff=self.cutoff_dist,
+            )
+
+            is_hit = self._geomid != -1
+            depth = self._dist * self._cos_fan
+            is_valid = is_hit & (depth <= self.max_range)
+
+            codes[i, ~is_hit] = LineSensorCode.no_return
+            codes[i, is_hit & ~is_valid] = LineSensorCode.beyond_limit
+            ranges[i, is_valid] = depth[is_valid]
+
+            world_pts = site_pos + world_vecs[is_valid] * self._dist[is_valid, np.newaxis]
+            points[i, is_valid] = (world_pts - root_pos) @ root_mat
+
+        return ranges, codes, points
+
+
 class MujocoServerSensorManagerSync:
     """
     Handles rendering scene sensors to a buffer.
@@ -110,7 +208,7 @@ class MujocoServerSensorManagerSync:
 
         self.sensor_lock = threading.Lock()
 
-        # Scratch MjData that the lidar ray casting runs against. Tracing 64k
+        # Scratch MjData that the lidar and line sensor ray casting runs against. Tracing 64k
         # rays takes ~50ms, and in the passive viewer the lock guarding mjdata
         # is the viewer lock -- the same one the 100Hz physics thread needs
         # every step. Holding it that long starves physics badly enough to drop
@@ -180,6 +278,19 @@ class MujocoServerSensorManagerSync:
                     )
                 except Exception as e:
                     print(f"Failed to initialize NativeMjLidar for site '{site_name}': {e}")
+
+        # The line sensors point down at the floor from the rim of the base, so
+        # they see the scene and the robot (a lowered gripper, say) but not the
+        # base shell their emitters sit on.
+        self.line_sensors: NativeMjLineSensors | None = None
+        if StretchSensors.line_sensors in self.sensors_to_use:
+            self.line_sensors = NativeMjLineSensors(
+                self.mujoco_server.mjmodel,
+                geomgroup=scene_and_robot_geomgroup,
+                bodyexclude=mujoco.mj_name2id(
+                    self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_BODY, "base_link"
+                ),
+            )
 
         # Initialize native MuJoCo LiDAR wrapper for 2D base lidar if site 'lidar' exists
         site_id_base = mujoco.mj_name2id(self.mujoco_server.mjmodel, mujoco.mjtObj.mjOBJ_SITE, "lidar")
@@ -325,14 +436,15 @@ class MujocoServerSensorManagerSync:
                         )
                     else:
                         data = self._compute_lidar_rays()
+                elif sensor == StretchSensors.line_sensors:
+                    # Ray cast below, outside the lock.
+                    continue
                 else:
                     data = self.mujoco_server.mjdata.sensor(sensor.name).data
 
                 sensor_status.set_data(sensor, data)
 
-            self.mujoco_server.data_proxies.set_sensors(sensor_status)
-
-            if self.lidar_wrappers:
+            if self.lidar_wrappers or self.line_sensors is not None:
                 # Cheap memcpy so the expensive ray casting below can run with
                 # the physics lock released, see `_lidar_scratch_data`.
                 mujoco.mj_copyData(
@@ -340,6 +452,15 @@ class MujocoServerSensorManagerSync:
                     self.mujoco_server.mjmodel,
                     self.mujoco_server.mjdata,
                 )
+
+        if self.line_sensors is not None:
+            (
+                sensor_status.line_sensor_ranges,
+                sensor_status.line_sensor_codes,
+                sensor_status.line_sensor_points,
+            ) = self.line_sensors.trace(self._lidar_scratch_data, self.root_body_id)
+
+        self.mujoco_server.data_proxies.set_sensors(sensor_status)
 
         if self.lidar_wrappers:
             lidar_pts = self.pull_lidar_points(
