@@ -40,11 +40,9 @@ Usage:
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import math
 import os
-import queue
 import sys
 import threading
 import time
@@ -77,6 +75,7 @@ from examples.vla.molmobot_droid.droid import (
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
+    HEAD_SIDES,
     MIN_BASE_ROTATION,
     PARALLEL_GRIPPER_TOOL,
     SLOW_FACTOR,
@@ -91,6 +90,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     custom_start_link0_height,
     custom_start_option,
     franka_yaw_for_start,
+    head_camera_for_tool,
     overlay_gripper_option,
     params_from_kwargs,
     planar_transform,
@@ -99,8 +99,9 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     stretch_cameras_to_use,
     wrist_view,
 )
+from examples.vla.molmobot_droid.franka_retarget.console import KEYS_HELP, Console, continuous_session
 from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
-from examples.vla.molmobot_droid.rollout import StepInfo, run_rollout
+from examples.vla.molmobot_droid.rollout import StepInfo
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
 IMAGE_PORT = 4409
@@ -115,17 +116,6 @@ PARALLEL_GRIPPER_OPEN_MM = 77.0
 # stretch4_body SE4 default motion profiles; --slow runs at SLOW_FACTOR of them.
 DEFAULT_SPEEDS = {"lift": 0.3, "arm": 0.4, "wrist": 7.0, "base_rotate": 2.0}
 
-
-KEYS_HELP = (
-    "  Type an instruction + Enter   run it (typing another while one runs switches to it)\n"
-    "  Enter or Space                stop the robot where it is\n"
-    "  'home' or 'reset' + Enter       raise the lift, go back to the start pose\n"
-    "  'jog' + Enter                   move the virtual Franka's joints and pedestal with the keys\n"
-    "  'set q1 ... q7' + Enter         raise the lift, go to the Franka at those joints (rad)\n"
-    "  'pose' / 'height <m>' + Enter   print the Franka's joints and pedestal / set the pedestal\n"
-    "  'offset x y z [r yw p]' + Enter set the grasp offset (mm, deg); 'offset' prints it\n"
-    "  'quit' + Enter, or Ctrl+C       stop and exit"
-)
 
 MOTION_SUBSYSTEMS = ["arm", "lift", "omnibase", "end_of_arm"]
 LIFT_RANGE = (0.0, 1.2)
@@ -143,126 +133,6 @@ DEFAULT_RECOVER_AFTER = 10
 
 RETARGET_LOG = f"{rerun_scene.LOG_PATH}/retarget"
 """Rerun entity the actions Stretch could not follow are logged under, one per step."""
-
-HEAD_SIDES = ("left", "right")
-"""The head fisheyes the publisher has to send (--head_camera left,right)."""
-
-
-class Console:
-    """
-    The terminal while the robot runs: a status line at the bottom with what is being typed
-    after it, events printed above it, and commands queued for the control loop as they are
-    typed -- ("stop", None) the moment Enter or Space is pressed on an empty line, ("text",
-    line) when a line is entered. Falls back to plain lines when stdin is not a terminal.
-
-    Inside `keys()`, every key press goes to `read()` instead (the `Keys` jogging takes).
-    """
-
-    PROMPT = click.style("› ", fg="cyan", bold=True)
-
-    def __init__(self):
-        self.queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
-        self._keys: queue.Queue[str] | None = None
-        self._lock = threading.Lock()
-        self._status = ""
-        self._buffer = ""
-        self._terminal = None
-        if sys.stdin.isatty():
-            import termios
-            import tty
-
-            self._terminal = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin)  # keys arrive one at a time; Ctrl+C still interrupts
-        threading.Thread(target=self._read, daemon=True).start()
-        self._render()
-
-    # -- output -------------------------------------------------------------
-
-    def _render(self) -> None:
-        if self._terminal is None:
-            return
-        status = f"{self._status}  " if self._status else ""
-        sys.stdout.write(f"\r\x1b[2K{status}{self.PROMPT}{self._buffer}")
-        sys.stdout.flush()
-
-    def event(self, message: str, color: str | None = None) -> None:
-        """A line above the status line."""
-        with self._lock:
-            if self._terminal is not None:
-                sys.stdout.write("\r\x1b[2K")
-            click.secho(message, fg=color)
-            self._render()
-
-    def status(self, text: str) -> None:
-        with self._lock:
-            self._status = text
-            self._render()
-
-    # -- input --------------------------------------------------------------
-
-    def _read(self) -> None:
-        if self._terminal is None:
-            for line in sys.stdin:
-                text = line.strip()
-                self.queue.put(("text", text) if text else ("stop", None))
-            self.queue.put(("text", "quit"))
-            return
-        while True:
-            # A key press at a time: an arrow key's escape sequence arrives in one read.
-            chunk = os.read(sys.stdin.fileno(), 8).decode(errors="ignore")
-            with self._lock:
-                if not chunk:
-                    self.queue.put(("text", "quit"))
-                    return
-                if self._keys is not None:
-                    self._keys.put(chunk)
-                    continue
-                for char in chunk:
-                    if char in ("\n", "\r") or (char == " " and not self._buffer):
-                        text, self._buffer = self._buffer.strip(), ""
-                        self.queue.put(("text", text) if text else ("stop", None))
-                    elif char in ("\x7f", "\b"):
-                        self._buffer = self._buffer[:-1]
-                    elif char.isprintable():
-                        self._buffer += char
-                self._render()
-
-    def pending(self) -> bool:
-        return not self.queue.empty()
-
-    def get(self) -> tuple[str, str | None]:
-        return self.queue.get()
-
-    @contextlib.contextmanager
-    def keys(self):
-        """Every key press to `read()` until left, and `show()` on the status line."""
-        if self._terminal is None:
-            raise RuntimeError("Jogging needs a terminal")
-        with self._lock:
-            self._keys = queue.Queue()
-        try:
-            yield self
-        finally:
-            with self._lock:
-                self._keys = None
-            self.status("")
-
-    def read(self) -> str:
-        return self._keys.get()
-
-    def show(self, text: str) -> None:
-        self.status(text)
-
-    def close(self) -> None:
-        if self._terminal is not None:
-            import termios
-
-            with self._lock:
-                sys.stdout.write("\r\x1b[2K")
-                sys.stdout.flush()
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._terminal)
-                self._terminal = None
-
 
 def _start_client(robot_ip: str):
     from stretch4_body.robot.robot_client import RobotClient
@@ -338,20 +208,6 @@ def rotate_head_image_to_upright(image: np.ndarray, head_camera_side: str) -> np
     if head_camera_side == "right":
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
     return image
-
-
-def head_camera_for_tool(tool_facing: str | None, tool_side: str | None) -> str:
-    """
-    The head fisheye the policy's exo view comes from, by stretch4_body's `end_of_arm` status
-    (see its get_tool_facing() and get_tool_side()): the side the tool points toward, or,
-    pointing ahead, the side of the arm it is on; right when that is the centre too, or the
-    status has neither.
-    """
-    if tool_facing in HEAD_SIDES:
-        return tool_facing
-    if tool_side in HEAD_SIDES:
-        return tool_side
-    return "right"
 
 
 def _decode(message: dict, *keys: str) -> np.ndarray | None:
@@ -887,93 +743,6 @@ class LiveView:
         self._thread.join(timeout=1.0)
 
 
-def start_pose_command(editor: StretchStartPoseEditor, text: str, console: Console) -> bool:
-    """Run `text` if it is a start pose command (the editor's), and say whether it was."""
-    try:
-        return editor.handle_command(text)
-    except RuntimeError as error:  # e.g. jogging without a terminal
-        console.event(f"◆ {error}", "red")
-        return True
-    finally:
-        console.status("")
-
-
-def continuous_session(
-    env: RealStretch4Env,
-    policy,
-    params: RetargetParams,
-    max_steps: int,
-    on_step,
-    console: Console,
-    editor: StretchStartPoseEditor,
-) -> None:
-    """
-    The control loop: runs the current instruction until a key says otherwise (KEYS_HELP),
-    indefinitely unless `max_steps` > 0. The start pose commands go to `editor`.
-
-    Every action Stretch cannot follow is printed, and the first of a run of twisted ones.
-    """
-    env.interrupted = console.pending
-    env.say = console.event
-    command = console.get()
-    while True:
-        kind, text = command
-        if kind == "stop":
-            env.stop_motion()
-            console.status("")
-            console.event("■ stopped", "yellow")
-        elif text in ("quit", "exit", "q"):
-            return
-        elif text == "reset":
-            console.status(click.style("◆ going to the start pose", fg="yellow"))
-            try:
-                env.go_home()
-                console.event("◆ start pose" if not console.pending() else "◆ start pose (interrupted)", "yellow")
-            except RuntimeError as error:
-                console.event(f"◆ {error}", "red")
-            editor.on_move()  # the ghost and Rerun follow
-            console.status("")
-        elif start_pose_command(editor, text, console):
-            pass
-        else:
-            console.event(f"▶ {text}", "green")
-            twisting = False
-
-            def step(info: StepInfo) -> None:
-                nonlocal twisting
-                on_step(info)
-                miss = env.last_miss
-                if miss is not None and (miss.kind == "unreachable" or not twisting):
-                    color = "red" if miss.kind == "unreachable" else "yellow"
-                    console.event(f"  step {info.step}: {miss.describe()}", color)
-                twisting = miss is not None and miss.kind == "twisted"
-                error = env.tool_error_m()
-                retargeter = env.retargeter
-                console.status(
-                    click.style(f"▶ {text}", fg="green")
-                    + click.style(
-                        f"  step {info.step}"
-                        + (f" · tool {error * 1000:.0f} mm off" if error is not None else "")
-                        + (f" · {retargeter.ik_twisted} twisted" if retargeter.ik_twisted else "")
-                        + (f" · {retargeter.ik_failures} unreachable" if retargeter.ik_failures else "")
-                        + (f" · {env.recoveries} recovered" if env.recoveries else "")
-                        + (f" · {env.stale_observations} stale" if env.stale_observations else "")
-                        + "  · Enter/Space stops",
-                        dim=True,
-                    )
-                )
-
-            result = run_rollout(
-                env, policy, text, params.execute_horizon, params.execute_first_n,
-                max_steps if max_steps > 0 else 10**12, step, should_stop=console.pending,
-            )
-            if not console.pending():
-                env.stop_motion()
-                console.status("")
-                console.event(f"■ done after {result.steps} steps", "yellow")
-        command = console.get()
-
-
 @click.command()
 @click.option("--robot_ip", "--robot-ip", "robot_ip", required=True, help="Stretch 4's IP address.")
 @click.option("--object-height", type=float, default=0.80, show_default=True,
@@ -1086,7 +855,7 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
             say=console.event,
             on_move=lambda: log_frame(env.observe()),
         )
-        continuous_session(env, policy, params, max_steps, log_step, console, editor)
+        continuous_session(env, policy, params, max_steps, log_step, console, editor, reset=env.go_home)
     except KeyboardInterrupt:
         pass
     finally:

@@ -27,6 +27,7 @@ import functools
 import math
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import click
 import cv2
@@ -129,8 +130,8 @@ PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 DEFAULT_GRASP_OFFSET_MM = {
     STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
     # PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0),
-    # PARALLEL_GRIPPER_TOOL: (4.0 + 33, 0, 0),
-    PARALLEL_GRIPPER_TOOL: (4.0, 5.0, 5.0),
+    PARALLEL_GRIPPER_TOOL: (4.0 + 33, 0, 0),
+    # PARALLEL_GRIPPER_TOOL: (4.0, 5.0, 5.0),
     # PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
 }
 """Per tool, along the approach axis: where its fingers close relative to its grasp_center_link,
@@ -430,6 +431,44 @@ def prepare_exo(image: np.ndarray, params: RetargetParams) -> np.ndarray:
     if params.exo_camera in HEAD_CAMERAS and params.head_crop == "droid":
         return to_droid_frame(image)
     return image
+
+
+HEAD_SIDES = ("left", "right")
+"""The head fisheyes the exo view switches between, following the tool (`head_camera_for_tool()`)."""
+
+
+def head_camera_for_tool(tool_facing: str | None, tool_side: str | None) -> str:
+    """
+    The head fisheye the policy's exo view comes from, by stretch4_body's `end_of_arm` status
+    (see its get_tool_facing() and get_tool_side()): the side the tool points toward, or,
+    pointing ahead, the side of the arm it is on; right when that is the centre too, or the
+    status has neither.
+    """
+    if tool_facing in HEAD_SIDES:
+        return tool_facing
+    if tool_side in HEAD_SIDES:
+        return tool_side
+    return "right"
+
+
+@functools.cache
+def _end_of_arm():
+    """stretch4_body's end_of_arm module and its get_wrist_tool_geometry(), read once from the URDF
+    its fleet directory names: `examples.digital_twin.ensure_fleet_directory()`'s stand-in (the
+    simulator's robot) unless HELLO_FLEET_PATH names one."""
+    from examples.digital_twin import ensure_fleet_directory
+
+    ensure_fleet_directory()  # before stretch4_body is imported: RobotParams reads it then
+    from stretch4_body.subsystem.end_of_arm import end_of_arm
+
+    return end_of_arm, end_of_arm.get_wrist_tool_geometry()
+
+
+def tool_facing_and_side(wrist_yaw: float, wrist_pitch: float) -> tuple[str, str]:
+    """(tool_facing, tool_side) as stretch4_body's `end_of_arm` status reports them for these
+    wrist angles (rad): its get_tool_facing() and get_tool_side()."""
+    end_of_arm, geometry = _end_of_arm()
+    return end_of_arm.get_tool_facing(wrist_yaw, wrist_pitch), end_of_arm.get_tool_side(wrist_yaw, wrist_pitch, *geometry)
 
 
 # ---------------------------------------------------------------------------
@@ -1017,22 +1056,24 @@ def planar_from_pose(pos, quat_wxyz, floor_z: float = 0.0) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def stretch_cameras_to_use(params: RetargetParams):
-    """Only the cameras the policy needs, so the simulator renders nothing else."""
+def stretch_cameras_to_use(params: RetargetParams, exo_camera: str | None = None):
+    """Only the cameras the policy needs, so the simulator renders nothing else: the gripper
+    camera, and the head camera `exo_camera` (default: --exo_camera) if it is one."""
     from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
+    exo_camera = exo_camera or params.exo_camera
     gripper = {
         "left": StretchCameras.cam_gripper_se4_left_rgb,
         "right": StretchCameras.cam_gripper_se4_right_rgb,
     }[params.gripper_camera]
     cameras = [gripper]
-    if params.exo_camera in HEAD_CAMERAS:
+    if exo_camera in HEAD_CAMERAS:
         # The simulator's center camera is the low-resolution one unless asked otherwise, and
         # it is reported under `cam_nav_rgb_se4_center`.
         cameras.append(
             StretchCameras.cam_nav_rgb_se4_center
-            if params.exo_camera == "center"
-            else HEAD_CAMERAS[params.exo_camera]
+            if exo_camera == "center"
+            else HEAD_CAMERAS[exo_camera]
         )
     return cameras
 
@@ -1044,10 +1085,11 @@ SPAWN_ARM_EXTENSION = 0.2
 """m. Stretch's arm goes this far out as it starts, nearer where the Franka's start poses need it."""
 
 
-def spawn_stretch4(stretch_scene, params: RetargetParams):
+def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool = False):
     """
     A `Stretch4MujocoSimulator` for a `custom_scene.Stretch4Scene` (not started), rendering only
-    the cameras `params` needs and publishing the robot's and the target object's poses.
+    the cameras `params` needs (with `both_head_sides`, both side head fisheyes, for
+    `Stretch4SimEnv.head_follows_tool`) and publishing the robot's and the target object's poses.
 
     Stretch spawns with its lift SPAWN_LIFT_FRACTION up, and homes its arm SPAWN_ARM_EXTENSION out
     (see `spawn_with_arm_out()`): at the model's lift of 0 the gripper is often under a table,
@@ -1056,11 +1098,10 @@ def spawn_stretch4(stretch_scene, params: RetargetParams):
     from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
     spawn_with_arm_out(stretch_scene.model, SPAWN_LIFT_FRACTION, SPAWN_ARM_EXTENSION)
-    sim = Stretch4MujocoSimulator(
-        model=stretch_scene.model,
-        cameras_to_use=stretch_cameras_to_use(params),
-        tool_name=params.tool_name,
-    )
+    cameras = stretch_cameras_to_use(params)
+    if both_head_sides:
+        cameras = [cameras[0], *(HEAD_CAMERAS[side] for side in HEAD_SIDES)]
+    sim = Stretch4MujocoSimulator(model=stretch_scene.model, cameras_to_use=cameras, tool_name=params.tool_name)
     sim.watch_bodies(stretch_scene.watched_bodies)
     return sim
 
@@ -1169,8 +1210,37 @@ class Stretch4SimEnv:
         """Show the policy the Franka in place of Stretch: the Robotiq's fingers for Stretch's
         gripper in the wrist view, the whole Franka for Stretch's arm in the exo view
         (`SceneMirror.render_with_franka()`; needs the ghost Franka)."""
+        self.head_follows_tool = False
+        """The exo view from the side head fisheye the tool is toward (`head_camera_for_tool()`),
+        as on the real robot, rather than --exo_camera's. Needs the simulator rendering both
+        (`spawn_stretch4(both_head_sides=True)`)."""
+        self.exo_camera = params.exo_camera
+        """Where the exo view comes from now: --exo_camera, or with `head_follows_tool` the side
+        `update_exo_side()` last picked."""
+        self.on_exo_side_change: Callable[[str, str, str], None] = lambda side, facing, tool_side: None
+        """Called with (the new side, tool_facing, tool_side) when `head_follows_tool` switches."""
 
     # -- state ------------------------------------------------------------
+
+    @property
+    def last_miss(self) -> ReachMiss | None:
+        """Why the last step's action was twisted or unreachable."""
+        return self.retargeter.last_miss
+
+    def cameras(self) -> list:
+        """The simulator cameras the policy's views come from now: gripper, then any head camera."""
+        return stretch_cameras_to_use(self.params, self.exo_camera)
+
+    def update_exo_side(self, joints: StretchJoints) -> None:
+        """With `head_follows_tool`, point `exo_camera` at the head fisheye on the tool's side at
+        `joints` (`tool_facing_and_side()`)."""
+        if not self.head_follows_tool:
+            return
+        facing, side = tool_facing_and_side(joints.wrist_yaw, joints.wrist_pitch)
+        exo_camera = head_camera_for_tool(facing, side)
+        if exo_camera != self.exo_camera:
+            self.exo_camera = exo_camera
+            self.on_exo_side_change(exo_camera, facing, side)
 
     def world_from_footprint(self) -> np.ndarray:
         pos, quat = self.sim.pull_body_poses()["stretch4"]
@@ -1198,7 +1268,7 @@ class Stretch4SimEnv:
         counting a timeout in `stale_observations`.
         """
         since = self.sim.pull_status().time
-        cameras = stretch_cameras_to_use(self.params)
+        cameras = self.cameras()
         deadline = time.monotonic() + FRESH_OBSERVATION_TIMEOUT
         while True:
             # The status first: it is cheap, and the frames cannot be newer than it.
@@ -1215,7 +1285,7 @@ class Stretch4SimEnv:
         """(head image or None, gripper image), RGB and upright, as the simulator renders them,
         from `cameras` (default: the newest camera data)."""
         cameras = cameras or self.sim.pull_camera_data()
-        gripper_camera, *head = stretch_cameras_to_use(self.params)
+        gripper_camera, *head = self.cameras()
         gripper = cameras.get_camera_data(gripper_camera, auto_correct_rgb=False)
         head_image = cameras.get_camera_data(head[0], auto_correct_rgb=False) if head else None
         return head_image, gripper
@@ -1225,10 +1295,12 @@ class Stretch4SimEnv:
         status = self.sim.pull_status()
         poses = self.sim.pull_body_poses()
         footprint = planar_from_pose(*poses["stretch4"], self.stretch_scene.scene.floor_z)
-        state8, self.ik_converged = self.retargeter.stretch_to_franka(footprint, self.joints(status))
+        joints = self.joints(status)
+        state8, self.ik_converged = self.retargeter.stretch_to_franka(footprint, joints)
         self.reverse_ik_failures += not self.ik_converged
         self.mirror.update(status, poses)
         self.mirror.set_ghost(state8[:7])
+        self.update_exo_side(joints)
 
         head, gripper = self.camera_images(cameras)
         if self.params.exo_camera == "droid":
@@ -1242,7 +1314,7 @@ class Stretch4SimEnv:
         else:
             if self.overlay_franka_gripper:
                 # The head camera with the Franka in place of Stretch's arm.
-                head_camera = stretch_cameras_to_use(self.params)[1]
+                head_camera = self.cameras()[1]
                 exo = prepare_exo(self.mirror.render_with_franka(head_camera, state8[7], "franka"), self.params)
             else:
                 exo = prepare_exo(head, self.params)
@@ -1251,7 +1323,7 @@ class Stretch4SimEnv:
             extra["head_raw"] = head
         if self.overlay_franka_gripper:
             # The policy's wrist view with the Franka's gripper where it is told its hand is.
-            gripper = self.mirror.render_with_franka(stretch_cameras_to_use(self.params)[0], state8[7], "fingers")
+            gripper = self.mirror.render_with_franka(self.cameras()[0], state8[7], "fingers")
         return Observation(exo_rgb=exo, wrist_rgb=wrist_view(gripper), state8=state8, extra_cameras=extra)
 
     def tool_error_m(self) -> float | None:
@@ -1289,6 +1361,15 @@ class Stretch4SimEnv:
         sim.end_of_arm.wrist_pitch.move_to(targets.wrist_pitch, v_m=joint_speed("wrist_pitch", params))
         sim.end_of_arm.wrist_roll.move_to(targets.wrist_roll, v_m=joint_speed("wrist_roll", params))
         self.send_gripper(targets.gripper_closed)
+
+    def stop_motion(self) -> None:
+        """Hold every joint where it is now."""
+        status = self.sim.pull_status()
+        self.sim.base.set_velocity(0.0, 0.0, 0.0)
+        self.sim.lift.move_to(status.lift.pos)
+        self.sim.arm.move_to(status.arm.pos)
+        for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
+            getattr(self.sim.end_of_arm, joint).move_to(getattr(status, joint).pos)
 
     def send_gripper(self, closed: bool) -> None:
         if closed == self._gripper_closed:

@@ -186,7 +186,7 @@ All are run as modules from the repo root, e.g. `python -m examples.vla.molmobot
 
 | Script | |
 |---|---|
-| `run_franka.py` | Franka DROID in a MolmoSpaces house (`--scene-id procthor-10k/val/0 --object-type mug`). Type instructions; watch in the passive viewer and Rerun. |
+| `run_franka.py` | Franka DROID in a MolmoSpaces house (`--scene-id procthor-10k/val/0 --object-type mug`). Type instructions; watch in the passive viewer and Rerun. `--use_stretch4_gripper` and `--use_stretch4_gripper_camera` swap in Stretch 4's hardware (see below). |
 | `run_stretch4_sim.py` | The same with Stretch 4, plus all the flags above and `--include_franka`. |
 | `run_stretch4_real.py` | The real robot (`--robot_ip`), run continuously: type an instruction + Enter and it works on it until told otherwise. Typing another instruction switches to it; Enter or Space on an empty line stops the robot; `home` raises the lift and returns to the start pose; `quit` or Ctrl+C exits. `--max-steps` (default 0, unlimited) caps an instruction. Needs `send_gripper_and_head_images_with_joint_states.py -r` from stretch4_compliant_gripper running on the robot, with the camera sides matching the flags. `--object-height` sets the virtual Franka's height. |
 | `run_benchmark_franka.py` | A MolmoSpaces benchmark on the Franka (default `FrankaPickDroidMiniBench`). `--list` shows what is installed. |
@@ -247,6 +247,63 @@ Other commands at the prompt: `pose` prints the arm's joints and pedestal height
 moves with the arm. In MuJoCo's viewer, the arm also
 follows its Control sliders, or, while paused (Space), its Joint sliders.
 
+### Stretch 4's gripper and gripper camera on the Franka
+
+These two flags test whether the policy copes with Stretch 4's gripper and gripper camera on
+the robot it was trained on. That separates their effect from everything else retargeting
+changes.
+
+```bash
+python -m examples.vla.molmobot_droid.run_franka --use_stretch4_gripper pg4 --use_stretch4_gripper_camera
+```
+
+- `--use_stretch4_gripper sg4|pg4` replaces the Robotiq with the Stretch gripper (SG4) or the
+  parallel gripper (PG4).
+- `--use_stretch4_gripper_camera` makes Stretch 4's left gripper camera the policy's wrist
+  camera, instead of DROID's.
+
+Either flag works alone. Both parts are mounted on the Franka's flange as they are on Stretch
+4's wrist:
+
+- **Gripper:** the tool's `quick_connect_interface_link` (its mating face; all of the tool is in
+  front of it) goes on the flange, where the Robotiq's `gripper/base` attaches. It is turned as
+  retargeting turns the tool to the Franka's TCP (`TCP_ALIGN`): it approaches along the flange's
+  axis, with the fingers on the Robotiq's finger axis.
+- **TCP:** the policy's TCP, `grasp_site`, stays where the Robotiq's is, 155 mm from the
+  flange. The tool's own grasp center ends up further out: 235 mm for SG4 and 167 mm for PG4.
+  Retargeting's grasp offset does not apply here.
+- **Camera:** it goes where it is on Stretch 4 relative to the quick connect, 57 mm off the
+  flange's axis on the side DROID's camera is. That is the same for either tool, so it is the
+  same with the Robotiq kept.
+- **Gripper command and state:** these stay in the Robotiq's units (0–255 command, driver angle
+  0.003–0.824). They are converted to and from the Stretch fingers as retargeting does, so a
+  grasp that stops on an object reads as partly closed.
+- **Wrist image:** rendered with stretch4_mujoco's intrinsics (640×400), then DROID-framed to
+  640×368, as in retargeting.
+
+The camera's housing reaches 24 mm behind the mating face, beside `fr3_link7`, where on Stretch
+the wrist roll is. So:
+
+- none of Stretch's parts collide with the Franka's arm they are mounted on (they still collide
+  with the scene);
+- the Franka's arm is hidden from the Stretch gripper camera. The exo and scene cameras still
+  show it.
+
+![Stretch 4's grippers on the Franka, seen from outside, from DROID's wrist camera, and from Stretch 4's gripper camera](franka_retarget/docs/stretch4_grippers_on_franka.png)
+
+Each row is one gripper: the stock Robotiq, SG4 and PG4. The columns show:
+
+1. The outside view. The SG4 and PG4 rows also have the Stretch camera on (the black housing).
+2. DROID's wrist camera (`--use_stretch4_gripper` alone).
+3. Stretch 4's gripper camera (with `--use_stretch4_gripper_camera`).
+
+The camera images are what the policy is given.
+
+The code is in `franka_retarget/stretch4_hardware_on_franka.py`. It cuts Stretch 4's MJCF down
+to the wrist roll body, holding the tool and/or the camera, and attaches that to the Franka's
+emptied `gripper/base`, the quick connect on its origin. `gripper/base` keeps `grasp_site` and
+DROID's wrist camera.
+
 ## Tests
 
 ```bash
@@ -272,6 +329,7 @@ python -m pytest examples/vla/molmobot_droid/franka_retarget/test_retargetting.p
 | `molmospaces/custom_scene.py` | Any house plus target object, for either robot; picking a robot pose; the client-side `SceneMirror` that renders cameras Stretch's simulator doesn't have. |
 | `molmospaces/benchmark.py` | Benchmark episodes, success checks, recording and reports. |
 | `franka_retarget/stretch4_retarget.py` | Retargeting, its flags, and the Stretch 4 sim env. |
+| `franka_retarget/stretch4_hardware_on_franka.py` | Stretch 4's gripper and gripper camera on the Franka (`run_franka.py --use_stretch4_gripper`, `--use_stretch4_gripper_camera`), driven in the Robotiq's units. |
 | `franka_retarget/test_retargetting.py` | The 20-pose retargeting test, shown in Rerun. Its `conftest.py` stops the repo root, which is a package named `stretch4_mujoco`, from shadowing the library under pytest. |
 | `rollout.py` | The query/execute loop and the interactive prompt. |
 | `rerun_scene.py` | The Rerun view: the whole house in 3D from the simulated model, cameras, tool target vs. actual. |
