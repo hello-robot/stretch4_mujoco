@@ -656,6 +656,9 @@ class FrankaOverlayView:
     `camera` is one of Stretch's (rendered as stretch4_mujoco renders it, fisheye included,
     with its intrinsics given to `model`) or a camera of `model`'s own, rendered as is. `model`'s
     geom groups, colours and materials are changed only while rendering.
+
+    `hidden_root`, if given, is the body whose subtree is hidden in place of the kind's part of
+    Stretch: for a scene without Stretch, e.g. the Franka the ghost stands in for.
     """
 
     MASK_COLOUR = (1.0, 0.0, 1.0, 1.0)
@@ -664,7 +667,14 @@ class FrankaOverlayView:
     them, by more than this in some channel: segmentation cannot go through the fisheye's
     stitched views."""
 
-    def __init__(self, model: mujoco.MjModel, franka: FrankaSpawn, camera: StretchCameras | str, kind: OverlayKind):
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        franka: FrankaSpawn,
+        camera: StretchCameras | str,
+        kind: OverlayKind,
+        hidden_root: str | None = None,
+    ):
         self.model, self.franka, self.kind = model, franka, kind
         if isinstance(camera, StretchCameras):
             name = camera.camera_name_in_mjcf
@@ -673,7 +683,7 @@ class FrankaOverlayView:
         else:
             size = tuple(int(v) for v in model.cam_resolution[model.camera(camera).id])
             self.renderer = PinholeRenderer(model, camera, size)
-        hidden_root = _OVERLAY_HIDDEN_ROOT[kind]
+        hidden_root = hidden_root or _OVERLAY_HIDDEN_ROOT[kind]
         self.hidden = subtree_geoms(model, hidden_root) if hidden_root else []
         self.ghost = subtree_geoms(model, franka.base_name)
         bodies, self.rgba, materials = franka_visual_look()
@@ -771,14 +781,24 @@ class FrankaDroidEnv:
 
     With a Stretch 4 tool in place of the Robotiq (`spawn.stretch_tool`), `view`'s gripper
     drives and reads it in the Robotiq's units.
+
+    `ghost`, if given, is a ghost Franka (`add_franka_ghost()`) standing where this one stands,
+    for showing what the Franka DROID as it comes would see; its pedestal follows this one's.
     """
 
-    def __init__(self, model: mujoco.MjModel, spawn: FrankaSpawn, scene_camera: str | None = None):
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        spawn: FrankaSpawn,
+        scene_camera: str | None = None,
+        ghost: FrankaSpawn | None = None,
+    ):
         from molmo_spaces.robots.robot_views.franka_droid_view import FrankaDroidRobotView
 
         self.model = model
         self.data = mujoco.MjData(model)
         self.spawn = spawn
+        self.ghost = ghost
         if spawn.stretch_tool is not None:
             from examples.vla.molmobot_droid.franka_retarget.stretch4_hardware_on_franka import (
                 FrankaStretch4ToolRobotView,
@@ -832,6 +852,8 @@ class FrankaDroidEnv:
         model = self.model
         delta = height - self.spawn.pedestal_height
         resize_franka_pedestal(model, self.spawn, height)
+        if self.ghost is not None:
+            resize_franka_pedestal(model, self.ghost, height)
         if self.spawn.exo_camera in HEAD_CAMERAS:
             # It hangs off fr3_link1, whose z is the world's.
             model.cam_pos[model.camera(self.spawn.exo_camera_name).id, 2] -= delta

@@ -54,6 +54,13 @@ SCENE_CAMERA_SIZE = (960, 540)
 DROID_EXO_IN_STRETCH_SCENE = "droid_exo_camera"
 STRETCH_ROOT_BODY = STRETCH_ROOT
 
+INSERTABLE_OBJECTS = {"tennis_ball": "8e4d2af61f1742ce9e43561f9fdba055"}
+"""Objects no MolmoSpaces house has that --object-type can still name, by their Objaverse asset
+uid (from molmospaces' val split): `load_custom_scene()` swaps one in for one of the house's
+own objects (`in_place_of`)."""
+INSERT_DROP_HEIGHT = 0.002
+"""m. An inserted object starts this far above where the object it replaces rested."""
+
 
 @dataclass
 class CustomScene:
@@ -71,10 +78,12 @@ class CustomScene:
     added_objects: dict[str, str] = field(default_factory=dict)
     """Episode additions, {body path: asset xml relative to molmospaces' ASSETS_DIR}."""
     removed_objects: list[str] = field(default_factory=list)
+    object_label: str | None = None
+    """What to call the target, when its body name does not say (an `INSERTABLE_OBJECTS` one)."""
 
     @property
     def object_category(self) -> str:
-        return object_category(self.object_name)
+        return self.object_label or object_category(self.object_name)
 
     def load_spec(self) -> mujoco.MjSpec:
         """A fresh spec of the house with the episode's modifications applied."""
@@ -117,38 +126,120 @@ def free_bodies(model: mujoco.MjModel) -> list[str]:
 
 
 def load_custom_scene(
-    scene_id: str, object_type: str, object_index: int = 0, variant: str = "base"
+    scene_id: str, object_type: str, object_index: int = 0, variant: str = "base",
+    in_place_of: str | None = None,
 ) -> CustomScene:
     """
     Load a MolmoSpaces house and pick the target object.
 
     Args:
         scene_id: "<dataset>/<split>/<house_index>", e.g. "procthor-10k/val/0".
-        object_type: the object's category ("mug", "apple", ...), or an exact body name.
-        object_index: which one, when the house has several of that category (sorted by name).
+        object_type: the object's category ("mug", "apple", ...), or an exact body name, or
+            one of INSERTABLE_OBJECTS, put where `in_place_of` was (see `insert_in_place_of()`).
+        object_index: which one, when the house has several of that category (sorted by name);
+            with an INSERTABLE_OBJECTS one, which `in_place_of`.
+        in_place_of: with an INSERTABLE_OBJECTS `object_type`, the house's object it replaces
+            (a category or a body name, as `object_type`).
     """
     scene_xml = resolve_scene_xml(scene_id, variant)
     model = mujoco.MjModel.from_xml_path(scene_xml)
-    candidates = free_bodies(model)
-    if object_type in candidates:
-        matches = [object_type]
-    else:
-        matches = sorted(n for n in candidates if object_category(n) == object_type.lower())
-    if not matches:
-        categories = sorted({object_category(n) for n in candidates})
-        raise ValueError(f"No '{object_type}' in {scene_id}. Movable categories: {categories}")
-    if object_index >= len(matches):
-        raise ValueError(f"Only {len(matches)} '{object_type}' in {scene_id}: {matches}")
-
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    body = data.body(matches[object_index])
+    insertable = object_type.lower().replace(" ", "_")
+    if insertable in INSERTABLE_OBJECTS:
+        if in_place_of is None:
+            raise ValueError(
+                f"No house has a {insertable}: say which object it goes in place of with --in-place-of "
+                f"(movable categories in {scene_id}: {movable_categories(model)})"
+            )
+        replaced = pick_free_body(model, scene_id, in_place_of, object_index)
+        return insert_in_place_of(scene_id, scene_xml, model, data, insertable, replaced)
+
+    body = data.body(pick_free_body(model, scene_id, object_type, object_index))
     return CustomScene(
         scene_id=scene_id,
         scene_xml=scene_xml,
         object_name=body.name,
         object_pos=body.xpos.copy(),
         object_quat=body.xquat.copy(),
+    )
+
+
+def movable_categories(model: mujoco.MjModel) -> list[str]:
+    return sorted({object_category(n) for n in free_bodies(model)})
+
+
+def pick_free_body(model: mujoco.MjModel, scene_id: str, object_type: str, object_index: int) -> str:
+    """The `object_index`th free body of category `object_type` (sorted by name), or the one
+    named `object_type`."""
+    candidates = free_bodies(model)
+    if object_type in candidates:
+        matches = [object_type]
+    else:
+        matches = sorted(n for n in candidates if object_category(n) == object_type.lower())
+    if not matches:
+        raise ValueError(
+            f"No '{object_type}' in {scene_id}. Movable categories: {movable_categories(model)}, "
+            f"and in place of one of them: {sorted(INSERTABLE_OBJECTS)}"
+        )
+    if object_index >= len(matches):
+        raise ValueError(f"Only {len(matches)} '{object_type}' in {scene_id}: {matches}")
+    return matches[object_index]
+
+
+def world_aabb(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """(min, max) corners of the world-aligned box around the colliding geoms of `body_id` and
+    its children: what it rests on things by."""
+    lows, highs = [], []
+    for geom in range(model.ngeom):
+        if not (model.geom_contype[geom] or model.geom_conaffinity[geom]):
+            continue
+        body = model.geom_bodyid[geom]
+        while body not in (body_id, 0):
+            body = model.body_parentid[body]
+        if body != body_id:
+            continue
+        rotation = data.geom_xmat[geom].reshape(3, 3)
+        center = data.geom_xpos[geom] + rotation @ model.geom_aabb[geom, :3]
+        half = np.abs(rotation) @ model.geom_aabb[geom, 3:]
+        lows.append(center - half)
+        highs.append(center + half)
+    return np.min(lows, axis=0), np.max(highs, axis=0)
+
+
+def insert_in_place_of(
+    scene_id: str, scene_xml: str, model: mujoco.MjModel, data: mujoco.MjData, object_type: str, replaced: str
+) -> CustomScene:
+    """
+    The house with an INSERTABLE_OBJECTS object as the target, in place of its `replaced` free
+    body: centred where `replaced`'s geoms were, resting where their bottom was (dropped from
+    INSERT_DROP_HEIGHT above), upright.
+    """
+    from molmo_spaces.utils.lazy_loading_utils import install_uid
+
+    uid = INSERTABLE_OBJECTS[object_type]
+    asset = mujoco.MjModel.from_xml_path(str(install_uid(uid)))  # first use downloads it
+    asset_data = mujoco.MjData(asset)
+    mujoco.mj_kinematics(asset, asset_data)
+    asset_low, asset_high = world_aabb(asset, asset_data, 1)  # relative to its body at the origin
+
+    low, high = world_aabb(model, data, model.body(replaced).id)
+    center = (low + high) / 2
+    pos = np.array([
+        *(center[:2] - (asset_low[:2] + asset_high[:2]) / 2),
+        low[2] - asset_low[2] + INSERT_DROP_HEIGHT,
+    ])
+    name = f"{object_type.replace('_', '')}_{uid}_0"  # molmospaces' `<category>_<asset>_<ids>`
+    return CustomScene(
+        scene_id=scene_id,
+        scene_xml=scene_xml,
+        object_name=name,
+        object_pos=pos,
+        object_quat=np.array([1.0, 0.0, 0.0, 0.0]),
+        object_poses={name: [*pos, 1.0, 0.0, 0.0, 0.0]},
+        added_objects={name: f"objects/objaverse/{uid}/{uid}.xml"},
+        removed_objects=[replaced],
+        object_label=object_type.replace("_", " "),
     )
 
 
@@ -190,8 +281,12 @@ def add_objects(
                 type=mujoco.mjtJoint.mjJNT_FREE,
                 damping=OBJAVERSE_FREE_JOINT_DEFAULT_DAMPING,
             )
+        # The pose goes on the body, not the frame: `apply_object_poses()` sets the body's pose
+        # to it too, which on top of the frame's would apply it twice.
         pose = object_poses.get(object_name, [0, 0, 0, 1, 0, 0, 0])
-        frame = spec.worldbody.add_frame(pos=pose[:3], quat=pose[3:7])
+        body.pos = list(pose[:3])
+        body.quat = list(pose[3:7])
+        frame = spec.worldbody.add_frame()
         frame.attach_body(body, "/".join(path) + "/" if path else "", "")
 
 
@@ -329,7 +424,8 @@ def load_custom_scene_franka_droid(
     their own and `standing_on_floor=False`, to keep molmospaces' floating 0.58 m pedestal.
     `stretch4_gripper` ("sg4", "pg4") and `stretch4_gripper_camera` put Stretch 4's gripper and
     gripper camera on it in place of the Robotiq and DROID's wrist camera (see
-    `stretch4_hardware_on_franka`).
+    `stretch4_hardware_on_franka`), with a ghost Franka DROID as it comes (`env.ghost`, its wrist
+    camera kept) standing in the same place, to show what it would see (`RobotiqGhost`).
     """
     spec = scene.load_spec()
     spawn = spawn_franka_droid(
@@ -344,8 +440,13 @@ def load_custom_scene_franka_droid(
         from examples.vla.molmobot_droid.franka_retarget.stretch4_hardware_on_franka import put_stretch4_hardware_on
 
         put_stretch4_hardware_on(spec, spawn, stretch4_gripper, stretch4_gripper_camera)
+        ghost = add_franka_ghost(
+            spec, robot_pose, spawn.world_from_link0[2, 3], floor_z=scene.floor_z, keep_wrist_camera=True
+        )
+    else:
+        ghost = None
     add_scene_camera(spec, robot_pose, scene.object_pos)
-    return FrankaDroidEnv(spec.compile(), spawn, scene_camera=SCENE_CAMERA)
+    return FrankaDroidEnv(spec.compile(), spawn, scene_camera=SCENE_CAMERA, ghost=ghost)
 
 
 # ---------------------------------------------------------------------------
