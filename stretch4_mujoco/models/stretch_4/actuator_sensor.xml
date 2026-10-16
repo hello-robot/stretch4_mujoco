@@ -16,6 +16,7 @@
   <sensor>
     <gyro name="base_gyro" site="imu" />
     <accelerometer name="base_accel" site="imu" />
+    <framequat name="base_quat" objtype="site" objname="imu" />
   </sensor>
 
 </mujoco>
