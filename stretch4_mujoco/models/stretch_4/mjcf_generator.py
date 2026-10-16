@@ -33,6 +33,11 @@ PARALLEL_GRIPPER_BODY_ALIASES = {
     "gripper_fingertip_right_link": None,
 }
 
+# The PG4's printed fin-ray fingers, sampled off the real tool. The body they
+# hang from is the same black as the rest of the wrist, so it is colored by the
+# "pjg_body" entry in the dark-gray list below.
+PARALLEL_GRIPPER_FINGER_RGBA = "0.05 0.62 0.85 1"
+
 
 def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
     """
@@ -108,6 +113,9 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             mesh_name = geom.get("mesh", "")
             if "aruco" in mesh_name:
                 geom.set("rgba", "1 1 1 1")  # Pure white
+            elif mesh_name.startswith("finger_"):
+                # PG4 fin-ray fingers. SG4's are "gripper_finger_*", caught below.
+                geom.set("rgba", PARALLEL_GRIPPER_FINGER_RGBA)
             elif "arm_l4" in mesh_name or "finger_" in mesh_name:
                 geom.set("rgba", "0.9 0.9 0.88 1")  # Off-white / Cream
             elif any(
@@ -117,6 +125,7 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
                     "gripper",
                     "tool",
                     "quick_connect",
+                    "pjg_body",
                     "grasp",
                     "camera",
                     "lidar",
