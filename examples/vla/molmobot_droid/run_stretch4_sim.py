@@ -24,6 +24,7 @@ Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --custom_franka_start_pose
     python -m examples.vla.molmobot_droid.run_stretch4_sim --overlay_franka_gripper
     python -m examples.vla.molmobot_droid.run_stretch4_sim --use_franka_gripper_camera
+    python -m examples.vla.molmobot_droid.run_stretch4_sim --object-type tennis_ball --in-place-of mug
 """
 
 from __future__ import annotations
@@ -168,7 +169,7 @@ def with_nearby_free_bodies(stretch_scene, watched: list[str]) -> list[str]:
 @custom_start_option
 @overlay_gripper_option
 @franka_gripper_camera_option
-def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint, rerun, include_franka,
+def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps, checkpoint, rerun, include_franka,
          custom_franka_start_pose, overlay_franka_gripper, use_franka_gripper_camera, **kwargs):
     params = params_from_kwargs(kwargs)
     # The Robotiq and the Franka's wrist camera are the ghost's.
@@ -176,7 +177,7 @@ def main(scene_id, object_type, object_index, robot_pose, max_steps, checkpoint,
     if overlay_franka_gripper:
         apply_overlay_grasp_offset(params)
         click.secho(f"Grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
-    scene = load_custom_scene(scene_id, object_type, object_index)
+    scene = load_custom_scene(scene_id, object_type, object_index, in_place_of=in_place_of)
     click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
     link0_height = virtual_franka_link0_height(scene)

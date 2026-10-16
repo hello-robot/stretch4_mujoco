@@ -48,7 +48,9 @@ from examples.vla.molmobot_droid.droid import (
     FRANKA_PREFIX,
     GHOST_GEOM_GROUP,
     FrankaKinematics,
+    FrankaOverlayView,
     FrankaSpawn,
+    OverlayKind,
     StretchCameraRenderer,
     apply_stretch_camera_settings,
     body_transform,
@@ -227,6 +229,54 @@ class Stretch4GripperCameraRenderer(StretchCameraRenderer):
             return super().render(data)
         finally:
             self.model.geom_group[self.arm] = saved
+
+
+ROBOTIQ_WRIST_CAMERAS: dict[str, OverlayKind] = {
+    "franka_wrist": "franka_alone",
+    "franka_wrist_with_stretch4": "franka_with_stretch",
+}
+"""What DROID's wrist camera on the Franka DROID as it comes (`RobotiqGhost`) sees, by Rerun
+camera name: without Stretch 4's hardware, and with it in view too."""
+
+
+class RobotiqGhost:
+    """
+    The Franka DROID as it comes, Robotiq and DROID's wrist camera, posed as the Franka with
+    Stretch 4's hardware on it (`env.ghost`, see `load_custom_scene_franka_droid()`): what its
+    wrist camera would see (ROBOTIQ_WRIST_CAMERAS), as `run_stretch4_sim.py` shows for the ghost
+    Franka over Stretch. It is posed in a copy of the sim's data, `data`, which leaves the sim
+    alone and shows the ghost where the arm is in Rerun.
+    """
+
+    def __init__(self, env):
+        self.env = env
+        franka, ghost = env.spawn, env.ghost
+        self.data = mujoco.MjData(env.model)
+        self.joints = [(f"{franka.prefix}fr3_joint{i}", f"{ghost.prefix}fr3_joint{i}") for i in range(1, 8)]
+        self.views = {
+            name: FrankaOverlayView(
+                env.model, ghost, ghost.wrist_camera_name, kind,
+                hidden_root=franka.base_name if kind == "franka_alone" else None,
+            )
+            for name, kind in ROBOTIQ_WRIST_CAMERAS.items()
+        }
+
+    def pose(self) -> MjData:
+        """`data` posed as the sim's, the ghost as the Franka, its Robotiq as open as the tool."""
+        sim, data = self.env.data, self.data
+        data.qpos[:], data.mocap_pos[:], data.mocap_quat[:] = sim.qpos, sim.mocap_pos, sim.mocap_quat
+        for franka, ghost in self.joints:
+            data.joint(ghost).qpos = sim.joint(franka).qpos
+        next(iter(self.views.values())).pose_fingers(data, self.env.state8[7])
+        return data
+
+    def render(self) -> dict[str, np.ndarray]:
+        """The wrist camera's views, of `data` as last posed."""
+        return {name: view.render(self.data) for name, view in self.views.items()}
+
+    def close(self) -> None:
+        for view in self.views.values():
+            view.close()
 
 
 # ---------------------------------------------------------------------------
