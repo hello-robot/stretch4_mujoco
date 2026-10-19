@@ -178,6 +178,7 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
 | `--grasp-offset-deg roll,yaw,pitch` | `0,0,0` | The same, rotations about x, z and y. |
 | `--exo_camera droid\|left\|right\|center` | `left` | The policy's exo view. `droid` is the DROID shoulder camera where the virtual Franka's would be (sim only). |
 | `--gripper_camera left\|right` | `left` | Which gripper camera stands in for the wrist camera. |
+| `--apply_franka_gripper_image_mismatch_fix` | off | Show the policy the gripper camera image as DROID's wrist camera would see the scene: a homography for the 19.5° pitch and focal length difference between the cameras, exact on the plane through the grasp point (what is between the fingers), Stretch's fingers filled out, and the Robotiq drawn in (`franka_retarget/gripper_image_fix.py`). Further out, the cameras being apart leaves parallax: about 30 px at 5 cm past the grasp point, 50 px at 30 cm (against about 110 px without the fix). On the real robot it undoes the gripper camera's lens distortion with its calibration. **For now the left gripper camera's is hardcoded** (`HARDCODED_CALIBRATIONS`, stretch-se4-4024's, used on every robot), and so is how that camera is turned from the model's (`HARDCODED_CAMERA_CORRECTIONS`: 5.4° further down toward the fingers, fitted to the PG4's fingertip tags in one screenshot); otherwise it uses the factory calibration the publisher sends with the images (`camera_matrix`, `distortion_coefficients`), and warns if there is none. Also in `run_franka.py`, with `--use_stretch4_gripper` and `--use_stretch4_gripper_camera`. Not with `--overlay_franka_gripper` or `--use_franka_gripper_camera`. |
 | `--include_franka` | off | Overlay the Franka being driven: see-through, no collisions. Moving in Rerun and the scene camera. In MuJoCo's viewer it is static at home, in geom group 5 (press `5` to show it). It is in group 5 so that none of Stretch's cameras, and so not the policy, can see it. |
 
 ## Scripts
@@ -261,6 +262,8 @@ python -m examples.vla.molmobot_droid.run_franka --use_stretch4_gripper pg4 --us
   parallel gripper (PG4).
 - `--use_stretch4_gripper_camera` makes Stretch 4's left gripper camera the policy's wrist
   camera, instead of DROID's.
+- `--apply_franka_gripper_image_mismatch_fix`, with both, warps that camera's image into DROID's
+  wrist camera's view, as the Stretch 4 scripts do. Rerun's `franka_wrist` shows what it should match.
 
 Either flag works alone. Both parts are mounted on the Franka's flange as they are on Stretch
 4's wrist:
