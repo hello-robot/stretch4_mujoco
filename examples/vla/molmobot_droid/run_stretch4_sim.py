@@ -35,6 +35,7 @@ import numpy as np
 from examples.vla.molmobot_droid import rerun_scene
 from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, build_instruction, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.console import KEYS_HELP, Console, continuous_session
+from examples.vla.molmobot_droid.franka_retarget.gripper_image_fix import reject_with_fix
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
     HEAD_SIDES,
@@ -172,6 +173,11 @@ def with_nearby_free_bodies(stretch_scene, watched: list[str]) -> list[str]:
 def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps, checkpoint, rerun, include_franka,
          custom_franka_start_pose, overlay_franka_gripper, use_franka_gripper_camera, **kwargs):
     params = params_from_kwargs(kwargs)
+    reject_with_fix(
+        params.fix_gripper_image_mismatch,
+        overlay_franka_gripper=overlay_franka_gripper,
+        use_franka_gripper_camera=use_franka_gripper_camera,
+    )
     # The Robotiq and the Franka's wrist camera are the ghost's.
     include_franka = include_franka or overlay_franka_gripper or use_franka_gripper_camera
     if overlay_franka_gripper:

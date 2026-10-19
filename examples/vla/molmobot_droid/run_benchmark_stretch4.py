@@ -28,6 +28,7 @@ import click
 
 from examples.vla.molmobot_droid import rerun_scene
 from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, load_policy, unload_policy
+from examples.vla.molmobot_droid.franka_retarget.gripper_image_fix import reject_with_fix
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
     Stretch4SimEnv,
@@ -65,6 +66,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
         click.echo("\n".join(bench.list_benchmarks()))
         return
     params = params_from_kwargs(kwargs)
+    reject_with_fix(params.fix_gripper_image_mismatch, overlay_franka_gripper=overlay_franka_gripper)
     include_franka = include_franka or overlay_franka_gripper  # the Robotiq is the ghost's
     if overlay_franka_gripper:
         apply_overlay_grasp_offset(params)  # before the run name, which has the offset
