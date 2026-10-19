@@ -10,8 +10,8 @@ fingers for Stretch's gripper in the wrist view, the whole Franka for Stretch's 
 view (as in `run_stretch4_sim.py`).
 
 Writes to <out>/<run name>/: per-episode videos of every camera (the policy's two views,
-Stretch's raw head and gripper cameras, the scene camera), a grid of them with the instruction
-in `grid/` (each episode prints a link to its grid), `report.md`, and `results.json`.
+Stretch's raw head and gripper cameras, the scene camera), a grid of all but the raw cameras
+with the instruction in `grid/` (each episode prints a link to its grid), `report.md`, and `results.json`.
 Retargeting counts (IK failures, clamped targets) are in the report.
 
 Usage:
@@ -42,7 +42,11 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     spawn_stretch4,
 )
 from examples.vla.molmobot_droid.molmospaces import benchmark as bench
-from examples.vla.molmobot_droid.molmospaces.custom_scene import SceneMirror, load_custom_scene_stretch4
+from examples.vla.molmobot_droid.molmospaces.custom_scene import (
+    SceneMirror,
+    load_custom_scene_stretch4,
+    scene_camera_pose,
+)
 from examples.vla.molmobot_droid.run_benchmark_franka import benchmark_options, parse_episodes, print_result
 from examples.vla.molmobot_droid.run_stretch4_sim import (
     RERUN_CAMERAS,
@@ -139,7 +143,10 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                         env.move_to_franka_pose(start_q7)
                         logger = None
                         if rerun:
-                            rerun_scene.new_recording(f"{run.current} {setup.scene.scene_id}: {setup.instruction}")
+                            rerun_scene.new_recording(
+                                f"{run.current} {setup.scene.scene_id}: {setup.instruction}",
+                                eye=scene_camera_pose(stretch_scene.robot_pose, setup.scene.object_pos),
+                            )
                             env.observe()
                             logger = StretchRerunLogger(env)
 
