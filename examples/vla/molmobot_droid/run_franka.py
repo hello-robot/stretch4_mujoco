@@ -23,7 +23,7 @@ scene starts looking at the Franka.
 Usage:
     python -m examples.vla.molmobot_droid.run_franka --scene-id procthor-10k/val/0 --object-type mug
     python -m examples.vla.molmobot_droid.run_franka --robot-pose 5.85,7.57,-1.571 --exo_camera center \\
-        --execute-horizon 8 --execute-horizon-do-only-first-n-steps 2
+        --execute-horizon 8 --execute-horizon-do-only-first-n-steps 8
     python -m examples.vla.molmobot_droid.run_franka --use_stretch4_gripper pg4 --use_stretch4_gripper_camera
     python -m examples.vla.molmobot_droid.run_franka --use_stretch4_gripper pg4 --use_stretch4_gripper_camera \\
         --apply_franka_gripper_image_mismatch_fix

@@ -250,7 +250,7 @@ def execution_options(function):
         "--execute-horizon-do-only-first-n-steps",
         "execute_first_n",
         type=int,
-        default=2,
+        default=8,
         show_default=True,
         help="Of the actions kept, execute this many, then discard the rest and query again.",
     )(function)
