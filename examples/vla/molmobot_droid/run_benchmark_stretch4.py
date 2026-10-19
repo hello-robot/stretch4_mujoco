@@ -52,6 +52,14 @@ from examples.vla.molmobot_droid.run_stretch4_sim import (
 )
 
 
+def failed_result(index: int, setup, error: Exception) -> bench.EpisodeResult:
+    """The result of an episode that could not run, with `error` as its reason."""
+    return bench.EpisodeResult(
+        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
+        error=f"{type(error).__name__}: {error}",
+    )
+
+
 @click.command()
 @benchmark_options
 @retarget_options
@@ -100,14 +108,20 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     start_q7 = setup.franka_init_qpos or FRANKA_HOME_QPOS
                 # Stretch spawns turned the way the start pose would turn its base, so it does not have to.
                 franka_yaw = franka_yaw_for_start(params, link0_height, start_q7, setup.scene.floor_z)
-                stretch_scene = load_custom_scene_stretch4(
-                    setup.scene,
-                    setup.robot_pose,
-                    include_franka=include_franka,
-                    tool_name=params.tool_name,
-                    link0_height=link0_height,
-                    stretch_yaw=-franka_yaw,
-                )
+                try:
+                    stretch_scene = load_custom_scene_stretch4(
+                        setup.scene,
+                        setup.robot_pose,
+                        include_franka=include_franka,
+                        tool_name=params.tool_name,
+                        link0_height=link0_height,
+                        stretch_yaw=-franka_yaw,
+                    )
+                except RuntimeError as error:  # Stretch 4 cannot stand clear of the scene here
+                    result = failed_result(index, setup, error)
+                    print_result(run.current, result, out_dir)
+                    run.record(result)
+                    continue
                 if stretch_scene.removed_bodies:
                     click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
                 if stretch_scene.backed_off:
@@ -143,10 +157,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     finally:
                         env.close()
                 except Exception as error:  # e.g. Stretch cannot reach the start pose
-                    result = bench.EpisodeResult(
-                        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
-                        error=f"{type(error).__name__}: {error}",
-                    )
+                    result = failed_result(index, setup, error)
                 finally:
                     sim.stop()
                 print_result(run.current, result, out_dir)
