@@ -8,7 +8,7 @@ them with the instruction in `grid/`, `report.md` and `results.json`.
 Usage:
     python -m examples.vla.molmobot_droid.run_benchmark_franka
     python -m examples.vla.molmobot_droid.run_benchmark_franka --exo_camera center \\
-        --execute-horizon 8 --execute-horizon-do-only-first-n-steps 2
+        --execute-horizon 8 --execute-horizon-do-only-first-n-steps 8
     python -m examples.vla.molmobot_droid.run_benchmark_franka --list
 """
 
