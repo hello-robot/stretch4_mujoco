@@ -252,13 +252,15 @@ def video_path(out_dir: Path, prefix: str, camera: str) -> Path:
 
 class EpisodeRecorder:
     """
-    Streams one mp4 per camera, plus a grid of all of them, at the policy rate. Frames are
-    written as they come, so an episode never holds its video in memory. The grid puts the
-    scene camera large on the left, the other cameras beside it, and `title` (the instruction)
-    across the top.
+    Streams one mp4 per camera, plus a grid of them, at the policy rate. Frames are written as
+    they come, so an episode never holds its video in memory. The grid puts the scene camera
+    large on the left, the other cameras but `GRID_EXCLUDED` beside it, and `title` (the
+    instruction) across the top.
     """
 
     GRID_TILE_HEIGHT = 360
+    GRID_EXCLUDED = ("head_raw", "gripper_raw")
+    """Stretch's raw cameras: their own videos are enough, the grid shows the policy's views of them."""
 
     def __init__(self, out_dir: Path, prefix: str, fps: float = POLICY_HZ, title: str = ""):
         self.out_dir = out_dir
@@ -288,7 +290,7 @@ class EpisodeRecorder:
         self._writer("grid").append_data(self._grid(frames))
 
     def _grid(self, frames: dict[str, np.ndarray]) -> np.ndarray:
-        frames = dict(frames)
+        frames = {name: frame for name, frame in frames.items() if name not in self.GRID_EXCLUDED}
         scene = frames.pop("scene", None)
         tiles = [_labelled_tile(frame, name, self.GRID_TILE_HEIGHT) for name, frame in frames.items()]
         grid = None
@@ -544,8 +546,8 @@ def write_report(
         )
     lines += [
         "",
-        f"Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `{GRID_DIR}/<run>_ep<#>_grid.mp4` with every "
-        "camera and the instruction.",
+        f"Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `{GRID_DIR}/<run>_ep<#>_grid.mp4` with the "
+        "policy's views, the scene camera and the instruction.",
         "",
     ]
     path = out_dir / "report.md"

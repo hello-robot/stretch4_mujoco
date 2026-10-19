@@ -172,7 +172,7 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
 | `--wait-for-arrival / --no-wait-for-arrival` | on | Wait for each action to arrive (`wait_command()`) before the next. Never less than one 66 ms step. |
 | `--head-crop droid\|none` | `droid` | Center-crop head images to the 640:368 aspect, then resize to 640x368. |
 | `--execute-horizon` | 8 | How many of the 16 predicted actions to keep. |
-| `--execute-horizon-do-only-first-n-steps` | 2 | Execute this many of those, then query again. |
+| `--execute-horizon-do-only-first-n-steps` | 8 | Execute this many of those, then query again. |
 | `--use_parallel_gripper` | off | Stretch 4 with the parallel jaw gripper (PG4) instead of the Stretch gripper (SG4). Sim only: `run_stretch4_real.py` uses the gripper the robot reports. |
 | `--grasp-offset-mm x,y,z` | `-9,0,0` with SG4; `4,0,0` with PG4 | Stretch's tool relative to the Franka TCP, in the TCP frame (x = approach, y = between the fingers). The defaults line each tool's fingers up with the Robotiq's. The policy never sees it. |
 | `--grasp-offset-deg roll,yaw,pitch` | `0,0,0` | The same, rotations about x, z and y. |
