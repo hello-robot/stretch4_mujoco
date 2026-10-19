@@ -100,6 +100,13 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     wrist_view,
 )
 from examples.vla.molmobot_droid.franka_retarget.console import KEYS_HELP, Console, continuous_session
+from examples.vla.molmobot_droid.franka_retarget.gripper_image_fix import (
+    HARDCODED_CALIBRATIONS,
+    HARDCODED_CAMERA_CORRECTIONS,
+    GripperImageFix,
+    calibration_from_message,
+    reject_with_fix,
+)
 from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
 from examples.vla.molmobot_droid.rollout import StepInfo
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
@@ -447,6 +454,28 @@ class RealStretch4Env:
         self.last_miss: ReachMiss | None = None
         """Why the last step's action was twisted or unreachable (`FrankaStretchRetargeter.last_miss`)."""
         self.check_camera_sides()
+        self.gripper_image_fix: GripperImageFix | None = None
+        if params.fix_gripper_image_mismatch:
+            # Through the lens calibration: hardcoded for now (see HARDCODED_CALIBRATIONS), else
+            # the one the publisher sends with the images.
+            camera = stretch_cameras_to_use(params)[0]
+            calibration = HARDCODED_CALIBRATIONS.get(camera)
+            if calibration is not None:
+                click.secho(f"Gripper image fix: using the HARDCODED {camera.name} calibration (stretch-se4-4024's), "
+                            "not this robot's", fg="yellow")
+            else:
+                calibration = calibration_from_message(self.receiver.latest()[1])
+            if calibration is None:
+                click.secho("The robot's publisher sends no gripper camera calibration: the gripper image fix "
+                            "takes the camera to be a pinhole, and the lens's distortion is left in", fg="yellow")
+            # And where the camera is: the model's, turned as HARDCODED_CAMERA_CORRECTIONS has it for now.
+            correction = HARDCODED_CAMERA_CORRECTIONS.get(camera)
+            if correction is not None:
+                click.secho(f"Gripper image fix: turning the {camera.name} by a HARDCODED {correction} degrees "
+                            "(fitted on stretch-se4-4024), not this robot's", fg="yellow")
+            self.gripper_image_fix = GripperImageFix(
+                params.tool_name, camera, real=True, calibration=calibration, camera_correction=correction
+            )
 
     def check_camera_sides(self) -> None:
         message = self.receiver.receive()
@@ -566,9 +595,13 @@ class RealStretch4Env:
             wrist = self.gripper_overlay.apply(wrist, footprint, joints, state8)
         if side in self.exo_overlays:
             head = self.exo_overlays[side].apply(head, footprint, joints, state8)
+        if self.gripper_image_fix is not None:
+            wrist = self.gripper_image_fix(wrist, state8[7], self.params.tcp_offset)
+        else:
+            wrist = wrist_view(wrist)
         return Observation(
             exo_rgb=prepare_exo(head, self.params),
-            wrist_rgb=wrist_view(wrist),
+            wrist_rgb=wrist,
             state8=state8,
             extra_cameras={"head_raw": message["head_rgbs"][side], "gripper_raw": message["wrist_rgb"]},
         )
@@ -761,6 +794,7 @@ class LiveView:
 def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, custom_franka_start_pose,
          overlay_franka_gripper, **kwargs):
     params = params_from_kwargs(kwargs)
+    reject_with_fix(params.fix_gripper_image_mismatch, overlay_franka_gripper=overlay_franka_gripper)
     if params.exo_camera == "droid":
         raise click.BadParameter("the real robot has no DROID exo camera; its exo view is the head camera on the "
                                  "tool's side", param_hint="--exo_camera")
@@ -798,7 +832,8 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         click.echo(
             click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
             + click.style("Cameras  ", bold=True) + f"head on the tool's side (now {env.exo_side}), gripper {params.gripper_camera}"
-            + (" (head cropped to DROID)" if params.head_crop == "droid" else "") + "\n"
+            + (" (head cropped to DROID)" if params.head_crop == "droid" else "")
+            + (", gripper image matched to DROID's wrist camera" if params.fix_gripper_image_mismatch else "") + "\n"
             + click.style("Motion   ", bold=True) + ("slow" if params.slow else "full speed")
             + (", waiting for each action to arrive" if params.wait_for_arrival else "")
             + f", {params.execute_first_n} of every {params.execute_horizon} predicted actions"
