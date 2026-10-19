@@ -161,6 +161,9 @@ class RetargetParams:
     exo_camera: str = "left"
     gripper_camera: str = "left"
     use_parallel_gripper: bool = False
+    fix_gripper_image_mismatch: bool = False
+    """--apply_franka_gripper_image_mismatch_fix: the policy's wrist view is Stretch's gripper
+    image redrawn as DROID's wrist camera would see it (`gripper_image_fix.GripperImageFix`)."""
 
     def __post_init__(self):
         if not 1 <= self.execute_first_n <= self.execute_horizon <= ACTION_HORIZON:
@@ -195,7 +198,7 @@ class RetargetParams:
 
     def flags(self) -> dict[str, object]:
         """The CLI flags these came from (spelled as on the command line), for reports and run names."""
-        return {
+        flags = {
             "exo_camera": self.exo_camera,
             "gripper_camera": self.gripper_camera,
             **execution_flags(self.execute_horizon, self.execute_first_n),
@@ -206,6 +209,10 @@ class RetargetParams:
             "grasp-offset-mm": ",".join(f"{v:g}" for v in self.effective_grasp_offset_mm),
             "grasp-offset-deg": ",".join(f"{v:g}" for v in self.grasp_offset_deg),
         }
+        # Only when given, so earlier runs keep their names for --resume.
+        if self.fix_gripper_image_mismatch:
+            flags["apply_franka_gripper_image_mismatch_fix"] = True
+        return flags
 
 
 def execution_flags(execute_horizon: int, execute_first_n: int) -> dict[str, int]:
@@ -312,6 +319,21 @@ def overlay_gripper_option(function):
     )(function)
 
 
+def gripper_image_fix_option(function):
+    """--apply_franka_gripper_image_mismatch_fix (see `gripper_image_fix`)."""
+    return click.option(
+        "--apply_franka_gripper_image_mismatch_fix",
+        "--apply-franka-gripper-image-mismatch-fix",
+        "fix_gripper_image_mismatch",
+        is_flag=True,
+        help="Show the policy Stretch's gripper camera image as DROID's wrist camera would see the same "
+        "scene: turned 19.5 degrees toward the fingers and zoomed out to DROID's focal length (both the same "
+        "at every distance, which no grasp offset can match), exactly for what is at the grasp point, "
+        "Stretch's fingers taken out and the Robotiq's drawn in. The grasp offset then only has to line the "
+        "fingers up.",
+    )(function)
+
+
 def apply_overlay_grasp_offset(params: RetargetParams) -> None:
     """With --overlay_franka_gripper: OVERLAY_GRASP_OFFSET_MM's grasp offset, unless one was given.
     Call it once the tool is known, before anything that depends on the offset."""
@@ -364,6 +386,7 @@ def retarget_options(function=None, *, gripper_option: bool = True):
             show_default=True,
             help="Which gripper camera stands in for the Franka's wrist camera.",
         ),
+        gripper_image_fix_option,
     ]
     if gripper_option:
         options.append(
@@ -393,6 +416,7 @@ def params_from_kwargs(kwargs: dict) -> RetargetParams:
         exo_camera=kwargs.pop("exo_camera"),
         gripper_camera=kwargs.pop("gripper_camera"),
         use_parallel_gripper=kwargs.pop("use_parallel_gripper", False),
+        fix_gripper_image_mismatch=kwargs.pop("fix_gripper_image_mismatch"),
     )
 
 
@@ -1222,6 +1246,11 @@ class Stretch4SimEnv:
         `update_exo_side()` last picked."""
         self.on_exo_side_change: Callable[[str, str, str], None] = lambda side, facing, tool_side: None
         """Called with (the new side, tool_facing, tool_side) when `head_follows_tool` switches."""
+        self.gripper_image_fix = None
+        if params.fix_gripper_image_mismatch:
+            from examples.vla.molmobot_droid.franka_retarget.gripper_image_fix import gripper_image_fix
+
+            self.gripper_image_fix = gripper_image_fix(params.tool_name, self.cameras()[0])
 
     # -- state ------------------------------------------------------------
 
@@ -1333,7 +1362,11 @@ class Stretch4SimEnv:
         if self.overlay_franka_gripper:
             # The policy's wrist view with the Franka's gripper where it is told its hand is.
             gripper = self.mirror.render_with_franka(self.cameras()[0], state8[7], "fingers")
-        return Observation(exo_rgb=exo, wrist_rgb=wrist_view(gripper), state8=state8, extra_cameras=extra)
+        if self.gripper_image_fix is not None:
+            wrist = self.gripper_image_fix(gripper, state8[7], self.params.tcp_offset)
+        else:
+            wrist = wrist_view(gripper)
+        return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=extra)
 
     def tool_error_m(self) -> float | None:
         """How far Stretch's tool is from where the policy wants it."""
