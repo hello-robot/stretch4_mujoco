@@ -47,21 +47,18 @@ from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     load_custom_scene_stretch4,
     scene_camera_pose,
 )
-from examples.vla.molmobot_droid.run_benchmark_franka import benchmark_options, parse_episodes, print_result
+from examples.vla.molmobot_droid.run_benchmark_franka import (
+    benchmark_options,
+    failed_result,
+    parse_episodes,
+    print_result,
+)
 from examples.vla.molmobot_droid.run_stretch4_sim import (
     RERUN_CAMERAS,
     StretchRerunLogger,
     include_franka_option,
     with_nearby_free_bodies,
 )
-
-
-def failed_result(index: int, setup, error: Exception) -> bench.EpisodeResult:
-    """The result of an episode that could not run, with `error` as its reason."""
-    return bench.EpisodeResult(
-        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
-        error=f"{type(error).__name__}: {error}",
-    )
 
 
 @click.command()
@@ -121,7 +118,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                         link0_height=link0_height,
                         stretch_yaw=-franka_yaw,
                     )
-                except RuntimeError as error:  # Stretch 4 cannot stand clear of the scene here
+                except Exception as error:  # e.g. Stretch 4 cannot stand clear of the scene here
                     result = failed_result(index, setup, error)
                     print_result(run.current, result, out_dir)
                     run.record(result)

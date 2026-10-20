@@ -36,6 +36,9 @@ from examples.vla.molmobot_droid.molmospaces.custom_scene import CustomScene, re
 from examples.vla.molmobot_droid.rollout import StepInfo, run_rollout
 
 DEFAULT_BENCHMARK = "molmospaces-bench-v2/procthor-10k/FrankaPickDroidMiniBench"
+SCENE_VARIANT = "ceiling"
+"""The house variant molmospaces builds and evaluates benchmarks on (its `house_variant`
+default). The "base" XMLs leave out objects episodes place, sometimes the target itself."""
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +70,27 @@ def resolve_benchmark_dir(benchmark: str) -> Path:
         if builds:
             return builds[0].parent
     raise FileNotFoundError(f"No {dataset}/{name} under {suite_dir}")
+
+
+def benchmark_description(benchmark_dir: Path | str) -> str:
+    """
+    e.g. "`FrankaPickDroidMiniBench_json_benchmark_20251231`, task `PickTask` (molmospaces-bench-v2
+    20260415, procthor-10k, 1000 episodes)": the build, its task and where it comes from.
+    """
+    benchmark_dir = Path(benchmark_dir)
+    details = []
+    if benchmark_dir.parts[-6:-5] == ("benchmarks",):  # benchmarks/<suite>/<version>/<dataset>/<name>/<build>
+        suite, version, dataset = benchmark_dir.parts[-5:-2]
+        details += [f"{suite} {version}", dataset]
+    task = ""
+    metadata = benchmark_dir / "benchmark_metadata.json"
+    if metadata.exists():
+        meta = json.loads(metadata.read_text())
+        tasks = [cls.rsplit(".", 1)[-1] for cls in meta.get("task_cls_counts", {})]
+        task = f", task {', '.join(f'`{t}`' for t in tasks)}" if tasks else ""
+        if meta.get("num_episodes"):
+            details.append(f"{meta['num_episodes']} episodes")
+    return f"`{benchmark_dir.name}`{task}" + (f" ({', '.join(details)})" if details else "")
 
 
 def list_benchmarks() -> list[str]:
@@ -111,7 +135,9 @@ def episode_setup(episode) -> EpisodeSetup:
     object_pose = episode.scene_modifications.object_poses.get(object_name) or task.get("pickup_obj_start_pose")
     scene = CustomScene(
         scene_id=f"{episode.scene_dataset}/{episode.data_split}/{episode.house_index}",
-        scene_xml=resolve_scene_xml(f"{episode.scene_dataset}/{episode.data_split}/{episode.house_index}"),
+        scene_xml=resolve_scene_xml(
+            f"{episode.scene_dataset}/{episode.data_split}/{episode.house_index}", SCENE_VARIANT
+        ),
         object_name=object_name,
         object_pos=np.asarray(object_pose[:3], dtype=float),
         object_quat=np.asarray(object_pose[3:7], dtype=float),
@@ -472,10 +498,12 @@ def write_report(
     started: float,
     stopped_at: str | None = None,
     resume_command: str | None = None,
+    stop_reason: str | None = None,
 ) -> Path:
     """
     `report.md` for people and `results.json` for `compare_benchmarks.py`. `stopped_at` is the
-    episode a Ctrl+C interrupted (not in `results`); the report says how to resume from it.
+    episode a Ctrl+C or a crash (`stop_reason`) interrupted (not in `results`); the report says
+    how to resume from it.
     """
     results = sorted(results, key=lambda r: r.index)
     finished = [r for r in results if r.error is None]
@@ -486,6 +514,7 @@ def write_report(
         "run_name": name,
         "flags": flags,
         "benchmark": str(benchmark_dir),
+        "scene_variant": SCENE_VARIANT,
         "checkpoint": f"{HF_REPO}@{HF_REVISION[:7]}",
         "molmobot_commit": MOLMOBOT_COMMIT[:7],
         "policy_dt_s": POLICY_DT,
@@ -495,6 +524,7 @@ def write_report(
         "success_rate": rate,
         "total_wall_seconds": time.time() - started,
         "stopped_at": stopped_at,
+        "stop_reason": stop_reason,
         "results": [asdict(r) for r in results],
     }
     (out_dir / "results.json").write_text(json.dumps(summary, indent=2, default=float))
@@ -503,12 +533,14 @@ def write_report(
     lines = [
         f"# MolmoBot-DROID benchmark: {robot}",
         "",
+        f"**Benchmark:** {benchmark_description(benchmark_dir)}, `{SCENE_VARIANT}` scenes",
+        "",
         f"**{successes}/{len(results)} succeeded ({rate:.0%})**"
         + (f", {summary['errors']} errored" if summary["errors"] else ""),
         "",
         *(
             [
-                f"> **Stopped early** (Ctrl+C) during `{stopped_at}`, which is not counted. "
+                f"> **Stopped early** ({stop_reason or 'Ctrl+C'}) during `{stopped_at}`, which is not counted. "
                 f"Resume with `--resume {stopped_at}`:",
                 ">",
                 f"> `{resume_command}`",
@@ -611,10 +643,11 @@ class BenchmarkRun:
         self.results.append(result)
         self.write()
 
-    def write(self, stopped_at: str | None = None) -> Path:
+    def write(self, stopped_at: str | None = None, stop_reason: str | None = None) -> Path:
         return write_report(
             self.out_dir, self.robot, self.name, self.flags, self.benchmark_dir, self.results, self.started,
             stopped_at=stopped_at, resume_command=resume_command(stopped_at) if stopped_at else None,
+            stop_reason=stop_reason,
         )
 
     def __enter__(self) -> "BenchmarkRun":
@@ -622,14 +655,16 @@ class BenchmarkRun:
         return self
 
     def __exit__(self, kind, error, traceback_) -> bool:
-        if kind is KeyboardInterrupt:
-            report = self.write(stopped_at=self.current)
-            print(f"\nStopped during {self.current}. Report so far: {report}")
-            if self.current:
-                print(f"Resume with:\n  {resume_command(self.current)}")
-            return True  # handled: the runner returns normally
-        self.write()
-        return False
+        if kind is None:
+            self.write()
+            return False
+        # Ctrl+C or a crash: either way the report says where the run stopped.
+        reason = "Ctrl+C" if kind is KeyboardInterrupt else f"crashed: {kind.__name__}: {str(error)[:200]}"
+        report = self.write(stopped_at=self.current, stop_reason=reason)
+        print(f"\nStopped during {self.current} ({reason}). Report so far: {report}")
+        if self.current:
+            print(f"Resume with:\n  {resume_command(self.current)}")
+        return kind is KeyboardInterrupt  # handled: the runner returns normally; a crash still raises
 
 
 def allow_ctrl_c() -> None:
