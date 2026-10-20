@@ -192,7 +192,7 @@ All are run as modules from the repo root, e.g. `python -m examples.vla.molmobot
 | `run_stretch4_real.py` | The real robot (`--robot_ip`), run continuously: type an instruction + Enter and it works on it until told otherwise. Typing another instruction switches to it; Enter or Space on an empty line stops the robot; `home` raises the lift and returns to the start pose; `quit` or Ctrl+C exits. `--max-steps` (default 0, unlimited) caps an instruction. Needs `send_gripper_and_head_images_with_joint_states.py -r` from stretch4_compliant_gripper running on the robot, with the camera sides matching the flags. `--object-height` sets the virtual Franka's height. |
 | `run_benchmark_franka.py` | A MolmoSpaces benchmark on the Franka (default `FrankaPickDroidMiniBench`). `--list` shows what is installed. |
 | `run_benchmark_stretch4.py` | The same benchmark on Stretch 4. Its footprint goes where each episode puts the Franka's base. Furniture Stretch would spawn inside is removed and listed (`furniture_removed` in the report). The Franka's pedestal there is a mocap body, which static chairs never push on. |
-| `compare_benchmarks.py` | `--franka <run> --stretch4 <run>`: side-by-side videos and `comparison_report.md`. |
+| `compare_benchmarks.py` | `--franka <run> --stretch4 <run> [--stretch4 <run> ...]`, or `--all <dir>` for every run in it: `comparison_report.md`; with `--videos`, each episode's grid videos stacked vertically. |
 
 A benchmark run writes to `outputs/molmobot_droid/<run name>/`. The run name is the robot
 plus the flags, joined with underscores, e.g.

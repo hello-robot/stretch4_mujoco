@@ -52,6 +52,14 @@ def parse_episodes(text: str | None) -> list[int] | None:
     return [int(v) for v in text.split(",")] if text else None
 
 
+def failed_result(index: int, setup, error: Exception) -> bench.EpisodeResult:
+    """The result of an episode that could not run, with `error` as its reason."""
+    return bench.EpisodeResult(
+        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
+        error=f"{type(error).__name__}: {error}",
+    )
+
+
 @click.command()
 @benchmark_options
 @exo_camera_option("droid")
@@ -78,13 +86,19 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
             for index, episode in run.episodes():
                 setup = bench.episode_setup(episode)
                 click.secho(f"[{run.current}] {setup.scene.scene_id}: {setup.instruction}", fg="cyan")
-                env = load_custom_scene_franka_droid(
-                    setup.scene,
-                    setup.robot_pose,
-                    exo_camera=exo_camera,
-                    link0_height=setup.link0_height,
-                    standing_on_floor=False,  # the benchmark's floating 0.58 m pedestal
-                )
+                try:
+                    env = load_custom_scene_franka_droid(
+                        setup.scene,
+                        setup.robot_pose,
+                        exo_camera=exo_camera,
+                        link0_height=setup.link0_height,
+                        standing_on_floor=False,  # the benchmark's floating 0.58 m pedestal
+                    )
+                except Exception as error:  # e.g. the scene lacks a body the episode names
+                    result = failed_result(index, setup, error)
+                    print_result(run.current, result, out_dir)
+                    run.record(result)
+                    continue
                 try:
                     env.reset(setup.franka_init_qpos or FRANKA_HOME_QPOS)
                     result = bench.run_episode(

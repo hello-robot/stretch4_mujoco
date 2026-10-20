@@ -1,17 +1,24 @@
 """
-Compare a Franka DROID benchmark run with a Stretch 4 one: side-by-side videos for every
-episode both ran, and `comparison_report.md` with both runs' flags, success rates and
-per-episode results.
+Compare a Franka DROID benchmark run with one or more Stretch 4 ones: `comparison_report.md`
+with the runs' flags, success rates, head-to-head differences and per-episode results, and with
+--videos, each episode's grid videos stacked top to bottom (Franka first).
 
 Usage:
     python -m examples.vla.molmobot_droid.compare_benchmarks \\
         --franka outputs/molmobot_droid/franka_exo-droid_eh-8_n-2 \\
         --stretch4 outputs/molmobot_droid/stretch4_exo-left_grip-left_eh-8_n-2_...
+    # Several Stretch 4 runs, e.g. with and without a fix, against the same Franka run:
+    python -m examples.vla.molmobot_droid.compare_benchmarks --franka <run> \\
+        --stretch4 <run> --stretch4 <run> --videos
+    # Every run in a directory (one Franka run; pass --franka too if there are several):
+    python -m examples.vla.molmobot_droid.compare_benchmarks --all outputs/molmobot_droid
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+from itertools import combinations
 from pathlib import Path
 
 import click
@@ -19,20 +26,39 @@ import cv2
 import numpy as np
 
 from examples.vla.molmobot_droid.checkpoint import POLICY_HZ
-from examples.vla.molmobot_droid.molmospaces.benchmark import episode_name, video_path
+from examples.vla.molmobot_droid.molmospaces.benchmark import (
+    FLAG_ABBREVIATIONS,
+    benchmark_description,
+    episode_name,
+    video_path,
+)
 
-SIDE_BY_SIDE_CAMERAS = ("grid", "scene")
-TILE_HEIGHT = 540
+LABEL_HEIGHT = 40
 
 
-def load_run(run_dir: Path) -> dict:
+def load_run(run_dir: Path, label: str) -> dict:
     results = run_dir / "results.json"
     if not results.exists():
         raise click.ClickException(f"No results.json in {run_dir}")
     run = json.loads(results.read_text())
     run["dir"] = run_dir
+    run["label"] = label
     run["by_index"] = {r["index"]: r for r in run["results"]}
     return run
+
+
+def stretch_labels(flags: list[dict]) -> list[str]:
+    """ "Stretch 4" for one run; for several, numbered and with the flags that set each apart."""
+    if len(flags) == 1:
+        return ["Stretch 4"]
+    keys = dict.fromkeys(k for f in flags for k in f)
+    differing = [k for k in keys if len({repr(f.get(k)) for f in flags}) > 1]
+    labels = []
+    for n, f in enumerate(flags, 1):
+        parts = [f"{FLAG_ABBREVIATIONS.get(k, k)}-{int(f[k]) if isinstance(f[k], bool) else f[k]}"
+                 for k in differing if k in f]
+        labels.append(f"Stretch 4 #{n}" + (f" ({', '.join(parts)})" if parts else ""))
+    return labels
 
 
 def episode_video(run: dict, index: int, camera: str) -> Path | None:
@@ -51,37 +77,40 @@ def read_frames(path: Path) -> list[np.ndarray]:
         return [frame for frame in reader]
 
 
-def labelled(frame: np.ndarray, label: str, success: bool) -> np.ndarray:
-    tile = cv2.resize(frame, (round(frame.shape[1] * TILE_HEIGHT / frame.shape[0]), TILE_HEIGHT))
+def labelled(frame: np.ndarray, label: str, success: bool, width: int) -> np.ndarray:
+    """`frame` at `width`, under a bar naming its run and outcome."""
+    if frame.shape[1] != width:
+        frame = cv2.resize(frame, (width, round(frame.shape[0] * width / frame.shape[1])))
+    bar = np.zeros((LABEL_HEIGHT, width, 3), np.uint8)
     color = (60, 220, 60) if success else (230, 60, 60)
-    cv2.rectangle(tile, (0, 0), (tile.shape[1], 40), (0, 0, 0), -1)
-    cv2.putText(tile, f"{label}: {'success' if success else 'fail'}", (10, 28),
+    cv2.putText(bar, f"{label}: {'success' if success else 'fail'}", (10, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-    return tile
+    return np.vstack([bar, frame])
 
 
-def write_side_by_side(left: Path, right: Path, out: Path, left_label, right_label, left_ok, right_ok) -> None:
-    """Both videos next to each other; the shorter one holds its last frame."""
+def write_stacked(videos: list[Path], out: Path, labels: list[str], successes: list[bool]) -> None:
+    """The videos one above the other at the first one's width; the shorter ones hold their last frame."""
     import imageio.v2 as imageio
 
-    a, b = read_frames(left), read_frames(right)
-    length = max(len(a), len(b))
+    clips = [read_frames(v) for v in videos]
+    width = clips[0][0].shape[1]
+    length = max(len(c) for c in clips)
     with imageio.get_writer(out, fps=POLICY_HZ, codec="libx264", quality=7, macro_block_size=8) as writer:
         size = None
         for i in range(length):
-            frame = np.hstack(
-                [labelled(a[min(i, len(a) - 1)], left_label, left_ok), labelled(b[min(i, len(b) - 1)], right_label, right_ok)]
+            frame = np.vstack(
+                [labelled(c[min(i, len(c) - 1)], label, ok, width) for c, label, ok in zip(clips, labels, successes)]
             )
             if size is None:
                 size = (frame.shape[1] - frame.shape[1] % 8, frame.shape[0] - frame.shape[0] % 8)
             writer.append_data(cv2.resize(frame, size))
 
 
-def flags_table(franka: dict, stretch: dict) -> list[str]:
-    keys = list(dict.fromkeys([*franka["flags"], *stretch["flags"]]))
-    lines = ["| Flag | Franka | Stretch 4 |", "|---|---|---|"]
+def flags_table(runs: list[dict]) -> list[str]:
+    keys = list(dict.fromkeys(k for run in runs for k in run["flags"]))
+    lines = ["| Flag | " + " | ".join(run["label"] for run in runs) + " |", "|---" * (len(runs) + 1) + "|"]
     for key in keys:
-        lines.append(f"| `--{key}` | {_cell(franka['flags'].get(key))} | {_cell(stretch['flags'].get(key))} |")
+        lines.append(f"| `--{key}` | " + " | ".join(_cell(run["flags"].get(key)) for run in runs) + " |")
     return lines
 
 
@@ -89,54 +118,82 @@ def _cell(value) -> str:
     return "—" if value is None else f"`{value}`"
 
 
-def comparison_report(franka: dict, stretch: dict, common: list[int], videos: dict[int, list[str]]) -> str:
-    def rate(run, indices):
-        hits = sum(run["by_index"][i]["success"] for i in indices)
-        return hits, (hits / len(indices) if indices else 0.0)
+def _rate(run: dict, indices: list[int]) -> tuple[int, float]:
+    hits = sum(run["by_index"][i]["success"] for i in indices)
+    return hits, (hits / len(indices) if indices else 0.0)
 
-    f_hits, f_rate = rate(franka, common)
-    s_hits, s_rate = rate(stretch, common)
-    both = sum(franka["by_index"][i]["success"] and stretch["by_index"][i]["success"] for i in common)
-    only_franka = [i for i in common if franka["by_index"][i]["success"] and not stretch["by_index"][i]["success"]]
-    only_stretch = [i for i in common if stretch["by_index"][i]["success"] and not franka["by_index"][i]["success"]]
 
+def difference(a: dict, b: dict, common: list[int]) -> str:
+    """How `b` does against `a` on the episodes both ran."""
+    both = sum(a["by_index"][i]["success"] and b["by_index"][i]["success"] for i in common)
+    only_a = [i for i in common if a["by_index"][i]["success"] and not b["by_index"][i]["success"]]
+    only_b = [i for i in common if b["by_index"][i]["success"] and not a["by_index"][i]["success"]]
+    return (
+        f"Success rate difference ({b['label']} − {a['label']}): "
+        f"**{(_rate(b, common)[1] - _rate(a, common)[1]) * 100:+.0f} points**. "
+        f"Both succeeded on {both}; only {a['label']} on {len(only_a)} {only_a or ''}; "
+        f"only {b['label']} on {len(only_b)} {only_b or ''}."
+    )
+
+
+def comparison_report(franka: dict, stretches: list[dict], common: list[int], videos: dict[int, str]) -> str:
+    runs = [franka, *stretches]
+
+    def row(name: str, values) -> str:
+        return f"| {name} | " + " | ".join(values) + " |"
+
+    def success(run: dict) -> str:
+        hits, rate = _rate(run, common)
+        return f"{hits}/{len(common)} ({rate:.0%})"
+
+    per_stretch = lambda title: [f"{title}" if len(stretches) == 1 else f"{s['label']} {title[0].lower()}{title[1:]}"
+                                 for s in stretches]
+    benchmarks = list(dict.fromkeys(run["benchmark"] for run in runs))
     lines = [
         "# MolmoBot-DROID: Franka DROID vs. Stretch 4",
         "",
-        f"On the {len(common)} episodes both runs have:",
+        *[f"**Benchmark:** {benchmark_description(b)}" for b in benchmarks],
+        *(["", "> **The runs used different benchmarks**, so their episodes are not the same."]
+          if len(benchmarks) > 1 else []),
         "",
-        "| | Franka | Stretch 4 |",
-        "|---|---|---|",
-        f"| Success | {f_hits}/{len(common)} ({f_rate:.0%}) | {s_hits}/{len(common)} ({s_rate:.0%}) |",
-        f"| Run | `{franka['run_name']}` | `{stretch['run_name']}` |",
-        f"| Benchmark | `{franka['benchmark']}` | `{stretch['benchmark']}` |",
-        f"| Checkpoint | `{franka['checkpoint']}` | `{stretch['checkpoint']}` |",
+        f"On the {len(common)} episodes {'both runs have' if len(runs) == 2 else 'all runs have'}:",
         "",
-        f"Success rate difference (Stretch 4 − Franka): **{(s_rate - f_rate) * 100:+.0f} points**. "
-        f"Both succeeded on {both}; only the Franka on {len(only_franka)} {only_franka or ''}; "
-        f"only Stretch 4 on {len(only_stretch)} {only_stretch or ''}.",
+        "| | " + " | ".join(run["label"] for run in runs) + " |",
+        "|---" * (len(runs) + 1) + "|",
+        row("Success", [success(run) for run in runs]),
+        row("Run", [f"`{run['run_name']}`" for run in runs]),
+        row("Benchmark", [f"`{run['benchmark']}`" for run in runs]),
+        # Runs from before `scene_variant` was recorded used the "base" scenes.
+        row("Scenes", [f"`{run.get('scene_variant', 'base')}`" for run in runs]),
+        row("Checkpoint", [f"`{run['checkpoint']}`" for run in runs]),
         "",
+        *[line for s in stretches for line in (difference(franka, s, common), "")],
+        *[line for a, b in combinations(stretches, 2) for line in (difference(a, b, common), "")],
         "## Flags",
         "",
-        *flags_table(franka, stretch),
+        *flags_table(runs),
         "",
         "## Episodes",
         "",
-        "| # | Instruction | Franka | Stretch 4 | Franka steps | Stretch 4 steps | Stretch IK failures | "
-        "Stretch IK clamped | Videos |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| # | Instruction | " + " | ".join(run["label"] for run in runs) + " | "
+        + " | ".join(f"{run['label']} steps" for run in runs) + " | "
+        + " | ".join(per_stretch("Stretch IK failures") + per_stretch("Stretch IK clamped")) + " | Videos |",
+        "|---" * (2 * len(runs) + 2 * len(stretches) + 3) + "|",
     ]
     for i in common:
-        f, s = franka["by_index"][i], stretch["by_index"][i]
+        results = [run["by_index"][i] for run in runs]
         lines.append(
-            f"| {i} | {f['instruction']} | {_outcome(f)} | {_outcome(s)} | {f['steps']} | {s['steps']} | "
-            f"{_metric(s, 'ik_failures')} | {_metric(s, 'ik_clamped')} | "
-            + " ".join(f"[{v.split('_')[1]}]({v})" for v in videos.get(i, []))
+            f"| {i} | {results[0]['instruction']} | "
+            + " | ".join(_outcome(r) for r in results) + " | "
+            + " | ".join(str(r["steps"]) for r in results) + " | "
+            + " | ".join([_metric(r, "ik_failures") for r in results[1:]] + [_metric(r, "ik_clamped") for r in results[1:]])
+            + " | "
+            + (f"[grid]({videos[i]})" if i in videos else "")
             + " |"
         )
-    missing = sorted(set(franka["by_index"]) ^ set(stretch["by_index"]))
+    missing = sorted(set().union(*(run["by_index"] for run in runs)) - set(common))
     if missing:
-        lines += ["", f"Episodes in only one run (not compared): {missing}"]
+        lines += ["", f"Episodes not in every run (not compared): {missing}"]
     return "\n".join(lines) + "\n"
 
 
@@ -151,36 +208,75 @@ def _metric(result: dict, name: str) -> str:
     return "" if value is None else f"{value:g}"
 
 
+def default_out_dir(franka: dict, stretches: list[dict]) -> Path:
+    parent = stretches[0]["dir"].parent
+    if len(stretches) == 1:
+        return parent / f"compare__{franka['run_name']}__vs__{stretches[0]['run_name']}"
+    # Several run names are too long for one directory name.
+    digest = hashlib.sha1("\n".join(s["run_name"] for s in stretches).encode()).hexdigest()[:8]
+    return parent / f"compare__{franka['run_name']}__vs__{len(stretches)}_stretch4_runs_{digest}"
+
+
+def find_runs(directory: Path) -> dict[str, list[Path]]:
+    """The runs in `directory`'s subfolders, {robot: [run dir, ...]}, from their `results.json`."""
+    runs: dict[str, list[Path]] = {}
+    for results in sorted(directory.glob("*/results.json")):
+        runs.setdefault(json.loads(results.read_text())["robot"], []).append(results.parent)
+    return runs
+
+
 @click.command()
-@click.option("--franka", "franka_dir", required=True, type=click.Path(exists=True, file_okay=False))
-@click.option("--stretch4", "stretch_dir", required=True, type=click.Path(exists=True, file_okay=False))
-@click.option("--out", default=None, type=click.Path(), help="Default: next to the two runs.")
-@click.option("--no-videos", is_flag=True, help="Only write the report.")
-def main(franka_dir, stretch_dir, out, no_videos):
-    franka, stretch = load_run(Path(franka_dir)), load_run(Path(stretch_dir))
-    out_dir = Path(out) if out else Path(stretch_dir).parent / f"compare__{franka['run_name']}__vs__{stretch['run_name']}"
+@click.option("--franka", "franka_dir", default=None, type=click.Path(exists=True, file_okay=False))
+@click.option("--stretch4", "stretch_dirs", multiple=True, type=click.Path(exists=True, file_okay=False),
+              help="A Stretch 4 run. Give it more than once to compare several.")
+@click.option("--all", "all_dir", default=None, type=click.Path(exists=True, file_okay=False),
+              help="Compare every run in this directory's subfolders, in place of --stretch4 (and of --franka, "
+              "unless there are several Franka runs).")
+@click.option("--out", default=None, type=click.Path(), help="Default: next to the runs.")
+@click.option("--videos", is_flag=True, help="Also stack each episode's grid videos, one run above the other.")
+def main(franka_dir, stretch_dirs, all_dir, out, videos):
+    if all_dir:
+        if stretch_dirs:
+            raise click.UsageError("--all finds the Stretch 4 runs itself; leave out --stretch4")
+        found = find_runs(Path(all_dir))
+        stretch_dirs = found.get("stretch4", [])
+        if franka_dir is None:
+            frankas = found.get("franka", [])
+            if len(frankas) != 1:
+                raise click.UsageError(
+                    f"--all needs exactly one Franka run in {all_dir}, found {len(frankas)}"
+                    + (f": {[f.name for f in frankas]}. Pick one with --franka." if frankas else ".")
+                )
+            franka_dir = frankas[0]
+        click.echo(f"Franka: {Path(franka_dir).name}\n" + "\n".join(f"Stretch 4: {Path(d).name}" for d in stretch_dirs))
+    if franka_dir is None or not stretch_dirs:
+        raise click.UsageError("Need --franka and at least one --stretch4, or --all")
+    franka = load_run(Path(franka_dir), "Franka")
+    stretch_flags = [json.loads((Path(d) / "results.json").read_text())["flags"]
+                     if (Path(d) / "results.json").exists() else {} for d in stretch_dirs]
+    stretches = [load_run(Path(d), label) for d, label in zip(stretch_dirs, stretch_labels(stretch_flags))]
+    runs = [franka, *stretches]
+    out_dir = Path(out) if out else default_out_dir(franka, stretches)
     out_dir.mkdir(parents=True, exist_ok=True)
-    common = sorted(set(franka["by_index"]) & set(stretch["by_index"]))
+    common = sorted(set.intersection(*(set(run["by_index"]) for run in runs)))
     if not common:
         raise click.ClickException("The runs have no episodes in common")
 
-    videos: dict[int, list[str]] = {}
-    if not no_videos:
+    stacked: dict[int, str] = {}
+    if videos:
         for i in common:
-            for camera in SIDE_BY_SIDE_CAMERAS:
-                left, right = episode_video(franka, i, camera), episode_video(stretch, i, camera)
-                if left is None or right is None:
-                    continue
-                name = f"{episode_name(i)}_{camera}_side_by_side.mp4"
-                write_side_by_side(
-                    left, right, out_dir / name, "Franka", "Stretch 4",
-                    franka["by_index"][i]["success"], stretch["by_index"][i]["success"],
-                )
-                videos.setdefault(i, []).append(name)
-                click.echo(f"wrote {out_dir / name}")
+            paths = [p for run in runs if (p := episode_video(run, i, "grid")) is not None]
+            if len(paths) < len(runs):
+                continue
+            name = f"{episode_name(i)}_grid_stacked.mp4"
+            write_stacked(
+                paths, out_dir / name, [run["label"] for run in runs], [run["by_index"][i]["success"] for run in runs]
+            )
+            stacked[i] = name
+            click.echo(f"wrote {out_dir / name}")
 
     report = out_dir / "comparison_report.md"
-    report.write_text(comparison_report(franka, stretch, common, videos))
+    report.write_text(comparison_report(franka, stretches, common, stacked))
     click.secho(f"Report: {report}", fg="green")
 
 
