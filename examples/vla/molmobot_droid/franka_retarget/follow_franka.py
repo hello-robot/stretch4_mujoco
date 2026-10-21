@@ -26,7 +26,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from examples.vla.molmobot_droid.checkpoint import GRIPPER_CLOSED, robotiq_driver_angle
+from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, GRIPPER_CLOSED, robotiq_driver_angle
 from examples.vla.molmobot_droid.droid import (
     FRANKA_PEDESTAL_HEIGHT,
     FrankaDroidEnv,
@@ -138,10 +138,16 @@ class FollowFrankaEnv(Stretch4SimEnv):
             math.atan2(world_from_footprint[1, 0], world_from_footprint[0, 0]),
         ])
 
+    def move_to_franka_pose(self, franka_q7=FRANKA_HOME_QPOS, timeout: float = 30.0) -> StretchTargets:
+        """Stretch to where the Franka at `franka_q7` has its tool (its base stays where it is), then
+        the Franka put there. If Stretch cannot get there, neither moves."""
+        targets = super().move_to_franka_pose(franka_q7, timeout)
+        self.franka.reset(franka_q7)
+        return targets
+
     def reset(self) -> None:
-        """Stretch to where the Franka at `start_q7` has its tool (its base stays where it is), then the Franka there."""
+        """Both robots to `start_q7` (`move_to_franka_pose()`), starting a new `trajectory`."""
         self.move_to_franka_pose(self.start_q7)
-        self.franka.reset(self.start_q7)
         self.start_yaw = float(self.base_pose(self.world_from_footprint())[2])
         self.trajectory = StretchTrajectory()
         self.tool_errors = []
