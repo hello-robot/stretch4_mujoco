@@ -716,6 +716,10 @@ class FrankaOverlayView:
     `hidden_root`, if given, is the body whose subtree is hidden in place of the kind's part of
     Stretch: for a scene without Stretch, e.g. the Franka the ghost stands in for. With `pool`,
     it renders with the pool's renderer.
+
+    `scenery` are geoms only the Franka's own views draw (`custom_scene.keep_for_franka_views()`:
+    furniture Stretch's scene took out), drawn with "franka_alone", where the Franka is in
+    Stretch's place.
     """
 
     MASK_COLOUR = (1.0, 0.0, 1.0, 1.0)
@@ -732,8 +736,10 @@ class FrankaOverlayView:
         kind: OverlayKind,
         hidden_root: str | None = None,
         pool: RendererPool | None = None,
+        scenery: list[int] = (),
     ):
         self.model, self.franka, self.kind = model, franka, kind
+        self.scenery = list(scenery) if kind == "franka_alone" else []
         if isinstance(camera, StretchCameras):
             name = camera.camera_name_in_mjcf
             apply_stretch_camera_settings(model, name, camera)
@@ -770,11 +776,11 @@ class FrankaOverlayView:
     @contextlib.contextmanager
     def _showing(self, geoms: list[int], flat: tuple | None = None):
         """
-        Of Stretch's hidden part and the ghost, only `geoms` drawn (in a group the renderer
-        draws; the rest in the ghost's, which it does not), the ghost in the Franka's look, or
-        `geoms` all in the `flat` colour.
+        Of Stretch's hidden part, the ghost and the scenery, only `geoms` drawn (in a group the
+        renderer draws; the rest in the ghost's, which it does not), the ghost in the Franka's
+        look, or `geoms` all in the `flat` colour.
         """
-        model, regrouped = self.model, self.hidden + self.ghost
+        model, regrouped = self.model, self.hidden + self.ghost + self.scenery
         saved = (model.geom_group[regrouped].copy(), model.geom_rgba[regrouped].copy(), model.geom_matid[regrouped].copy())
         model.geom_group[regrouped] = GHOST_GEOM_GROUP
         model.geom_group[geoms] = 0
@@ -788,7 +794,7 @@ class FrankaOverlayView:
 
     def render(self, data: mujoco.MjData) -> np.ndarray:
         """The camera's image, with the Franka in place of Stretch's part."""
-        with self._showing(self.shown):
+        with self._showing(self.shown + self.scenery):
             return self.renderer.render(data)
 
     def masks(self, data: mujoco.MjData, size: tuple[int, int] | None = None) -> tuple[np.ndarray, np.ndarray]:
