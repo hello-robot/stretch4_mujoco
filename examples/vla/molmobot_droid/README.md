@@ -193,6 +193,9 @@ All are run as modules from the repo root, e.g. `python -m examples.vla.molmobot
 | `run_benchmark_franka.py` | A MolmoSpaces benchmark on the Franka (default `FrankaPickDroidMiniBench`). `--list` shows what is installed. |
 | `run_benchmark_stretch4.py` | The same benchmark on Stretch 4. Its footprint goes where each episode puts the Franka's base. Furniture Stretch would spawn inside is removed and listed (`furniture_removed` in the report). The Franka's pedestal there is a mocap body, which static chairs never push on. |
 | `compare_benchmarks.py` | `--franka <run> --stretch4 <run> [--stretch4 <run> ...]`, or `--all <dir>` for every run in it: `comparison_report.md`; with `--videos`, each episode's grid videos stacked vertically. |
+| `run_follow_franka.py` | The policy drives the Franka while Stretch 4 follows it blind (see [Following the Franka](#following-the-franka-data-for-fine-tuning)). Type instructions as in `run_franka.py`; each ends when Stretch has picked the object up. Prints how closely Stretch followed. |
+| `run_benchmark_follow_franka.py` | A benchmark run the same way. It saves each episode Stretch succeeds in as a Stretch 4 trajectory for `run_finetune.py`. |
+| `run_finetune.py` | Fine-tunes MolmoBot-DROID on those trajectories to drive Stretch 4's joints directly (see [Fine-tuning](#fine-tuning-on-stretch-4-run_finetunepy)). |
 
 A benchmark run writes to `outputs/molmobot_droid/<run name>/`. The run name is the robot
 plus the flags, joined with underscores, e.g.
@@ -307,6 +310,123 @@ to the wrist roll body, holding the tool and/or the camera, and attaches that to
 emptied `gripper/base`, the quick connect on its origin. `gripper/base` keeps `grasp_site` and
 DROID's wrist camera.
 
+## Following the Franka (data for fine-tuning)
+
+`run_follow_franka.py` and `run_benchmark_follow_franka.py` turn the Franka's episodes into
+Stretch 4 demonstrations (`franka_retarget/follow_franka.py`):
+
+- **The policy drives a Franka.** It sees only the Franka's DROID exo and wrist cameras. They
+  are rendered in the house Stretch's simulator runs, with the Franka drawn where its joints are
+  and Stretch hidden. Its state is the Franka's own joints, not Stretch's mapped back.
+- **The Franka touches nothing.** It is simulated alone, in a model of its own, so its joints
+  move as on the Franka DROID. Only Stretch 4 moves objects.
+- **Stretch follows blind.** Each Franka action is retargeted as in `run_stretch4_sim.py`. The
+  same flags apply, except the camera ones: `--slow`, `--wait-for-arrival`, the execute
+  horizon, `--grasp-offset-mm/-deg`, `--use_parallel_gripper` and `--custom_franka_start_pose`.
+- **The gripper state comes from Stretch.** The Robotiq would close on nothing, while Stretch's
+  fingers stop on the object they hold. So the state's gripper value is Stretch's opening
+  (`robotiq_driver_angle()`), and the Robotiq is drawn closed that far.
+- **Success is judged on Stretch.** It is molmospaces' pick criterion: the object lifted 1 cm
+  and touching nothing but Stretch.
+
+Every camera of Stretch's is recorded, raw and as a policy would be shown it:
+
+| Video | |
+|---|---|
+| `fisheye_left`, `fisheye_right` | The head fisheyes, DROID-framed (`--head-crop droid`'s crop to 640x368). `_raw`: as rendered, 1200x1920 upright. |
+| `center` | The center head camera, as rendered: the simulator's low-resolution one, 965x1280 upright. |
+| `gripper_left`, `gripper_right` | The gripper cameras as the retargeted policy's wrist view (640x368). `_raw`: as rendered, 640x400. |
+| `exo`, `wrist` | What the policy saw: the Franka's cameras. |
+
+The grid videos show the Franka's views, Stretch's cropped ones and the scene camera. In the
+scene camera, the Franka is see-through over Stretch. The report adds the mean and maximum
+distance between Stretch's tool and where the Franka's action put it (`tool_error_mean_m`,
+`tool_error_max_m`), and whether a trajectory was saved (`saved`).
+
+For each successful episode, `run_benchmark_follow_franka.py` also writes
+`<run>_ep<#>.h5` next to its videos (`finetune/dataset.py`). It is laid out as molmospaces'
+trajectories are, so MolmoBot's trainer reads it as is:
+
+- `traj_0/obs/agent/qpos` and `traj_0/actions/joint_pos` hold Stretch's state and joint targets
+  per step, as JSON per move group.
+- `traj_0/obs/sensor_data/<video>` names each video above.
+- `traj_0/stretch4/` holds the same as plain arrays, plus the Franka's states and actions,
+  Stretch's base pose, and whether each action was reached, clamped, twisted or unreachable.
+
+Stretch's 8 values (`finetune/stretch4_joints.py`) are the joints retargeting moves, in the
+Franka's slots: base heading (from the episode's start), lift, arm, wrist yaw, pitch and roll,
+an unused 0, and the gripper. The gripper state is the driver angle; the gripper action is 0
+open or 255 closed.
+
+```bash
+python -m examples.vla.molmobot_droid.run_follow_franka --use_parallel_gripper --custom_franka_start_pose
+python -m examples.vla.molmobot_droid.run_benchmark_follow_franka --use_parallel_gripper \
+    --custom_franka_start_pose --no-wait-for-arrival --max-episodes 200 --no-rerun
+```
+
+## Fine-tuning on Stretch 4 (`run_finetune.py`)
+
+`run_finetune.py` fine-tunes MolmoBot-DROID with MolmoBot's own trainer (`finetune/train.py`).
+The fine-tuned policy's state and actions are Stretch's 8 values above. Its exo view is a head
+fisheye (`--use_fisheye left|right`, DROID-framed) and its wrist view a gripper camera
+(`--use_gripper left|right`). As in MolmoBot-DROID, each query sees 2 frames per camera, 8 steps
+apart.
+
+`--use_parallel_gripper` picks the PG4 trajectories; without it, the SG4 ones. Everything else
+about the model is the checkpoint's own config. Only the normalization is new: it is computed
+from the data into `norm_stats.yaml` on the first run.
+
+What is trained:
+
+| Flag | Default | |
+|---|---|---|
+| `--use_action_head / --no-use_action_head` | on | The flow-matching action expert. Its 8 outputs keep their shape, so its pretrained weights load. |
+| `--use_vision_transformer / --no-use_vision_transformer` | off | The SigLIP2 encoder and its connector into the LLM. Training them backpropagates through the whole LLM, so each step costs several times as much. |
+
+The LLM is always frozen. Its weights stay in fp32 (FSDP2 keeps fp32 master weights; bf16 is
+only for compute), about 20 GB for the whole model. With the LLM's gradients too, it would not
+fit in 32 GB.
+
+The optimizer is bitsandbytes' 8-bit AdamW. Its kernels refuse FSDP2's sharded (DTensor)
+parameters, so `LocalShardAdamW8bit` steps each one's local shard. On one GPU that is the whole
+parameter, and checkpoints save and resume its state as usual.
+
+Other defaults: 50,000 steps, a batch of 32 in micro-batches of 8, and 10% of the episodes held
+out for validation loss. Options after `--` go straight to MolmoBot's TrainConfig, e.g.
+`-- --optimizer.action_expert_learning_rate=3e-5`. `--debug` runs a tiny, randomly initialized
+model to check the pipeline end to end.
+
+Output goes to `outputs/molmobot_droid/finetune/<run>/`:
+
+- `dataset/`: links to the run directories, split train/val, with each split's index;
+- `norm_stats.yaml` and `spec.json`;
+- sharded checkpoints every `--save-interval` steps. To resume, run the same command again;
+- the final `step<N>-unsharded/`, which `checkpoint.load_policy()` loads.
+
+```bash
+python -m examples.vla.molmobot_droid.run_finetune --use_parallel_gripper \
+    --data outputs/molmobot_droid/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0_customstart-1
+```
+
+### Setup
+
+MolmoBot pins Python 3.11, so training runs in its own venv, in the git-ignored clone that
+`checkpoint.py` also loads the model code from. The lock's torch is the CUDA 12.6 build, which
+has no kernels for Blackwell GPUs (RTX 50xx). Replace it with the cu128 build:
+
+```bash
+git clone https://github.com/allenai/MolmoBot.git examples/vla/molmobot_droid/molmobot
+cd examples/vla/molmobot_droid/molmobot/MolmoBot
+uv sync --extra train --python 3.11
+uv pip install --python .venv/bin/python --reinstall-package torch --reinstall-package torchvision \
+    --reinstall-package torchaudio torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv/bin/python bitsandbytes
+```
+
+Run `run_finetune.py` itself from this repo's venv. It launches torchrun in MolmoBot's venv.
+Don't `uv sync` there again, or it puts the cu126 torch back.
+
 ## Tests
 
 ```bash
@@ -336,3 +456,7 @@ python -m pytest examples/vla/molmobot_droid/franka_retarget/test_retargetting.p
 | `franka_retarget/test_retargetting.py` | The 20-pose retargeting test, shown in Rerun. Its `conftest.py` stops the repo root, which is a package named `stretch4_mujoco`, from shadowing the library under pytest. |
 | `rollout.py` | The query/execute loop and the interactive prompt. |
 | `rerun_scene.py` | The Rerun view: the whole house in 3D from the simulated model, cameras, tool target vs. actual. |
+| `franka_retarget/follow_franka.py` | Stretch 4 following the Franka blind: the env, Stretch's recorded views, saving trajectories. |
+| `finetune/stretch4_joints.py` | Stretch 4's joints as the policy's 8 state and action values. |
+| `finetune/dataset.py` | The trajectory h5 files, and the train/val directory MolmoBot reads them from. |
+| `finetune/train.py` | MolmoBot's trainer with Stretch's presets, the checkpoint's own model config, 8-bit AdamW and the optional frozen action expert. It runs in MolmoBot's venv. |

@@ -42,6 +42,10 @@ MOLMOBOT_REPO_URL = "https://github.com/allenai/MolmoBot.git"
 MOLMOBOT_COMMIT = "33c0ca77bf6062a23d60ffd4a6859334c4a46d30"
 MOLMOBOT_CACHE_DIR = Path.home() / ".cache" / "molmobot"
 MOLMOBOT_PATH_ENV = "MOLMOBOT_PATH"
+MOLMOBOT_LOCAL_DIR = Path(__file__).parent / "molmobot"
+"""The checkout fine-tuning uses (`run_finetune.py`), with its training venv in `MolmoBot/.venv`
+(git-ignored). Used for inference too when it is there, so a fine-tuned checkpoint runs on the
+code that trained it."""
 
 DROID_IMAGE_SIZE = (640, 368)
 """(width, height) the training data was rendered at (molmospaces `FrankaDroidCameraSystem`)."""
@@ -71,6 +75,14 @@ FRANKA_HOME_QPOS = (0.0, -0.7853, 0.0, -2.35619, 0.0, 1.57079, 0.0)
 ROBOTIQ_DRIVER_OPEN = 0.00296
 ROBOTIQ_DRIVER_CLOSED = 0.824
 """Range of `gripper/left_driver_joint`, which is the 8th state element the policy reads."""
+
+
+def robotiq_driver_angle(open_fraction: float) -> float:
+    """The Robotiq driver angle (the state's 8th value) for a gripper `open_fraction` of the way
+    open (1 open .. 0 closed): how a Stretch 4 gripper's opening is reported to the policy."""
+    return ROBOTIQ_DRIVER_OPEN + (1.0 - float(np.clip(open_fraction, 0.0, 1.0))) * (
+        ROBOTIQ_DRIVER_CLOSED - ROBOTIQ_DRIVER_OPEN
+    )
 
 
 @dataclass(frozen=True)
@@ -117,11 +129,14 @@ def ensure_molmobot_code() -> Path:
     Make MolmoBot's `olmo` package importable and return the directory that contains it.
 
     Uses $MOLMOBOT_PATH if set (either the allenai/MolmoBot checkout or its `MolmoBot/`
-    subdirectory), otherwise clones MOLMOBOT_COMMIT into ~/.cache/molmobot/<commit> on first use.
+    subdirectory), then MOLMOBOT_LOCAL_DIR if it is checked out, otherwise clones MOLMOBOT_COMMIT
+    into ~/.cache/molmobot/<commit> on first use.
     """
     override = os.environ.get(MOLMOBOT_PATH_ENV)
     if override:
         root = Path(override).expanduser()
+    elif (MOLMOBOT_LOCAL_DIR / ".git").exists():
+        root = MOLMOBOT_LOCAL_DIR
     else:
         root = MOLMOBOT_CACHE_DIR / MOLMOBOT_COMMIT
         if not (root / ".git").exists():
