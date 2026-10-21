@@ -186,7 +186,22 @@ class BaseController:
         if is_stop_motion:
             self._set_base_velocity(0.0, 0.0, 0.0, a_m=self.curr_max_accel_xy_m, a_r=self.curr_max_accel_w_r)
 
-    def _set_wheel_vel(self, left_wheel_vel, back_wheel_vel, right_wheel_vel):
+    def _set_wheel_vel(self, left_wheel_vel: float, back_wheel_vel: float, right_wheel_vel: float) -> None:
+        """
+        Store measured wheel speeds in the status as motor-frame velocities.
+
+        The inputs are wheel (output-shaft) speeds, which are multiplied by the
+        gear ratio and wheel polarity, since _update_odom and motor_vel_to_base_vel
+        expect status['wheelN_vel'] in the motor frame.
+
+        Args:
+            left_wheel_vel: Left wheel (wheel 0) joint velocity in rad/s.
+            back_wheel_vel: Back wheel (wheel 1) joint velocity in rad/s.
+            right_wheel_vel: Right wheel (wheel 2) joint velocity in rad/s.
+
+        Returns:
+            None.
+        """
         # Wheel number is based on http://3.12.229.27/index.php/Base_Frame_Convention_%26_Wheel_Odometry
         # Wheel polarity was trial and error
         self.status['wheel0_vel'] = self.params['wheel0_polarity'] * left_wheel_vel * self.params['gr']
@@ -242,15 +257,23 @@ class BaseController:
         #     print(f"DEBUG_ODOM: wheel_speeds={wheel_speeds}, Vb={Vb}, dt={dt:.4f}, Sb={Sb}, status_y={self.status['y']:.4f}, status_theta={self.status['theta']:.4f}")
         self.status['pose_time_s'] = time.time()
 
-    def update(self):
+    def update(self) -> None:
         """
-        The update method to set mujoco ctrl's for the base while in motion.
+        Step the wheel velocity profiles and set the wheel actuator ctrls.
+
+        The profiles run in the motor frame; the wheel actuators' MJCF gear maps
+        that back to wheel speed. The active base command, if any, then sets the
+        next profile targets.
+
+        Returns:
+            None.
         """
         if not self.profiles_initialized:
-            # Need to initialize profiles with current positions to avoid sudden jumps
-            self.left_wheel_profile.set_position(self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).length[0] * self.params['gr'])
-            self.right_wheel_profile.set_position(self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).length[0] * self.params['gr'])
-            self.back_wheel_profile.set_position(self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).length[0] * self.params['gr'])
+            # Need to initialize profiles with current positions to avoid sudden jumps.
+            # Actuator length is already gear * qpos, i.e. motor-frame position.
+            self.left_wheel_profile.set_position(self.mujoco_server.mjdata.actuator(Actuators.left_wheel_vel.name).length[0])
+            self.right_wheel_profile.set_position(self.mujoco_server.mjdata.actuator(Actuators.right_wheel_vel.name).length[0])
+            self.back_wheel_profile.set_position(self.mujoco_server.mjdata.actuator(Actuators.back_wheel_vel.name).length[0])
             self.profiles_initialized = True
 
         # Always step the profiles if we are in omni mode
@@ -1029,9 +1052,17 @@ class MujocoServer:
         # wrote rather than being overwritten by them. See `SafeMotion`.
         self.safe_motion_manager.step()
 
-    def pull_status(self):
+    def pull_status(self) -> None:
         """
-        Pull joints status of the robot from the simulator
+        Read the joint, base and contact state from the simulator and publish it.
+
+        Base pose comes from the base_link body pose. In omni mode the base twist
+        comes from wheel odometry over the ground-truth wheel joint velocities, so
+        it reflects wheel slip but not encoder noise. The result is written to the
+        shared status proxy rather than returned.
+
+        Returns:
+            None.
         """
 
         new_status = StatusStretchJoints.default()
@@ -1098,9 +1129,10 @@ class MujocoServer:
         if not self.use_diff_drive:
             # We use ground truth wheel velocity to calculate wheel odometry
             # We won't see motor or encoder noise represented, but we will see wheel slip and numerical integration.
-            left_wheel_vel = self.mjdata.joint(Actuators.left_wheel_vel.get_joint_names_in_mjcf()[1]).qvel[0] / self.base_controller.params['gr']
-            back_wheel_vel = self.mjdata.joint(Actuators.back_wheel_vel.get_joint_names_in_mjcf()[1]).qvel[0] / self.base_controller.params['gr']
-            right_wheel_vel = self.mjdata.joint(Actuators.right_wheel_vel.get_joint_names_in_mjcf()[1]).qvel[0] / self.base_controller.params['gr']
+            # qvel is the wheel (output-shaft) speed; _set_wheel_vel applies the gear ratio itself.
+            left_wheel_vel = self.mjdata.joint(Actuators.left_wheel_vel.get_joint_names_in_mjcf()[1]).qvel[0]
+            back_wheel_vel = self.mjdata.joint(Actuators.back_wheel_vel.get_joint_names_in_mjcf()[1]).qvel[0]
+            right_wheel_vel = self.mjdata.joint(Actuators.right_wheel_vel.get_joint_names_in_mjcf()[1]).qvel[0]
             self.base_controller._set_wheel_vel(left_wheel_vel=left_wheel_vel, back_wheel_vel=back_wheel_vel, right_wheel_vel=right_wheel_vel)
 
             # Compute wheel odometry and assign it

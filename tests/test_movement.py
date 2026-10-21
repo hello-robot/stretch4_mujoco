@@ -364,6 +364,44 @@ def wait_for_sim_time(sim, duration_s):
         time.sleep(0.01)
 
 
+def assert_base_twist(
+    sim: Stretch4MujocoSimulator,
+    vx: float,
+    vy: float,
+    w: float,
+    xy_tol: float = 0.02,
+    w_tol: float = 0.05,
+) -> None:
+    """
+    Assert that the reported base twist matches a commanded steady-state velocity.
+
+    Displacement checks read the base_link pose directly and so cannot catch a
+    scaling error in the odometry twist; this checks the reported x_vel, y_vel
+    and theta_vel themselves. Call it while the command is still active and past
+    its acceleration ramp.
+
+    Args:
+        sim: The running simulator.
+        vx: Commanded forward velocity in the base frame, in m/s.
+        vy: Commanded lateral velocity in the base frame, in m/s.
+        w: Commanded yaw rate in rad/s.
+        xy_tol: Absolute tolerance on x_vel and y_vel, in m/s.
+        w_tol: Absolute tolerance on theta_vel, in rad/s.
+
+    Returns:
+        None.
+    """
+    base = sim.pull_status().base
+    click.secho(
+        f"  reported twist: x_vel={base.x_vel:.4f}, y_vel={base.y_vel:.4f}, theta_vel={base.theta_vel:.4f} "
+        f"(cmd {vx:.2f}, {vy:.2f}, {w:.2f})",
+        fg="green",
+    )
+    assert np.isclose(base.x_vel, vx, atol=xy_tol), f"Reported x_vel={base.x_vel:.4f}, commanded {vx:.4f}"
+    assert np.isclose(base.y_vel, vy, atol=xy_tol), f"Reported y_vel={base.y_vel:.4f}, commanded {vy:.4f}"
+    assert np.isclose(base.theta_vel, w, atol=w_tol), f"Reported theta_vel={base.theta_vel:.4f}, commanded {w:.4f}"
+
+
 def get_perf_str(sim):
     """Returns formatted sim FPS and real-time-ratio string."""
     status = sim.pull_status()
@@ -372,8 +410,26 @@ def get_perf_str(sim):
     return f"FPS: {fps:.1f}, RTR: {rtr}"
 
 
-def run_movement_tests(sim, test_cameras=False, recorder: MotionProfileRecorder | None = None):
-    """Runs the core movement test suite on an active simulator instance."""
+def run_movement_tests(
+    sim: Stretch4MujocoSimulator,
+    test_cameras: bool = False,
+    recorder: MotionProfileRecorder | None = None,
+) -> None:
+    """
+    Run the core movement test suite on an active simulator instance.
+
+    Base velocity moves are checked on both displacement and the reported base
+    twist, since the pose and the twist come from different sources.
+
+    Args:
+        sim: The running simulator.
+        test_cameras: Whether to also check that camera data is available.
+        recorder: Recorder that tags each move for plotting; an unstarted one is
+            used when None.
+
+    Returns:
+        None.
+    """
     # An unstarted recorder records the segments and has nothing to plot, so the
     # suite reads the same whether or not the caller wants figures out of it.
     recorder = recorder or MotionProfileRecorder(sim, PLOT_ROOT / "unused")
@@ -431,6 +487,7 @@ def run_movement_tests(sim, test_cameras=False, recorder: MotionProfileRecorder 
         start_th = sim.base.status.theta
         sim.base.set_velocity(vx_m=0.20, vy_m=0.0, w_r=0.0)
         wait_for_sim_time(sim, 4.0)
+        assert_base_twist(sim, 0.20, 0.0, 0.0)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
         time.sleep(0.5)
         end_x = sim.base.status.x
@@ -459,6 +516,7 @@ def run_movement_tests(sim, test_cameras=False, recorder: MotionProfileRecorder 
         start_th = sim.base.status.theta
         sim.base.set_velocity(vx_m=0.0, vy_m=0.20, w_r=0.0)
         wait_for_sim_time(sim, 3.0)
+        assert_base_twist(sim, 0.0, 0.20, 0.0)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
         time.sleep(0.5)
         end_x = sim.base.status.x
@@ -487,6 +545,7 @@ def run_movement_tests(sim, test_cameras=False, recorder: MotionProfileRecorder 
         start_th = sim.base.status.theta
         sim.base.set_velocity(vx_m=0.15, vy_m=0.15, w_r=0.0)
         wait_for_sim_time(sim, 3.0)
+        assert_base_twist(sim, 0.15, 0.15, 0.0)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
         time.sleep(0.5)
         end_x = sim.base.status.x
@@ -516,6 +575,7 @@ def run_movement_tests(sim, test_cameras=False, recorder: MotionProfileRecorder 
         start_th = sim.base.status.theta
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.50)
         wait_for_sim_time(sim, 3.0)
+        assert_base_twist(sim, 0.0, 0.0, 0.50)
         sim.base.set_velocity(vx_m=0.0, vy_m=0.0, w_r=0.0)
         time.sleep(0.5)
         end_x = sim.base.status.x
