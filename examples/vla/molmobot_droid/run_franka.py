@@ -9,6 +9,10 @@ Between instructions the sim keeps running, so the start pose can be changed fir
 - at the prompt, `jog` moves joints with the keys, `pose` prints the arm's joint positions,
   `set q1 ... q7` (rad) jumps the arm there, and `home` jumps it to the home pose.
 
+`object` says what the target is and what can replace it; `object <name> [index]` puts that in
+its place (a THOR category or prefab, or tennis_ball; see `custom_scene.find_asset()`). The scene
+is rebuilt, with the arm and its pedestal where they were.
+
 `--use_stretch4_gripper sg4|pg4` and `--use_stretch4_gripper_camera` put Stretch 4's gripper and
 gripper camera on the Franka in place of the Robotiq and DROID's wrist camera, mounted on its
 flange as they are on Stretch 4's wrist (see `franka_retarget/stretch4_hardware_on_franka.py`):
@@ -75,6 +79,10 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
 )
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     INSERTABLE_OBJECTS,
+    OBJECT_COMMANDS,
+    SwapTarget,
+    object_command,
+    run_with_swaps,
     load_custom_scene,
     free_bodies,
     load_custom_scene_franka_droid,
@@ -91,13 +99,14 @@ def scene_options(function):
         click.option("--scene-id", default="procthor-10k/val/0", show_default=True,
                      help="<dataset>/<split>/<house index>"),
         click.option("--object-type", default="boiler", show_default=True,
-                     help="Category of the target object (mug, apple, ...) or its exact body name, or one "
-                     f"no house has ({', '.join(INSERTABLE_OBJECTS)}), put in place of --in-place-of."),
+                     help="Category of the target object (mug, apple, ...) or its exact body name. With "
+                     f"--in-place-of, an object to put in that one's place instead: {', '.join(INSERTABLE_OBJECTS)}, "
+                     "a THOR category (apple, alarm clock, ...) or prefab (Apple_3). 'object' at the prompt lists them."),
         click.option("--object-index", type=int, default=0,
                      help="Which one, if there are several (of --in-place-of's, with it)."),
         click.option("--in-place-of", default=None,
-                     help=f"With --object-type {next(iter(INSERTABLE_OBJECTS))}: the house's object (a category "
-                     "or body name) to swap it in for, resting where that one did."),
+                     help="The house's object (a category or body name) to swap --object-type in for, resting "
+                     "where that one did."),
         click.option("--robot-pose", default=None,
                      help="x,y,yaw of the robot's footprint (yaw in rad). Default: a clear spot facing the object."),
         click.option("--max-steps", type=int, default=300, show_default=True, help="Steps per instruction (15/s)."),
@@ -391,96 +400,117 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
         # It takes Stretch's fingers out of the image, and the Robotiq's would be left in.
         raise click.BadParameter("needs --use_stretch4_gripper and --use_stretch4_gripper_camera", param_hint=FIX_FLAG)
     scene = load_custom_scene(scene_id, object_type, object_index, in_place_of=in_place_of)
-    click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
-    env = load_custom_scene_franka_droid(
-        scene,
-        pose,
-        exo_camera=exo_camera,
-        stretch4_gripper=use_stretch4_gripper,
-        stretch4_gripper_camera=use_stretch4_gripper_camera,
-    )
-    if exo_camera in HEAD_CAMERAS and head_crop == "droid":
-        env.prepare_exo = to_droid_frame
-    if fix_gripper_image_mismatch:
-        fix = gripper_image_fix(STRETCH4_GRIPPERS[use_stretch4_gripper], STRETCH4_GRIPPER_CAMERA)
-        # Where the tool's grasp center is from the Robotiq's grasp_site, as a grasp offset is.
-        tool = np.linalg.inv(env.tcp_world() @ TCP_ALIGN) @ body_transform(
-            env.data, f"{env.spawn.prefix}gripper/{STRETCH_TCP}"
+
+    def say(message: str, color: str | None = None) -> None:
+        click.secho(message, fg=color)
+
+    def run_scene(scene, carry: dict) -> None:
+        """The Franka in `scene` until `quit`, or until `object` swaps the target (SwapTarget, its
+        `carry` the arm's joints and the pedestal's height, which the next scene starts from)."""
+        click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
+        env = load_custom_scene_franka_droid(
+            scene,
+            pose,
+            exo_camera=exo_camera,
+            stretch4_gripper=use_stretch4_gripper,
+            stretch4_gripper_camera=use_stretch4_gripper_camera,
         )
-        env.prepare_wrist = lambda image: fix(image, env.state8[7], tool)
-    elif use_stretch4_gripper_camera:
-        env.prepare_wrist = wrist_view
-    env.launch_viewer()
+        if exo_camera in HEAD_CAMERAS and head_crop == "droid":
+            env.prepare_exo = to_droid_frame
+        if fix_gripper_image_mismatch:
+            fix = gripper_image_fix(STRETCH4_GRIPPERS[use_stretch4_gripper], STRETCH4_GRIPPER_CAMERA)
+            # Where the tool's grasp center is from the Robotiq's grasp_site, as a grasp offset is.
+            tool = np.linalg.inv(env.tcp_world() @ TCP_ALIGN) @ body_transform(
+                env.data, f"{env.spawn.prefix}gripper/{STRETCH_TCP}"
+            )
+            env.prepare_wrist = lambda image: fix(image, env.state8[7], tool)
+        elif use_stretch4_gripper_camera:
+            env.prepare_wrist = wrist_view
+        env.launch_viewer()
 
-    logger = None
-    robotiq = None
-    if rerun:
-        robotiq = RobotiqGhost(env) if env.ghost is not None else None
-        cameras = ["exo", "wrist", "scene"] + (list(ROBOTIQ_WRIST_CAMERAS) if robotiq else [])
-        rerun_scene.init_rerun("MolmoBot-DROID Franka", cameras, eye=scene_camera_pose(pose, scene.object_pos))
-        rerun_scene.set_step(0)
-        moving = [env.spawn.base_name, scene.object_name] + ([env.ghost.base_name] if robotiq else [])
-        logger = rerun_scene.RerunScene(env.model, robotiq.pose() if robotiq else env.data, moving)
-    step_count = 0
-
-    def log_frame(observation: Observation, metrics: dict[str, float]):
-        """One Rerun step: rollout steps and idle frames share the `step` timeline."""
-        nonlocal step_count
-        step_count += 1
-        if logger is not None:
-            rerun_scene.set_step(step_count)
-            images = {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, "scene": env.render_scene()}
-            if robotiq is not None:
-                logger.log(robotiq.pose())
-                images.update(robotiq.render())
+        logger = None
+        robotiq = None
+        if rerun:
+            robotiq = RobotiqGhost(env) if env.ghost is not None else None
+            eye = scene_camera_pose(pose, scene.object_pos)
+            if carry:  # a swapped-in target: a recording of its own, with its own scene geometry
+                rerun_scene.new_recording(f"{scene.scene_id}: {scene.object_category}", eye=eye)
             else:
-                logger.log(env.data)
-            rerun_scene.log_cameras(images)
-            rerun_scene.log_tool_poses(None, env.tcp_world())
-            rerun_scene.log_metrics(metrics)
+                cameras = ["exo", "wrist", "scene"] + (list(ROBOTIQ_WRIST_CAMERAS) if robotiq else [])
+                rerun_scene.init_rerun("MolmoBot-DROID Franka", cameras, eye=eye)
+            rerun_scene.set_step(0)
+            moving = [env.spawn.base_name, scene.object_name] + ([env.ghost.base_name] if robotiq else [])
+            logger = rerun_scene.RerunScene(env.model, robotiq.pose() if robotiq else env.data, moving)
+        step_count = 0
 
-    last_logged_state = None
-    watched_qpos = robot_and_target_qpos(env, scene.object_name)
+        def log_frame(observation: Observation, metrics: dict[str, float]):
+            """One Rerun step: rollout steps and idle frames share the `step` timeline."""
+            nonlocal step_count
+            step_count += 1
+            if logger is not None:
+                rerun_scene.set_step(step_count)
+                images = {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, "scene": env.render_scene()}
+                if robotiq is not None:
+                    logger.log(robotiq.pose())
+                    images.update(robotiq.render())
+                else:
+                    logger.log(env.data)
+                rerun_scene.log_cameras(images)
+                rerun_scene.log_tool_poses(None, env.tcp_world())
+                rerun_scene.log_metrics(metrics)
 
-    def log_if_moved():
-        """A Rerun step outside a rollout, when the robot or the target moved since the last one."""
-        nonlocal last_logged_state
-        state = np.append(env.data.qpos[watched_qpos], env.spawn.pedestal_height)
-        if last_logged_state is not None and np.abs(state - last_logged_state).max() < IDLE_LOG_TOLERANCE:
-            return
-        last_logged_state = state
-        log_frame(env.observe(), {})
+        last_logged_state = None
+        watched_qpos = robot_and_target_qpos(env, scene.object_name)
 
-    def on_step(info: StepInfo):
-        log_frame(info.observation, {"gripper_command": info.action[7], "query": info.query})
-        if env.viewer is not None and not env.viewer.is_running():
-            raise SystemExit("Viewer closed")
+        def log_if_moved():
+            """A Rerun step outside a rollout, when the robot or the target moved since the last one."""
+            nonlocal last_logged_state
+            state = np.append(env.data.qpos[watched_qpos], env.spawn.pedestal_height)
+            if last_logged_state is not None and np.abs(state - last_logged_state).max() < IDLE_LOG_TOLERANCE:
+                return
+            last_logged_state = state
+            log_frame(env.observe(), {})
 
-    editor = StartPoseEditor(env, on_frame=log_if_moved if rerun else None)
-    editor.frame()  # the start pose, while the policy loads
+        def on_step(info: StepInfo):
+            log_frame(info.observation, {"gripper_command": info.action[7], "query": info.query})
+            if env.viewer is not None and not env.viewer.is_running():
+                raise SystemExit("Viewer closed")
+
+        editor = StartPoseEditor(env, on_frame=log_if_moved if rerun else None)
+        if carry:  # the arm and the pedestal where they were before the swap
+            editor.set_pedestal_height(carry["pedestal"])
+            editor.set_arm(carry["q7"], jump=True)
+        editor.frame()  # the start pose, while the policy loads
+        try:
+            policy = load_policy(checkpoint)
+            try:
+                interactive_session(
+                    env,
+                    policy,
+                    build_instruction("pick", scene.object_category),
+                    execute_horizon,
+                    execute_first_n,
+                    max_steps,
+                    reset=editor.reset,
+                    on_step=on_step,
+                    handle_command=lambda text: object_command(text, scene, say) or editor.handle_command(text),
+                    idle=editor.idle,
+                    extra_help=lambda: f"Start pose: {editor.COMMANDS}.\nTarget: {OBJECT_COMMANDS}.\n{pickable_objects_text(env)}",
+                    while_waiting=editor.frame if rerun else None,
+                )
+            except SwapTarget as swap:
+                swap.carry.update(q7=editor.arm.joint_pos.copy(), pedestal=env.spawn.pedestal_height)
+                raise
+        finally:
+            if robotiq is not None:
+                robotiq.close()
+            env.close()
+
     try:
-        policy = load_policy(checkpoint)
-        interactive_session(
-            env,
-            policy,
-            build_instruction("pick", scene.object_category),
-            execute_horizon,
-            execute_first_n,
-            max_steps,
-            reset=editor.reset,
-            on_step=on_step,
-            handle_command=editor.handle_command,
-            idle=editor.idle,
-            extra_help=lambda: f"Start pose: {editor.COMMANDS}.\n{pickable_objects_text(env)}",
-            while_waiting=editor.frame if rerun else None,
-        )
+        run_with_swaps(scene, run_scene, say)
     finally:
         unload_policy()
-        if robotiq is not None:
-            robotiq.close()
-        env.close()
-
 
 if __name__ == "__main__":
     main()

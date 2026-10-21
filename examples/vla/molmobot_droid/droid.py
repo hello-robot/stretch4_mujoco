@@ -190,59 +190,115 @@ def apply_stretch_camera_settings(model: mujoco.MjModel, camera_name: str, camer
         model.cam_sensorsize[cam_id] = settings.sensor_size
 
 
+def _new_renderer(model: mujoco.MjModel, width: int, height: int) -> mujoco.Renderer:
+    """A `mujoco.Renderer` of `width` x `height`, the model's offscreen buffer grown to fit it."""
+    model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
+    model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+    renderer = mujoco.Renderer(model, width=width, height=height)
+    renderer._scene_option.flags[mujoco.mjtVisFlag.mjVIS_RANGEFINDER] = False  # as the library does
+    return renderer
+
+
+class RendererPool:
+    """
+    One `mujoco.Renderer` for every camera of `model` rendered in this process, whatever their
+    sizes. Each renderer holds its own GL context and its own copy of the model's textures and
+    meshes on the GPU, about 1.7 GB for a MolmoSpaces house, so one per camera adds up (with
+    Stretch's simulator and the policy, to more than a 32 GB GPU).
+
+    `get(width, height)` returns it drawing to a `width` x `height` corner of its offscreen
+    buffer, which every MuJoCo renderer has at the model's `offwidth` x `offheight` anyway.
+    Asked for more than that, it grows the buffer and replaces the renderer. Use it from one
+    thread, and take each image before the next `get()`.
+    """
+
+    def __init__(self, model: mujoco.MjModel):
+        self.model = model
+        self._renderer: mujoco.Renderer | None = None
+        self._buffer = (0, 0)
+        """The renderer's offscreen buffer (width, height): the model's when it was made."""
+
+    def get(self, width: int, height: int) -> mujoco.Renderer:
+        if self._renderer is None or width > self._buffer[0] or height > self._buffer[1]:
+            self.close()
+            buffer = self.model.vis.global_
+            self._buffer = (max(width, buffer.offwidth), max(height, buffer.offheight))
+            self._renderer = _new_renderer(self.model, *self._buffer)
+        # The only things `mujoco.Renderer.render()` reads its size from.
+        self._renderer._width, self._renderer._height = width, height
+        self._renderer._rect = mujoco.MjrRect(0, 0, width, height)
+        return self._renderer
+
+    def close(self) -> None:
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+
+
 class StretchCameraRenderer:
     """
     Renders a camera the way stretch4_mujoco renders `camera` (fisheye included) and returns
     the image the way `StatusStretchCameras.get_camera_data(auto_correct_rgb=False)` does:
-    RGB, rotated upright.
+    RGB, rotated upright. With `pool`, it renders with the pool's renderer.
     """
 
-    def __init__(self, model: mujoco.MjModel, camera_name: str, camera: StretchCameras):
+    def __init__(self, model: mujoco.MjModel, camera_name: str, camera: StretchCameras, pool: RendererPool | None = None):
         self.camera_name = camera_name
         self.camera = camera
         settings = camera.initial_camera_settings
         self.fisheye = camera.create_fisheye_renderer() if camera.is_fisheye else None
-        width, height = self.fisheye.render_size if self.fisheye else (settings.width, settings.height)
-        model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
-        model.vis.global_.offheight = max(model.vis.global_.offheight, height)
-        self.renderer = mujoco.Renderer(model, width=width, height=height)
-        self.renderer._scene_option.flags[mujoco.mjtVisFlag.mjVIS_RANGEFINDER] = False  # as the library does
+        self.size = self.fisheye.render_size if self.fisheye else (settings.width, settings.height)
+        self.pool = pool
+        self._own = _new_renderer(model, *self.size) if pool is None else None
+
+    @property
+    def renderer(self) -> mujoco.Renderer:
+        return self._own if self._own is not None else self.pool.get(*self.size)
 
     def render(self, data: mujoco.MjData) -> np.ndarray:
+        renderer = self.renderer
         if self.fisheye is not None:
-            self.fisheye.render_views(self.renderer, data, self.camera_name)
+            self.fisheye.render_views(renderer, data, self.camera_name)
             image = self.fisheye.project()
         else:
-            self.renderer.update_scene(data, camera=self.camera_name)
-            image = self.renderer.render()
+            renderer.update_scene(data, camera=self.camera_name)
+            image = renderer.render()
         rotations = self.camera.initial_camera_settings.rotate_number_of_times
         return np.ascontiguousarray(np.rot90(image, rotations)) if rotations else image
 
     def close(self):
-        self.renderer.close()
+        if self._own is not None:
+            self._own.close()
 
 
 class PinholeRenderer:
-    """Renders a plain MuJoCo camera at its own resolution, optionally with extra geom groups on."""
+    """Renders a plain MuJoCo camera at its own resolution, optionally with extra geom groups on.
+    With `pool`, it renders with the pool's renderer."""
 
     def __init__(
-        self, model: mujoco.MjModel, camera_name: str, size: tuple[int, int], geom_groups_on: tuple[int, ...] = ()
+        self, model: mujoco.MjModel, camera_name: str, size: tuple[int, int], geom_groups_on: tuple[int, ...] = (),
+        pool: RendererPool | None = None,
     ):
         self.camera_name = camera_name
-        width, height = size
-        model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
-        model.vis.global_.offheight = max(model.vis.global_.offheight, height)
-        self.renderer = mujoco.Renderer(model, width=width, height=height)
+        self.size = tuple(size)
+        self.pool = pool
+        self._own = _new_renderer(model, *self.size) if pool is None else None
         self.scene_option = mujoco.MjvOption()
         for group in geom_groups_on:
             self.scene_option.geomgroup[group] = 1
 
+    @property
+    def renderer(self) -> mujoco.Renderer:
+        return self._own if self._own is not None else self.pool.get(*self.size)
+
     def render(self, data: mujoco.MjData) -> np.ndarray:
-        self.renderer.update_scene(data, camera=self.camera_name, scene_option=self.scene_option)
-        return self.renderer.render()
+        renderer = self.renderer
+        renderer.update_scene(data, camera=self.camera_name, scene_option=self.scene_option)
+        return renderer.render()
 
     def close(self):
-        self.renderer.close()
+        if self._own is not None:
+            self._own.close()
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +714,8 @@ class FrankaOverlayView:
     geom groups, colours and materials are changed only while rendering.
 
     `hidden_root`, if given, is the body whose subtree is hidden in place of the kind's part of
-    Stretch: for a scene without Stretch, e.g. the Franka the ghost stands in for.
+    Stretch: for a scene without Stretch, e.g. the Franka the ghost stands in for. With `pool`,
+    it renders with the pool's renderer.
     """
 
     MASK_COLOUR = (1.0, 0.0, 1.0, 1.0)
@@ -674,15 +731,16 @@ class FrankaOverlayView:
         camera: StretchCameras | str,
         kind: OverlayKind,
         hidden_root: str | None = None,
+        pool: RendererPool | None = None,
     ):
         self.model, self.franka, self.kind = model, franka, kind
         if isinstance(camera, StretchCameras):
             name = camera.camera_name_in_mjcf
             apply_stretch_camera_settings(model, name, camera)
-            self.renderer = StretchCameraRenderer(model, name, camera)
+            self.renderer = StretchCameraRenderer(model, name, camera, pool=pool)
         else:
             size = tuple(int(v) for v in model.cam_resolution[model.camera(camera).id])
-            self.renderer = PinholeRenderer(model, camera, size)
+            self.renderer = PinholeRenderer(model, camera, size, pool=pool)
         hidden_root = hidden_root or _OVERLAY_HIDDEN_ROOT[kind]
         self.hidden = subtree_geoms(model, hidden_root) if hidden_root else []
         self.ghost = subtree_geoms(model, franka.base_name)

@@ -176,8 +176,8 @@ def continuous_session(
 ) -> None:
     """
     The control loop: runs the current instruction until a key says otherwise (KEYS_HELP),
-    indefinitely unless `max_steps` > 0. The start pose commands go to `editor`; `reset` goes
-    back to the start pose.
+    indefinitely unless `max_steps` > 0, or until `on_step` returns True (a success check, say).
+    The start pose commands go to `editor`; `reset` goes back to the start pose.
 
     `env` is a `RealStretch4Env` or a `Stretch4SimEnv`, with `stop_motion()`, `last_miss` and
     `tool_error_m()`; its `interrupted` is pointed at the keys, and its `say` at the console.
@@ -210,9 +210,9 @@ def continuous_session(
             console.event(f"▶ {text}", "green")
             twisting = False
 
-            def step(info: StepInfo) -> None:
+            def step(info: StepInfo) -> bool | None:
                 nonlocal twisting
-                on_step(info)
+                done = on_step(info)
                 miss = env.last_miss
                 if miss is not None and (miss.kind == "unreachable" or not twisting):
                     color = "red" if miss.kind == "unreachable" else "yellow"
@@ -233,6 +233,7 @@ def continuous_session(
                         dim=True,
                     )
                 )
+                return done
 
             result = run_rollout(
                 env, policy, text, params.execute_horizon, params.execute_first_n,
