@@ -42,6 +42,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     Stretch4SimEnv,
     StretchTargets,
     _wrap,
+    head_rectifier,
     planar_from_pose,
     to_droid_frame,
     wrist_view,
@@ -71,11 +72,12 @@ GRID_EXCLUDED: tuple[str, ...] = tuple(view for view in STRETCH_VIEWS if view.en
 """Left out of the grid videos (their own videos have them): it shows the Franka's views and Stretch's cropped ones."""
 
 
-def stretch_views(images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def stretch_views(images: dict[str, np.ndarray], rectify: bool = False) -> dict[str, np.ndarray]:
     """
     Each Stretch camera's image as rendered (`<name>_raw`) and as a policy would be shown it
-    (`<name>`): the head fisheyes DROID-framed as --head-crop droid frames them, the gripper
-    cameras as the retargeted policy's wrist view. The center camera only as rendered.
+    (`<name>`): the head fisheyes DROID-framed as --head-crop droid frames them (with `rectify`,
+    redrawn as the DROID exo camera, as --rectify does), the gripper cameras as the retargeted
+    policy's wrist view. The center camera only as rendered.
     """
     views = {}
     for name, image in images.items():
@@ -83,7 +85,12 @@ def stretch_views(images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             views[name] = image
             continue
         views[f"{name}_raw"] = image
-        views[name] = wrist_view(image) if name.startswith("gripper") else to_droid_frame(image)
+        if name.startswith("gripper"):
+            views[name] = wrist_view(image)
+        elif rectify:
+            views[name] = head_rectifier(name.removeprefix("fisheye_"))(image)
+        else:
+            views[name] = to_droid_frame(image)
     return views
 
 
@@ -173,7 +180,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         self.trajectory.observe(
             stretch4_joints.state8(_wrap(base[2] - self.start_yaw), joints), state8, base, status.time
         )
-        return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=stretch_views(images))
+        return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=stretch_views(images, self.params.rectify))
 
     def step(self, action8: np.ndarray) -> StretchTargets | None:
         joints = self.joints()
