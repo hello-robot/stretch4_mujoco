@@ -454,13 +454,17 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
             moving = [env.spawn.base_name, scene.object_name] + ([env.ghost.base_name] if robotiq else [])
             logger = rerun_scene.RerunScene(env.model, robotiq.pose() if robotiq else env.data, moving)
         step_count = 0
+        sim_time = last_data_time = 0.0
 
         def log_frame(observation: Observation, metrics: dict[str, float]):
-            """One Rerun step: rollout steps and idle frames share the `step` timeline."""
-            nonlocal step_count
+            """One Rerun step: rollout steps and idle frames share the `step` timeline, and
+            `sim_time`, which keeps counting across `reset()` putting `data.time` back to 0."""
+            nonlocal step_count, sim_time, last_data_time
             step_count += 1
+            sim_time += max(0.0, env.data.time - last_data_time)
+            last_data_time = env.data.time
             if logger is not None:
-                rerun_scene.set_step(step_count)
+                rerun_scene.set_step(step_count, sim_time)
                 images = {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, "scene": env.render_scene()}
                 if robotiq is not None:
                     logger.log(robotiq.pose())
@@ -468,7 +472,7 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
                 else:
                     logger.log(env.data)
                 rerun_scene.log_cameras(images)
-                rerun_scene.log_tool_poses(None, env.tcp_world())
+                rerun_scene.log_tool_poses(None, env.tcp_world(), actual_label="Franka tool")
                 rerun_scene.log_metrics(metrics)
 
         last_logged_state = None

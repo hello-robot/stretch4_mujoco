@@ -165,6 +165,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         poses = self.sim.pull_body_poses()
         footprint = planar_from_pose(*poses[STRETCH_ROOT_BODY], self.stretch_scene.scene.floor_z)
         joints = self.joints(status)
+        self.observed_state = (status.time, footprint, joints)
         self.mirror.update(status, poses)
 
         q7 = self.franka.state8[:7]

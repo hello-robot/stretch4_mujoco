@@ -265,6 +265,10 @@ class ImageAndJointReceiver:
     decoded: `head_rgbs` has each head fisheye the publisher sends, upright, by side (a side
     missing from a message keeps its last frame). `receive()` waits for the next one; `latest()`
     does not wait.
+
+    Each message gets `captured_at`, when its frames were captured on this computer's clock
+    (`time.time()`): the publisher stamps them on the robot's, whose offset from this one is
+    taken from the quickest message to arrive, so it is late by that message's latency at most.
     """
 
     def __init__(self, robot_ip: str, port: int = IMAGE_PORT):
@@ -280,6 +284,8 @@ class ImageAndJointReceiver:
         self._message: dict | None = None
         self._heads: dict[str, np.ndarray] = {}
         self._count = 0
+        self._clock_offset = math.inf
+        """s from the robot's clock to this one, plus the least latency seen."""
         self._new = threading.Condition()
         self._running = True
         self._thread = threading.Thread(target=self._receive_loop, daemon=True)
@@ -290,6 +296,13 @@ class ImageAndJointReceiver:
             if not self.socket.poll(100):
                 continue
             message = self.socket.recv_pyobj()
+            received_at = time.time()
+            captured = message.get("system_timestamp")
+            if captured is None:  # an older publisher
+                message["captured_at"] = received_at
+            else:
+                self._clock_offset = min(self._clock_offset, received_at - captured)
+                message["captured_at"] = captured + self._clock_offset
             message["wrist_rgb"] = _decode(
                 message, "wrist_color_image_compressed", "wrist_color_image", "color_image_compressed", "color_image"
             )
@@ -618,7 +631,7 @@ class RealStretch4Env:
         # The images are as old as the pipeline makes them, but the joints need not be: moving,
         # the message's are an image's latency behind, and the policy would start each chunk,
         # and limit_joint_delta() each action, from a little way back along the motion.
-        message = {**message, "closest_joint_state": self.live_joint_state()}
+        message = {**message, "closest_joint_state": self.live_joint_state(), "observed_at": time.time()}
         self.last_message = message
         footprint, joints = self._state(message)
         state8, _ = self.retargeter.stretch_to_franka(footprint, joints)
@@ -773,16 +786,19 @@ class LiveView:
     saw) to Rerun at `hz`, on its own thread, from the first message on -- whether or not an
     instruction is running.
 
-    On the `time` timeline, and on `step` at `step()`, the step the policy's views were last
-    logged at: Rerun keeps the time per thread, so without it this thread's logs would be on no
-    `step` at all, and gone when replaying by step.
+    On the `time` timeline only, at each message's `captured_at`, the frames and the joint
+    state it carries being from then. Not on `step`: this thread would log the pose at the end
+    of a step, as the next one ran, at that step, ahead of the tool poses and views the policy
+    saw; `log_step()` logs the robot as the policy saw it there instead.
     """
 
-    def __init__(self, env: RealStretch4Env, robot_model: RobotModel, step: Callable[[], int], hz: float = 10.0):
-        self.env, self.robot_model, self.step, self.period = env, robot_model, step, 1.0 / hz
+    def __init__(self, env: RealStretch4Env, robot_model: RobotModel, hz: float = 10.0):
+        self.env, self.robot_model, self.period = env, robot_model, 1.0 / hz
         _, message = env.receiver.latest()
         robot_model.pose(*self._robot_state(message or env.receiver.receive()))
         self.scene = rerun_scene.RerunScene(robot_model.model, robot_model.data, ["stretch4", robot_model.franka.base_name])
+        self._step_data = mujoco.MjData(robot_model.model)
+        """`log_step()`'s, so it need not wait for this thread's."""
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -797,13 +813,17 @@ class LiveView:
             count, message = self.env.receiver.latest()
             if message is not None and count != last:
                 last = count
-                rerun_scene.rr.set_time("time", timestamp=time.time())
-                rerun_scene.set_step(self.step())
+                rerun_scene.rr.set_time("time", timestamp=message["captured_at"])
                 head = message["head_rgbs"].get(self.env.exo_side)
                 rerun_scene.log_cameras({"head_raw": head, "gripper_raw": message["wrist_rgb"]})
                 self.robot_model.pose(*self._robot_state(message))
                 self.scene.log(self.robot_model.data)
             time.sleep(self.period)
+
+    def log_step(self, world_from_footprint: np.ndarray, joints: StretchJoints, franka_q7) -> None:
+        """The robot (and the ghost Franka at `franka_q7`) at a policy step, on the calling thread's timelines."""
+        self.robot_model.pose(world_from_footprint, joints, franka_q7, data=self._step_data)
+        self.scene.log(self._step_data)
 
     def close(self) -> None:
         self._running = False
@@ -880,22 +900,31 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
                 "MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True,
                 main_cameras=["exo", "wrist"],
             )
-            live = LiveView(env, robot_model, step=lambda: step_count)
+            live = LiveView(env, robot_model)
             click.secho("Rerun is showing the cameras live.", dim=True)
 
         click.secho("Loading MolmoBot-DROID...", dim=True)
         policy = load_policy(checkpoint)
 
         def log_frame(observation: Observation) -> None:
-            """One Rerun step: rollout steps and start pose moves share the `step` timeline."""
+            """
+            One Rerun step: rollout steps and start pose moves share the `step` timeline. On
+            `time`, the views at when they were captured, and the robot and its tool at when
+            `observe()` read the joints, which is later.
+            """
             nonlocal step_count
             step_count += 1
             if not rerun:
                 return
+            message = env.last_message
             rerun_scene.set_step(step_count)
-            rerun_scene.rr.set_time("time", timestamp=time.time())
-            rerun_scene.log_cameras({"exo": observation.exo_rgb, "wrist": observation.wrist_rgb})
-            footprint, joints = env._state(env.last_message)
+            rerun_scene.rr.set_time("time", timestamp=message["captured_at"])
+            rerun_scene.log_cameras(
+                {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, **observation.extra_cameras}
+            )
+            rerun_scene.rr.set_time("time", timestamp=message["observed_at"])
+            footprint, joints = env._state(message)
+            live.log_step(footprint, joints, env.last_state8[:7])
             rerun_scene.log_tool_poses(
                 env.retargeter.last_target_tool_world, env.retargeter.stretch_tool_world(footprint, joints)
             )
