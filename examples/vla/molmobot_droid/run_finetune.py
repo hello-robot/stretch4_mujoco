@@ -5,9 +5,11 @@ Fine-tune MolmoBot-DROID to drive Stretch 4 directly, on the Stretch 4 trajector
 The fine-tuned policy's state and actions are Stretch 4's joints, the ones retargeting moves
 (`finetune/stretch4_joints.py`): base heading, lift, arm, wrist yaw/pitch/roll, an unused slot
 and the gripper, in the Franka's 8 slots so the pretrained action head loads. Its exo view is a
-head fisheye, DROID-framed (--use_fisheye), and its wrist view a gripper camera (--use_gripper),
-2 frames 8 steps apart each, as MolmoBot-DROID's are. Everything else about the model is the
-checkpoint's.
+head fisheye, DROID-framed (--use_fisheye: left, right, or `tool`, the one on the tool's side each
+step, as `run_stretch4_sim.py` and the real robot pick it; with --use_rectified_fisheye, redrawn
+as the DROID exo camera instead, as --rectify does), and its wrist view a gripper camera
+(--use_gripper), 2 frames 8 steps apart each, as MolmoBot-DROID's are. Everything else about the
+model is the checkpoint's.
 
 What is trained. The LLM stays frozen: on 32 GB, its weights and gradients alone would not fit.
 - --use_action_head (default): the flow-matching action expert, which turns the LLM's features
@@ -44,6 +46,9 @@ Usage:
         --data outputs/molmobot_droid/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0
     python -m examples.vla.molmobot_droid.run_finetune --data outputs/molmobot_droid --use_parallel_gripper \\
         --use_fisheye right --use_gripper right --use_vision_transformer --no-use_action_head
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool \
+        --use_rectified_fisheye
     # Check the whole pipeline in a few minutes: a tiny randomly initialized model, 20 steps.
     python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --debug --steps 20
     # Any of MolmoBot's TrainConfig options after --, e.g. the action expert's learning rate:
@@ -84,10 +89,10 @@ TRAINING_ENV = {
 }
 
 
-def run_name(fisheye: str, gripper: str, parallel_gripper: bool, action_head: bool, vit: bool, steps: int,
-             debug: bool) -> str:
+def run_name(fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool, action_head: bool, vit: bool,
+             steps: int, debug: bool) -> str:
     return (
-        f"stretch4_fish-{fisheye}_grip-{gripper}_pg-{int(parallel_gripper)}_ah-{int(action_head)}_vit-{int(vit)}"
+        f"stretch4_fish-{fisheye}{'-rect' if rectified else ''}_grip-{gripper}_pg-{int(parallel_gripper)}_ah-{int(action_head)}_vit-{int(vit)}"
         f"_steps-{steps}" + ("_debug" if debug else "")
     )
 
@@ -96,8 +101,13 @@ def run_name(fisheye: str, gripper: str, parallel_gripper: bool, action_head: bo
 @click.option("--data", multiple=True, required=True, type=click.Path(exists=True, path_type=Path),
               help="A run directory of run_benchmark_follow_franka.py, or a directory holding several: every "
               "trajectory saved under it is used (that matches the gripper and has the cameras). Repeatable.")
-@click.option("--use_fisheye", "--use-fisheye", "use_fisheye", type=click.Choice(["left", "right"]), default="left",
-              show_default=True, help="The head fisheye, DROID-framed, that is the policy's exo view.")
+@click.option("--use_fisheye", "--use-fisheye", "use_fisheye", type=click.Choice(["left", "right", "tool"]),
+              default="left", show_default=True,
+              help="The head fisheye, DROID-framed, that is the policy's exo view: tool is the one on the tool's "
+              "side each step (fisheye_tool), as run_stretch4_sim.py and the real robot pick it.")
+@click.option("--use_rectified_fisheye", "--use-rectified-fisheye", "use_rectified_fisheye", is_flag=True,
+              help="The --use_fisheye fisheye redrawn as the DROID exo camera (its _rectified video, as --rectify "
+              "draws it) instead of only cropped to its aspect.")
 @click.option("--use_gripper", "--use-gripper", "use_gripper", type=click.Choice(["left", "right"]), default="left",
               show_default=True, help="The gripper camera that is the policy's wrist view.")
 @click.option("--use_parallel_gripper", "--use-parallel-gripper", "use_parallel_gripper", is_flag=True,
@@ -124,7 +134,7 @@ def run_name(fisheye: str, gripper: str, parallel_gripper: bool, action_head: bo
 @click.option("--debug", is_flag=True, help="A tiny randomly initialized model instead of the checkpoint's "
               "weights (its config still), batch 1 and no validation: to check the pipeline end to end.")
 @click.argument("trainer_options", nargs=-1, type=click.UNPROCESSED)
-def main(data, use_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps,
+def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps,
          global_batch_size, device_batch_size, val_fraction, val_interval, save_interval, num_workers, out,
          checkpoint, use_wandb, debug, trainer_options):
     """Fine-tune MolmoBot-DROID on Stretch 4 trajectories (see the module docstring). Options after
@@ -136,7 +146,8 @@ def main(data, use_fisheye, use_gripper, use_parallel_gripper, use_action_head, 
                                    "`python -m examples.vla.molmobot_droid.run_finetune --help`'s module docstring says")
 
     tool = PARALLEL_GRIPPER_TOOL if use_parallel_gripper else STRETCH_GRIPPER_TOOL
-    cameras = [f"fisheye_{use_fisheye}", f"gripper_{use_gripper}"]  # exo then wrist, as MolmoBot-DROID's
+    exo = f"fisheye_{use_fisheye}" + ("_rectified" if use_rectified_fisheye else "")
+    cameras = [exo, f"gripper_{use_gripper}"]  # exo then wrist, as MolmoBot-DROID's
     episodes = find_episodes(data)
     usable = [e for e in episodes if e.tool_name == tool and set(cameras) <= set(e.cameras)]
     other_tool = sum(e.tool_name != tool for e in episodes)
@@ -149,7 +160,8 @@ def main(data, use_fisheye, use_gripper, use_parallel_gripper, use_action_head, 
         fg="green",
     )
 
-    name = run_name(use_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps, debug)
+    name = run_name(use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head,
+                    use_vision_transformer, steps, debug)
     save_dir = out.resolve() / name
     counts = build_dataset(usable, save_dir / "dataset", val_fraction)
     click.secho(f"Dataset: {save_dir / 'dataset'} ({counts['train']} train, {counts['val']} val)", fg="green")
