@@ -109,6 +109,13 @@ def get_default_blueprint(
     )
 
 
+def _pointcloud_color(points_name: str) -> list[int]:
+    """Left lidar cyan, right lidar amber, line sensors dark blue."""
+    if "line_sensor" in points_name:
+        return [0, 0, 160]
+    return [0, 220, 255] if "left" in points_name else [255, 180, 0]
+
+
 class RerunLogger:
     def __init__(self, maxsize: int = 1):
         # maxsize=1: `_put_queue()` drops a still-pending item in favor of the
@@ -137,8 +144,7 @@ class RerunLogger:
                     if isinstance(points, dict):
                         for points_name, points_instance in points.items():
                             if len(points_instance) > 0:
-                                # Left lidar cyan, right lidar amber
-                                c = [0, 220, 255] if "left" in points_name else [255, 180, 0]
+                                c = _pointcloud_color(points_name)
                                 rr.log(
                                     f"{label}/{points_name}",
                                     rr.Points3D(positions=points_instance, radii=0.008, colors=c),
@@ -146,8 +152,7 @@ class RerunLogger:
                     elif isinstance(points, list):
                         for points_name, points_instance in points:
                             if len(points_instance) > 0:
-                                # Left lidar cyan, right lidar amber
-                                c = [0, 220, 255] if "left" in points_name else [255, 180, 0]
+                                c = _pointcloud_color(points_name)
                                 rr.log(
                                     f"{label}/{points_name}",
                                     rr.Points3D(positions=points_instance, radii=0.008, colors=c),
