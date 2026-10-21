@@ -29,11 +29,6 @@ class SafeMotionGuardedContact(SafeMotion):
     `Stepper.current_to_effort_pct` computes from current over `iMax`. The trip
     point is therefore `i_contact_a / i_max_a` of the force range, and the
     config carries the robot's own amp figures so the two stay in step.
-
-    Without this the sim's position actuators drive at full stall force into
-    whatever they hit -- enough to lever the robot over, since the arm needs
-    only about 59 N at gripper height to beat the 50 N.m the robot's weight
-    holds it down with.
     """
 
     def __init__(self, mujoco_server: "MujocoServer", overrides: "MotionOverrides"):
@@ -94,10 +89,7 @@ class SafeMotionGuardedContact(SafeMotion):
         """Multiplier on the contact threshold, from the named profile.
 
         Mirrors `coeff_sensitivity_pos`/`_neg` in spirit: lower is more
-        sensitive, i.e. the joint gives up sooner. The firmware's exact curve
-        from coefficient to current is not in stretch4_body -- it lives on the
-        stepper -- so this is a plain multiplier on `i_contact_a`, with
-        `default` being the robot's documented contact current itself.
+        sensitive, i.e. the joint gives up sooner.
         """
         profile = self.params.get("sensitivity_profile", "default")
         return self.params.get("sensitivity", {}).get(profile, 1.0)
@@ -111,15 +103,7 @@ class SafeMotionGuardedContact(SafeMotion):
         return 100.0 * (gains["i_contact_a"] / gains["i_max_a"]) * self.sensitivity
 
     def _is_driving(self, actuator_name: str, profile: "TrapezoidalProfile") -> int:
-        """Which way the actuator is pushing: -1, 0 or +1.
-
-        The lead of the setpoint over where the joint actually is, which is
-        what the position controller turns into force. Taking the direction
-        from here rather than from the caller's goal matters once a profile has
-        run to completion against an obstacle: the setpoint has arrived, so the
-        goal says "nothing left to do", while the joint is still metres of
-        error behind it and leaning with everything it has.
-        """
+        """Which way the actuator is pushing: -1, 0 or +1."""
         error = profile.current_pos - self.mujoco_server._measured_position(actuator_name)
         if abs(error) <= self.params.get("drive_deadband", 0.001):
             return 0

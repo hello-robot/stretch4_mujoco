@@ -130,24 +130,6 @@ class MotionOverrides:
         motion profile, re-run here so it overrides the setpoint
         `push_command()` wrote earlier this cycle. Call it every control cycle
         for as long as the hold should last.
-
-        The hold parks the joint at the position it has actually reached, not at
-        the setpoint it was chasing. That distinction is the whole point when a
-        joint is stopped because it ran into something: a blocked joint's
-        setpoint keeps advancing past where the joint physically is, and with
-        the lift's kp of 8000 even 24 mm of that lead is 192 N. Holding the
-        setpoint would therefore keep leaning on the obstacle with nearly full
-        force while reporting the joint as stopped. Holding the measured
-        position instead takes the position error -- and so the force -- to
-        zero, which is what the stepper's `MODE_SAFETY` does on the robot.
-
-        Once latched the joint stays pinned rather than being left on a
-        zero-velocity goal. A caller that keeps re-commanding its original goal
-        re-plans the profile every cycle, and each re-plan gets one tick of
-        acceleration in before this override takes it back -- enough to walk
-        the joint millimetres across the seconds a hold lasts. On the robot
-        there is nothing to walk: the stepper is latched in safety mode until
-        something takes it out.
         """
         profile = self.mujoco_server.joint_profiles.get(actuator_name)
         if profile is None:
