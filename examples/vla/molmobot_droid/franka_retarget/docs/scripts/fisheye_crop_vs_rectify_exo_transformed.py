@@ -2,7 +2,9 @@
 docs/fisheye_crop_vs_rectify_exo_transformed.png: each head fisheye on the Franka where it is on
 Stretch (`run_franka.py --exo_camera left|right`), beside the DROID exo camera moved to the same
 pose. Columns: left fisheye, the DROID exo camera there, right fisheye, the DROID exo camera
-there; top row cropped (--head-crop droid), bottom row rectified (--rectify).
+there; top row cropped (--head-crop droid), bottom row rectified (--rectify). For the left
+fisheye the Franka is LEFT_FISHEYE_LOWERING lower, the camera staying put, as the left fisheye is
+otherwise inside its arm.
 
 The rectified fisheye should be the moved DROID camera's image: the script prints how far apart
 they are (mean difference, and the shift between them).
@@ -27,6 +29,10 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
 )
 from examples.vla.molmobot_droid.molmospaces.custom_scene import load_custom_scene_franka_droid
 from stretch4_mujoco.fisheye_renderer import FISHEYE_LENS_PROTRUSION_M
+
+LEFT_FISHEYE_LOWERING = 0.2
+"""How far (m) the Franka is lowered for the left fisheye. Within the ±0.3 m its height is
+randomized by in training."""
 
 
 def droid_exo_at_fisheye(env: FrankaDroidEnv) -> np.ndarray:
@@ -66,6 +72,8 @@ def main():
     for side in HEAD_SIDES:
         env = load_custom_scene_franka_droid(scene, pose, exo_camera=side)
         try:
+            if side == "left":
+                env.set_pedestal_height(env.spawn.pedestal_height - LEFT_FISHEYE_LOWERING)
             env.reset()
             fisheye[side] = env.exo_renderer.render(env.data)
             exo[side] = droid_exo_at_fisheye(env)

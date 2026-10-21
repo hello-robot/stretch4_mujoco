@@ -31,8 +31,8 @@ DROID), at OPENING_STEPS openings, and the fix needs no simulator, so it runs on
 as in sim.
 
 The models' cameras are pinholes; the real gripper camera's wide lens is not. Given its
-calibration (the publisher sends the factory one with every image), the warp starts from the
-lens's own distorted image: each of DROID's pixels is traced back through the homography and the
+calibration (the robot's own, which the publisher sends with every image), the warp starts from
+the lens's own distorted image: each of DROID's pixels is traced back through the homography and the
 lens to the robot's image, and sampled there once. Without it, Stretch's fingertips, near the
 image's corners, show past their mask, the lens having drawn them in toward the centre.
 """
@@ -72,42 +72,6 @@ robot, calibration."""
 FILL_LEVELS = 6
 """Pyramid levels `_fill()` averages over: at 1/64 of the image, every hole has colours around it."""
 
-HARDCODED_CALIBRATIONS: dict[StretchCameras, tuple[np.ndarray, np.ndarray]] = {
-    StretchCameras.cam_gripper_se4_left_rgb: (
-        np.array([
-            [396.84320068359375, 0.0, 313.5003967285156],
-            [0.0, 396.9339904785156, 214.98081970214844],
-            [0.0, 0.0, 1.0],
-        ]),
-        np.array([
-            4.080583095550537, 13.048171997070312, -0.0005616556154564023, 0.0015580180333927274,
-            -26.622535705566406, 3.805536985397339, 14.001622200012207, -27.407394409179688,
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ]),
-    ),
-}
-"""
-TODO(hardcoded): ONE robot's gripper camera calibration, used for every robot. These are
-stretch-se4-4024's `gripper_left` (calibrated 2026-09-22, `distortion_model: wide_angle`, 640x400)
-from its ~/stretch_user/stretch-se4-4024/calibration_cameras/calibration_rgb_head_camera.yaml.
-run_stretch4_real prefers them to the calibration the publisher sends (`calibration_from_message()`),
-which should replace them once it is checked to match. Its lens is nearly distortion-free: a ray
-45 degrees out lands 0.8% short of where a pinhole would put it.
-"""
-
-HARDCODED_CAMERA_CORRECTIONS: dict[StretchCameras, tuple[float, float, float]] = {
-    StretchCameras.cam_gripper_se4_left_rgb: (-5.41, -0.99, 0.93),
-}
-"""
-TODO(hardcoded): how ONE robot's gripper camera is turned from where the model has it, used for
-every robot: a rotation vector in degrees, about the model camera's own (OpenCV) x, y and z, so
-the real camera is the model's turned by it. stretch-se4-4024's left gripper camera is pitched
-5.4 degrees further down toward the fingers than the model's. It was fitted on 2026-10-16 to TWO
-points only: the PG4's ArUco fingertip tags, gripper fully open, in one screenshot of the fixed
-wrist view (residual 0.3 px). Shifting the camera instead fits worse (6 px, 10.6 mm). Replace it
-with a calibration of the gripper camera against the fingers, or fix the model's camera mount.
-"""
-
 CV_FROM_MJ = np.diag([1.0, -1.0, -1.0, 1.0])
 """MuJoCo's camera axes (looking down -z, y up) to OpenCV's (looking down +z, y down), and back."""
 
@@ -123,11 +87,10 @@ def _camera_pose(model: mujoco.MjModel, data: mujoco.MjData, camera: str) -> np.
     return make_transform(data.cam_xmat[i].reshape(3, 3), data.cam_xpos[i]) @ CV_FROM_MJ
 
 
-def _pinhole(width: int, height: int, fovy_deg: float, center=None) -> np.ndarray:
-    """K of a camera as MuJoCo renders it: square pixels, `center` (default the image's)."""
+def _pinhole(width: int, height: int, fovy_deg: float) -> np.ndarray:
+    """K of a camera as MuJoCo renders it: square pixels, centred."""
     f = height / 2 / math.tan(math.radians(fovy_deg) / 2)
-    cx, cy = center if center is not None else (width / 2, height / 2)
-    return np.array([[f, 0.0, cx], [0.0, f, cy], [0.0, 0.0, 1.0]])
+    return np.array([[f, 0.0, width / 2], [0.0, f, height / 2], [0.0, 0.0, 1.0]])
 
 
 def _hide_all_but(model: mujoco.MjModel, shown: list[int]) -> None:
@@ -218,27 +181,17 @@ class GripperImageFix:
     it, DROID_IMAGE_SIZE: the policy's wrist view in place of `stretch4_retarget.wrist_view()`.
 
     `calibration`: the robot's camera, (camera matrix, OpenCV distortion coefficients) at its
-    image size. None: the camera is a pinhole, as the simulator renders it, centred, unless
-    `real`, when it has the principal point `camera.initial_camera_settings` gives.
-
-    `camera_correction`: how the robot's camera is turned from the model's, a rotation vector
-    in degrees about the model camera's x, y and z (see HARDCODED_CAMERA_CORRECTIONS).
+    image size. None: the camera is a pinhole, as the simulator renders it.
     """
 
     def __init__(
         self,
         tool_name: str,
         camera: StretchCameras,
-        real: bool = False,
         calibration: tuple[np.ndarray, np.ndarray] | None = None,
-        camera_correction: tuple[float, float, float] | None = None,
     ):
         self.franka_camera, self.k_franka, (self.robotiq_rgbs, self.robotiq_masks) = _droid_wrist_camera()
         self.stretch_camera, finger_masks = _stretch_gripper_camera(tool_name, camera)
-        turn = np.eye(3)
-        if camera_correction is not None:
-            turn = cv2.Rodrigues(np.radians(np.asarray(camera_correction, dtype=float)))[0]
-            self.stretch_camera = self.stretch_camera @ make_transform(turn, [0.0, 0.0, 0.0])
         settings = camera.initial_camera_settings
         self.size = (settings.width, settings.height)
         k_rendered = _pinhole(*self.size, settings.field_of_view_vertical_in_degrees)
@@ -246,11 +199,10 @@ class GripperImageFix:
             self.k_stretch = np.asarray(calibration[0], dtype=float).reshape(3, 3)
             self.distortion = np.asarray(calibration[1], dtype=float).ravel()
         else:
-            center = settings.optical_center if real else None
-            self.k_stretch = _pinhole(*self.size, settings.field_of_view_vertical_in_degrees, center)
+            self.k_stretch = k_rendered
             self.distortion = np.zeros(5)
-        # The fingers as this camera, turned, would see them, from as the simulator rendered them.
-        to_camera = self.k_stretch @ turn.T @ np.linalg.inv(k_rendered)
+        # The fingers as this camera would see them, from as the simulator rendered them.
+        to_camera = self.k_stretch @ np.linalg.inv(k_rendered)
         margin = np.ones((2 * FINGER_MARGIN_PX + 1,) * 2, np.uint8)
         self.stretch_seen = np.stack([
             cv2.warpPerspective(cv2.dilate(mask.astype(np.uint8), margin), to_camera, self.size, flags=cv2.INTER_NEAREST) == 0
@@ -339,8 +291,8 @@ def _project(rays: np.ndarray, k: np.ndarray, distortion: np.ndarray, max_radius
     """
     Pixels of `rays` (N x 3, z = 1) through OpenCV's rational lens model (k1 k2 p1 p2 k3 k4 k5 k6),
     as `cv2.projectPoints()` would, but for its poles. The radial factor (1 + k1 r^2 + k2 r^4 +
-    k3 r^6) / (1 + k4 r^2 + k5 r^4 + k6 r^6) of a fit like HARDCODED_CALIBRATIONS' has both near
-    zero at some radius (r = 0.87 there), where it shoots off; so it is tabulated out to
+    k3 r^6) / (1 + k4 r^2 + k5 r^4 + k6 r^6) of a fit like stretch-se4-4024's gripper camera's has
+    both near zero at some radius (r = 0.87 there), where it shoots off; so it is tabulated out to
     `max_radius` and, where the denominator is near zero, bridged from the radii either side.
     """
     coefficients = np.zeros(14)
@@ -389,19 +341,10 @@ def _fill(image: np.ndarray, holes: np.ndarray) -> np.ndarray:
 
 
 @functools.cache
-def gripper_image_fix(tool_name: str, camera: StretchCameras, real: bool = False) -> GripperImageFix:
+def gripper_image_fix(tool_name: str, camera: StretchCameras) -> GripperImageFix:
     """A `GripperImageFix` without a calibration, made once per process (its renders take a few
     seconds the first time; a `GripperImageFix` made with one reuses them)."""
-    return GripperImageFix(tool_name, camera, real)
-
-
-def calibration_from_message(message: dict) -> tuple[np.ndarray, np.ndarray] | None:
-    """The gripper camera's (camera matrix, distortion coefficients) the robot's publisher sends
-    with its images (stretch4_compliant_gripper: the factory calibration), if it does."""
-    k, distortion = message.get("camera_matrix"), message.get("distortion_coefficients")
-    if k is None or distortion is None:
-        return None
-    return np.asarray(k, dtype=float).reshape(3, 3), np.asarray(distortion, dtype=float).ravel()
+    return GripperImageFix(tool_name, camera)
 
 
 def reject_with_fix(fix: bool, **flags: bool) -> None:
