@@ -18,9 +18,12 @@ The virtual Franka is placed the way molmospaces places it in training: `fr3_lin
 
 from __future__ import annotations
 
+import functools
 import math
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 import mujoco
 import numpy as np
@@ -38,6 +41,7 @@ from examples.vla.molmobot_droid.droid import (
     FrankaDroidEnv,
     FrankaSpawn,
     PinholeRenderer,
+    RendererPool,
     STRETCH_ROOT,
     RobotPose,
     add_franka_ghost,
@@ -57,7 +61,7 @@ STRETCH_ROOT_BODY = STRETCH_ROOT
 INSERTABLE_OBJECTS = {"tennis_ball": "8e4d2af61f1742ce9e43561f9fdba055"}
 """Objects no MolmoSpaces house has that --object-type can still name, by their Objaverse asset
 uid (from molmospaces' val split): `load_custom_scene()` swaps one in for one of the house's
-own objects (`in_place_of`)."""
+own objects (`in_place_of`), as it can any THOR asset (`find_asset()`)."""
 INSERT_DROP_HEIGHT = 0.002
 """m. An inserted object starts this far above where the object it replaces rested."""
 
@@ -134,35 +138,32 @@ def load_custom_scene(
 
     Args:
         scene_id: "<dataset>/<split>/<house_index>", e.g. "procthor-10k/val/0".
-        object_type: the object's category ("mug", "apple", ...), or an exact body name, or
-            one of INSERTABLE_OBJECTS, put where `in_place_of` was (see `insert_in_place_of()`).
+        object_type: the object's category ("mug", "apple", ...), or an exact body name. With
+            `in_place_of`, an asset put where that object was instead (`find_asset()`: one of
+            INSERTABLE_OBJECTS, or a THOR category or prefab, see `insert_in_place_of()`).
         object_index: which one, when the house has several of that category (sorted by name);
-            with an INSERTABLE_OBJECTS one, which `in_place_of`.
-        in_place_of: with an INSERTABLE_OBJECTS `object_type`, the house's object it replaces
-            (a category or a body name, as `object_type`).
+            with `in_place_of`, which of its.
+        in_place_of: the house's object (a category or a body name, as `object_type`) that
+            `object_type` replaces.
     """
     scene_xml = resolve_scene_xml(scene_id, variant)
     model = mujoco.MjModel.from_xml_path(scene_xml)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    insertable = object_type.lower().replace(" ", "_")
-    if insertable in INSERTABLE_OBJECTS:
-        if in_place_of is None:
-            raise ValueError(
-                f"No house has a {insertable}: say which object it goes in place of with --in-place-of "
-                f"(movable categories in {scene_id}: {movable_categories(model)})"
-            )
-        replaced = pick_free_body(model, scene_id, in_place_of, object_index)
-        return insert_in_place_of(scene_id, scene_xml, model, data, insertable, replaced)
-
-    body = data.body(pick_free_body(model, scene_id, object_type, object_index))
-    return CustomScene(
+    if in_place_of is None and object_type.lower().replace(" ", "_") in INSERTABLE_OBJECTS:
+        raise ValueError(
+            f"No house has a {object_type}: say which object it goes in place of with --in-place-of "
+            f"(movable categories in {scene_id}: {movable_categories(model)})"
+        )
+    body = data.body(pick_free_body(model, scene_id, in_place_of or object_type, object_index))
+    house = CustomScene(
         scene_id=scene_id,
         scene_xml=scene_xml,
         object_name=body.name,
         object_pos=body.xpos.copy(),
         object_quat=body.xquat.copy(),
     )
+    return swap_target(house, object_type) if in_place_of is not None else house
 
 
 def movable_categories(model: mujoco.MjModel) -> list[str]:
@@ -207,21 +208,108 @@ def world_aabb(model: mujoco.MjModel, data: mujoco.MjData, body_id: int) -> tupl
     return np.min(lows, axis=0), np.max(highs, axis=0)
 
 
-def insert_in_place_of(
-    scene_id: str, scene_xml: str, model: mujoco.MjModel, data: mujoco.MjData, object_type: str, replaced: str
-) -> CustomScene:
-    """
-    The house with an INSERTABLE_OBJECTS object as the target, in place of its `replaced` free
-    body: centred where `replaced`'s geoms were, resting where their bottom was (dropped from
-    INSERT_DROP_HEIGHT above), upright.
-    """
-    from molmo_spaces.utils.lazy_loading_utils import install_uid
+@dataclass(frozen=True)
+class Asset:
+    """An object to put in a house (`insert_in_place_of()`)."""
 
-    uid = INSERTABLE_OBJECTS[object_type]
-    asset = mujoco.MjModel.from_xml_path(str(install_uid(uid)))  # first use downloads it
-    asset_data = mujoco.MjData(asset)
-    mujoco.mj_kinematics(asset, asset_data)
-    asset_low, asset_high = world_aabb(asset, asset_data, 1)  # relative to its body at the origin
+    label: str
+    """What instructions call it, e.g. "alarm clock"."""
+    asset_id: str
+    """Its name in its library: an Objaverse uid or a THOR prefab, e.g. "Alarm_Clock_3"."""
+    added_path: str
+    """Its XML relative to molmospaces' ASSETS_DIR, as `CustomScene.added_objects` holds it."""
+
+
+THOR_VARIANT_SUFFIXES = ("_mesh", "_prim", "_old")
+"""THOR prefab XMLs ending in these are other versions of the one without (collision variants)."""
+
+
+def thor_category(prefab: str) -> str:
+    """A THOR prefab's category: its name, lower-case, without its numbers ("Alarm_Clock_10" and
+    "Armchair_205_1" are an "alarm_clock" and an "armchair")."""
+    return re.sub(r"(_\d+)+$", "", prefab).lower()
+
+
+@functools.cache
+def thor_prefabs() -> dict[str, list[str]]:
+    """THOR's prefabs by category (`thor_category()`), numbered ones in order of number."""
+    from molmo_spaces.utils.lazy_loading_utils import get_thor_uid_to_xmls
+
+    by_category: dict[str, list[str]] = {}
+    for stem in get_thor_uid_to_xmls():
+        if stem.endswith(THOR_VARIANT_SUFFIXES):
+            continue
+        by_category.setdefault(thor_category(stem), []).append(stem)
+    number = lambda stem: int(m.group(1)) if (m := re.search(r"_(\d+)$", stem)) else -1
+    return {category: sorted(stems, key=lambda s: (number(s), s)) for category, stems in sorted(by_category.items())}
+
+
+def find_asset(object_type: str, index: int = 0) -> Asset:
+    """
+    The asset `object_type` names: one of INSERTABLE_OBJECTS, a THOR prefab ("Apple_3") or a
+    THOR category ("apple", "alarm clock"), the `index`th prefab of it. Spaces and underscores
+    are the same, and case does not matter.
+    """
+    from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+    from molmo_spaces.utils.lazy_loading_utils import get_thor_uid_to_xmls, install_uid
+
+    key = object_type.strip().lower().replace(" ", "_")
+    if key in INSERTABLE_OBJECTS:
+        uid = INSERTABLE_OBJECTS[key]
+        install_uid(uid)  # first use downloads it
+        return Asset(key.replace("_", " "), uid, f"objects/objaverse/{uid}/{uid}.xml")
+    prefabs = thor_prefabs()
+    stems = {stem.lower(): stem for category in prefabs.values() for stem in category}
+    if key in stems:
+        stem = stems[key]
+    elif key in prefabs:
+        if index >= len(prefabs[key]):
+            raise ValueError(f"Only {len(prefabs[key])} THOR '{key}' prefabs: {', '.join(prefabs[key])}")
+        stem = prefabs[key][index]
+    else:
+        near = [c for c in prefabs if key in c or c in key]
+        raise ValueError(
+            f"No object '{object_type}': it is neither {' nor '.join(INSERTABLE_OBJECTS)} nor a THOR category or "
+            f"prefab" + (f" (did you mean {', '.join(near[:8])}?)" if near else " ('object' alone lists them)")
+        )
+    # The THOR library is a link into molmospaces' resources: the path goes through it.
+    thor = (Path(ASSETS_DIR) / "objects" / "thor").resolve()
+    return Asset(thor_category(stem).replace("_", " "), stem, str(Path("objects/thor") / get_thor_uid_to_xmls()[stem].relative_to(thor)))
+
+
+def swappable_text(scene: CustomScene) -> str:
+    """What `object` says: the target, and what can be put in its place."""
+    # Not the house's structure (still swappable by name, if anyone wants a window to pick up).
+    structure = ("robothor", "_", "countertop", "window", "wall", "door", "floortile", "shower", "sink", "toilet")
+    categories = [c for c in thor_prefabs() if not c.startswith(structure)]
+    return (
+        f"The target is the {scene.object_category} ({scene.object_name}). "
+        f"'object <name> [index]' puts another in its place: {', '.join(INSERTABLE_OBJECTS)}, a THOR prefab "
+        f"(e.g. Apple_3), or the index-th prefab of a THOR category: {', '.join(c.replace('_', ' ') for c in categories)}."
+    )
+
+
+def swap_target(scene: CustomScene, object_type: str, index: int = 0) -> CustomScene:
+    """`scene` with the asset `object_type` names (`find_asset()`) in place of its target."""
+    return insert_in_place_of(scene, find_asset(object_type, index), scene.object_name)
+
+
+def insert_in_place_of(scene: CustomScene, asset: Asset, replaced: str) -> CustomScene:
+    """
+    `scene` with `asset` as the target, in place of its `replaced` free body as it starts
+    (`scene`'s modifications applied, so it can be an asset an earlier swap put in): centred
+    where `replaced`'s geoms were, resting where their bottom was (dropped from
+    INSERT_DROP_HEIGHT above), upright. The asset's mass is its XML's.
+    """
+    from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
+
+    model = scene.load_spec().compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    asset_model = mujoco.MjModel.from_xml_path(str(Path(ASSETS_DIR) / asset.added_path))
+    asset_data = mujoco.MjData(asset_model)
+    mujoco.mj_kinematics(asset_model, asset_data)
+    asset_low, asset_high = world_aabb(asset_model, asset_data, 1)  # relative to its body at the origin
 
     low, high = world_aabb(model, data, model.body(replaced).id)
     center = (low + high) / 2
@@ -229,18 +317,89 @@ def insert_in_place_of(
         *(center[:2] - (asset_low[:2] + asset_high[:2]) / 2),
         low[2] - asset_low[2] + INSERT_DROP_HEIGHT,
     ])
-    name = f"{object_type.replace('_', '')}_{uid}_0"  # molmospaces' `<category>_<asset>_<ids>`
-    return CustomScene(
-        scene_id=scene_id,
-        scene_xml=scene_xml,
+    # molmospaces' `<category>_<asset>_<ids>`, the category in one word.
+    name = f"{asset.label.replace(' ', '')}_{asset.asset_id.lower()}_0"
+    # An object an earlier swap added is taken out of the additions; one of the house's is removed.
+    added = {body: xml for body, xml in scene.added_objects.items() if body != replaced}
+    poses = {body: pose for body, pose in scene.object_poses.items() if body != replaced}
+    removed = list(scene.removed_objects) + ([] if replaced in scene.added_objects else [replaced])
+    added[name] = asset.added_path
+    poses[name] = [*pos, 1.0, 0.0, 0.0, 0.0]
+    return replace(
+        scene,
         object_name=name,
         object_pos=pos,
         object_quat=np.array([1.0, 0.0, 0.0, 0.0]),
-        object_poses={name: [*pos, 1.0, 0.0, 0.0, 0.0]},
-        added_objects={name: f"objects/objaverse/{uid}/{uid}.xml"},
-        removed_objects=[replaced],
-        object_label=object_type.replace("_", " "),
+        object_poses=poses,
+        added_objects=added,
+        removed_objects=removed,
+        object_label=asset.label,
     )
+
+
+class SwapTarget(Exception):
+    """Raised by `object_command()` for the runner to rebuild its scene as `scene`, keeping
+    the robot where it is (`carry`, which the runner fills in on the way out)."""
+
+    def __init__(self, scene: CustomScene, replaced_mass: float, mass: float):
+        super().__init__(f"Swapping in {scene.object_name}")
+        self.scene = scene
+        self.replaced_mass = replaced_mass
+        self.mass = mass
+        self.carry: dict = {}
+
+    def describe(self) -> str:
+        return (f"Swapping the {self.scene.object_category} ({self.mass:.2f} kg) in for the target "
+                f"({self.replaced_mass:.2f} kg): rebuilding the scene...")
+
+
+OBJECT_COMMANDS = (
+    "'object' to see what can stand in for the target, 'object <category or prefab> [index]' to put it in "
+    "the target's place (the scene is rebuilt, the robot kept where it is)"
+)
+
+
+def object_command(text: str, scene: CustomScene, say: Callable[[str], None]) -> bool:
+    """
+    `object` (what the target is and what can replace it) or `object <name> [index]`: raises
+    SwapTarget with `scene`'s target swapped for that asset (`swap_target()`). Returns whether
+    `text` was one; an asset that cannot be found is said and counts as one.
+    """
+    words = text.split()
+    if not words or words[0] != "object":
+        return False
+    if len(words) == 1:
+        say(swappable_text(scene))
+        return True
+    index = int(words.pop()) if len(words) > 2 and words[-1].isdigit() else 0
+    try:
+        swapped = swap_target(scene, "_".join(words[1:]), index)
+    except ValueError as error:
+        say(str(error))
+        return True
+    raise SwapTarget(swapped, subtree_mass(scene, scene.object_name), subtree_mass(swapped, swapped.object_name))
+
+
+def run_with_swaps(scene: CustomScene, run_scene: Callable[[CustomScene, dict], None],
+                   say: Callable[[str, str | None], None]) -> None:
+    """
+    `run_scene(scene, carry)`, and again with each scene an `object` command swaps in
+    (`SwapTarget`), until it returns. `carry` is what the last run put in the SwapTarget's to
+    take over (the robot's pose, say); empty the first time.
+    """
+    carry: dict = {}
+    while True:
+        try:
+            run_scene(scene, carry)
+            return
+        except SwapTarget as swap:
+            say(swap.describe(), "yellow")
+            scene, carry = swap.scene, swap.carry
+
+
+def subtree_mass(scene: CustomScene, body: str) -> float:
+    model = scene.load_spec().compile()
+    return float(model.body_subtreemass[model.body(body).id])
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +446,12 @@ def add_objects(
         body.pos = list(pose[:3])
         body.quat = list(pose[3:7])
         frame = spec.worldbody.add_frame()
-        frame.attach_body(body, "/".join(path) + "/" if path else "", "")
+        # Everything the asset brings (textures, materials, meshes, geoms) is suffixed with the
+        # body's name, so it cannot clash with the house's (THOR assets share names with its
+        # objects) or another copy's. The body keeps its own name.
+        prefix = "/".join(path) + "/" if path else ""
+        attached = frame.attach_body(body, prefix, f"_{body_name}")
+        attached.name = prefix + body_name
 
 
 def apply_object_poses(spec: mujoco.MjSpec, object_poses: dict[str, list[float]]) -> None:
@@ -648,7 +812,9 @@ class SceneMirror:
     reports (`pull_status()`, `pull_body_poses()`), for rendering cameras the simulator
     does not have (the scene camera, the DROID exo camera) and for rerun.
 
-    Only watched bodies move; everything else stays where the scene put it.
+    Only watched bodies move; everything else stays where the scene put it. Every camera is
+    rendered with one renderer (`RendererPool`): one each would hold a copy of the house's
+    textures on the GPU apiece.
     """
 
     def __init__(self, stretch_scene: Stretch4Scene):
@@ -656,6 +822,7 @@ class SceneMirror:
         self.model = stretch_scene.model
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
+        self.pool = RendererPool(self.model)
         self._renderers: dict[tuple[str, bool], PinholeRenderer] = {}
         self._franka_views: dict[tuple, FrankaOverlayView] = {}
         self._ghost_joints = (
@@ -708,7 +875,7 @@ class SceneMirror:
         key = (camera, kind)
         if key not in self._franka_views:
             # The simulator runs its own copy of the model, so this changes only what is rendered here.
-            self._franka_views[key] = FrankaOverlayView(self.model, self.stretch_scene.franka, camera, kind)
+            self._franka_views[key] = FrankaOverlayView(self.model, self.stretch_scene.franka, camera, kind, pool=self.pool)
         view = self._franka_views[key]
         view.pose_fingers(self.data, driver_angle)
         return view.render(self.data)
@@ -722,7 +889,7 @@ class SceneMirror:
         if key not in self._renderers:
             size = tuple(int(v) for v in self.model.cam_resolution[self.model.camera(camera).id])
             groups = (GHOST_GEOM_GROUP,) if show_ghost else ()
-            self._renderers[key] = PinholeRenderer(self.model, camera, size, geom_groups_on=groups)
+            self._renderers[key] = PinholeRenderer(self.model, camera, size, geom_groups_on=groups, pool=self.pool)
         return self._renderers[key].render(self.data)
 
     def close(self) -> None:
@@ -732,3 +899,4 @@ class SceneMirror:
         for view in self._franka_views.values():
             view.close()
         self._franka_views.clear()
+        self.pool.close()

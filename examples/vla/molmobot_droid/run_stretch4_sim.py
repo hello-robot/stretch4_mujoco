@@ -17,6 +17,10 @@ the virtual Franka's joints and pedestal with the keys and Stretch follows, `pos
 `set q1 ... q7` (rad) moves it there, `height <m>` sets the pedestal, and `offset x y z [roll
 yaw pitch]` changes the grasp offset (mm, deg; `offset` alone prints it).
 
+`object` says what the target is and what can replace it; `object <name> [index]` puts that in
+its place (a THOR category or prefab, or tennis_ball; see `custom_scene.find_asset()`). The
+scene is rebuilt and the simulator restarted, with Stretch back where it was.
+
 Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_sim --scene-id procthor-10k/val/0 --object-type boiler
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --exo_camera center \\
@@ -54,7 +58,10 @@ from examples.vla.molmobot_droid.molmospaces.benchmark import allow_ctrl_c
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     STRETCH_ROOT_BODY,
     SceneMirror,
+    SwapTarget,
     free_bodies,
+    object_command,
+    run_with_swaps,
     load_custom_scene,
     load_custom_scene_stretch4,
     scene_camera_pose,
@@ -184,38 +191,7 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
         apply_overlay_grasp_offset(params)
         click.secho(f"Grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
     scene = load_custom_scene(scene_id, object_type, object_index, in_place_of=in_place_of)
-    click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
     pose = resolve_pose(scene, robot_pose)
-    link0_height = virtual_franka_link0_height(scene)
-    start_q7 = np.array(FRANKA_HOME_QPOS)
-    if custom_franka_start_pose:
-        link0_height = custom_start_link0_height(params, scene.floor_z)
-        start_q7 = np.array(CUSTOM_START_QPOS)
-        click.secho(f"Franka fr3_link0 at z={link0_height:.3f} (molmospaces would put it at "
-                    f"{virtual_franka_link0_height(scene):.3f})", fg="green")
-    # Stretch spawns turned the way the start pose would turn its base, so it does not have to.
-    franka_yaw = franka_yaw_for_start(params, link0_height, start_q7, scene.floor_z)
-    stretch_scene = load_custom_scene_stretch4(
-        scene, pose, include_franka=include_franka, tool_name=params.tool_name, link0_height=link0_height,
-        stretch_yaw=-franka_yaw,
-    )
-
-    if stretch_scene.removed_bodies:
-        click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
-    if stretch_scene.backed_off:
-        click.secho(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
-                    f"rests on: --robot-pose {stretch_scene.robot_pose}", fg="yellow")
-    # As on the real robot, the exo view follows the tool between the side head fisheyes.
-    head_follows_tool = params.exo_camera in HEAD_SIDES
-    sim = spawn_stretch4(stretch_scene, params, both_head_sides=head_follows_tool)
-    if overlay_franka_gripper:
-        sim.watch_bodies(with_nearby_free_bodies(stretch_scene, stretch_scene.watched_bodies))
-    sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
-    allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator, leaving this waiting on the console
-    env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
-    env.overlay_franka_gripper = overlay_franka_gripper
-    env.use_franka_gripper_camera = use_franka_gripper_camera
-    env.head_follows_tool = head_follows_tool
     console = None
 
     def say(message: str, color: str | None = None) -> None:
@@ -224,66 +200,133 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
         else:
             click.secho(message, fg=color)
 
-    env.on_exo_side_change = lambda side, facing, tool_side: say(
-        f"◐ exo view from the {side} head camera (tool facing {facing}, on the {tool_side})"
-    )
-    try:
-        logger = None
-        if rerun:
-            franka_cameras = list(FRANKA_WRIST_CAMERAS) if include_franka else []
-            rerun_scene.init_rerun(
-                "MolmoBot-DROID Stretch 4", RERUN_CAMERAS + franka_cameras, main_cameras=["exo", "wrist", *franka_cameras],
-                eye=scene_camera_pose(stretch_scene.robot_pose, scene.object_pos),
-            )
-            rerun_scene.set_step(0)
-            env.observe()  # poses the mirror
-            logger = StretchRerunLogger(env)
-        step_count = 0
-
-        env.start_q7 = start_q7
-
-        def log_pose() -> None:
-            """A Rerun step outside a rollout; rollout steps and these share the `step` timeline."""
-            nonlocal step_count
-            if logger is not None:
-                step_count += 1
-                logger.log_pose(step_count)
-
-        def go_to_start() -> None:
-            """To the start pose, logging its tool target in Rerun even when Stretch cannot reach it."""
-            try:
-                env.reset()
-            finally:
-                log_pose()
-
-        click.secho("Moving Stretch 4 to the Franka's start pose...", fg="yellow")
-        go_to_start()
-
-        def on_step(info: StepInfo):
-            nonlocal step_count
-            step_count += 1
-            if not sim.is_running():
-                raise SystemExit("The simulator stopped")
-            if logger is not None:
-                logger.log(step_count, info)
-
-        policy = load_policy(checkpoint)
-        click.echo(f"\nThe target's instruction: {build_instruction('pick', scene.object_category)}\n\n{KEYS_HELP}\n")
-        console = Console()
-        editor = StretchStartPoseEditor(
-            env, go_to=env.move_to_franka_pose, set_pedestal_height=stretch_scene.set_franka_pedestal_height,
-            keys=console.keys, say=console.event, on_move=log_pose,
+    def run_scene(scene, carry: dict) -> None:
+        """Stretch in `scene` until `quit`, or until `object` swaps the target (SwapTarget, its
+        `carry` the virtual Franka's joints and pedestal, which the next scene starts from)."""
+        nonlocal console
+        click.secho(f"Target: {scene.object_name} at {scene.object_pos.round(3)}", fg="green")
+        link0_height = virtual_franka_link0_height(scene)
+        start_q7 = np.array(FRANKA_HOME_QPOS)
+        if custom_franka_start_pose:
+            link0_height = custom_start_link0_height(params, scene.floor_z)
+            start_q7 = np.array(CUSTOM_START_QPOS)
+            click.secho(f"Franka fr3_link0 at z={link0_height:.3f} (molmospaces would put it at "
+                        f"{virtual_franka_link0_height(scene):.3f})", fg="green")
+        if "pedestal" in carry:
+            link0_height = scene.floor_z + carry["pedestal"]
+        # Stretch spawns turned the way the start pose would turn its base, so it does not have to.
+        franka_yaw = franka_yaw_for_start(params, link0_height, start_q7, scene.floor_z)
+        stretch_scene = load_custom_scene_stretch4(
+            scene, pose, include_franka=include_franka, tool_name=params.tool_name, link0_height=link0_height,
+            stretch_yaw=-franka_yaw,
         )
-        continuous_session(env, policy, params, max_steps, on_step, console, editor, reset=env.reset)
+
+        if stretch_scene.removed_bodies:
+            say(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", "yellow")
+        if stretch_scene.backed_off:
+            say(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
+                f"rests on: --robot-pose {stretch_scene.robot_pose}", "yellow")
+        # As on the real robot, the exo view follows the tool between the side head fisheyes.
+        head_follows_tool = params.exo_camera in HEAD_SIDES
+        sim = spawn_stretch4(stretch_scene, params, both_head_sides=head_follows_tool)
+        if overlay_franka_gripper:
+            sim.watch_bodies(with_nearby_free_bodies(stretch_scene, stretch_scene.watched_bodies))
+        env = None
+        try:
+            sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
+            allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator, leaving this waiting on the console
+            env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
+            env.overlay_franka_gripper = overlay_franka_gripper
+            env.use_franka_gripper_camera = use_franka_gripper_camera
+            env.head_follows_tool = head_follows_tool
+            env.on_exo_side_change = lambda side, facing, tool_side: say(
+                f"◐ exo view from the {side} head camera (tool facing {facing}, on the {tool_side})"
+            )
+            logger = None
+            if rerun:
+                eye = scene_camera_pose(stretch_scene.robot_pose, scene.object_pos)
+                if carry:  # a swapped-in target: a recording of its own, with its own scene geometry
+                    rerun_scene.new_recording(f"{scene.scene_id}: {scene.object_category}", eye=eye)
+                else:
+                    franka_cameras = list(FRANKA_WRIST_CAMERAS) if include_franka else []
+                    rerun_scene.init_rerun(
+                        "MolmoBot-DROID Stretch 4", RERUN_CAMERAS + franka_cameras,
+                        main_cameras=["exo", "wrist", *franka_cameras], eye=eye,
+                    )
+                rerun_scene.set_step(0)
+                env.observe()  # poses the mirror
+                logger = StretchRerunLogger(env)
+            step_count = 0
+
+            env.start_q7 = start_q7
+
+            def log_pose() -> None:
+                """A Rerun step outside a rollout; rollout steps and these share the `step` timeline."""
+                nonlocal step_count
+                if logger is not None:
+                    step_count += 1
+                    logger.log_pose(step_count)
+
+            def go_to_start() -> None:
+                """To the start pose, logging its tool target in Rerun even when Stretch cannot reach it."""
+                try:
+                    env.reset()
+                finally:
+                    log_pose()
+
+            say("Moving Stretch 4 to the Franka's start pose...", "yellow")
+            go_to_start()
+            go_to_carried_pose(env, carry, say)
+            log_pose()
+
+            def on_step(info: StepInfo):
+                nonlocal step_count
+                step_count += 1
+                if not sim.is_running():
+                    raise SystemExit("The simulator stopped")
+                if logger is not None:
+                    logger.log(step_count, info)
+
+            policy = load_policy(checkpoint)
+            if console is None:
+                click.echo(f"\n{KEYS_HELP}\n  'object [name [index]]' + Enter  swap another object in for the target\n")
+                console = Console()
+            say(f"The target's instruction: {build_instruction('pick', scene.object_category)}", "green")
+            editor = StretchStartPoseEditor(
+                env, go_to=env.move_to_franka_pose, set_pedestal_height=stretch_scene.set_franka_pedestal_height,
+                keys=console.keys, say=console.event, on_move=log_pose,
+                extra_commands=lambda text: object_command(text, scene, console.event),
+            )
+            try:
+                continuous_session(env, policy, params, max_steps, on_step, console, editor, reset=env.reset)
+            except SwapTarget as swap:
+                swap.carry.update(q7=editor.franka_pose(), pedestal=stretch_scene.franka.pedestal_height)
+                raise
+        finally:
+            if env is not None:
+                env.close()
+            sim.stop()
+
+    try:
+        run_with_swaps(scene, run_scene, say)
     except KeyboardInterrupt:
         pass
     finally:
         if console is not None:
             console.close()
         unload_policy()
-        env.close()
-        sim.stop()
 
+
+def go_to_carried_pose(env, carry: dict, say) -> None:
+    """After an `object` swap, Stretch back where it was: at the Franka's `carry["q7"]`, from
+    the start pose. Stays at the start pose if it cannot get there."""
+    if "q7" not in carry:
+        return
+    try:
+        env.move_to_franka_pose(carry["q7"])
+    except RuntimeError:
+        say("Stretch 4 cannot get back to where it was: staying at the start pose", "yellow")
+        env.reset()
 
 if __name__ == "__main__":
     main()
