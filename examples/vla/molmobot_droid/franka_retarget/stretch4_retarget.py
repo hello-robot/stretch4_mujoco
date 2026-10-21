@@ -128,7 +128,9 @@ STRETCH_GRIPPER_TOOL = "eoa_wrist_dw4_tool_sg4"
 PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 
 DEFAULT_GRASP_OFFSET_MM = {
+    # STRETCH_GRIPPER_TOOL: (0.0, 0.0, 0.0),
     STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
+    # PARALLEL_GRIPPER_TOOL: (0.0 , 0, 0),
     PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0),
     # PARALLEL_GRIPPER_TOOL: (4.0 + 33, -21, 17),
     # PARALLEL_GRIPPER_TOOL: (4.0 + 33, 0, 0),
@@ -1126,15 +1128,25 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
     current = seed.to_numpy()
     exact: list[tuple[tuple, object]] = []
     best, best_error = None, np.inf
-    for start in seeds:
-        q = kinematics._closed_loop_inverse_kinematics(
-            model,
-            kinematics.data_ik,
-            STRETCH_TCP,
-            target_pose,
-            q_guess=start.to_pinocchio_q(Stretch4IKModes.BASE_ROTATE),
-            max_iter=300,
-        )
+    attempts = [(start, False) for start in seeds]
+    if prefer_margin:  # with the base held (see below)
+        attempts += [(start, True) for start in seeds]
+    lower, upper = model.lowerPositionLimit.copy(), model.upperPositionLimit.copy()
+    for start, hold_base in attempts:  # grows: see below
+        q_guess = start.to_pinocchio_q(Stretch4IKModes.BASE_ROTATE)
+        if hold_base:  # q is [base, lift, arm, yaw, pitch, roll]
+            model.lowerPositionLimit[0] = model.upperPositionLimit[0] = q_guess[0] = 0.0
+        try:
+            q = kinematics._closed_loop_inverse_kinematics(
+                model,
+                kinematics.data_ik,
+                STRETCH_TCP,
+                target_pose,
+                q_guess=np.clip(q_guess, model.lowerPositionLimit, model.upperPositionLimit),
+                max_iter=300,
+            )
+        finally:
+            model.lowerPositionLimit[:], model.upperPositionLimit[:] = lower, upper
         solution = StretchJointPositions.from_pinocchio_q(q)
         # base rotation and the wrist: indices 2, 5, 6, 7 of [x, y, theta, lift, arm, yaw, pitch, roll]
         jump = np.max(np.abs(solution.to_numpy()[[2, 5, 6, 7]] - current[[2, 5, 6, 7]]))
@@ -1153,6 +1165,12 @@ def solve_stretch_ik(kinematics, target: np.ndarray, seed, prefer_margin: bool =
             else:
                 score = (margin < WRIST_LIMIT_MARGIN, float(np.linalg.norm(solution.to_numpy()[2:] - current[2:])))
             exact.append((score, solution))
+            if prefer_margin and not hold_base:
+                # A grasp pointing straight down lines the wrist's yaw and roll up, so the pose
+                # is reached along a family of base turns, and a free solve lands anywhere on it
+                # (~1 degree off, which the base turns to no better than ~0.7). Solved again from
+                # here with the base held, it slides along the family to where the base stays put.
+                attempts.append((solution, True))
             continue
         # Closest in position, among those not far off in orientation.
         error = position_error + (np.inf if rotation_error > MAX_CLAMPED_ROTATION_ERROR else 0)

@@ -49,7 +49,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     to_droid_frame,
     wrist_view,
 )
-from examples.vla.molmobot_droid.molmospaces.custom_scene import DROID_EXO_IN_STRETCH_SCENE, STRETCH_ROOT_BODY
+from examples.vla.molmobot_droid.molmospaces.custom_scene import DROID_EXO_IN_STRETCH_SCENE, STRETCH_ROOT_BODY, CustomScene
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
 STRETCH_CAMERAS: dict[str, StretchCameras] = {
@@ -131,14 +131,22 @@ def follow_flags(params: RetargetParams, custom_franka_start_pose: bool) -> dict
     return flags
 
 
-def franka_alone() -> FrankaDroidEnv:
+def franka_alone(scene: CustomScene) -> FrankaDroidEnv:
     """
     The Franka DROID by itself, on molmospaces' pedestal with nothing else in its model,
-    simulated at the policy's rate as `FrankaDroidEnv` simulates it in a house: what the policy
-    drives while Stretch follows. Where it stands does not change how its joints move, so it
-    stands at the origin; its views are rendered where the virtual Franka is.
+    simulated at the policy's rate as `FrankaDroidEnv` simulates it in `scene`'s house: what the
+    policy drives while Stretch follows. Where it stands does not change how its joints move, so
+    it stands at the origin; its views are rendered where the virtual Franka is.
+
+    It takes the house's physics options (`<option>`: integrator, cone, impratio, noslip,
+    gravity), without which its joints follow the same actions differently from the Franka's in
+    the house (by up to 0.03 rad over a reach), and the policy is shown another arm's state.
     """
     spec = mujoco.MjSpec()
+    house = mujoco.MjSpec.from_file(scene.scene_xml).option
+    for name in dir(house):
+        if not name.startswith("_"):
+            setattr(spec.option, name, getattr(house, name))
     spawn = spawn_franka_droid(spec, RobotPose(0.0, 0.0, 0.0), FRANKA_PEDESTAL_HEIGHT, exo_camera=None)
     return FrankaDroidEnv(spec.compile(), spawn, render_cameras=False)
 
@@ -156,7 +164,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         if not stretch_scene.include_franka:
             raise ValueError("Following the Franka needs it in the scene (include_franka) to render its cameras")
         super().__init__(sim, stretch_scene, params, mirror)
-        self.franka = franka_alone()
+        self.franka = franka_alone(stretch_scene.scene)
         self.trajectory = StretchTrajectory()
         self.start_yaw = 0.0
         """Stretch's heading at `reset()`: its state's base_yaw is from there."""
