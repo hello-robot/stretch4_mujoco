@@ -212,11 +212,12 @@ through the Kannala-Brandt lens model (OpenCV's fisheye model) to where the fish
 things are the size DROID's camera shows them right out to the edges.
 
 - **Calibration.** Sim: stretch4_mujoco's, which the fisheyes are rendered through. Real robot:
-  the one the publisher sends with the frames (`head_<side>_camera_matrix`,
-  `head_<side>_distortion_coefficients`), when it is a fisheye one (four coefficients, or the
-  rest zero); otherwise stretch4_mujoco's, which is another robot's lens, with a warning. The
-  calibration is for the landscape sensor, so each ray is turned the way the image was turned
-  upright, and scaled to the size of the image it is given.
+  the robot's own, `head_left` / `head_right` from its
+  `calibration_cameras/calibration_rgb_head_camera.yaml`, which the publisher sends with the
+  frames (`camera_calibration`). It has to be a fisheye model (`equidistant`); without one
+  `run_stretch4_real.py --rectify` stops and says what is missing. The calibration is for the
+  landscape sensor, so each ray is turned the way the image was turned upright, and scaled to
+  the size of the image it is given.
 - **Sampling.** It samples the fisheye at 1280×736 (`RECTIFY_SUPERSAMPLE`, bilinear), then
   area-averages down to 640×368. In fisheye pixels per output pixel, at 1920×1200 that is 2.0 at
   the centre, 0.75 across at the side edges and 0.8 at the corners: the edges are enlarged up to
@@ -247,8 +248,9 @@ The same check from the same place. Each fisheye is put on the Franka where it i
 `run_franka.py --exo_camera left|right` puts it, and the DROID exo camera (a pinhole 71° high, at
 640×368, upright, on the fisheye's optical axis and 6 mm in front of it, where the fisheye's views
 are rendered from) is moved to the same pose. Columns: left fisheye, the DROID exo camera there,
-right fisheye, the DROID exo camera there; cropped on the top row, `--rectify` on the bottom. The
-rectified fisheyes are the DROID camera's image to within half a pixel, and a mean difference
+right fisheye, the DROID exo camera there; cropped on the top row, `--rectify` on the bottom. For
+the left fisheye the Franka stands 0.2 m lower, with the camera left where it is; at its usual
+height the left fisheye sits inside its arm. The rectified fisheyes are the DROID camera's image to within half a pixel, and a mean difference
 of under 1/255.
 
 ## `run_stretch4_real.py`: the real robot
