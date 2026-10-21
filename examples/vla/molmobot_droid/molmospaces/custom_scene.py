@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import math
 import re
+import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -64,6 +65,10 @@ uid (from molmospaces' val split): `load_custom_scene()` swaps one in for one of
 own objects (`in_place_of`), as it can any THOR asset (`find_asset()`)."""
 INSERT_DROP_HEIGHT = 0.002
 """m. An inserted object starts this far above where the object it replaces rested."""
+VISUAL_GEOM_MASS = 1e-8
+"""kg. What procthor writes on the visual geom of every prefab it inlines into a house, and what
+`repair_visual_geom_masses()` writes on an added one's. Not zero: a zero-mass `inertia="shell"`
+mesh is a degenerate inertia MuJoCo can reject."""
 
 
 @dataclass
@@ -299,7 +304,8 @@ def insert_in_place_of(scene: CustomScene, asset: Asset, replaced: str) -> Custo
     `scene` with `asset` as the target, in place of its `replaced` free body as it starts
     (`scene`'s modifications applied, so it can be an asset an earlier swap put in): centred
     where `replaced`'s geoms were, resting where their bottom was (dropped from
-    INSERT_DROP_HEIGHT above), upright. The asset's mass is its XML's.
+    INSERT_DROP_HEIGHT above), upright. The asset's mass is its XML's, with its visual geoms'
+    repaired (`repair_visual_geom_masses()`).
     """
     from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
 
@@ -417,7 +423,8 @@ def remove_objects(spec: mujoco.MjSpec, names: list[str]) -> None:
 def add_objects(
     spec: mujoco.MjSpec, added_objects: dict[str, str], object_poses: dict[str, list[float]]
 ) -> None:
-    """Add episode objects the way molmospaces' `JsonEvalTaskSampler.add_auxiliary_objects()` does."""
+    """Add episode objects the way molmospaces' `JsonEvalTaskSampler.add_auxiliary_objects()` does,
+    but at the mass they would have inlined in a house (`repair_visual_geom_masses()`)."""
     if not added_objects:
         return
     from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
@@ -431,6 +438,7 @@ def add_objects(
         if not object_xml.is_file():
             object_xml = Path(install_uid(Path(object_xml_rel).stem))
         object_spec = mujoco.MjSpec.from_file(str(object_xml))
+        repair_visual_geom_masses(object_spec, object_name)
         body = object_spec.worldbody.bodies[0]
         *path, body_name = object_name.split("/")
         body.name = body_name
@@ -452,6 +460,26 @@ def add_objects(
         prefix = "/".join(path) + "/" if path else ""
         attached = frame.attach_body(body, prefix, f"_{body_name}")
         attached.name = prefix + body_name
+
+
+def repair_visual_geom_masses(object_spec: mujoco.MjSpec, object_name: str) -> None:
+    """
+    Give an added object the mass it would have inlined in a house. A THOR prefab's XML gives
+    its colliders a density but its visual mesh none, and that mesh is `inertia="shell"`, so
+    MuJoCo weighs its surface at 1000 kg/m^3: a 17.5 kg Potato_1, a 2.4 kg Mug_1. procthor
+    writes VISUAL_GEOM_MASS on those geoms when it builds a house, and molmospaces' samplers
+    (`JsonEvalTaskSampler.add_auxiliary_objects()`, `PickTaskSampler`) attach the raw prefab,
+    so nothing does it for added objects. Objaverse assets already carry it. A visual geom
+    with a mass of its own is left as it is, and so is an object with no collider to carry
+    its mass instead (it would be massless).
+    """
+    visual = [geom for geom in object_spec.geoms if geom.contype == 0 and geom.conaffinity == 0]
+    if len(visual) == len(object_spec.geoms):
+        warnings.warn(f"{object_name} has no collision geom, so its visual mesh's mass is left as is")
+        return
+    for geom in visual:
+        if math.isnan(geom.mass):  # unset: derived from the geom's density
+            geom.mass = VISUAL_GEOM_MASS
 
 
 def apply_object_poses(spec: mujoco.MjSpec, object_poses: dict[str, list[float]]) -> None:
