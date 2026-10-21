@@ -11,7 +11,9 @@ does each of its actions in the world through retargeting (`FrankaStretchRetarge
 - The policy's state is the Franka's own joints, not Stretch's mapped back. Only the gripper's
   opening is Stretch's: the Franka's Robotiq would close on nothing, where Stretch's stops on the
   object it holds, and the Robotiq is drawn closed as far.
-- Stretch's cameras are recorded raw and as a policy would be shown them (`stretch_views()`),
+- Stretch's cameras are recorded raw and as a policy would be shown them, the head fisheyes
+  also rectified to the DROID exo camera, and the fisheye on the tool's side as
+  `run_stretch4_sim.py` picks its exo view (`fisheye_tool`) all three ways (`stretch_views()`),
   and its joints and joint targets as `finetune.stretch4_joints` values (`trajectory`), for
   `save_trajectory()`.
 
@@ -63,21 +65,43 @@ STRETCH_CAMERAS: dict[str, StretchCameras] = {
 UNCROPPED = ("center",)
 """Recorded only as rendered: the others are also recorded as a policy would be shown them."""
 
+RECTIFIED = ("fisheye_left", "fisheye_right")
+"""Also recorded redrawn as the DROID exo camera would see them (`<name>_rectified`, as --rectify does)."""
+
+TOOL_FISHEYE = "fisheye_tool"
+"""The head fisheye on the side the tool is toward (`head_camera_for_tool()`), as
+`run_stretch4_sim.py` and the real robot pick the exo view: `fisheye_left` or `fisheye_right`
+each step, raw, cropped and rectified as they are."""
+
 STRETCH_VIEWS: tuple[str, ...] = tuple(
-    view for name in STRETCH_CAMERAS for view in ((name,) if name in UNCROPPED else (f"{name}_raw", name))
+    view
+    for name in (*STRETCH_CAMERAS, TOOL_FISHEYE)
+    for view in ((name,) if name in UNCROPPED else (f"{name}_raw", name))
+    + ((f"{name}_rectified",) if name in (*RECTIFIED, TOOL_FISHEYE) else ())
 )
-"""What `stretch_views()` returns, in order."""
+"""What `stretch_views()` returns given a `tool_side`, in order."""
 
-GRID_EXCLUDED: tuple[str, ...] = tuple(view for view in STRETCH_VIEWS if view.endswith("_raw")) + UNCROPPED
-"""Left out of the grid videos (their own videos have them): it shows the Franka's views and Stretch's cropped ones."""
+GRID_EXCLUDED: tuple[str, ...] = (
+    tuple(
+        view for view in STRETCH_VIEWS
+        if view.endswith("_raw") or (view.endswith("_rectified") and view != f"{TOOL_FISHEYE}_rectified")
+    )
+    + UNCROPPED
+)
+"""Left out of the grid videos (their own videos have them): it shows the Franka's views, Stretch's
+cropped ones, and TOOL_FISHEYE's cropped and rectified."""
 
 
-def stretch_views(images: dict[str, np.ndarray], rectify: bool = False) -> dict[str, np.ndarray]:
+def stretch_views(
+    images: dict[str, np.ndarray], rectify: bool = False, tool_side: str | None = None
+) -> dict[str, np.ndarray]:
     """
     Each Stretch camera's image as rendered (`<name>_raw`) and as a policy would be shown it
     (`<name>`): the head fisheyes DROID-framed as --head-crop droid frames them (with `rectify`,
     redrawn as the DROID exo camera, as --rectify does), the gripper cameras as the retargeted
-    policy's wrist view. The center camera only as rendered.
+    policy's wrist view. The center camera only as rendered. The head fisheyes also redrawn as
+    the DROID exo camera whatever `rectify` is (`<name>_rectified`). With `tool_side` (left or
+    right), that side's fisheye views again as TOOL_FISHEYE's.
     """
     views = {}
     for name, image in images.items():
@@ -87,10 +111,14 @@ def stretch_views(images: dict[str, np.ndarray], rectify: bool = False) -> dict[
         views[f"{name}_raw"] = image
         if name.startswith("gripper"):
             views[name] = wrist_view(image)
-        elif rectify:
-            views[name] = head_rectifier(name.removeprefix("fisheye_"))(image)
-        else:
-            views[name] = to_droid_frame(image)
+            continue
+        rectified = head_rectifier(name.removeprefix("fisheye_"))(image)
+        views[name] = rectified if rectify else to_droid_frame(image)
+        views[f"{name}_rectified"] = rectified
+    if tool_side is not None:
+        source = f"fisheye_{tool_side}"
+        for suffix in ("_raw", "", "_rectified"):
+            views[f"{TOOL_FISHEYE}{suffix}"] = views[f"{source}{suffix}"]
     return views
 
 
@@ -134,6 +162,8 @@ class FollowFrankaEnv(Stretch4SimEnv):
         """Stretch's heading at `reset()`: its state's base_yaw is from there."""
         self.tool_errors: list[float] = []
         """m. After each step, how far Stretch's tool is from where the Franka's action put it."""
+        # `exo_camera` follows the tool, for TOOL_FISHEYE: the policy's views are the Franka's either way.
+        self.head_follows_tool = True
 
     def cameras(self) -> list[StretchCameras]:
         return list(STRETCH_CAMERAS.values())
@@ -167,6 +197,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         joints = self.joints(status)
         self.observed_state = (status.time, footprint, joints)
         self.mirror.update(status, poses)
+        self.update_exo_side(joints)
 
         q7 = self.franka.state8[:7]
         driver = robotiq_driver_angle(joints.gripper_open_fraction)
@@ -181,7 +212,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         self.trajectory.observe(
             stretch4_joints.state8(_wrap(base[2] - self.start_yaw), joints), state8, base, status.time
         )
-        return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=stretch_views(images, self.params.rectify))
+        return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=stretch_views(images, self.params.rectify, self.exo_camera))
 
     def step(self, action8: np.ndarray) -> StretchTargets | None:
         joints = self.joints()

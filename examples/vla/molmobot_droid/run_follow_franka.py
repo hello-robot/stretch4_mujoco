@@ -23,8 +23,9 @@ Watch it in stretch4_mujoco's viewer (the Franka is in geom group 5: press 5 to 
 home) and in Rerun: the policy's views (the Franka's exo and wrist cameras), Stretch's head
 fisheyes and gripper cameras as a policy would be shown them, the scene camera with the Franka
 see-through over Stretch, and the house in 3D with the Franka's tool target and Stretch's tool.
-With --rectify, the fisheyes are shown redrawn as the DROID exo camera would see them
-(`FisheyeRectifier`) instead of only cropped to its aspect; the policy still sees the Franka's.
+`fisheye_tool` is the fisheye on the tool's side, switching as `run_stretch4_sim.py` switches
+its exo view. With --rectify, the fisheyes are shown redrawn as the DROID exo camera would see
+them (`FisheyeRectifier`) instead of only cropped to its aspect; the policy still sees the Franka's.
 
 Usage:
     python -m examples.vla.molmobot_droid.run_follow_franka --scene-id procthor-10k/val/0 --object-type mug
@@ -41,7 +42,7 @@ import numpy as np
 from examples.vla.molmobot_droid import rerun_scene
 from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, build_instruction, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.console import KEYS_HELP, Console, continuous_session
-from examples.vla.molmobot_droid.franka_retarget.follow_franka import STRETCH_CAMERAS, FollowFrankaEnv
+from examples.vla.molmobot_droid.franka_retarget.follow_franka import STRETCH_CAMERAS, TOOL_FISHEYE, FollowFrankaEnv
 from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
@@ -69,8 +70,9 @@ from examples.vla.molmobot_droid.rollout import StepInfo
 from examples.vla.molmobot_droid.run_franka import resolve_pose, scene_options
 from examples.vla.molmobot_droid.run_stretch4_sim import go_to_carried_pose, with_nearby_free_bodies
 
-RERUN_CAMERAS = ["exo", "wrist", "fisheye_left", "fisheye_right", "gripper_left", "gripper_right", "scene"]
-"""The policy's (the Franka's) views, Stretch's as a policy would be shown them, the scene camera."""
+RERUN_CAMERAS = ["exo", "wrist", "fisheye_left", "fisheye_right", TOOL_FISHEYE, "gripper_left", "gripper_right", "scene"]
+"""The policy's (the Franka's) views, Stretch's as a policy would be shown them (TOOL_FISHEYE: the
+fisheye on the tool's side, as `run_stretch4_sim.py` picks its exo view), the scene camera."""
 
 
 def spawn_follow_sim(stretch_scene, params, judged_bodies: list[str]):
@@ -175,6 +177,9 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
             allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator, leaving this waiting on the console
             env = FollowFrankaEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
             env.start_q7 = start_q7
+            env.on_exo_side_change = lambda side, facing, tool_side: say(
+                f"◐ {TOOL_FISHEYE} from the {side} head camera (tool facing {facing}, on the {tool_side})"
+            )
             logger = None
             step_count = 0
             if rerun:
