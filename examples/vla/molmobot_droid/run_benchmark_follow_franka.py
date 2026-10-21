@@ -113,6 +113,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                         tool_name=params.tool_name,
                         link0_height=link0_height,
                         stretch_yaw=-franka_yaw,
+                        keep_removed_for_franka=True,
                     )
                 except Exception as error:  # e.g. Stretch 4 cannot stand clear of the scene here
                     result = failed_result(index, setup, error)
@@ -120,7 +121,8 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     run.record(result)
                     continue
                 if stretch_scene.removed_bodies:
-                    click.secho(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", fg="yellow")
+                    click.secho(f"Removed furniture Stretch 4 would spawn inside (the Franka's views still show it): "
+                                f"{stretch_scene.removed_bodies}", fg="yellow")
                 if stretch_scene.backed_off:
                     click.secho(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
                                 f"rests on: --robot-pose {stretch_scene.robot_pose}", fg="yellow")

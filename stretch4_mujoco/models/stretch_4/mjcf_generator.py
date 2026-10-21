@@ -329,11 +329,21 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             mast, "geom", mesh="mast_collision_link", **{"class": "collision"}, mass="4.25"
         )
 
-    # 9. Update arm_l0_link if needed and add gravcomp to lift, arm, wrist, gripper bodies
+    # 9. Update arm_l0_link if needed and add gravcomp to lift, arm, wrist, gripper bodies.
+    # The whole tool (the Stretch gripper or the parallel gripper) hangs off
+    # tool_attachment_site_link; parts of it (the mount, the SG4's quick connect) match none
+    # of the names below, and neither do Stretch 4's arm and wrist links (arm_l0_link,
+    # wrist_yaw_link, ...), which uncompensated sag the lift ~2 mm under its kp.
+    carried = set()
+    for root in ("tool_attachment_site_link", "arm_l0_link", "wrist_yaw_link"):
+        body = find_body(root)
+        if body is not None:
+            carried.update(body.iter("body"))
     for b in worldbody.findall(".//body"):
         name = b.get("name", "")
         if (
-            "lift_link" in name
+            b in carried
+            or "lift_link" in name
             or "arm_link" in name
             or "wrist_link" in name
             or "gripper" in name
