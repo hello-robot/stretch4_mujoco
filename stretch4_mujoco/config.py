@@ -93,7 +93,76 @@ robot_settings_se4 = {
         "wheel0_polarity": -1,
         "wheel1_polarity": -1,
         "wheel2_polarity": -1,
-    }
+    },
+    # Safe motions, mirrored from stretch4_body's `robot/robot_params_SE4.py`.
+    'safe_motion_manager': {
+        # Guarded contact runs first: a joint it stops is one less thing pushing
+        # the robot over for overtilt to have to catch.
+        'controllers': ['safe_motion_guarded_contact', 'safe_motion_overtilt_avoid']},
+    'safe_motion_guarded_contact': {
+        'py_module_name': 'stretch4_mujoco.safe_motions.safe_motion_guarded_contact',
+        'py_class_name': 'SafeMotionGuardedContact',
+        'enabled': 1,
+        'alert_period': 2.0,
+        # The robot's stepper gains, copied from `robot_params_SE4.py`. The
+        # firmware calls contact when motor current passes `i_contact`; the
+        # sim's stand-in for current is actuator force over its force range
+        # (the same ratio `Stepper.current_to_effort_pct` takes), so contact is
+        # called at `i_contact_a / i_max_a` of force range. Measured peaks in
+        # ordinary profiled motion are well under these: lift 11.5%, arm 1.1%,
+        # wheels ~1%.
+        'joints': {
+            'arm':             {'i_max_a': 7.7, 'i_contact_a': 2.0},   # 26%
+            'lift':            {'i_max_a': 6.7, 'i_contact_a': 2.0},   # 30%
+            'left_wheel_vel':  {'i_max_a': 7.7, 'i_contact_a': 2.0},   # 26%
+            'right_wheel_vel': {'i_max_a': 7.7, 'i_contact_a': 2.0},
+            'back_wheel_vel':  {'i_max_a': 7.7, 'i_contact_a': 2.0},
+        },
+        # The wrist and gripper are Feetech servos, not steppers, and the robot
+        # guards them a different way: `feetech_SM_hello._unpack_status` calls
+        # a stall once the joint has sat under `stall_min_vel` while over
+        # `stall_max_effort` percent for longer than `stall_max_time`. Values
+        # from `SE4_wrist_*_DW4` / `SE4_stretch_gripper_DW4`.
+        # NOTE: the thresholds below are a percentage of the actuator's
+        # `forcerange`, which for the wrist is 400 N.m in defaults.xml. That is
+        # servo-implausible, and it puts the 20% trip point at 80 N.m -- above
+        # the ~50 N.m that tips the robot, so the wrist guard cannot engage in
+        # time. Correct the wrist `forcerange` and this starts working.
+        'servo_joints': {
+            name: {'stall_max_effort_pct': 20.0,
+                   'stall_min_vel': 0.1,
+                   'stall_max_time_s': 1.0}
+            for name in ('wrist_yaw', 'wrist_pitch', 'wrist_roll',
+                         'gripper_left_finger', 'gripper_right_finger')
+        },
+        # How far the setpoint must lead the measured position before the joint
+        # counts as driving into something rather than holding station. Any
+        # effort near a trip threshold implies far more error than this; it is
+        # here so a joint parked against a standing load cannot latch.
+        'drive_deadband': 0.001,
+        # Multiplier on the threshold. Lower is more sensitive, as the robot's
+        # `coeff_sensitivity_pos`/`_neg` are; `default` is the robot's
+        # documented contact current itself.
+        'sensitivity': {'default': 1.0, 'high': 0.5, 'low': 1.5},
+        'sensitivity_profile': 'default',
+        # Effort low-pass, the robot's `effort_LPF`. Keeps the contact solver's
+        # first-touch force spike from reading as a collision.
+        'effort_lpf_hz': 2.0,
+    },
+    'safe_motion_overtilt_avoid': {
+        'py_module_name': 'stretch4_mujoco.safe_motions.safe_motion_overtilt_avoid',
+        'py_class_name': 'SafeMotionOvertiltAvoid',
+        # Angles (deg) before the robot pauses motion to prevent tipping over
+        'gravity_tilt_thresh_deg': {'default': 6.0, 'conservative': 9.0, 'aggressive': 3.0},
+        'enabled': 1,
+        'alert_period': 2.0,
+        # Tilt (deg) the base must come back under before motion is released.
+        # The robot has no such band -- its motors latch into safety/freewheel
+        # until something re-commands them -- but the sim re-decides every
+        # control cycle, so without hysteresis a robot parked right on 6 deg
+        # would chatter in and out of the override at 100 Hz.
+        'gravity_tilt_release_deg': 4.0,
+    },
 }
 
 
