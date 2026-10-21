@@ -162,10 +162,11 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
         franka_yaw = franka_yaw_for_start(params, link0_height, start_q7, scene.floor_z)
         stretch_scene = load_custom_scene_stretch4(
             scene, pose, include_franka=True, tool_name=params.tool_name, link0_height=link0_height,
-            stretch_yaw=-franka_yaw,
+            stretch_yaw=-franka_yaw, keep_removed_for_franka=True,
         )
         if stretch_scene.removed_bodies:
-            say(f"Removed furniture Stretch 4 would spawn inside: {stretch_scene.removed_bodies}", "yellow")
+            say(f"Removed furniture Stretch 4 would spawn inside (the Franka's views still show it): "
+                f"{stretch_scene.removed_bodies}", "yellow")
         if stretch_scene.backed_off:
             say(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
                 f"rests on: --robot-pose {stretch_scene.robot_pose}", "yellow")

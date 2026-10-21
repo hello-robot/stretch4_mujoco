@@ -51,6 +51,7 @@ from examples.vla.molmobot_droid.droid import (
     pose_to_transform,
     resize_franka_pedestal,
     spawn_franka_droid,
+    subtree_geoms,
 )
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 
@@ -420,6 +421,36 @@ def remove_objects(spec: mujoco.MjSpec, names: list[str]) -> None:
             spec.delete(body)
 
 
+FRANKA_VIEW_GEOM_GROUP = 4
+"""The geom group of scenery only the Franka's own views draw (`keep_for_franka_views()`): not
+Stretch's cameras (groups 0 and 3), MuJoCo's default (0-2), nor the scene camera's ghost group.
+The houses' colliders are in it too, and nothing draws them."""
+
+
+def keep_for_franka_views(spec: mujoco.MjSpec, names: list[str]) -> list[str]:
+    """
+    The bodies `names` as scenery only the Franka's own views draw, in place of removing them:
+    welded where they stand (any joints deleted), touching nothing, what MuJoCo draws by default
+    of them (groups 0-2) moved to FRANKA_VIEW_GEOM_GROUP and the rest (colliders) deleted.
+    Returns the bodies' names in `spec`.
+    """
+    kept = []
+    for name in names:
+        body = spec.body(name) or spec.body(name.split("/")[-1])
+        if body is None:
+            continue
+        for joint in body.find_all("joint"):
+            spec.delete(joint)
+        for geom in body.find_all("geom"):
+            if geom.group > 2:
+                spec.delete(geom)
+                continue
+            geom.contype = geom.conaffinity = 0
+            geom.group = FRANKA_VIEW_GEOM_GROUP
+        kept.append(body.name)
+    return kept
+
+
 def add_objects(
     spec: mujoco.MjSpec, added_objects: dict[str, str], object_poses: dict[str, list[float]]
 ) -> None:
@@ -656,6 +687,8 @@ class Stretch4Scene:
     include_franka: bool
     removed_bodies: list[str] = field(default_factory=list)
     """Furniture taken out because Stretch 4 would have spawned inside it."""
+    franka_view_bodies: list[str] = field(default_factory=list)
+    """Of `removed_bodies`, those kept for the Franka's own views (`keep_removed_for_franka`)."""
     backed_off: float = 0.0
     """How far (m) `robot_pose` was moved away from the target so Stretch 4 clears what it rests on."""
 
@@ -686,11 +719,17 @@ def load_custom_scene_stretch4(
     link0_height: float | None = None,
     clear_footprint: bool = True,
     stretch_yaw: float = 0.0,
+    keep_removed_for_franka: bool = False,
 ) -> Stretch4Scene:
     """
     The scene with Stretch 4 standing at `robot_pose`, compiled for
     `Stretch4MujocoSimulator(model=...)`. Stretch faces `stretch_yaw` (rad) to the left of
     `robot_pose`'s heading, the Franka along it: see `franka_yaw_for_start()`.
+
+    `keep_removed_for_franka` keeps the furniture `clear_footprint` removes for the Franka's own
+    views (`keep_for_franka_views()`, drawn by `SceneMirror.render_with_franka()`'s
+    "franka_alone"), for following the Franka: its policy is then shown the house as the Franka
+    DROID in it would see it. Stretch, its cameras and the physics have it removed either way.
 
     The retargeting Franka is virtual: its `fr3_link0` is at `robot_pose` and the training
     height for the target object. `include_franka` also puts it in the scene as a ghost (no
@@ -706,7 +745,9 @@ def load_custom_scene_stretch4(
     removed: list[str] = []
     pose, backed_off = robot_pose, 0.0
     for _ in range(4):
-        stretch_scene = _build_stretch4_scene(scene, pose, include_franka, tool_name, link0_height, removed, stretch_yaw)
+        stretch_scene = _build_stretch4_scene(
+            scene, pose, include_franka, tool_name, link0_height, removed, stretch_yaw, keep_removed_for_franka
+        )
         if not clear_footprint:
             return stretch_scene
         blocking = bodies_blocking_stretch(stretch_scene)
@@ -794,11 +835,16 @@ def _build_stretch4_scene(
     link0_height: float | None,
     removed: list[str],
     stretch_yaw: float = 0.0,
+    keep_removed_for_franka: bool = False,
 ) -> "Stretch4Scene":
     from examples.molmo_environment import add_stretch_to_scene
 
     spec = scene.load_spec()
-    remove_objects(spec, removed)
+    franka_view_bodies = []
+    if keep_removed_for_franka:
+        franka_view_bodies = keep_for_franka_views(spec, removed)
+    else:
+        remove_objects(spec, removed)
     stretch_pose = RobotPose(robot_pose.x, robot_pose.y, robot_pose.yaw + stretch_yaw)
     add_stretch_to_scene(
         spec, pos=[robot_pose.x, robot_pose.y, scene.floor_z], quat=stretch_pose.quat_wxyz, tool_name=tool_name
@@ -831,7 +877,7 @@ def _build_stretch4_scene(
     add_scene_camera(spec, robot_pose, scene.object_pos)
 
     model = spec.compile()
-    return Stretch4Scene(model, scene, robot_pose, franka, include_franka)
+    return Stretch4Scene(model, scene, robot_pose, franka, include_franka, franka_view_bodies=franka_view_bodies)
 
 
 class SceneMirror:
@@ -858,6 +904,7 @@ class SceneMirror:
             if stretch_scene.include_franka
             else []
         )
+        self._franka_scenery = [g for body in stretch_scene.franka_view_bodies for g in subtree_geoms(self.model, body)]
         self.set_ghost(FRANKA_HOME_QPOS)
 
     def update(self, status, body_poses: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
@@ -903,7 +950,9 @@ class SceneMirror:
         key = (camera, kind)
         if key not in self._franka_views:
             # The simulator runs its own copy of the model, so this changes only what is rendered here.
-            self._franka_views[key] = FrankaOverlayView(self.model, self.stretch_scene.franka, camera, kind, pool=self.pool)
+            self._franka_views[key] = FrankaOverlayView(
+                self.model, self.stretch_scene.franka, camera, kind, pool=self.pool, scenery=self._franka_scenery
+            )
         view = self._franka_views[key]
         view.pose_fingers(self.data, driver_angle)
         return view.render(self.data)
