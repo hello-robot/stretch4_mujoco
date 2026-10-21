@@ -30,6 +30,7 @@ from examples.vla.molmobot_droid.molmospaces.benchmark import (
     FLAG_ABBREVIATIONS,
     benchmark_description,
     episode_name,
+    scene_table,
     video_path,
 )
 
@@ -175,15 +176,15 @@ def comparison_report(franka: dict, stretches: list[dict], common: list[int], vi
         "",
         "## Episodes",
         "",
-        "| # | Instruction | " + " | ".join(run["label"] for run in runs) + " | "
+        "| # | Episode | Scene | Instruction | " + " | ".join(run["label"] for run in runs) + " | "
         + " | ".join(f"{run['label']} steps" for run in runs) + " | "
         + " | ".join(per_stretch("Stretch IK failures") + per_stretch("Stretch IK clamped")) + " | Videos |",
-        "|---" * (2 * len(runs) + 2 * len(stretches) + 3) + "|",
+        "|---" * (2 * len(runs) + 2 * len(stretches) + 5) + "|",
     ]
     for i in common:
         results = [run["by_index"][i] for run in runs]
         lines.append(
-            f"| {i} | {results[0]['instruction']} | "
+            f"| {i} | {episode_name(i)} | {results[0]['scene_id']} | {results[0]['instruction']} | "
             + " | ".join(_outcome(r) for r in results) + " | "
             + " | ".join(str(r["steps"]) for r in results) + " | "
             + " | ".join([_metric(r, "ik_failures") for r in results[1:]] + [_metric(r, "ik_clamped") for r in results[1:]])
@@ -194,6 +195,18 @@ def comparison_report(franka: dict, stretches: list[dict], common: list[int], vi
     missing = sorted(set().union(*(run["by_index"] for run in runs)) - set(common))
     if missing:
         lines += ["", f"Episodes not in every run (not compared): {missing}"]
+    lines += [
+        "",
+        "## Scenes",
+        "",
+        "Where each episode happens, as the Franka run built it. Stretch 4's footprint and the furniture "
+        "removed for it are in each Stretch 4 run's `report.md`. To rerun episodes (e.g. `--episodes 3,7`):",
+        "",
+        *[f"- {run['label']}: `{run['command']} --episodes <#>`" if run.get("command")
+          else f"- {run['label']}: (not recorded; the run predates it)" for run in runs],
+        "",
+        *scene_table([franka["by_index"][i] for i in common]),
+    ]
     return "\n".join(lines) + "\n"
 
 

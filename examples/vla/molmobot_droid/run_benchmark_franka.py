@@ -54,10 +54,7 @@ def parse_episodes(text: str | None) -> list[int] | None:
 
 def failed_result(index: int, setup, error: Exception) -> bench.EpisodeResult:
     """The result of an episode that could not run, with `error` as its reason."""
-    return bench.EpisodeResult(
-        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
-        error=f"{type(error).__name__}: {error}",
-    )
+    return bench.new_result(index, setup, error=f"{type(error).__name__}: {error}")
 
 
 @click.command()
