@@ -32,7 +32,7 @@ import numpy as np
 
 from examples.vla.molmobot_droid.checkpoint import HF_REPO, HF_REVISION, MOLMOBOT_COMMIT, POLICY_DT, POLICY_HZ
 from examples.vla.molmobot_droid.droid import FRANKA_PEDESTAL_HEIGHT, Observation, RobotPose, quat_to_mat
-from examples.vla.molmobot_droid.molmospaces.custom_scene import CustomScene, resolve_scene_xml
+from examples.vla.molmobot_droid.molmospaces.custom_scene import CustomScene, parse_scene_id, resolve_scene_xml
 from examples.vla.molmobot_droid.rollout import StepInfo, run_rollout
 
 DEFAULT_BENCHMARK = "molmospaces-bench-v2/procthor-10k/FrankaPickDroidMiniBench"
@@ -124,6 +124,8 @@ class EpisodeSetup:
     task_type: str
     task: dict
     horizon_steps: int
+    source: dict = field(default_factory=dict)
+    """Where the benchmark's episode came from: its datagen `h5_file` and `traj_key`."""
 
 
 def episode_setup(episode) -> EpisodeSetup:
@@ -154,7 +156,24 @@ def episode_setup(episode) -> EpisodeSetup:
         task_type=task.get("task_type", "pick"),
         task=task,
         horizon_steps=round(task.get("task_horizon_sec", 20) * POLICY_HZ),
+        source={"h5_file": episode.source.h5_file, "traj_key": episode.source.traj_key},
     )
+
+
+def scene_record(index: int, setup: EpisodeSetup) -> dict:
+    """What `results.json` keeps of an episode's scene: enough to find it and rebuild it."""
+    dataset, split, house = parse_scene_id(setup.scene.scene_id)
+    return {
+        "episode": episode_name(index),
+        "dataset": dataset,
+        "split": split,
+        "house": house,
+        "scene_xml": Path(setup.scene.scene_xml).name,
+        "target": setup.scene.object_name,
+        "target_start_pose": [*map(float, setup.scene.object_pos), *map(float, setup.scene.object_quat)],
+        "robot_base_pose": list(setup.task["robot_base_pose"]),  # x, y, z, qw, qx, qy, qz
+        "source": setup.source,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -436,10 +455,19 @@ class EpisodeResult:
     videos: list[str] = field(default_factory=list)
     """Relative to the run directory."""
     error: str | None = None
+    scene: dict = field(default_factory=dict)
+    """`scene_record()`, plus what a runner changed about the scene (Stretch 4's footprint, removed furniture)."""
 
     @property
     def grid_video(self) -> str | None:
         return next((v for v in self.videos if v.endswith("_grid.mp4")), None)
+
+
+def new_result(index: int, setup: EpisodeSetup, **fields) -> EpisodeResult:
+    return EpisodeResult(
+        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
+        scene=scene_record(index, setup), **fields,
+    )
 
 
 def run_episode(
@@ -458,7 +486,7 @@ def run_episode(
 ) -> EpisodeResult:
     """Run one episode on an already built env, recording it (the cameras in `grid_excluded`
     only in their own videos), and judge it."""
-    result = EpisodeResult(index, setup.scene.scene_id, setup.scene.object_name, setup.instruction)
+    result = new_result(index, setup)
     judge = make_judge(setup)
     recorder = EpisodeRecorder(
         out_dir, f"{prefix}_{episode_name(index)}", title=setup.instruction, grid_excluded=grid_excluded
@@ -533,6 +561,7 @@ def write_report(
         "total_wall_seconds": time.time() - started,
         "stopped_at": stopped_at,
         "stop_reason": stop_reason,
+        "command": episode_command(benchmark_dir),
         "results": [asdict(r) for r in results],
     }
     (out_dir / "results.json").write_text(json.dumps(summary, indent=2, default=float))
@@ -572,15 +601,15 @@ def write_report(
         "",
         "## Episodes",
         "",
-        "| # | Scene | Instruction | Success | Video | Steps | Queries | s/query | Wall s | "
+        "| # | Episode | Scene | Instruction | Success | Video | Steps | Queries | s/query | Wall s | "
         + " | ".join(metric_names)
         + " | Error |",
-        "|---|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
+        "|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
     ]
     for r in results:
         metrics = " | ".join(_format(r.metrics.get(m, "")) for m in metric_names)
         lines.append(
-            f"| {r.index} | {r.scene_id} | {r.instruction} | {'yes' if r.success else 'no'} | "
+            f"| {r.index} | {episode_name(r.index)} | {r.scene_id} | {r.instruction} | {'yes' if r.success else 'no'} | "
             f"{f'[grid]({r.grid_video})' if r.grid_video else ''} | {r.steps} | "
             f"{r.queries} | {r.mean_inference_seconds:.2f} | {r.wall_seconds:.0f} | {metrics} | {r.error or ''} |"
         )
@@ -588,6 +617,16 @@ def write_report(
         "",
         f"Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `{GRID_DIR}/<run>_ep<#>_grid.mp4` with the "
         "policy's views, the scene camera and the instruction.",
+        "",
+        "## Scenes",
+        "",
+        f"From benchmark build `{benchmark_dir}`, with molmospaces' `{SCENE_VARIANT}` scene files. "
+        "Poses are world-frame metres, quaternions in results.json as w, x, y, z. To rerun episodes "
+        "(e.g. `--episodes 3,7`):",
+        "",
+        f"`{summary['command']} --episodes <#>`",
+        "",
+        *scene_table([asdict(r) for r in results]),
         "",
     ]
     path = out_dir / "report.md"
@@ -683,23 +722,75 @@ def allow_ctrl_c() -> None:
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
-def resume_command(episode: str) -> str:
-    """This command line, with `--resume <episode>` in place of any earlier one."""
+def command_line(options: dict[str, str | None]) -> str:
+    """This command line, with `options` ({"--resume": "ep0003"}; None drops one) in place of earlier ones."""
     args, skip = [], False
     for arg in sys.argv[1:]:
         if skip:
             skip = False
             continue
-        if arg == "--resume":
-            skip = True
+        if arg in options:
+            skip = True  # its value
             continue
-        if arg.startswith("--resume="):
+        if arg.split("=", 1)[0] in options:
             continue
         args.append(arg)
+    for option, value in options.items():
+        if value is not None:
+            args += [option, value]
     main = sys.modules["__main__"]
     module = getattr(getattr(main, "__spec__", None), "name", None)
     program = f"python -m {module}" if module else f"python {sys.argv[0]}"
-    return f"{program} {shlex.join(args + ['--resume', episode])}"
+    return f"{program} {shlex.join(args)}"
+
+
+def resume_command(episode: str) -> str:
+    """This command line, with `--resume <episode>` in place of any earlier one."""
+    return command_line({"--resume": episode})
+
+
+def episode_command(benchmark_dir: Path) -> str:
+    """This command line for this benchmark build; add `--episodes <#>` to rerun just those episodes."""
+    return command_line({"--resume": None, "--max-episodes": None, "--episodes": None, "--benchmark": str(benchmark_dir)})
+
+
+def scene_table(results: list[dict]) -> list[str]:
+    """
+    Each episode's scene, from `results.json` results: the house and scene file, the target
+    and where it starts, where the episode puts the Franka, and the benchmark's source
+    trajectory; with Stretch 4's footprint and the furniture removed for it when a run has them.
+    """
+    stretch = any("stretch_robot_pose" in r.get("scene", {}) for r in results)
+    columns = ["#", "Episode", "Dataset", "House", "Scene file", "Target", "Target start (x, y, z)",
+               "Franka base (x, y, z, yaw°)", "Source"]
+    if stretch:
+        columns += ["Stretch 4 footprint (x, y, yaw°)", "Removed furniture"]
+    lines = ["| " + " | ".join(columns) + " |", "|---" * len(columns) + "|"]
+    for r in results:
+        scene = r.get("scene") or {}
+        if not scene:  # a run from before scenes were recorded
+            lines.append(f"| {r['index']} | {episode_name(r['index'])} | {r['scene_id']} |" + " |" * (len(columns) - 3))
+            continue
+        base, source = scene["robot_base_pose"], scene.get("source", {})
+        rotation = quat_to_mat(base[3:7])
+        cells = [
+            str(r["index"]), scene["episode"], f"{scene['dataset']}/{scene['split']}", str(scene["house"]),
+            f"`{scene['scene_xml']}`", f"`{scene['target']}`", _numbers(scene["target_start_pose"][:3]),
+            _numbers([*base[:3], math.degrees(math.atan2(rotation[1, 0], rotation[0, 0]))]),
+            f"`{'/'.join(Path(source['h5_file']).parts[-2:])}:{source['traj_key']}`" if source else "",
+        ]
+        if stretch:
+            pose = scene.get("stretch_robot_pose")
+            cells += [
+                _numbers([pose[0], pose[1], math.degrees(pose[2])]) if pose else "",
+                ", ".join(f"`{b}`" for b in scene.get("removed_furniture", [])),
+            ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def _numbers(values) -> str:
+    return ", ".join(f"{v:.3f}" for v in values)
 
 
 def _format(value) -> str:
