@@ -1358,6 +1358,9 @@ class Stretch4SimEnv:
         self.reverse_ik_failures = 0
         self.stale_observations = 0
         """Observations no frames or poses from after `observe()` was called arrived in time for."""
+        self.observed_state: tuple[float, np.ndarray, StretchJoints] | None = None
+        """(simulation time, world_from_footprint, joints) the last `observe()` read, for logging
+        what it saw rather than where Stretch has got to since."""
         self.start_q7 = np.array(FRANKA_HOME_QPOS, dtype=float)
         """The Franka pose `reset()` goes back to."""
         self.overlay_franka_gripper = False
@@ -1458,6 +1461,7 @@ class Stretch4SimEnv:
         poses = self.sim.pull_body_poses()
         footprint = planar_from_pose(*poses["stretch4"], self.stretch_scene.scene.floor_z)
         joints = self.joints(status)
+        self.observed_state = (status.time, footprint, joints)
         state8, self.ik_converged = self.retargeter.stretch_to_franka(footprint, joints)
         self.reverse_ik_failures += not self.ik_converged
         self.mirror.update(status, poses)

@@ -136,8 +136,13 @@ class RerunScene:
             self._log_pose(geom, data)
 
 
-def set_step(step: int) -> None:
+def set_step(step: int, sim_time: float | None = None) -> None:
+    """`step` on the `step` timeline and, with `sim_time` (s), when it was in the simulation on
+    `sim_time`: replayed on that one, the motion plays at the speed it happened, pauses and
+    start pose moves included."""
     rr.set_time("step", sequence=step)
+    if sim_time is not None:
+        rr.set_time("sim_time", duration=sim_time)
 
 
 def log_cameras(images: dict[str, np.ndarray]) -> None:
@@ -153,14 +158,60 @@ def log_cameras(images: dict[str, np.ndarray]) -> None:
         rr.log(f"{CAMERAS_PATH}/{name}", rr.Image(image).compress(jpeg_quality=85))
 
 
-def log_tool_poses(target_world: np.ndarray | None, actual_world: np.ndarray | None) -> None:
-    """Where the policy wants the tool (from the Franka) vs. where it is."""
-    for name, pose, color in (("target", target_world, [255, 160, 0]), ("actual", actual_world, [0, 200, 255])):
+TARGET_COLOR = [255, 160, 0]
+"""Orange: where the policy wants the tool."""
+ACTUAL_COLOR = [0, 200, 255]
+"""Blue: where the tool is."""
+LABEL_HEIGHTS = {"target": 0.12, "actual": 0.06}
+"""m above each tool point its label sits, on a stalk: clear of the gripper, and of each other
+when the two points meet."""
+
+
+def log_tool_poses(
+    target_world: np.ndarray | None, actual_world: np.ndarray | None, actual_label: str = "Stretch tool"
+) -> None:
+    """
+    Where the policy wants the tool (orange, from the Franka) vs. where it is (blue, `actual_label`),
+    each a point with its axes. The target's point is the larger, see-through one, so on target
+    reads as a blue dot inside an orange ball; a line joins them when both are known, and the
+    blue label says how far apart they are. The labels are under `world/tool/labels`, to hide
+    them all at once.
+    """
+    error = (
+        np.linalg.norm(actual_world[:3, 3] - target_world[:3, 3])
+        if target_world is not None and actual_world is not None
+        else None
+    )
+    markers = {
+        "target": (target_world, "policy target", TARGET_COLOR + [140], 0.014),
+        "actual": (
+            actual_world,
+            actual_label + (f" · {error * 1000:.0f} mm off" if error is not None else ""),
+            ACTUAL_COLOR,
+            0.009,
+        ),
+    }
+    for name, (pose, label, color, radius) in markers.items():
         if pose is None:
+            rr.log(f"world/tool/{name}", rr.Clear(recursive=True))
+            rr.log(f"world/tool/labels/{name}", rr.Clear(recursive=True))
             continue
-        rr.log(f"world/tool/{name}", rr.Transform3D(translation=pose[:3, 3], mat3x3=pose[:3, :3]))
-        rr.log(f"world/tool/{name}", rr.TransformAxes3D(0.08), static=True)
-        rr.log(f"world/tool/{name}/point", rr.Points3D([[0, 0, 0]], colors=[color], radii=0.01))
+        position = pose[:3, 3]
+        rr.log(f"world/tool/{name}", rr.Transform3D(translation=position, mat3x3=pose[:3, :3]), rr.TransformAxes3D(0.08))
+        rr.log(f"world/tool/{name}/point", rr.Points3D([[0, 0, 0]], colors=[color], radii=radius))
+        tip = position + [0, 0, LABEL_HEIGHTS[name]]
+        rr.log(
+            f"world/tool/labels/{name}",
+            rr.Points3D([tip], colors=[color[:3]], radii=0.003, labels=[label], show_labels=True),
+            rr.LineStrips3D([[position, tip]], colors=[color[:3] + [120]], radii=0.0008),
+        )
+    if error is None:
+        rr.log("world/tool/error", rr.Clear(recursive=False))
+    else:
+        rr.log(
+            "world/tool/error",
+            rr.LineStrips3D([[target_world[:3, 3], actual_world[:3, 3]]], colors=[[230, 230, 230, 200]], radii=0.002),
+        )
 
 
 def log_metrics(values: dict[str, float]) -> None:

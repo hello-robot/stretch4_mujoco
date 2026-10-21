@@ -116,12 +116,17 @@ class StretchRerunLogger:
     def log_pose(self, step: int) -> None:
         """Outside a rollout (the start pose, jogging): where the tool should be for the Franka,
         and where it got to (if it could get there at all)."""
-        rerun_scene.set_step(step)
-        self._log_scene(self.env.observe())
+        self._log_scene(step, self.env.observe())
 
-    def _log_scene(self, observation) -> np.ndarray:
-        """The mirror scene, the cameras, and the target vs. actual tool; returns the actual."""
+    def _log_scene(self, step: int, observation) -> np.ndarray:
+        """
+        The mirror scene, the cameras, and the target vs. actual tool, as of `observation`
+        (Stretch keeps moving after it, so its actual tool is from the state it read, not
+        now); returns the actual.
+        """
         env = self.env
+        sim_time, footprint, joints = env.observed_state
+        rerun_scene.set_step(step, sim_time)
         self.scene.log(env.mirror.data)
         images = {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, **observation.extra_cameras,
                   "scene": env.render_scene()}
@@ -130,14 +135,13 @@ class StretchRerunLogger:
             for name, kind in FRANKA_WRIST_CAMERAS.items():
                 images[name] = env.mirror.render_with_franka(wrist_camera, observation.state8[7], kind)
         rerun_scene.log_cameras(images)
-        actual = env.retargeter.stretch_tool_world(env.world_from_footprint(), env.joints())
+        actual = env.retargeter.stretch_tool_world(footprint, joints)
         rerun_scene.log_tool_poses(env.retargeter.last_target_tool_world, actual)
         return actual
 
     def log(self, step: int, info: StepInfo) -> None:
         env = self.env
-        rerun_scene.set_step(step)
-        actual = self._log_scene(info.observation)
+        actual = self._log_scene(step, info.observation)
         targets = info.step_result
         metrics = {
             "gripper_command": info.action[7],
