@@ -60,6 +60,8 @@ class StretchStartPoseEditor:
     Franka at `q7` has its tool, and waits; `set_pedestal_height(m)` raises or lowers the virtual
     Franka to `fr3_link0` that far above the floor; `keys()` gives the `Keys` to jog with;
     `say()` prints a line; `on_move()` is called after Stretch moves, to log it.
+    `extra_commands(text)`, if given, sees every line first and returns True for the runner's
+    own commands.
     """
 
     COMMANDS = (
@@ -77,8 +79,10 @@ class StretchStartPoseEditor:
         keys: Callable[[], ContextManager[Keys]] = TerminalKeys,
         say: Callable[[str], None] = click.echo,
         on_move: Callable[[], None] | None = None,
+        extra_commands: Callable[[str], bool] | None = None,
     ):
         self.env = env
+        self.extra_commands = extra_commands
         self.go_to = go_to
         self._set_pedestal_height = set_pedestal_height
         self.keys = keys
@@ -143,6 +147,8 @@ class StretchStartPoseEditor:
     # -- commands ------------------------------------------------------------
 
     def handle_command(self, text: str) -> bool:
+        if self.extra_commands is not None and self.extra_commands(text):
+            return True
         words = text.replace(",", " ").split()
         if not words:
             return False
