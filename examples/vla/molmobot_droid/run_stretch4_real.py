@@ -30,8 +30,8 @@ leaves it where it is, and --recover-after of those in a row send it back to the
 are printed, and logged to Rerun under RETARGET_LOG.
 
 With --rectify, the exo view is the head fisheye redrawn as the DROID exo camera would see it
-(`FisheyeRectifier`), through the lens calibration the publisher sends with the images when it
-has one (see `head_rectifiers()`), instead of only cropped to DROID's aspect.
+(`FisheyeRectifier`), through the robot's own calibration of the lens, which the publisher sends
+with the images (see `robot_calibration()`), instead of only cropped to DROID's aspect.
 
 With --overlay_franka_gripper, the policy's views show the Franka where it is told its arm and
 hand are, and Stretch painted out: the Robotiq's fingers for Stretch's gripper in the wrist view,
@@ -96,7 +96,6 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     custom_start_option,
     franka_yaw_for_start,
     head_camera_for_tool,
-    head_rectifier,
     overlay_gripper_option,
     params_from_kwargs,
     planar_transform,
@@ -107,10 +106,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
 )
 from examples.vla.molmobot_droid.franka_retarget.console import KEYS_HELP, Console, continuous_session
 from examples.vla.molmobot_droid.franka_retarget.gripper_image_fix import (
-    HARDCODED_CALIBRATIONS,
-    HARDCODED_CAMERA_CORRECTIONS,
     GripperImageFix,
-    calibration_from_message,
     reject_with_fix,
 )
 from examples.vla.molmobot_droid.franka_retarget.start_pose_editor import StretchStartPoseEditor
@@ -234,26 +230,55 @@ def _decode(message: dict, *keys: str) -> np.ndarray | None:
     return None
 
 
-def head_rectifiers(message: dict, say: Callable[[str, str | None], None]) -> dict[str, FisheyeRectifier]:
+def robot_calibration(message: dict, camera: str, size: tuple[int, int], fisheye: bool) -> tuple[np.ndarray, np.ndarray]:
     """
-    --rectify: a `FisheyeRectifier` per head fisheye in `message`, through the calibration the
-    publisher sends with it (`head_<side>_camera_matrix`, scaled to the frames it sends) when that
-    is a fisheye one: four coefficients, or the rest zero, as Luxonis reports its fisheye model.
-    Otherwise stretch4_mujoco's calibration, the simulator's (another robot's lens).
+    `camera`'s (`head_left`, `gripper_left`, ...) lens calibration, from the robot's own camera
+    calibration, which the publisher sends with every message (`camera_calibration`: its
+    $HELLO_FLEET_PATH/$HELLO_FLEET_ID/calibration_cameras/calibration_rgb_head_camera.yaml):
+    (camera matrix for images `size` (width, height) big, OpenCV distortion coefficients). The
+    camera matrix is scaled from the size it was calibrated at, as the cameras scale their frames
+    down. `fisheye`: whether the lens model must be OpenCV's fisheye one, or must not be.
     """
+    from stretch4_body.subsystem.cameras.enums.distortion_models import DistortionModels
+
+    calibrations = message.get("camera_calibration")
+    if calibrations is None:
+        raise click.ClickException(
+            "The robot's publisher sends no camera calibration: update stretch4_compliant_gripper on the robot, "
+            "and check its calibration_cameras/calibration_rgb_head_camera.yaml is in its fleet directory"
+        )
+    source = message.get("camera_calibration_path", "the robot's camera calibration")
+    if camera not in calibrations:
+        how = "REx_camera_calibrate --gripper" if camera.startswith("gripper") else "REx_camera_calibrate --intrinsics"
+        raise click.ClickException(f"{source} has no {camera} (it has {', '.join(calibrations)}): run `{how}` on the robot")
+    calibration = calibrations[camera]
+    model = DistortionModels[calibration["distortion_model"]]
+    if model.is_fisheye() != fisheye:
+        raise click.ClickException(
+            f"{source} calibrates {camera} with the {model.name} model; this needs " + ("a fisheye" if fisheye else "a non-fisheye") + " one"
+        )
+    calibrated_height, calibrated_width = calibration["image_size"][:2]
+    width, height = size
+    if not math.isclose(width / calibrated_width, height / calibrated_height, rel_tol=1e-3):
+        raise click.ClickException(
+            f"{source} calibrates {camera} at {calibrated_width}x{calibrated_height}, which is not the shape of "
+            f"its {width}x{height} frames"
+        )
+    matrix = np.asarray(calibration["camera_matrix"], dtype=float).reshape(3, 3)
+    matrix[:2] *= width / calibrated_width
+    return matrix, np.asarray(calibration["distortion_coefficients"], dtype=float).ravel()
+
+
+def head_rectifiers(message: dict) -> dict[str, FisheyeRectifier]:
+    """--rectify: a `FisheyeRectifier` per head fisheye in `message`, through the robot's own
+    calibration of it (`robot_calibration()`)."""
     rectifiers = {}
     for side, image in message["head_rgbs"].items():
         camera = HEAD_CAMERAS[side]
-        matrix, distortion = message.get(f"head_{side}_camera_matrix"), message.get(f"head_{side}_distortion_coefficients")
-        distortion = None if distortion is None else np.asarray(distortion, dtype=float).ravel()
-        if matrix is None or distortion is None or len(distortion) < 4 or np.any(distortion[4:]):
-            say(f"Rectifying the {side} head fisheye with stretch4_mujoco's calibration, not this robot's: "
-                "the publisher sends " + ("none" if matrix is None else "one that is not a fisheye model"), "yellow")
-            rectifiers[side] = head_rectifier(side)
-            continue
-        # The publisher's calibration is for its landscape frames, before they were turned upright.
+        # Calibrated in the sensor's landscape frames, before they were turned upright.
         height, width = image.shape[:2]
         size = (height, width) if camera.initial_camera_settings.rotate_number_of_times % 2 else (width, height)
+        matrix, distortion = robot_calibration(message, f"head_{side}", size, fisheye=True)
         rectifiers[side] = FisheyeRectifier(camera, matrix, distortion, size)
     return rectifiers
 
@@ -501,26 +526,13 @@ class RealStretch4Env:
         self.check_camera_sides()
         self.gripper_image_fix: GripperImageFix | None = None
         if params.fix_gripper_image_mismatch:
-            # Through the lens calibration: hardcoded for now (see HARDCODED_CALIBRATIONS), else
-            # the one the publisher sends with the images.
+            # Through the robot's own calibration of the lens, at the size the fix works at.
             camera = stretch_cameras_to_use(params)[0]
-            calibration = HARDCODED_CALIBRATIONS.get(camera)
-            if calibration is not None:
-                click.secho(f"Gripper image fix: using the HARDCODED {camera.name} calibration (stretch-se4-4024's), "
-                            "not this robot's", fg="yellow")
-            else:
-                calibration = calibration_from_message(self.receiver.latest()[1])
-            if calibration is None:
-                click.secho("The robot's publisher sends no gripper camera calibration: the gripper image fix "
-                            "takes the camera to be a pinhole, and the lens's distortion is left in", fg="yellow")
-            # And where the camera is: the model's, turned as HARDCODED_CAMERA_CORRECTIONS has it for now.
-            correction = HARDCODED_CAMERA_CORRECTIONS.get(camera)
-            if correction is not None:
-                click.secho(f"Gripper image fix: turning the {camera.name} by a HARDCODED {correction} degrees "
-                            "(fitted on stretch-se4-4024), not this robot's", fg="yellow")
-            self.gripper_image_fix = GripperImageFix(
-                params.tool_name, camera, real=True, calibration=calibration, camera_correction=correction
+            settings = camera.initial_camera_settings
+            calibration = robot_calibration(
+                self.receiver.latest()[1], f"gripper_{params.gripper_camera}", (settings.width, settings.height), fisheye=False
             )
+            self.gripper_image_fix = GripperImageFix(params.tool_name, camera, calibration=calibration)
 
     def check_camera_sides(self) -> None:
         message = self.receiver.receive()
@@ -532,7 +544,7 @@ class RealStretch4Env:
             )
         self._state(message)  # fixes the odometry origin: the world frame is where we start
         if self.params.rectify:
-            self.head_rectifiers = head_rectifiers(message, self.say)
+            self.head_rectifiers = head_rectifiers(message)
         self.robot.pull_status()
         self.update_exo_side(quiet=True)
 
@@ -786,14 +798,22 @@ class LiveView:
     saw) to Rerun at `hz`, on its own thread, from the first message on -- whether or not an
     instruction is running.
 
-    On the `time` timeline only, at each message's `captured_at`, the frames and the joint
-    state it carries being from then. Not on `step`: this thread would log the pose at the end
-    of a step, as the next one ran, at that step, ahead of the tool poses and views the policy
-    saw; `log_step()` logs the robot as the policy saw it there instead.
+    On the `time` timeline at each message's `captured_at`, the frames and the joint state it
+    carries being from then; and on `step`, each frame at a step of its own (`take_step()`
+    numbers the policy's), since Rerun keeps the time per thread, and logs on no `step` are
+    gone when replaying by step. Not while the policy is stepping, though: its steps log these
+    cameras and the robot as it saw them, and this thread's poses, a latency behind those, would
+    make the robot jump back and forth between them.
     """
+
+    IDLE_AFTER = 1.0
+    """s without a policy step before this thread takes steps of its own."""
 
     def __init__(self, env: RealStretch4Env, robot_model: RobotModel, hz: float = 10.0):
         self.env, self.robot_model, self.period = env, robot_model, 1.0 / hz
+        self._step = 0
+        self._policy_stepped_at = -math.inf
+        self._step_lock = threading.Lock()
         _, message = env.receiver.latest()
         robot_model.pose(*self._robot_state(message or env.receiver.receive()))
         self.scene = rerun_scene.RerunScene(robot_model.model, robot_model.data, ["stretch4", robot_model.franka.base_name])
@@ -814,11 +834,25 @@ class LiveView:
             if message is not None and count != last:
                 last = count
                 rerun_scene.rr.set_time("time", timestamp=message["captured_at"])
+                with self._step_lock:
+                    idle = time.monotonic() - self._policy_stepped_at > self.IDLE_AFTER
+                    if idle:
+                        self._step += 1
+                        rerun_scene.set_step(self._step)
+                if not idle:
+                    rerun_scene.rr.disable_timeline("step")
                 head = message["head_rgbs"].get(self.env.exo_side)
                 rerun_scene.log_cameras({"head_raw": head, "gripper_raw": message["wrist_rgb"]})
                 self.robot_model.pose(*self._robot_state(message))
                 self.scene.log(self.robot_model.data)
             time.sleep(self.period)
+
+    def take_step(self) -> int:
+        """The next step on `step`, for a policy frame, which keeps this thread off `step` for a while."""
+        with self._step_lock:
+            self._step += 1
+            self._policy_stepped_at = time.monotonic()
+            return self._step
 
     def log_step(self, world_from_footprint: np.ndarray, joints: StretchJoints, franka_q7) -> None:
         """The robot (and the ghost Franka at `franka_q7`) at a policy step, on the calling thread's timelines."""
@@ -894,7 +928,6 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
             + f", {params.execute_first_n} of every {params.execute_horizon} predicted actions"
             + ("\n" + click.style("Overlay  ", bold=True) + "the Franka in the wrist and exo views" if overlay_franka_gripper else "")
         )
-        step_count = 0
         if rerun:
             rerun_scene.init_rerun(
                 "MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True,
@@ -908,16 +941,14 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
 
         def log_frame(observation: Observation) -> None:
             """
-            One Rerun step: rollout steps and start pose moves share the `step` timeline. On
-            `time`, the views at when they were captured, and the robot and its tool at when
-            `observe()` read the joints, which is later.
+            One Rerun step: rollout steps, start pose moves and `LiveView`'s idle frames share
+            the `step` timeline. On `time`, the views at when they were captured, and the robot
+            and its tool at when `observe()` read the joints, which is later.
             """
-            nonlocal step_count
-            step_count += 1
             if not rerun:
                 return
             message = env.last_message
-            rerun_scene.set_step(step_count)
+            rerun_scene.set_step(live.take_step())
             rerun_scene.rr.set_time("time", timestamp=message["captured_at"])
             rerun_scene.log_cameras(
                 {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, **observation.extra_cameras}
