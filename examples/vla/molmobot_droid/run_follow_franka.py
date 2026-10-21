@@ -94,13 +94,15 @@ class FollowRerunLogger:
         self.scene = rerun_scene.RerunScene(env.mirror.model, env.mirror.data, moving)
 
     def log(self, step: int, observation, metrics: dict[str, float] | None = None) -> None:
+        """Step `step`, as of `observation`: Stretch's tool from the state it read, not now."""
         env = self.env
-        rerun_scene.set_step(step)
+        sim_time, footprint, joints = env.observed_state
+        rerun_scene.set_step(step, sim_time)
         self.scene.log(env.mirror.data)
         images = {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, "scene": env.render_scene()}
         images.update({name: observation.extra_cameras[name] for name in RERUN_CAMERAS if name in observation.extra_cameras})
         rerun_scene.log_cameras(images)
-        actual = env.retargeter.stretch_tool_world(env.world_from_footprint(), env.joints())
+        actual = env.retargeter.stretch_tool_world(footprint, joints)
         rerun_scene.log_tool_poses(env.retargeter.last_target_tool_world, actual)
         if metrics:
             rerun_scene.log_metrics(metrics)
