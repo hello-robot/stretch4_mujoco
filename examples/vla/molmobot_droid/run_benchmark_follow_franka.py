@@ -10,11 +10,14 @@ Franka's cameras; success is molmospaces' criterion judged on Stretch 4, the onl
 touches anything.
 
 Writes to <out>/<run name>/, as the other benchmark runners do: per-episode videos of every
-camera, a grid of the policy's (Franka's) views, Stretch's cropped head and gripper views and the
-scene camera with the instruction in `grid/` (each episode prints a link to its grid),
+camera, a grid of the policy's (Franka's) views, Stretch's cropped head and gripper views, the
+tool-side fisheye cropped and rectified, and the scene camera with the instruction in `grid/` (each episode prints a link to its grid),
 `report.md` and `results.json`. The cameras are the Franka's `exo` and `wrist` and every one of
-Stretch's: `fisheye_left`/`fisheye_right` (DROID-framed, and `_raw`), `center`, and
-`gripper_left`/`gripper_right` (as the wrist view, and `_raw`). For each successful episode it
+Stretch's: `fisheye_left`/`fisheye_right` (DROID-framed, `_rectified` as --rectify redraws them
+as the DROID exo camera, and `_raw`), `center`, and
+`gripper_left`/`gripper_right` (as the wrist view, and `_raw`); and `fisheye_tool` (and its
+`_raw` and `_rectified`), the fisheye on the tool's side each step as `run_stretch4_sim.py` picks
+its exo view, one continuous video (`run_finetune.py --use_fisheye tool`). For each successful episode it
 also writes `<run name>_ep<#>.h5`, Stretch's trajectory pointing at those videos
 (`finetune/dataset.py`): pass the run directory to `run_finetune.py --data`.
 
