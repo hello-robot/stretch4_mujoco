@@ -13,6 +13,10 @@ Between instructions the sim keeps running, so the start pose can be changed fir
 its place (a THOR category or prefab, or tennis_ball; see `custom_scene.find_asset()`). The scene
 is rebuilt, with the arm and its pedestal where they were.
 
+With `--exo_camera left|right` the exo view is Stretch 4's head fisheye on the Franka, cropped
+to DROID's aspect, or with `--rectify` redrawn as the DROID exo camera would see it from there
+(`FisheyeRectifier`).
+
 `--use_stretch4_gripper sg4|pg4` and `--use_stretch4_gripper_camera` put Stretch 4's gripper and
 gripper camera on the Franka in place of the Robotiq and DROID's wrist camera, mounted on its
 flange as they are on Stretch 4's wrist (see `franka_retarget/stretch4_hardware_on_franka.py`):
@@ -32,6 +36,7 @@ Usage:
     python -m examples.vla.molmobot_droid.run_franka --use_stretch4_gripper pg4 --use_stretch4_gripper_camera \\
         --apply_franka_gripper_image_mismatch_fix
     python -m examples.vla.molmobot_droid.run_franka --object-type tennis_ball --in-place-of mug
+    python -m examples.vla.molmobot_droid.run_franka --exo_camera right --rectify
 """
 
 from __future__ import annotations
@@ -72,8 +77,11 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     exo_camera_option,
     STRETCH_TCP,
     TCP_ALIGN,
+    HEAD_SIDES,
     gripper_image_fix_option,
     head_crop_option,
+    head_rectifier,
+    rectify_option,
     to_droid_frame,
     wrist_view,
 )
@@ -391,14 +399,17 @@ class StartPoseEditor:
     "Robotiq too), and DROID-framed as retargeting frames it.",
 )
 @gripper_image_fix_option
+@rectify_option
 def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps, checkpoint, rerun, exo_camera,
          head_crop, execute_horizon, execute_first_n, use_stretch4_gripper, use_stretch4_gripper_camera,
-         fix_gripper_image_mismatch):
+         fix_gripper_image_mismatch, rectify):
     if not 1 <= execute_first_n <= execute_horizon:
         raise click.BadParameter("need 1 <= --execute-horizon-do-only-first-n-steps <= --execute-horizon")
     if fix_gripper_image_mismatch and not (use_stretch4_gripper and use_stretch4_gripper_camera):
         # It takes Stretch's fingers out of the image, and the Robotiq's would be left in.
         raise click.BadParameter("needs --use_stretch4_gripper and --use_stretch4_gripper_camera", param_hint=FIX_FLAG)
+    if rectify and (exo_camera not in HEAD_SIDES or head_crop != "droid"):
+        raise click.BadParameter("needs --exo_camera left or right, and --head-crop droid", param_hint="--rectify")
     scene = load_custom_scene(scene_id, object_type, object_index, in_place_of=in_place_of)
     pose = resolve_pose(scene, robot_pose)
 
@@ -417,7 +428,7 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
             stretch4_gripper_camera=use_stretch4_gripper_camera,
         )
         if exo_camera in HEAD_CAMERAS and head_crop == "droid":
-            env.prepare_exo = to_droid_frame
+            env.prepare_exo = head_rectifier(exo_camera) if rectify else to_droid_frame
         if fix_gripper_image_mismatch:
             fix = gripper_image_fix(STRETCH4_GRIPPERS[use_stretch4_gripper], STRETCH4_GRIPPER_CAMERA)
             # Where the tool's grasp center is from the Robotiq's grasp_site, as a grasp offset is.
