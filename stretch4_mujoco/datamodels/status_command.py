@@ -43,6 +43,20 @@ class CommandKeyframe:
 
 
 @dataclass
+class CommandLedRing:
+    """The look of the LED rings around Stretch 4's head cameras.
+
+    `rgba` is the lit colour. `animation` is one of the LedRingAnimation
+    values; `period_s` is how long one cycle of a non-solid animation takes.
+    """
+
+    rgba: tuple[float, float, float, float]
+    animation: str
+    period_s: float
+    trigger: bool
+
+
+@dataclass
 class CommandCoordinateFrameArrowsViz:
     position: tuple[float, float, float]
     rotation: tuple[float, float, float]
@@ -61,6 +75,7 @@ class StatusCommand:
     base_velocity: CommandBaseVelocity = field(default_factory=lambda:CommandBaseVelocity(0, 0,0, False))
     keyframe: CommandKeyframe = field(default_factory=lambda:CommandKeyframe("", False))
     coordinate_frame_arrows_viz: list[CommandCoordinateFrameArrowsViz] = field(default_factory=list)
+    led_ring: CommandLedRing | None = None
 
     def set_move_to(self, command: CommandMove):
         """Sends a move_to command and removes conflicting move_by and joint_velocities commands."""
@@ -79,6 +94,10 @@ class StatusCommand:
         self.joint_velocities[actuator_name] = CommandJointVelocity(vel=v_m, accel=a_m)
         self.move_to.pop(actuator_name, None)
         self.move_by.pop(actuator_name, None)
+
+    def set_led_ring(self, command: CommandLedRing):
+        """Sets the head LED rings. Replaces any earlier, unapplied setting."""
+        self.led_ring = command
 
     def set_keyframe(self, command: CommandKeyframe):
         """Sends a keyframe and drops every per-joint command it supersedes."""

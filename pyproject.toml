@@ -14,6 +14,9 @@ dependencies = [
     "mujoco~=3.5.0",
     "numpy==2.2.5",
     "opencv-python",
+    # Used by models/stretch_4/head_texture.py to unwrap and paint the head mesh.
+    "pillow>=10.0",
+    "trimesh>=4.0",
     "pynput>=1.8.1",
     "rerun-sdk>=0.23.1",
     "yourdfpy",
