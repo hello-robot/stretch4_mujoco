@@ -29,6 +29,10 @@ turned less (see `FrankaStretchRetargeter.franka_to_stretch`); an action it cann
 leaves it where it is, and --recover-after of those in a row send it back to the start pose. Both
 are printed, and logged to Rerun under RETARGET_LOG.
 
+With --rectify, the exo view is the head fisheye redrawn as the DROID exo camera would see it
+(`FisheyeRectifier`), through the lens calibration the publisher sends with the images when it
+has one (see `head_rectifiers()`), instead of only cropped to DROID's aspect.
+
 With --overlay_franka_gripper, the policy's views show the Franka where it is told its arm and
 hand are, and Stretch painted out: the Robotiq's fingers for Stretch's gripper in the wrist view,
 the whole Franka for Stretch's arm in the exo view (see `RealFrankaOverlay`).
@@ -76,6 +80,7 @@ from examples.vla.molmobot_droid.droid import (
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
     HEAD_SIDES,
+    FisheyeRectifier,
     MIN_BASE_ROTATION,
     PARALLEL_GRIPPER_TOOL,
     SLOW_FACTOR,
@@ -91,6 +96,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     custom_start_option,
     franka_yaw_for_start,
     head_camera_for_tool,
+    head_rectifier,
     overlay_gripper_option,
     params_from_kwargs,
     planar_transform,
@@ -226,6 +232,30 @@ def _decode(message: dict, *keys: str) -> np.ndarray | None:
         image = cv2.imdecode(np.frombuffer(value, np.uint8), cv2.IMREAD_COLOR) if key.endswith("compressed") else value
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     return None
+
+
+def head_rectifiers(message: dict, say: Callable[[str, str | None], None]) -> dict[str, FisheyeRectifier]:
+    """
+    --rectify: a `FisheyeRectifier` per head fisheye in `message`, through the calibration the
+    publisher sends with it (`head_<side>_camera_matrix`, scaled to the frames it sends) when that
+    is a fisheye one: four coefficients, or the rest zero, as Luxonis reports its fisheye model.
+    Otherwise stretch4_mujoco's calibration, the simulator's (another robot's lens).
+    """
+    rectifiers = {}
+    for side, image in message["head_rgbs"].items():
+        camera = HEAD_CAMERAS[side]
+        matrix, distortion = message.get(f"head_{side}_camera_matrix"), message.get(f"head_{side}_distortion_coefficients")
+        distortion = None if distortion is None else np.asarray(distortion, dtype=float).ravel()
+        if matrix is None or distortion is None or len(distortion) < 4 or np.any(distortion[4:]):
+            say(f"Rectifying the {side} head fisheye with stretch4_mujoco's calibration, not this robot's: "
+                "the publisher sends " + ("none" if matrix is None else "one that is not a fisheye model"), "yellow")
+            rectifiers[side] = head_rectifier(side)
+            continue
+        # The publisher's calibration is for its landscape frames, before they were turned upright.
+        height, width = image.shape[:2]
+        size = (height, width) if camera.initial_camera_settings.rotate_number_of_times % 2 else (width, height)
+        rectifiers[side] = FisheyeRectifier(camera, matrix, distortion, size)
+    return rectifiers
 
 
 class ImageAndJointReceiver:
@@ -453,6 +483,8 @@ class RealStretch4Env:
         self.recoveries = 0
         self.last_miss: ReachMiss | None = None
         """Why the last step's action was twisted or unreachable (`FrankaStretchRetargeter.last_miss`)."""
+        self.head_rectifiers: dict[str, FisheyeRectifier] = {}
+        """With --rectify, what redraws each head fisheye as the DROID exo camera (`head_rectifiers()`)."""
         self.check_camera_sides()
         self.gripper_image_fix: GripperImageFix | None = None
         if params.fix_gripper_image_mismatch:
@@ -486,6 +518,8 @@ class RealStretch4Env:
                 f"with --head_camera {','.join(HEAD_SIDES)} --wrist_camera {self.params.gripper_camera}"
             )
         self._state(message)  # fixes the odometry origin: the world frame is where we start
+        if self.params.rectify:
+            self.head_rectifiers = head_rectifiers(message, self.say)
         self.robot.pull_status()
         self.update_exo_side(quiet=True)
 
@@ -600,7 +634,7 @@ class RealStretch4Env:
         else:
             wrist = wrist_view(wrist)
         return Observation(
-            exo_rgb=prepare_exo(head, self.params),
+            exo_rgb=prepare_exo(head, self.params, side, self.head_rectifiers.get(side)),
             wrist_rgb=wrist,
             state8=state8,
             extra_cameras={"head_raw": message["head_rgbs"][side], "gripper_raw": message["wrist_rgb"]},
@@ -832,7 +866,8 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         click.echo(
             click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
             + click.style("Cameras  ", bold=True) + f"head on the tool's side (now {env.exo_side}), gripper {params.gripper_camera}"
-            + (" (head cropped to DROID)" if params.head_crop == "droid" else "")
+            + (" (head rectified to DROID's exo camera)" if params.rectify
+               else " (head cropped to DROID)" if params.head_crop == "droid" else "")
             + (", gripper image matched to DROID's wrist camera" if params.fix_gripper_image_mismatch else "") + "\n"
             + click.style("Motion   ", bold=True) + ("slow" if params.slow else "full speed")
             + (", waiting for each action to arrive" if params.wait_for_arrival else "")

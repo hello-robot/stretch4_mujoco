@@ -171,6 +171,7 @@ Franka q (7) ──FK──> grasp_site pose ──fr3_link0 in world──> wor
 | `--slow` | off | Every joint at 20% of its default speed. |
 | `--wait-for-arrival / --no-wait-for-arrival` | on | Wait for each action to arrive (`wait_command()`) before the next. Never less than one 66 ms step. |
 | `--head-crop droid\|none` | `droid` | Center-crop head images to the 640:368 aspect, then resize to 640x368. |
+| `--rectify` | off | Redraw the left/right head fisheye as the DROID exo camera would see it (a 640x368 pinhole, 71° high, on the fisheye's axis) instead of only cropping it, so things are DROID's size out to the edges. Also in `run_franka.py` (`--exo_camera left\|right`) and `run_follow_franka.py` (Stretch's fisheye views in Rerun). See [the policy's images](franka_retarget/README.md#the-policys-images-every-crop-and-resize). |
 | `--execute-horizon` | 8 | How many of the 16 predicted actions to keep. |
 | `--execute-horizon-do-only-first-n-steps` | 8 | Execute this many of those, then query again. |
 | `--use_parallel_gripper` | off | Stretch 4 with the parallel jaw gripper (PG4) instead of the Stretch gripper (SG4). Sim only: `run_stretch4_real.py` uses the gripper the robot reports. |
@@ -297,7 +298,9 @@ the wrist roll is. So:
 
 ![Stretch 4's grippers on the Franka, seen from outside, from DROID's wrist camera, and from Stretch 4's gripper camera](franka_retarget/docs/stretch4_grippers_on_franka.png)
 
-Each row is one gripper: the stock Robotiq, SG4 and PG4. The columns show:
+The Franka is at home over a counter (`procthor-10k/val/0`, `--object-type tennis_ball
+--in-place-of toaster`), with the tennis ball moved to straight under its TCP. Each row is one
+gripper: the stock Robotiq, SG4 and PG4. The columns show:
 
 1. The outside view. The SG4 and PG4 rows also have the Stretch camera on (the black housing).
 2. DROID's wrist camera (`--use_stretch4_gripper` alone).

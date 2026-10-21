@@ -23,11 +23,14 @@ Watch it in stretch4_mujoco's viewer (the Franka is in geom group 5: press 5 to 
 home) and in Rerun: the policy's views (the Franka's exo and wrist cameras), Stretch's head
 fisheyes and gripper cameras as a policy would be shown them, the scene camera with the Franka
 see-through over Stretch, and the house in 3D with the Franka's tool target and Stretch's tool.
+With --rectify, the fisheyes are shown redrawn as the DROID exo camera would see them
+(`FisheyeRectifier`) instead of only cropped to its aspect; the policy still sees the Franka's.
 
 Usage:
     python -m examples.vla.molmobot_droid.run_follow_franka --scene-id procthor-10k/val/0 --object-type mug
     python -m examples.vla.molmobot_droid.run_follow_franka --use_parallel_gripper --no-wait-for-arrival
     python -m examples.vla.molmobot_droid.run_follow_franka --custom_franka_start_pose
+    python -m examples.vla.molmobot_droid.run_follow_franka --rectify
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     custom_start_option,
     franka_yaw_for_start,
     params_from_kwargs,
+    rectify_option,
     retarget_options,
     spawn_stretch4,
 )
@@ -119,6 +123,7 @@ def stats_text(env: FollowFrankaEnv) -> str:
 @click.command()
 @scene_options
 @retarget_options(camera_options=False)
+@rectify_option
 @custom_start_option
 @click.option("--stop-on-success/--no-stop-on-success", default=True, show_default=True,
               help="End an instruction once Stretch 4 has picked the object up.")

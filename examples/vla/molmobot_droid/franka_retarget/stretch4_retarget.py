@@ -42,6 +42,7 @@ from examples.vla.molmobot_droid.checkpoint import (
     robotiq_driver_angle,
 )
 from examples.vla.molmobot_droid.droid import (
+    DROID_EXO_FOVY,
     EXO_CAMERAS,
     HEAD_CAMERAS,
     FrankaKinematics,
@@ -129,6 +130,7 @@ PARALLEL_GRIPPER_TOOL = "eoa_wrist_dw4_tool_pg4"
 DEFAULT_GRASP_OFFSET_MM = {
     STRETCH_GRIPPER_TOOL: (-9.0, 0.0, 0.0),
     PARALLEL_GRIPPER_TOOL: (4.0 , 0, 0),
+    # PARALLEL_GRIPPER_TOOL: (4.0 + 33, -21, 17),
     # PARALLEL_GRIPPER_TOOL: (4.0 + 33, 0, 0),
     # PARALLEL_GRIPPER_TOOL: (4.0, 5.0, 5.0),
     # PARALLEL_GRIPPER_TOOL: (4 + 33, -21.0, 0.0),
@@ -163,6 +165,9 @@ class RetargetParams:
     fix_gripper_image_mismatch: bool = False
     """--apply_franka_gripper_image_mismatch_fix: the policy's wrist view is Stretch's gripper
     image redrawn as DROID's wrist camera would see it (`gripper_image_fix.GripperImageFix`)."""
+    rectify: bool = False
+    """--rectify: a head fisheye exo view is redrawn as the DROID exo camera would see it
+    (`FisheyeRectifier`), instead of only cropped to its aspect."""
 
     def __post_init__(self):
         if not 1 <= self.execute_first_n <= self.execute_horizon <= ACTION_HORIZON:
@@ -176,6 +181,10 @@ class RetargetParams:
             raise ValueError(f"--gripper_camera must be one of {GRIPPER_CAMERAS}")
         if self.head_crop not in HEAD_CROPS:
             raise ValueError(f"--head-crop must be one of {HEAD_CROPS}")
+        if self.rectify and self.head_crop != "droid":
+            raise ValueError("--rectify needs --head-crop droid: it frames the image as DROID's camera does")
+        if self.rectify and self.exo_camera not in HEAD_SIDES:
+            raise ValueError("--rectify is for the left and right head fisheyes: --exo_camera left or right")
 
     @property
     def tool_name(self) -> str:
@@ -211,6 +220,8 @@ class RetargetParams:
         # Only when given, so earlier runs keep their names for --resume.
         if self.fix_gripper_image_mismatch:
             flags["apply_franka_gripper_image_mismatch_fix"] = True
+        if self.rectify:
+            flags["rectify"] = True
         return flags
 
 
@@ -289,6 +300,18 @@ def head_crop_option(function):
     )(function)
 
 
+def rectify_option(function):
+    """--rectify (see `FisheyeRectifier`)."""
+    return click.option(
+        "--rectify",
+        is_flag=True,
+        help="Undistort the left/right head fisheyes into the DROID exo camera's pinhole view "
+        f"({DROID_EXO_FOVY:g} degrees high, {DROID_IMAGE_SIZE[0]}x{DROID_IMAGE_SIZE[1]}) along the fisheye's "
+        "optical axis, so things are the size DROID's camera shows them out to the edges, instead of only "
+        "cropping the fisheye to DROID's aspect (which shows 136x77 degrees, squeezed toward the edges).",
+    )(function)
+
+
 def custom_start_option(function):
     """--custom_franka_start_pose, for the Stretch 4 scripts (see `custom_start_link0_height()`)."""
     return click.option(
@@ -345,8 +368,8 @@ def retarget_options(function=None, *, gripper_option: bool = True, camera_optio
     Every `RetargetParams` flag, for the Stretch 4 scripts. Without `gripper_option` there is
     no --use_parallel_gripper (the real robot reports its gripper). Without `camera_options`
     there are none of the flags for which of Stretch's cameras the policy sees and how
-    (--head-crop, --exo_camera, --gripper_camera, --apply_franka_gripper_image_mismatch_fix):
-    for the follow-the-Franka scripts, where it sees the Franka's.
+    (--head-crop, --exo_camera, --gripper_camera, --apply_franka_gripper_image_mismatch_fix,
+    --rectify): for the follow-the-Franka scripts, where it sees the Franka's.
     """
     if function is None:
         return lambda f: retarget_options(f, gripper_option=gripper_option, camera_options=camera_options)
@@ -363,6 +386,7 @@ def retarget_options(function=None, *, gripper_option: bool = True, camera_optio
             help="Which gripper camera stands in for the Franka's wrist camera.",
         ),
         gripper_image_fix_option,
+        rectify_option,
     ]
     options = [
         click.option("--slow", is_flag=True, help="Run every joint at 20% of its default speed."),
@@ -423,6 +447,7 @@ def params_from_kwargs(kwargs: dict) -> RetargetParams:
         gripper_camera=kwargs.pop("gripper_camera", "left"),
         use_parallel_gripper=kwargs.pop("use_parallel_gripper", False),
         fix_gripper_image_mismatch=kwargs.pop("fix_gripper_image_mismatch", False),
+        rectify=kwargs.pop("rectify", False),
     )
 
 
@@ -456,11 +481,111 @@ def wrist_view(gripper_image: np.ndarray) -> np.ndarray:
     return to_droid_frame(gripper_image)
 
 
-def prepare_exo(image: np.ndarray, params: RetargetParams) -> np.ndarray:
-    """The exo image the policy sees: head images are cropped per `--head-crop`."""
-    if params.exo_camera in HEAD_CAMERAS and params.head_crop == "droid":
-        return to_droid_frame(image)
-    return image
+DROID_EXO_FOCAL_PX = DROID_IMAGE_SIZE[1] / 2 / math.tan(math.radians(DROID_EXO_FOVY) / 2)
+"""The DROID exo camera's focal length at DROID_IMAGE_SIZE: 258 px (71 degrees high, 102 across)."""
+
+RECTIFY_SUPERSAMPLE = 2
+"""--rectify samples the fisheye at this many times DROID_IMAGE_SIZE, then area-averages down:
+near the optical axis the fisheye has 1.3-2x the DROID camera's pixels per degree (more in the
+simulator's 1920x1200 than the real robot's default 1280x800), and sampling it once per output
+pixel would alias."""
+
+
+class FisheyeRectifier:
+    """
+    --rectify: an upright head fisheye image redrawn as the DROID exo camera would see it from
+    the same place, looking along the fisheye's optical axis: a pinhole DROID_EXO_FOVY high at
+    DROID_IMAGE_SIZE, so things are the size DROID's camera shows them right out to the edges.
+    `to_droid_frame()` only crops the fisheye to that aspect, which shows 136x77 degrees instead
+    of 102x71, squeezed more the further from the centre.
+
+    The lens is Kannala-Brandt (OpenCV's fisheye model), calibrated in the landscape sensor
+    frame: `camera_matrix` and `distortion` (k1..k4) for images `calibration_size` (width,
+    height) big; by default stretch4_mujoco's calibration of `camera`, which the simulator
+    renders through. Images of another size are taken to be the sensor's scaled, as the robot's
+    publisher scales its calibration. The maps are built once per image size.
+    """
+
+    def __init__(self, camera, camera_matrix=None, distortion=None, calibration_size=None):
+        settings = camera.initial_camera_settings
+        self.rotations = settings.rotate_number_of_times % 4
+        """Quarter turns counterclockwise from the sensor's frame to the upright image."""
+        if camera_matrix is None:
+            (fx, fy), (cx, cy) = settings.focal, settings.optical_center
+            camera_matrix = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
+            distortion = settings.distortion_params
+            calibration_size = (settings.width, settings.height)
+        self.camera_matrix = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
+        self.distortion = np.asarray(distortion, dtype=float).ravel()[:4]
+        self.calibration_size = tuple(calibration_size)
+        self._maps: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+
+    def sensor_size(self, image_shape) -> tuple[int, int]:
+        """(width, height) of the sensor's frame an upright image of `image_shape` was turned from."""
+        height, width = image_shape[:2]
+        return (height, width) if self.rotations % 2 else (width, height)
+
+    def maps(self, image_shape) -> tuple[np.ndarray, np.ndarray]:
+        """For each pixel of the supersampled output, where in an upright image of `image_shape`
+        to sample (`cv2.remap()` maps)."""
+        key = tuple(image_shape[:2])
+        if key in self._maps:
+            return self._maps[key]
+        sensor_width, sensor_height = self.sensor_size(image_shape)
+        sx, sy = sensor_width / self.calibration_size[0], sensor_height / self.calibration_size[1]
+        fx, fy = self.camera_matrix[0, 0] * sx, self.camera_matrix[1, 1] * sy
+        cx, cy = self.camera_matrix[0, 2] * sx, self.camera_matrix[1, 2] * sy
+
+        # The output's rays, in the upright camera's frame (x right, y down, z ahead) ...
+        width, height = (n * RECTIFY_SUPERSAMPLE for n in DROID_IMAGE_SIZE)
+        focal = DROID_EXO_FOCAL_PX * RECTIFY_SUPERSAMPLE
+        v, u = np.indices((height, width), dtype=np.float64)
+        x, y = (u - (width - 1) / 2) / focal, (v - (height - 1) / 2) / focal
+        # ... in the sensor's, which the upright image is turned counterclockwise from ...
+        x, y = {0: (x, y), 1: (-y, x), 2: (-x, -y), 3: (y, -x)}[self.rotations]
+        # ... through the lens onto the sensor ...
+        r = np.hypot(x, y)
+        theta = np.arctan(r)
+        t2 = theta * theta
+        k1, k2, k3, k4 = self.distortion
+        theta_d = theta * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+        along = np.divide(theta_d, r, out=np.ones_like(r), where=r > 0)
+        px, py = fx * x * along + cx, fy * y * along + cy
+        # ... and where that sensor pixel is in the upright image.
+        last_x, last_y = sensor_width - 1, sensor_height - 1
+        map_x, map_y = {0: (px, py), 1: (py, last_x - px), 2: (last_x - px, last_y - py), 3: (last_y - py, px)}[
+            self.rotations
+        ]
+        self._maps[key] = cv2.convertMaps(map_x.astype(np.float32), map_y.astype(np.float32), cv2.CV_16SC2)
+        return self._maps[key]
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        """`image` (upright) as the DROID exo camera would see it, DROID_IMAGE_SIZE big."""
+        map_xy, map_frac = self.maps(image.shape)
+        sampled = cv2.remap(image, map_xy, map_frac, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        return cv2.resize(sampled, DROID_IMAGE_SIZE, interpolation=cv2.INTER_AREA)
+
+
+@functools.cache
+def head_rectifier(side: str) -> FisheyeRectifier:
+    """The `FisheyeRectifier` for the `side` head fisheye, with stretch4_mujoco's calibration."""
+    return FisheyeRectifier(HEAD_CAMERAS[side])
+
+
+def prepare_exo(
+    image: np.ndarray, params: RetargetParams, side: str | None = None, rectifier: FisheyeRectifier | None = None
+) -> np.ndarray:
+    """
+    The exo image the policy sees from the head camera `side` (default: --exo_camera): cropped
+    per --head-crop, or, with --rectify, a side fisheye redrawn as the DROID exo camera
+    (by `rectifier`, default `head_rectifier(side)`).
+    """
+    side = side or params.exo_camera
+    if side not in HEAD_CAMERAS or params.head_crop != "droid":
+        return image
+    if params.rectify and side in HEAD_SIDES:
+        return (rectifier or head_rectifier(side))(image)
+    return to_droid_frame(image)
 
 
 HEAD_SIDES = ("left", "right")
@@ -1352,9 +1477,11 @@ class Stretch4SimEnv:
             if self.overlay_franka_gripper:
                 # The head camera with the Franka in place of Stretch's arm.
                 head_camera = self.cameras()[1]
-                exo = prepare_exo(self.mirror.render_with_franka(head_camera, state8[7], "franka"), self.params)
+                exo = prepare_exo(
+                    self.mirror.render_with_franka(head_camera, state8[7], "franka"), self.params, self.exo_camera
+                )
             else:
-                exo = prepare_exo(head, self.params)
+                exo = prepare_exo(head, self.params, self.exo_camera)
         extra = {"gripper_raw": gripper}
         if head is not None:
             extra["head_raw"] = head
