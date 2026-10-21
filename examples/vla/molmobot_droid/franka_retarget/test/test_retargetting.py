@@ -40,10 +40,12 @@ from examples.vla.molmobot_droid.droid import (  # noqa: E402
     site_transform,
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (  # noqa: E402
+    DROID_EXO_FOCAL_PX,
     TCP_ALIGN,
     FrankaStretchRetargeter,
     RetargetParams,
     StretchJoints,
+    head_rectifier,
     planar_transform,
 )
 
@@ -217,6 +219,39 @@ def test_stretch_follows_franka_across_wide_poses(rerun_recording, use_parallel_
         assert rotation_deg < TOLERANCE_DEG, f"pose {index}: TCPs {rotation_deg:.2f} deg apart"
         assert converged and reverse_mm < TOLERANCE_MM, f"pose {index}: mapping back is {reverse_mm:.2f} mm off"
     assert len(errors) == NUM_POSES
+
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("sensor_size", [(1920, 1200), (1280, 800)])
+def test_rectified_fisheye_is_the_droid_exo_camera(side, sensor_size):
+    """
+    --rectify: a dot where OpenCV's fisheye model puts a ray in the landscape sensor frame, turned
+    upright as the cameras' frames are, lands where a pinhole with the DROID exo camera's
+    intrinsics puts that ray.
+    """
+    import cv2
+
+    from examples.vla.molmobot_droid.droid import HEAD_CAMERAS
+
+    camera = HEAD_CAMERAS[side]
+    settings = camera.initial_camera_settings
+    scale = sensor_size[0] / settings.width
+    k = np.array([[settings.focal[0], 0, settings.optical_center[0]], [0, settings.focal[1], settings.optical_center[1]], [0, 0, 1]])
+    k[:2] *= scale
+    rectifier = head_rectifier(side)
+    for u, v in [(319.5, 183.5), (100, 60), (550, 300), (20, 340)]:
+        x, y = (u - 319.5) / DROID_EXO_FOCAL_PX, (v - 183.5) / DROID_EXO_FOCAL_PX
+        # The upright image is the sensor's turned counterclockwise rotate_number_of_times.
+        ray = {1: (-y, x, 1.0), 3: (y, -x, 1.0)}[settings.rotate_number_of_times % 4]
+        pixel, _ = cv2.fisheye.projectPoints(np.array([[ray]]), np.zeros(3), np.zeros(3), k, np.array(settings.distortion_params[:4]))
+        sensor = np.zeros((sensor_size[1], sensor_size[0], 3), np.uint8)
+        cv2.circle(sensor, tuple(int(round(c)) for c in pixel[0, 0]), 4, (255, 255, 255), -1)
+        out = rectifier(np.ascontiguousarray(np.rot90(sensor, settings.rotate_number_of_times))).sum(axis=2).astype(float)
+        rows, cols = np.nonzero(out > out.max() / 2)
+        weights = out[rows, cols]
+        found = (cols @ weights / weights.sum(), rows @ weights / weights.sum())
+        assert np.hypot(found[0] - u, found[1] - v) < 1.5, f"({u}, {v}) came out at {found}"
 
 
 if __name__ == "__main__":

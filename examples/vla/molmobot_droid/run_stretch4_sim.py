@@ -10,7 +10,9 @@ thinks it is driving overlaid, and its wrist camera's view with and without Stre
 camera without Stretch in it, instead of Stretch's gripper camera.
 
 With --exo_camera left or right (the default), the policy's exo view is the head fisheye on the
-side the tool is toward, as on the real robot (see `head_camera_for_tool()`).
+side the tool is toward, as on the real robot (see `head_camera_for_tool()`); with --rectify,
+redrawn as the DROID exo camera would see it (`FisheyeRectifier`) instead of only cropped to its
+aspect.
 
 The start pose can be changed between instructions (see `StretchStartPoseEditor`): `jog` moves
 the virtual Franka's joints and pedestal with the keys and Stretch follows, `pose` prints them,
@@ -28,6 +30,7 @@ Usage:
     python -m examples.vla.molmobot_droid.run_stretch4_sim --include_franka --custom_franka_start_pose
     python -m examples.vla.molmobot_droid.run_stretch4_sim --overlay_franka_gripper
     python -m examples.vla.molmobot_droid.run_stretch4_sim --use_franka_gripper_camera
+    python -m examples.vla.molmobot_droid.run_stretch4_sim --rectify
     python -m examples.vla.molmobot_droid.run_stretch4_sim --object-type tennis_ball --in-place-of mug
 """
 
