@@ -784,6 +784,9 @@ class FrankaDroidEnv:
 
     `ghost`, if given, is a ghost Franka (`add_franka_ghost()`) standing where this one stands,
     for showing what the Franka DROID as it comes would see; its pedestal follows this one's.
+
+    Without `render_cameras` it only simulates (no `observe()`, `render_scene()`): for a Franka
+    whose views are rendered elsewhere, as when Stretch 4 follows it (`follow_franka`).
     """
 
     def __init__(
@@ -792,6 +795,7 @@ class FrankaDroidEnv:
         spawn: FrankaSpawn,
         scene_camera: str | None = None,
         ghost: FrankaSpawn | None = None,
+        render_cameras: bool = True,
     ):
         from molmo_spaces.robots.robot_views.franka_droid_view import FrankaDroidRobotView
 
@@ -811,7 +815,13 @@ class FrankaDroidEnv:
         self.viewer = None
         self.prepare_exo: Callable[[np.ndarray], np.ndarray] | None = None
         self.prepare_wrist: Callable[[np.ndarray], np.ndarray] | None = None
+        self.exo_renderer = self.wrist_renderer = self.scene_renderer = None
+        if render_cameras:
+            self._make_renderers(scene_camera)
+        self.reset()
 
+    def _make_renderers(self, scene_camera: str | None) -> None:
+        model, spawn = self.model, self.spawn
         if spawn.exo_camera in HEAD_CAMERAS:
             apply_stretch_camera_settings(model, spawn.exo_camera_name, HEAD_CAMERAS[spawn.exo_camera])
             self.exo_renderer = StretchCameraRenderer(
@@ -830,7 +840,6 @@ class FrankaDroidEnv:
         self.scene_renderer = (
             PinholeRenderer(model, scene_camera, (960, 540)) if scene_camera else None
         )
-        self.reset()
 
     def reset(self, arm_qpos=FRANKA_HOME_QPOS) -> None:
         # Resetting also puts the mocap base back where `spawn_franka_droid()` placed it.
