@@ -27,3 +27,5 @@ stretch_temp_abs.xml
 # Generated motion profile plots from tests/test_movement.py
 tests/motion_profile_plots/
 outputs/
+# MolmoBot's code and its training venv, cloned for fine-tuning (examples/vla/molmobot_droid/run_finetune.py)
+examples/vla/molmobot_droid/molmobot/

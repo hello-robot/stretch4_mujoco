@@ -280,7 +280,7 @@ class EpisodeRecorder:
     """
     Streams one mp4 per camera, plus a grid of them, at the policy rate. Frames are written as
     they come, so an episode never holds its video in memory. The grid puts the scene camera
-    large on the left, the other cameras but `GRID_EXCLUDED` beside it, and `title` (the
+    large on the left, the other cameras but `grid_excluded` beside it, and `title` (the
     instruction) across the top.
     """
 
@@ -288,11 +288,15 @@ class EpisodeRecorder:
     GRID_EXCLUDED = ("head_raw", "gripper_raw")
     """Stretch's raw cameras: their own videos are enough, the grid shows the policy's views of them."""
 
-    def __init__(self, out_dir: Path, prefix: str, fps: float = POLICY_HZ, title: str = ""):
+    def __init__(
+        self, out_dir: Path, prefix: str, fps: float = POLICY_HZ, title: str = "",
+        grid_excluded: tuple[str, ...] = GRID_EXCLUDED,
+    ):
         self.out_dir = out_dir
         self.prefix = prefix
         self.fps = fps
         self.title = title
+        self.grid_excluded = grid_excluded
         self._writers: dict[str, object] = {}
         self._grid_size: tuple[int, int] | None = None
         (out_dir / GRID_DIR).mkdir(parents=True, exist_ok=True)
@@ -316,7 +320,7 @@ class EpisodeRecorder:
         self._writer("grid").append_data(self._grid(frames))
 
     def _grid(self, frames: dict[str, np.ndarray]) -> np.ndarray:
-        frames = {name: frame for name, frame in frames.items() if name not in self.GRID_EXCLUDED}
+        frames = {name: frame for name, frame in frames.items() if name not in self.grid_excluded}
         scene = frames.pop("scene", None)
         tiles = [_labelled_tile(frame, name, self.GRID_TILE_HEIGHT) for name, frame in frames.items()]
         grid = None
@@ -450,11 +454,15 @@ def run_episode(
     end_on_success: bool = True,
     on_step: Callable[[StepInfo, BenchmarkEnv], None] | None = None,
     extra_metrics: Callable[[BenchmarkEnv], dict] | None = None,
+    grid_excluded: tuple[str, ...] = EpisodeRecorder.GRID_EXCLUDED,
 ) -> EpisodeResult:
-    """Run one episode on an already built env, recording it, and judge it."""
+    """Run one episode on an already built env, recording it (the cameras in `grid_excluded`
+    only in their own videos), and judge it."""
     result = EpisodeResult(index, setup.scene.scene_id, setup.scene.object_name, setup.instruction)
     judge = make_judge(setup)
-    recorder = EpisodeRecorder(out_dir, f"{prefix}_{episode_name(index)}", title=setup.instruction)
+    recorder = EpisodeRecorder(
+        out_dir, f"{prefix}_{episode_name(index)}", title=setup.instruction, grid_excluded=grid_excluded
+    )
     latest: dict[str, object] = {"success": False, "metrics": {}}
 
     def step_callback(info: StepInfo) -> bool:

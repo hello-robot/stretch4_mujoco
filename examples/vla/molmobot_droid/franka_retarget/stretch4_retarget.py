@@ -39,8 +39,7 @@ from examples.vla.molmobot_droid.checkpoint import (
     FRANKA_HOME_QPOS,
     GRIPPER_CLOSED,
     POLICY_DT,
-    ROBOTIQ_DRIVER_CLOSED,
-    ROBOTIQ_DRIVER_OPEN,
+    robotiq_driver_angle,
 )
 from examples.vla.molmobot_droid.droid import (
     EXO_CAMERAS,
@@ -341,13 +340,30 @@ def apply_overlay_grasp_offset(params: RetargetParams) -> None:
         params.grasp_offset_mm = OVERLAY_GRASP_OFFSET_MM.get(params.tool_name)
 
 
-def retarget_options(function=None, *, gripper_option: bool = True):
+def retarget_options(function=None, *, gripper_option: bool = True, camera_options: bool = True):
     """
     Every `RetargetParams` flag, for the Stretch 4 scripts. Without `gripper_option` there is
-    no --use_parallel_gripper (the real robot reports its gripper).
+    no --use_parallel_gripper (the real robot reports its gripper). Without `camera_options`
+    there are none of the flags for which of Stretch's cameras the policy sees and how
+    (--head-crop, --exo_camera, --gripper_camera, --apply_franka_gripper_image_mismatch_fix):
+    for the follow-the-Franka scripts, where it sees the Franka's.
     """
     if function is None:
-        return lambda f: retarget_options(f, gripper_option=gripper_option)
+        return lambda f: retarget_options(f, gripper_option=gripper_option, camera_options=camera_options)
+    camera_flags = [
+        head_crop_option,
+        exo_camera_option("left"),
+        click.option(
+            "--gripper_camera",
+            "--gripper-camera",
+            "gripper_camera",
+            type=click.Choice(GRIPPER_CAMERAS),
+            default="left",
+            show_default=True,
+            help="Which gripper camera stands in for the Franka's wrist camera.",
+        ),
+        gripper_image_fix_option,
+    ]
     options = [
         click.option("--slow", is_flag=True, help="Run every joint at 20% of its default speed."),
         click.option(
@@ -356,7 +372,6 @@ def retarget_options(function=None, *, gripper_option: bool = True):
             show_default=True,
             help="Wait for Stretch to reach each action before executing the next.",
         ),
-        head_crop_option,
         execution_options,
         click.option(
             "--grasp-offset-mm",
@@ -376,17 +391,7 @@ def retarget_options(function=None, *, gripper_option: bool = True):
             help="roll,yaw,pitch offset of Stretch's tool from the Franka TCP, about the TCP's "
             "x, z and y axes. Hidden from the policy.",
         ),
-        exo_camera_option("left"),
-        click.option(
-            "--gripper_camera",
-            "--gripper-camera",
-            "gripper_camera",
-            type=click.Choice(GRIPPER_CAMERAS),
-            default="left",
-            show_default=True,
-            help="Which gripper camera stands in for the Franka's wrist camera.",
-        ),
-        gripper_image_fix_option,
+        *(camera_flags if camera_options else []),
     ]
     if gripper_option:
         options.append(
@@ -404,19 +409,20 @@ def retarget_options(function=None, *, gripper_option: bool = True):
 
 
 def params_from_kwargs(kwargs: dict) -> RetargetParams:
-    """Pop the `retarget_options()` values out of a click command's kwargs."""
+    """Pop the `retarget_options()` values out of a click command's kwargs (the camera flags'
+    defaults when it has none)."""
     return RetargetParams(
         slow=kwargs.pop("slow"),
         wait_for_arrival=kwargs.pop("wait_for_arrival"),
-        head_crop=kwargs.pop("head_crop"),
+        head_crop=kwargs.pop("head_crop", "droid"),
         execute_horizon=kwargs.pop("execute_horizon"),
         execute_first_n=kwargs.pop("execute_first_n"),
         grasp_offset_mm=kwargs.pop("grasp_offset_mm"),
         grasp_offset_deg=kwargs.pop("grasp_offset_deg"),
-        exo_camera=kwargs.pop("exo_camera"),
-        gripper_camera=kwargs.pop("gripper_camera"),
+        exo_camera=kwargs.pop("exo_camera", "left"),
+        gripper_camera=kwargs.pop("gripper_camera", "left"),
         use_parallel_gripper=kwargs.pop("use_parallel_gripper", False),
-        fix_gripper_image_mismatch=kwargs.pop("fix_gripper_image_mismatch"),
+        fix_gripper_image_mismatch=kwargs.pop("fix_gripper_image_mismatch", False),
     )
 
 
@@ -918,10 +924,7 @@ class FrankaStretchRetargeter:
                 break
         self.franka_seed = q7
         self.last_state_q7 = q7
-        driver = ROBOTIQ_DRIVER_OPEN + (1.0 - np.clip(joints.gripper_open_fraction, 0, 1)) * (
-            ROBOTIQ_DRIVER_CLOSED - ROBOTIQ_DRIVER_OPEN
-        )
-        return np.concatenate([q7, [driver]]), converged
+        return np.concatenate([q7, [robotiq_driver_angle(joints.gripper_open_fraction)]]), converged
 
     def reset(self) -> None:
         self.franka_seed = np.array(FRANKA_HOME_QPOS, dtype=float)
@@ -1109,11 +1112,12 @@ SPAWN_ARM_EXTENSION = 0.2
 """m. Stretch's arm goes this far out as it starts, nearer where the Franka's start poses need it."""
 
 
-def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool = False):
+def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool = False, cameras=None):
     """
     A `Stretch4MujocoSimulator` for a `custom_scene.Stretch4Scene` (not started), rendering only
     the cameras `params` needs (with `both_head_sides`, both side head fisheyes, for
-    `Stretch4SimEnv.head_follows_tool`) and publishing the robot's and the target object's poses.
+    `Stretch4SimEnv.head_follows_tool`), or `cameras` if given, and publishing the robot's and
+    the target object's poses.
 
     Stretch spawns with its lift SPAWN_LIFT_FRACTION up, and homes its arm SPAWN_ARM_EXTENSION out
     (see `spawn_with_arm_out()`): at the model's lift of 0 the gripper is often under a table,
@@ -1122,9 +1126,10 @@ def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool 
     from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
     spawn_with_arm_out(stretch_scene.model, SPAWN_LIFT_FRACTION, SPAWN_ARM_EXTENSION)
-    cameras = stretch_cameras_to_use(params)
-    if both_head_sides:
-        cameras = [cameras[0], *(HEAD_CAMERAS[side] for side in HEAD_SIDES)]
+    if cameras is None:
+        cameras = stretch_cameras_to_use(params)
+        if both_head_sides:
+            cameras = [cameras[0], *(HEAD_CAMERAS[side] for side in HEAD_SIDES)]
     sim = Stretch4MujocoSimulator(model=stretch_scene.model, cameras_to_use=cameras, tool_name=params.tool_name)
     sim.watch_bodies(stretch_scene.watched_bodies)
     return sim
