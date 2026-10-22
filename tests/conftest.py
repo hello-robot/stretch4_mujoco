@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
 # Importing stretch4_mujoco first picks the same MUJOCO_GL backend the tests use.
 _GL_PROBE = "import stretch4_mujoco, mujoco; mujoco.GLContext(64, 64).free()"
 
@@ -29,6 +31,22 @@ def _gl_unavailable_reason() -> str | None:
         return None
     lines = result.stderr.strip().splitlines()
     return lines[-1] if lines else f"exit code {result.returncode}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def generated_robot_model() -> None:
+    """
+    Generate the Stretch 4 robot MJCF once, before any test runs.
+
+    The default scene includes the generated MJCF, which is gitignored, so a
+    fresh checkout has none until a simulator is constructed. Tests that load
+    the scene directly would otherwise depend on an earlier test, which may be
+    skipped, having generated it. Overwrites any previously generated model.
+
+    Returns:
+        None.
+    """
+    Stretch4MujocoSimulator.get_robot_xml_path()
 
 
 def pytest_configure(config: pytest.Config) -> None:
