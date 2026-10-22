@@ -189,10 +189,6 @@ class MujocoServerCameraManagerSync:
         if for_camera.is_depth:
             renderer.enable_depth_rendering()
 
-        # Creating the renderer left its context current on this thread, which
-        # stops a render thread from taking it.
-        release_gl_context(renderer)
-
         return renderer
 
     def _render_camera(
@@ -358,6 +354,13 @@ class MujocoServerCameraManagerThreaded(MujocoServerCameraManagerSync):
         ever current on."""
 
         if use_threadpool_executor:
+            # Creating the renderers left the last one's context current on
+            # this thread, which stops a pool thread from taking it. Only done
+            # here: releasing on the passive viewer's UI thread stops its next
+            # render from making the context current again.
+            for renderer in self.camera_renderers.values():
+                release_gl_context(renderer)
+
             if platform.system() == "Darwin":
                 self.cameras_rendering_thread_pool = ThreadPoolExecutor(
                     max_workers=len(cameras_to_use) if cameras_to_use else 1

@@ -146,6 +146,10 @@ class StretchMujocoSimulator:
                 problem, but the camera then stays where the mouse leaves it
                 instead of following the body -- panning included, which a
                 tracking camera overrides. Ignored if viewer_track_body is set.
+
+        Returns:
+            None. Returns once the first status and camera frame arrive and the
+            robot is homed, or early if the Mujoco process exits.
         """
         self.is_stop_called = False
 
@@ -190,9 +194,14 @@ class StretchMujocoSimulator:
         atexit.register(self.stop)
 
         click.secho("Starting Stretch Mujoco Simulator...", fg="green")
+        # Poll often so start() returns soon after the first camera frame, but
+        # only report the wait once a second.
+        last_waiting_message = time.perf_counter()
         while self.pull_status().time == 0 or self.pull_camera_data().time == 0:
-            time.sleep(1)
-            click.secho("Still waiting to connect to the Mujoco Simulator.", fg="yellow")
+            time.sleep(0.05)
+            if time.perf_counter() - last_waiting_message >= 1.0:
+                last_waiting_message = time.perf_counter()
+                click.secho("Still waiting to connect to the Mujoco Simulator.", fg="yellow")
 
             if not self.is_running():
                 click.secho("The simulator is not running anymore, quitting..", fg="yellow")
