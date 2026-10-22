@@ -12,7 +12,7 @@ On the robot, run the image + joint-state publisher from stretch4_compliant_grip
 
 with both head fisheyes, and its wrist camera side matching --gripper_camera. The policy's exo
 view is the head fisheye on the side the tool is toward (see `head_camera_for_tool()`), so
---exo_camera is not used. Commands go
+--exo_camera is not used; with --no_head_follows_tool it is --exo_camera's (left or right). Commands go
 through stretch4_body's `RobotClient`; with --wait-for-arrival (the default) each action waits
 for the robot to stop moving.
 
@@ -550,7 +550,10 @@ class RealStretch4Env:
 
     def update_exo_side(self, quiet: bool = False) -> str:
         """Point `exo_side` at the head fisheye the tool is toward now, from the status last
-        pulled, saying so when it changes (unless `quiet`)."""
+        pulled, saying so when it changes (unless `quiet`); with --no_head_follows_tool, at --exo_camera's."""
+        if not self.params.head_follows_tool:
+            self.exo_side = self.params.exo_camera
+            return self.exo_side
         eoa = self.robot.status["end_of_arm"]
         facing, side = eoa.get("tool_facing"), eoa.get("tool_side")
         exo_side = head_camera_for_tool(facing, side)
@@ -886,6 +889,9 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
     if params.exo_camera == "droid":
         raise click.BadParameter("the real robot has no DROID exo camera; its exo view is the head camera on the "
                                  "tool's side", param_hint="--exo_camera")
+    if not params.head_follows_tool and params.exo_camera not in HEAD_SIDES:
+        raise click.BadParameter("with --no_head_follows_tool the exo view is a side head fisheye: left or right",
+                                 param_hint="--exo_camera")
 
     click.secho(f"Connecting to Stretch 4 at {robot_ip}...", dim=True)
     robot, gripper = connect(robot_ip)
@@ -919,7 +925,8 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         offset = ",".join(f"{v:g}" for v in params.effective_grasp_offset_mm)
         click.echo(
             click.style("Stretch 4 ", bold=True) + f"{robot_ip} · {gripper.replace('_', ' ')} · grasp offset {offset} mm\n"
-            + click.style("Cameras  ", bold=True) + f"head on the tool's side (now {env.exo_side}), gripper {params.gripper_camera}"
+            + click.style("Cameras  ", bold=True) + (f"head on the tool's side (now {env.exo_side})" if params.head_follows_tool else f"head {env.exo_side}")
+            + f", gripper {params.gripper_camera}"
             + (" (head rectified to DROID's exo camera)" if params.rectify
                else " (head cropped to DROID)" if params.head_crop == "droid" else "")
             + (", gripper image matched to DROID's wrist camera" if params.fix_gripper_image_mismatch else "") + "\n"
