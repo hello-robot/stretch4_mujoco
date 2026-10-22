@@ -1,6 +1,8 @@
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import multiprocessing
 from multiprocessing.managers import DictProxy, SyncManager
+from multiprocessing.synchronize import Lock
 import os
 import signal
 import threading
@@ -35,6 +37,7 @@ from stretch4_mujoco.datamodels.status_command import (
 )
 from stretch4_mujoco.enums.led_ring import LED_RING_MATERIAL, LedRingAnimation
 from stretch4_mujoco.mujoco_server_sensor_manager import MujocoServerSensorManagerThreaded
+from stretch4_mujoco.shared_camera_frames import SharedCameraFrameReader, SharedCameraFrameWriter
 import stretch4_mujoco.utils as utils
 from stretch4_mujoco.utils import FpsCounter, change_start_pose, H0_from_driving_dir, inverse_3x3_matrix, rotation_3x3_matrix
 from stretch4_mujoco.trapezoidal_profile import TrapezoidalProfile
@@ -47,12 +50,30 @@ class MujocoServerProxies:
     _sensors: "DictProxy[str, StatusStretchSensors]"
     _joint_limits: "DictProxy[str, dict[Actuators, tuple[float, float]]]"
     _lidar_lidar_points: "DictProxy[str, dict[str, np.ndarray]]"
+    _camera_frames_lock: Lock
+    """Held while a batch of camera frames is copied in or out of shared memory."""
+
+    _camera_frame_writer: SharedCameraFrameWriter | None = field(default=None, repr=False)
+    _camera_frame_reader: SharedCameraFrameReader | None = field(default=None, repr=False)
 
     def __setattr__(self, name: str, value) -> None:
         try:
             super().__setattr__(name, value)
         except BrokenPipeError:
             ...
+
+    def __getstate__(self) -> dict:
+        """
+        Pickle the proxies for the sim process, leaving out this process's
+        shared memory attachments.
+
+        Returns:
+            The attributes to pickle.
+        """
+        state = self.__dict__.copy()
+        state["_camera_frame_writer"] = None
+        state["_camera_frame_reader"] = None
+        return state
 
     def get_status(self) -> StatusStretchJoints:
         return self._status["val"]
@@ -67,10 +88,45 @@ class MujocoServerProxies:
         self._command["val"] = value
 
     def get_cameras(self) -> StatusStretchCameras:
-        return self._cameras["val"]
+        """
+        Pull the latest camera batch, with frames read from shared memory.
 
-    def set_cameras(self, value: StatusStretchCameras):
-        self._cameras["val"] = value
+        Returns:
+            The batch. Its frames are copies the caller owns.
+        """
+        if self._camera_frame_reader is None:
+            self._camera_frame_reader = SharedCameraFrameReader(self._camera_frames_lock, self._cameras)
+        return self._camera_frame_reader.read()
+
+    def set_cameras(self, value: StatusStretchCameras) -> None:
+        """
+        Publish a camera batch, with frames copied into shared memory.
+
+        Args:
+            value: The batch to publish. It is not modified.
+
+        Returns:
+            None.
+        """
+        if self._camera_frame_writer is None:
+            self._camera_frame_writer = SharedCameraFrameWriter(self._camera_frames_lock, self._cameras)
+        self._camera_frame_writer.write(value)
+
+    def close_camera_frames(self, unlink_leftovers: bool = False) -> None:
+        """
+        Release this process's camera frame segments and attachments.
+
+        Args:
+            unlink_leftovers: Also unlink segments the sim process left behind.
+                Only pass True once the sim process has exited.
+
+        Returns:
+            None.
+        """
+        if self._camera_frame_writer is not None:
+            self._camera_frame_writer.close()
+        if self._camera_frame_reader is not None:
+            self._camera_frame_reader.close(unlink_leftovers=unlink_leftovers)
 
     def get_sensors(self) -> StatusStretchSensors:
         return self._sensors["val"]
@@ -95,7 +151,19 @@ class MujocoServerProxies:
 
     @staticmethod
     def default(manager: SyncManager) -> "MujocoServerProxies":
+        """
+        Create the proxies the main and sim processes share.
+
+        Args:
+            manager: The Manager that holds the shared dicts.
+
+        Returns:
+            The proxies, to pass to the sim process when it is spawned.
+        """
         return MujocoServerProxies(
+            # The sim process is always spawned, and a lock can only be passed
+            # to a process started by its own context.
+            _camera_frames_lock=multiprocessing.get_context("spawn").Lock(),
             _command=manager.dict({"val": StatusCommand.default()}),
             _status=manager.dict({"val": StatusStretchJoints.default()}),
             _cameras=manager.dict({"val": StatusStretchCameras.default()}),
@@ -907,9 +975,12 @@ class MujocoServer:
             # We likely lost connection to the main process if we've hit this.
             ...
 
-    def close(self):
+    def close(self) -> None:
         """
-        Clean up C++ resources
+        Stop the camera and sensor threads and release renderers and camera frame segments.
+
+        Returns:
+            None.
         """
         self.request_to_stop()
 
@@ -920,6 +991,7 @@ class MujocoServer:
             self.sensor_manager.sensors_thread.join()
 
         self.camera_manager.close()
+        self.data_proxies.close_camera_frames()
 
     def _run_ui_simulation(self, show_viewer_ui: bool) -> None:
         """

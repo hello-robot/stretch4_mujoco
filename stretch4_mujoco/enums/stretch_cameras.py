@@ -108,10 +108,21 @@ class StretchCameras(Enum):
     @property
     def target_hz(self) -> float:
         """
-        Returns the target frame rate (Hz) for this camera.
-        Center camera runs at 10 Hz; left and right nav cameras run at 30 Hz.
+        The frame rate this camera renders at.
+
+        The centre camera runs at 10 Hz at either resolution; the head fisheye
+        and gripper cameras run at 30 Hz.
+
+        Returns:
+            The target frame rate in Hz.
         """
-        if self in [StretchCameras.cam_nav_rgb_se4_center, StretchCameras.cam_nav_rgb, StretchCameras.cam_d435i_rgb, StretchCameras.cam_d435i_depth]:
+        if self in [
+            StretchCameras.cam_nav_rgb_se4_center,
+            StretchCameras.cam_nav_rgb_se4_center_low_rez,
+            StretchCameras.cam_nav_rgb,
+            StretchCameras.cam_d435i_rgb,
+            StretchCameras.cam_d435i_depth,
+        ]:
             return 10.0
         return 30.0
 
