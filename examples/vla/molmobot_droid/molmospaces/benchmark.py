@@ -156,7 +156,8 @@ def episode_setup(episode) -> EpisodeSetup:
         task_type=task.get("task_type", "pick"),
         task=task,
         horizon_steps=round(task.get("task_horizon_sec", 20) * POLICY_HZ),
-        source={"h5_file": episode.source.h5_file, "traj_key": episode.source.traj_key},
+        # Generated benchmarks (`generated_benchmarks`) come from no datagen trajectory.
+        source={"h5_file": episode.source.h5_file, "traj_key": episode.source.traj_key} if episode.source else {},
     )
 
 
@@ -428,6 +429,7 @@ def recording_frames(observation: Observation, scene: np.ndarray | None) -> dict
 # ---------------------------------------------------------------------------
 
 FLAG_ABBREVIATIONS = {
+    "benchmark": "bench",
     "exo_camera": "exo",
     "gripper_camera": "grip",
     "execute-horizon": "eh",
@@ -825,6 +827,8 @@ class BenchmarkRun:
         self.results: list[EpisodeResult] = []
         self.current: str | None = None
         self.started = time.time()
+        self._session_started = self.started  # for the ETA; `started` goes back by a resumed run's earlier time
+        self._session_done = 0
         self.selected = list(selected)
         if resume:
             start = parse_episode_name(resume)
@@ -843,6 +847,7 @@ class BenchmarkRun:
                 print(f"No earlier results for {sorted(episode_name(i) for i in missing)}; the report leaves them out.")
 
     def episodes(self):
+        self._session_started = time.time()  # not counting loading the policy
         for index, episode in self.selected:
             self.current = episode_name(index)
             yield index, episode
@@ -851,6 +856,19 @@ class BenchmarkRun:
     def record(self, result: EpisodeResult) -> None:
         self.results.append(result)
         self.write()
+        self._session_done += 1
+        print(self.eta())
+
+    def eta(self) -> str:
+        """e.g. "    12/200 episodes this run, ETA 2h31m (14:05), at 48 s per episode": from this
+        run's episodes so far (not a resumed run's earlier ones)."""
+        done, total = self._session_done, len(self.selected)
+        per_episode = (time.time() - self._session_started) / done
+        remaining = per_episode * (total - done)
+        finish = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+        hours, minutes = divmod(round(remaining / 60), 60)
+        return (f"    {done}/{total} episodes this run, ETA {f'{hours}h' if hours else ''}{minutes:02d}m ({finish}), "
+                f"at {per_episode:.0f} s per episode")
 
     def write(self, stopped_at: str | None = None, stop_reason: str | None = None) -> Path:
         return write_report(

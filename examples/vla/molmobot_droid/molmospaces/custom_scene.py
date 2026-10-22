@@ -300,6 +300,11 @@ def swap_target(scene: CustomScene, object_type: str, index: int = 0) -> CustomS
     return insert_in_place_of(scene, find_asset(object_type, index), scene.object_name)
 
 
+def added_object_name(asset: Asset) -> str:
+    """The body name for `asset` put in a house: molmospaces' `<category>_<asset>_<ids>`, the category in one word."""
+    return f"{asset.label.replace(' ', '')}_{asset.asset_id.lower()}_0"
+
+
 def insert_in_place_of(scene: CustomScene, asset: Asset, replaced: str) -> CustomScene:
     """
     `scene` with `asset` as the target, in place of its `replaced` free body as it starts
@@ -324,8 +329,7 @@ def insert_in_place_of(scene: CustomScene, asset: Asset, replaced: str) -> Custo
         *(center[:2] - (asset_low[:2] + asset_high[:2]) / 2),
         low[2] - asset_low[2] + INSERT_DROP_HEIGHT,
     ])
-    # molmospaces' `<category>_<asset>_<ids>`, the category in one word.
-    name = f"{asset.label.replace(' ', '')}_{asset.asset_id.lower()}_0"
+    name = added_object_name(asset)
     # An object an earlier swap added is taken out of the additions; one of the house's is removed.
     added = {body: xml for body, xml in scene.added_objects.items() if body != replaced}
     poses = {body: pose for body, pose in scene.object_poses.items() if body != replaced}
@@ -550,38 +554,43 @@ def suggest_robot_pose(
     mujoco.mj_forward(model, data)
     object_id = model.body(scene.object_name).id
     target = scene.object_pos
-    floor_z = scene.floor_z
+
+    candidates = [(d, 2 * math.pi * i / headings) for d in distances for i in range(headings)]
+    for distance, angle in candidates:
+        x = target[0] - distance * math.cos(angle)
+        y = target[1] - distance * math.sin(angle)
+        if robot_footprint_clear(model, data, object_id, target, x, y, scene.floor_z, footprint_radius):
+            return RobotPose(x, y, angle)
+
+    raise ValueError(f"No clear pose {distances} m from {scene.object_name}; pass one explicitly")
+
+
+def robot_footprint_clear(
+    model: mujoco.MjModel, data: mujoco.MjData, object_id: int, target, x: float, y: float, floor_z: float,
+    footprint_radius: float = 0.2,
+) -> bool:
+    """
+    Whether a robot standing at (x, y) has clear floor under its whole footprint and the
+    object (root body `object_id`) in line of sight from there, at `target`'s height.
+    """
 
     def first_hit(origin, direction):
         geom = np.array([-1], dtype=np.int32)
         dist = mujoco.mj_ray(model, data, origin, direction, None, 1, -1, geom)
         return dist, int(geom[0])
 
-    candidates = [(d, 2 * math.pi * i / headings) for d in distances for i in range(headings)]
-    for distance, angle in candidates:
-        x = target[0] - distance * math.cos(angle)
-        y = target[1] - distance * math.sin(angle)
+    # Every point of the footprint must look straight down onto floor.
+    for r, a in [(0, 0)] + [(footprint_radius, k * math.pi / 4) for k in range(8)]:
+        origin = np.array([x + r * math.cos(a), y + r * math.sin(a), floor_z + 2.0])
+        dist, _ = first_hit(origin, np.array([0, 0, -1.0]))
+        if dist < 0 or abs(origin[2] - dist - floor_z) > 0.03:
+            return False
 
-        # Every point of the footprint must look straight down onto floor.
-        clear = True
-        for r, a in [(0, 0)] + [(footprint_radius, k * math.pi / 4) for k in range(8)]:
-            origin = np.array([x + r * math.cos(a), y + r * math.sin(a), floor_z + 2.0])
-            dist, _ = first_hit(origin, np.array([0, 0, -1.0]))
-            if dist < 0 or abs(origin[2] - dist - floor_z) > 0.03:
-                clear = False
-                break
-        if not clear:
-            continue
-
-        # Nothing between the robot and the object, at the object's height.
-        origin = np.array([x, y, target[2]])
-        direction = target - origin
-        dist, geom = first_hit(origin, direction / np.linalg.norm(direction))
-        if dist >= 0 and model.body_rootid[model.geom_bodyid[geom]] != object_id:
-            continue
-        return RobotPose(x, y, angle)
-
-    raise ValueError(f"No clear pose {distances} m from {scene.object_name}; pass one explicitly")
+    # Nothing between the robot and the object, at the object's height.
+    origin = np.array([x, y, target[2]])
+    direction = np.asarray(target) - origin
+    dist, geom = first_hit(origin, direction / np.linalg.norm(direction))
+    return not (dist >= 0 and model.body_rootid[model.geom_bodyid[geom]] != object_id)
 
 
 def look_at(position, target) -> np.ndarray:
