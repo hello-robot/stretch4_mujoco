@@ -189,8 +189,8 @@ class StretchMujocoSimulator:
         self._server_process.start()
 
         # Handle stopping, in all its various ways:
-        signal.signal(signal.SIGTERM, lambda num, sig: self.stop())
-        signal.signal(signal.SIGINT, lambda num, sig: self.stop())
+        signal.signal(signal.SIGTERM, lambda num, sig: self._stop_from_signal())
+        signal.signal(signal.SIGINT, lambda num, sig: self._stop_from_signal())
         atexit.register(self.stop)
 
         click.secho("Starting Stretch Mujoco Simulator...", fg="green")
@@ -211,9 +211,25 @@ class StretchMujocoSimulator:
 
         self.home()
 
+    def _stop_from_signal(self) -> None:
+        """
+        Stop the simulator from a signal handler, without blocking the main thread.
+
+        A signal handler runs on the main thread between two of its bytecodes,
+        possibly halfway through a call to the Manager. Manager proxies keep
+        one connection per thread, so calls made from the handler could take
+        the reply the interrupted call is waiting for. On its own thread,
+        `stop()` gets its own connection. The thread is not a daemon, so the
+        interpreter waits for it before exiting.
+
+        Returns:
+            None.
+        """
+        threading.Thread(target=self.stop, name="StretchMujocoStop").start()
+
     def stop(self) -> None:
         """
-        Stop the Mujoco process, release camera frame shared memory, and join threads.
+        Stop the Mujoco process, release camera frame shared memory, and join non-daemon threads.
 
         Called at exit, and on SIGTERM and SIGINT, so it runs at most once.
         Fingers-crossed we get a SIGTERM, and not a SIGKILL..
@@ -245,11 +261,15 @@ class StretchMujocoSimulator:
 
         # We're going to try to wait for threads to end. They might not gracefully stop before hitting an exception. Race conditions are rampant.
         # For example, the main thread or a thread may not be checking `sim.is_running()` and is oblivious that it should stop. Nothing we can do to stop it except sigkill.
+        # Daemon threads are skipped: they never hold up the interpreter's exit,
+        # and they are often stopped by the caller's own cleanup, which only
+        # runs once this returns -- a Rerun logger or keyboard listener, say.
         active_threads = threading.enumerate()
         for index, thread in enumerate(active_threads):
             if (
                 thread != threading.current_thread()
                 and thread != threading.main_thread()
+                and not thread.daemon
                 and not isinstance(thread, threading._DummyThread)
             ):
                 click.secho(
