@@ -347,12 +347,19 @@ def test_wrist_jammed_against_the_table_stalls_out(harness):
     assert peak_tilt < 5.0, f"robot tipped to {peak_tilt:.1f} deg"
 
 
-def test_full_range_wrist_motion_does_not_false_trip(harness):
-    """Big wrist sweeps at 4 N.m still track, and the stall guard stays out.
+def test_full_range_wrist_motion_does_not_false_trip(harness: Harness) -> None:
+    """
+    Check that big wrist sweeps at 4 N.m still track, and the stall guard stays out.
 
     Peak effort touches the limit on fast reversals, which is why the servo
     guard is gated on velocity as well: a joint that is moving is not stalled,
     however hard it is working.
+
+    Args:
+        harness: A settled headless server with guarded contact running.
+
+    Returns:
+        None.
     """
     server, guarded = harness.server, harness.guarded
     server._set_actuator_position("arm", 0.5)
