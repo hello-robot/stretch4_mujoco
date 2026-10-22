@@ -118,6 +118,8 @@ def camera_manager():
     """
     Create renderers for every Stretch 4 camera on the default scene.
 
+    Generates the robot MJCF first, overwriting any previously generated one.
+
     Both centre camera resolutions are included, since the simulator renders
     whichever one `use_full_center_camera_resolution` selects.
 
@@ -125,6 +127,9 @@ def camera_manager():
         The camera manager, closed after the module's tests.
     """
     cameras = list(BASELINE_RENDER_MS)
+    # The scene includes the robot MJCF, which is generated rather than checked
+    # in, so a fresh checkout has none until something generates it.
+    Stretch4MujocoSimulator.get_robot_xml_path()
     model = mujoco.MjModel.from_xml_path(Stretch4MujocoSimulator.get_scene_xml_path())
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
