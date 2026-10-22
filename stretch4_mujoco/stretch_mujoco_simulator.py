@@ -283,6 +283,12 @@ class StretchMujocoSimulator:
                         fg="red",
                     )
 
+        # The Manager's process otherwise lives until the program exits, and atexit keeps this
+        # simulator (its model and all) alive with it: a program that makes a simulator after
+        # another, e.g. one per benchmark episode, grows by both each time until it runs out of memory.
+        self._manager.shutdown()
+        atexit.unregister(self.stop)
+
         click.secho(
             f"The Stretch Mujoco Simulator has ended. Good-bye!",
             fg="red",
