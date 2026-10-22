@@ -3,9 +3,9 @@ Write benchmark runs' `report.md` (and `results.json`) again from their `results
 rerunning anything: e.g. after the report gains a score or a column.
 
 Usage:
-    python -m examples.vla.molmobot_droid.rewrite_reports outputs/molmobot_droid/<run> [<run> ...]
+    python -m examples.vla.molmobot_droid.rewrite_reports outputs/molmobot_droid/benchmarks/<run> [<run> ...]
     # Every run in a directory:
-    python -m examples.vla.molmobot_droid.rewrite_reports --all outputs/molmobot_droid
+    python -m examples.vla.molmobot_droid.rewrite_reports --all outputs/molmobot_droid/benchmarks
 """
 
 from __future__ import annotations

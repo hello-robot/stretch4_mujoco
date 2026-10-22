@@ -198,7 +198,8 @@ All are run as modules from the repo root, e.g. `python -m examples.vla.molmobot
 | `run_benchmark_follow_franka.py` | A benchmark run the same way. It saves each episode Stretch succeeds in as a Stretch 4 trajectory for `run_finetune.py`. |
 | `run_finetune.py` | Fine-tunes MolmoBot-DROID on those trajectories to drive Stretch 4's joints directly (see [Fine-tuning](#fine-tuning-on-stretch-4-run_finetunepy)). |
 
-A benchmark run writes to `outputs/molmobot_droid/<run name>/`. The run name is the robot
+A benchmark run writes to `outputs/molmobot_droid/benchmarks/<run name>/`
+(`run_benchmark_follow_franka.py`'s, which are fine-tuning data, to `outputs/molmobot_droid/finetuning/data/`). The run name is the robot
 plus the flags, joined with underscores, e.g.
 `stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-0_wait-1_pg-0_offmm--9,0,0_offdeg-0,0,0_ghost-0`.
 The directory contains:
@@ -399,16 +400,24 @@ out for validation loss. Options after `--` go straight to MolmoBot's TrainConfi
 `-- --optimizer.action_expert_learning_rate=3e-5`. `--debug` runs a tiny, randomly initialized
 model to check the pipeline end to end.
 
-Output goes to `outputs/molmobot_droid/finetune/<run>/`:
+Output goes to `outputs/molmobot_droid/finetuning/models/<run>/`:
 
 - `dataset/`: links to the run directories, split train/val, with each split's index;
 - `norm_stats.yaml` and `spec.json`;
-- sharded checkpoints every `--save-interval` steps. To resume, run the same command again;
-- the final `step<N>-unsharded/`, which `checkpoint.load_policy()` loads.
+- sharded checkpoints, with the optimizer state, every `--save-interval` steps (2,000 by
+  default). The latest is kept, for resuming: run the same command again (Ctrl+C does not save
+  one first, so up to `--save-interval` steps are redone). So are those at multiples of
+  `--keep-interval` (10,000 by default);
+- the final `step<N>-unsharded/` (the model alone), which `checkpoint.load_policy()` loads;
+- `metrics.jsonl`, every step's metrics and every validation's, and `metrics.png`, all of them
+  across steps in one figure: each loss (train, raw and smoothed, with validation), the learning
+  rates, the gradient norms, throughput and peak GPU memory. It is redrawn every
+  `--plot-interval` steps (50 by default) and when training ends or stops;
+  `python -m examples.vla.molmobot_droid.plot_finetune <run dir>` draws it any time.
 
 ```bash
 python -m examples.vla.molmobot_droid.run_finetune --use_parallel_gripper \
-    --data outputs/molmobot_droid/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0_customstart-1
+    --data outputs/molmobot_droid/finetuning/data/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0_customstart-1
 ```
 
 ### Setup
