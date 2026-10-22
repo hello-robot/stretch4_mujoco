@@ -20,6 +20,8 @@ from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.mujoco_server_camera_manager import MujocoServerCameraManagerSync
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
 
+pytestmark = pytest.mark.requires_gl
+
 BASELINE_RENDER_MS = {
     StretchCameras.cam_nav_rgb_se4_left: 3.8,
     StretchCameras.cam_nav_rgb_se4_right: 3.9,

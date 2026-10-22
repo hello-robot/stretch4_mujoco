@@ -1,10 +1,13 @@
 import time
 
 import numpy as np
+import pytest
 
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.fisheye_renderer import fisheye_angles
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+pytestmark = pytest.mark.requires_gl
 
 HEAD_CAMERAS = [StretchCameras.cam_nav_rgb_se4_left, StretchCameras.cam_nav_rgb_se4_right]
 

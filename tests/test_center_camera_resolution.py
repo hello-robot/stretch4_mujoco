@@ -1,6 +1,11 @@
 import time
+
+import pytest
+
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+pytestmark = pytest.mark.requires_gl
 
 
 def test_center_camera_outside_world_mapping():
