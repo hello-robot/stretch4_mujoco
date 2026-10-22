@@ -220,7 +220,7 @@ class SuccessJudge(Protocol):
     bodies: list[str]
     """Bodies whose poses and contacts it reads (what Stretch's simulator must watch)."""
 
-    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float]]: ...
+    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float | bool]]: ...
 
 
 @dataclass
@@ -238,13 +238,13 @@ class PickSuccess:
     def bodies(self) -> list[str]:
         return [self.object_name]
 
-    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float]]:
+    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float | bool]]:
         position, _ = env.body_pose(self.object_name)
         lift = float(position[2] - self.start_z)
         contacts = env.body_contacts(self.object_name)
         touching_robot = env.robot_root in contacts
         only_robot = touching_robot and all(c == env.robot_root for c in contacts)
-        return only_robot and lift >= self.threshold, {"lift_m": lift, "held": float(only_robot)}
+        return only_robot and lift >= self.threshold, {"lift_m": lift, "held": only_robot}
 
 
 @dataclass
@@ -264,14 +264,14 @@ class PickAndPlaceSuccess:
     def bodies(self) -> list[str]:
         return [self.object_name, self.receptacle_name]
 
-    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float]]:
+    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float | bool]]:
         contacts = env.body_contacts(self.object_name)
         receptacle_pos, _ = env.body_pose(self.receptacle_name)
         displacement = float(np.linalg.norm(receptacle_pos - self.receptacle_start))
         on_receptacle = self.receptacle_name in contacts
         released = env.robot_root not in contacts
         success = on_receptacle and released and displacement <= self.max_receptacle_displacement
-        return success, {"on_receptacle": float(on_receptacle), "receptacle_moved_m": displacement}
+        return success, {"on_receptacle": on_receptacle, "receptacle_moved_m": displacement}
 
 
 def make_judge(setup: EpisodeSetup) -> SuccessJudge:
@@ -612,7 +612,10 @@ def score_lines(results: list[EpisodeResult]) -> list[str]:
 
 def write_summary(out_dir: Path, summary: dict) -> Path:
     """`results.json` and `report.md` from a run's summary, with its scores worked out from its results."""
-    results = sorted((EpisodeResult(**r) for r in summary["results"]), key=lambda r: r.index)
+    results = sorted(
+        (EpisodeResult(**{**r, "metrics": typed_metrics(r["metrics"])}) for r in summary["results"]),
+        key=lambda r: r.index,
+    )
     summary = {**{k: v for k, v in summary.items() if k != "results"}, **score(results),
                "results": [asdict(r) for r in results]}
     (out_dir / "results.json").write_text(json.dumps(summary, indent=2, default=float))
@@ -652,6 +655,7 @@ def write_summary(out_dir: Path, summary: dict) -> Path:
         f"| Checkpoint | `{summary['checkpoint']}` (MolmoBot code `{summary['molmobot_commit']}`) |",
         f"| Wall time | {summary['total_wall_seconds'] / 60:.1f} min |",
         "",
+        *outcome_table(results),
         "## Flags",
         "",
         "| Flag | Value |",
@@ -678,6 +682,10 @@ def write_summary(out_dir: Path, summary: dict) -> Path:
         f"Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `{GRID_DIR}/<run>_ep<#>_grid.mp4` with the "
         "policy's views, the scene camera and the instruction.",
         "",
+        "### Columns",
+        "",
+        *column_descriptions(metric_names),
+        "",
         "## Scenes",
         "",
         f"From benchmark build `{benchmark_dir}`, with molmospaces' `{variant}` scene files. "
@@ -692,6 +700,93 @@ def write_summary(out_dir: Path, summary: dict) -> Path:
     path = out_dir / "report.md"
     path.write_text("\n".join(lines))
     return path
+
+
+COLUMN_DESCRIPTIONS = {
+    "#": "The episode's index in the benchmark.",
+    "Episode": "The episode's name in file names and `--resume`/`--episodes`.",
+    "Scene": "The molmospaces scene the episode runs in (see Scenes below).",
+    "Instruction": "What the policy is told to do.",
+    "Success": "Whether the success check passed at any step of the episode.",
+    "Reachable": f"Whether the target starts below Stretch 4's {STRETCH_MAST_HEIGHT} m mast; "
+                 "episodes marked **no** are left out of the reachable score.",
+    "Video": "The episode's grid video: the policy's views, the scene camera and the instruction.",
+    "Steps": "Actions executed (one per policy period).",
+    "Queries": "Times the policy was asked for a new action chunk.",
+    "s/query": "Mean seconds per policy query (inference).",
+    "Wall s": "Seconds the rollout took, wall clock.",
+    "Error": "The exception that ended the episode, if one did.",
+}
+"""What the report's fixed Episodes columns mean."""
+
+METRIC_DESCRIPTIONS = {
+    "lift_m": "Pick tasks: how far the target is above where it started, in metres, at the last step judged "
+              "(the success step when the episode ended on success).",
+    "held": "Pick tasks: whether the target, at the last step judged, touches the robot and nothing else.",
+    "on_receptacle": "Pick-and-place tasks: whether the object, at the last step judged, touches the receptacle.",
+    "receptacle_moved_m": "Pick-and-place tasks: how far the receptacle has moved from its start, in metres.",
+    "ik_failures": "Franka actions Stretch 4 could not reach even approximately (no Stretch target for them); "
+                   "counted after Stretch reached the start pose.",
+    "ik_clamped": "Franka actions out of Stretch 4's reach, so it went to the closest pose it could (including "
+                  "the twisted ones); counted after Stretch reached the start pose.",
+    "ik_twisted": "Of `ik_clamped`, the actions Stretch 4 reached only by turning its tool less about its approach "
+                  "axis than the Franka's (its wrist roll cannot turn as far).",
+    "reverse_ik_failures": "Steps where Stretch 4's pose could not be mapped back to a Franka state for the policy.",
+    "stale_observations": "Steps whose camera frames or body poses did not catch up with the joints in time, so the "
+                          "policy saw older ones.",
+    "furniture_removed": "Furniture taken out of the scene to make room for Stretch 4's footprint.",
+    "tool_error_mean_m": "Mean distance, in metres, between Stretch 4's tool and where the Franka's action put it, "
+                         "over the episode's steps.",
+    "tool_error_max_m": "Largest distance, in metres, between Stretch 4's tool and where the Franka's action put it, "
+                        "over the episode's steps.",
+    "saved": "Whether the episode's trajectory was saved for fine-tuning (successful episodes only).",
+}
+"""What the Episodes columns runners add from their success checks and `extra_metrics` mean."""
+
+METRIC_TYPES = {
+    **dict.fromkeys(("held", "on_receptacle", "saved"), bool),
+    **dict.fromkeys(("ik_failures", "ik_clamped", "ik_twisted", "reverse_ik_failures", "stale_observations",
+                     "furniture_removed"), int),
+}
+"""Metrics that are not floats. Runs from before they were recorded as such stored them as floats."""
+
+
+def typed_metrics(metrics: dict) -> dict:
+    return {k: METRIC_TYPES[k](v) if k in METRIC_TYPES else v for k, v in metrics.items()}
+
+
+OUTCOME_METRICS = ("ik_clamped", "ik_failures")
+"""Metrics the report averages over successes and failures separately."""
+
+
+def outcome_table(results: list[EpisodeResult]) -> list[str]:
+    """
+    The report's table of OUTCOME_METRICS averaged over the successful and the failed episodes
+    that have them (not those that errored before a rollout), or nothing if no episode has them.
+    """
+    names = [m for m in OUTCOME_METRICS if any(m in r.metrics for r in results)]
+    if not names:
+        return []
+    lines = [
+        "## IK by outcome",
+        "",
+        "Mean per episode, over the episodes that have them (episodes that errored before a rollout have none).",
+        "",
+        "| Episodes | Count | " + " | ".join(f"Mean {m}" for m in names) + " |",
+        "|---|---|" + "---|" * len(names),
+    ]
+    for label, success in (("Succeeded", True), ("Failed", False)):
+        group = [r for r in results if r.success == success and all(m in r.metrics for m in names)]
+        means = [f"{np.mean([r.metrics[m] for r in group]):.1f}" if group else "" for m in names]
+        lines.append(f"| {label} | {len(group)} | " + " | ".join(means) + " |")
+    return [*lines, ""]
+
+
+def column_descriptions(metric_names: list[str]) -> list[str]:
+    """The report's list of what each Episodes column means, the metric columns in `metric_names` included."""
+    descriptions = {**COLUMN_DESCRIPTIONS, **{m: METRIC_DESCRIPTIONS.get(m, "") for m in metric_names}}
+    order = [*list(COLUMN_DESCRIPTIONS)[:-1], *metric_names, "Error"]
+    return [f"- **{name}**: {descriptions[name]}" if descriptions[name] else f"- **{name}**" for name in order]
 
 
 def reachable_cell(scene: dict) -> str:
@@ -861,4 +956,6 @@ def _numbers(values) -> str:
 
 
 def _format(value) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
     return f"{value:.3f}" if isinstance(value, float) else str(value)

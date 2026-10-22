@@ -154,7 +154,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                             name, end_on_success=not run_to_horizon, on_step=on_step,
                             extra_metrics=lambda e: e.stats(), grid_excluded=GRID_EXCLUDED,
                         )
-                        result.metrics["saved"] = 0.0
+                        result.metrics["saved"] = False
                         if result.success and result.error is None:
                             prefix = f"{name}_{bench.episode_name(index)}"
                             try:
@@ -166,7 +166,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                                     "scene_id": setup.scene.scene_id,
                                     "object_name": setup.scene.object_name,
                                 })
-                                result.metrics["saved"] = 1.0
+                                result.metrics["saved"] = True
                                 click.echo(f"    trajectory: {saved}")
                             except Exception as error:  # the episode still succeeded
                                 traceback.print_exc()
