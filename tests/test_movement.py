@@ -18,6 +18,7 @@ from pathlib import Path
 import click
 import matplotlib
 import numpy as np
+import pytest
 
 matplotlib.use("Agg")  # headless-safe: these figures are only ever written to disk
 
@@ -26,6 +27,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 from stretch4_mujoco import config  # noqa: E402
 from stretch4_mujoco.datamodels.status_stretch_joints import StatusStretchJoints  # noqa: E402
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator  # noqa: E402
+
+pytestmark = pytest.mark.requires_gl
 
 PLOT_ROOT = Path(__file__).parent / "motion_profile_plots"
 

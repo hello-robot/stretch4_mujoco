@@ -1,7 +1,12 @@
 import time
+
 import click
 import numpy as np
+import pytest
+
 from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+pytestmark = pytest.mark.requires_gl
 
 
 def wait_for_movement(status_fn, start_val, delta=0.005, timeout=15.0):

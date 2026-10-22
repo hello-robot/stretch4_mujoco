@@ -52,13 +52,22 @@ jobs:
             libxrender-dev \
             xvfb
 
+      # The Windows runner has no GPU and only the GDI OpenGL 1.1 driver, which
+      # MuJoCo's renderer rejects (gladLoadGL error). Mesa's llvmpipe provides a
+      # software OpenGL that is deployed system-wide.
+      - name: Install Windows software OpenGL (Mesa llvmpipe)
+        if: runner.os == 'Windows'
+        uses: ssciwr/setup-mesa-dist-win@v3
+        with:
+          deployment-choice: '1'
+
       - name: Run test suite (Linux)
         if: runner.os == 'Linux'
-        run: xvfb-run -a uv run pytest tests/
+        run: xvfb-run -a uv run pytest -rs tests/
         env:
           MUJOCO_GL: egl
           PYOPENGL_PLATFORM: egl
 
       - name: Run test suite (Windows & macOS)
         if: runner.os != 'Linux'
-        run: uv run pytest tests/
+        run: uv run pytest -rs tests/
