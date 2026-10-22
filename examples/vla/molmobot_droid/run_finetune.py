@@ -37,14 +37,19 @@ Writes to <out>/<run name>/:
 - `dataset/`: links to the episodes' run directories, split into train and val;
 - `norm_stats.yaml`: Stretch's state and action normalization, computed on the first run;
 - `spec.json`: what `finetune/train.py` was given;
-- MolmoBot's checkpoints: `step<N>/` every --save-interval steps (sharded, the latest kept,
-  for resuming: run the same command again) and the final `step<steps>-unsharded/`, which
-  `checkpoint.load_policy()` loads.
+- `metrics.jsonl`: every step's metrics and every validation's, and `metrics.png`, all of them
+  across steps in one figure (losses, learning rates, gradient norms, throughput, GPU memory),
+  redrawn every --plot-interval steps and when training ends or stops (`plot_finetune.py` draws
+  it any time);
+- MolmoBot's checkpoints: `step<N>/` every --save-interval steps, sharded, with the optimizer
+  state: the latest, for resuming (run the same command again; Ctrl+C does not save one first),
+  and every --keep-interval steps'. And the final `step<steps>-unsharded/` (the model alone),
+  which `checkpoint.load_policy()` loads.
 
 Usage:
     python -m examples.vla.molmobot_droid.run_finetune --use_parallel_gripper \\
-        --data outputs/molmobot_droid/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0
-    python -m examples.vla.molmobot_droid.run_finetune --data outputs/molmobot_droid --use_parallel_gripper \\
+        --data outputs/molmobot_droid/finetuning/data/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0
+    python -m examples.vla.molmobot_droid.run_finetune --data outputs/molmobot_droid/finetuning/data --use_parallel_gripper \\
         --use_fisheye right --use_gripper right --use_vision_transformer --no-use_action_head
     python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool
     python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool \
@@ -60,6 +65,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import traceback
 from pathlib import Path
 
 import click
@@ -68,12 +74,16 @@ from examples.vla.molmobot_droid.checkpoint import MOLMOBOT_LOCAL_DIR, download_
 from examples.vla.molmobot_droid.finetune.dataset import build_dataset, find_episodes
 from examples.vla.molmobot_droid.finetune.stretch4_joints import MOVE_GROUPS
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import PARALLEL_GRIPPER_TOOL, STRETCH_GRIPPER_TOOL
+from examples.vla.molmobot_droid.plot_finetune import METRICS_FILE, latest_step, plot_metrics
 
 MOLMOBOT_DIR = MOLMOBOT_LOCAL_DIR / "MolmoBot"
 TORCHRUN = MOLMOBOT_DIR / ".venv" / "bin" / "torchrun"
 TRAIN_SCRIPT = Path(__file__).parent / "finetune" / "train.py"
 PRESET = "stretch4"
 """The action and camera preset `finetune/train.py` registers (its PRESET)."""
+
+PLOT_POLL_SECONDS = 15
+"""How often, while training, the metrics are checked for --plot-interval more steps."""
 
 VAL_MAX_EXAMPLES = 256
 """Val examples per evaluation: a few minutes at most, every --val-interval steps."""
@@ -127,20 +137,28 @@ def run_name(fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool
 @click.option("--val-interval", type=int, default=1000, show_default=True)
 @click.option("--save-interval", type=int, default=2000, show_default=True,
               help="Steps between (sharded) checkpoints, for resuming.")
+@click.option("--keep-interval", type=int, default=10_000, show_default=True,
+              help="Keep the sharded checkpoints (model and optimizer state) at multiples of this many steps, "
+              "not only the latest. A multiple of --save-interval; 0 keeps only the latest.")
+@click.option("--plot-interval", type=int, default=50, show_default=True,
+              help="Redraw metrics.png every this many steps while training (0: only at the end).")
 @click.option("--num-workers", type=int, default=4, show_default=True, help="Data loader workers.")
-@click.option("--out", default="outputs/molmobot_droid/finetune", show_default=True, type=click.Path(path_type=Path))
+@click.option("--out", default="outputs/molmobot_droid/finetuning/models", show_default=True, type=click.Path(path_type=Path))
 @click.option("--checkpoint", default=None, help="Checkpoint to start from. Default: MolmoBot-DROID from Hugging Face.")
 @click.option("--wandb", "use_wandb", is_flag=True, help="Log to Weights & Biases (needs WANDB_PROJECT and WANDB_ENTITY).")
 @click.option("--debug", is_flag=True, help="A tiny randomly initialized model instead of the checkpoint's "
               "weights (its config still), batch 1 and no validation: to check the pipeline end to end.")
 @click.argument("trainer_options", nargs=-1, type=click.UNPROCESSED)
 def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps,
-         global_batch_size, device_batch_size, val_fraction, val_interval, save_interval, num_workers, out,
+         global_batch_size, device_batch_size, val_fraction, val_interval, save_interval, keep_interval, plot_interval, num_workers, out,
          checkpoint, use_wandb, debug, trainer_options):
     """Fine-tune MolmoBot-DROID on Stretch 4 trajectories (see the module docstring). Options after
     the ones here go to MolmoBot's TrainConfig, e.g. --optimizer.action_expert_learning_rate=3e-5."""
     if not (use_action_head or use_vision_transformer):
         raise click.UsageError("Nothing to train: give --use_action_head or --use_vision_transformer (the LLM stays frozen)")
+    if keep_interval and keep_interval % save_interval:
+        raise click.UsageError(f"--keep-interval {keep_interval} is not a multiple of --save-interval {save_interval}: "
+                               "no checkpoint would be saved at its steps")
     if not TORCHRUN.exists():
         raise click.ClickException(f"No MolmoBot training venv at {TORCHRUN.parent.parent}: set it up as "
                                    "`python -m examples.vla.molmobot_droid.run_finetune --help`'s module docstring says")
@@ -191,7 +209,8 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
         f"--ft_connector={use_vision_transformer}",
         f"--save_interval={save_interval}",
         "--save_final_unsharded_checkpoint=True",
-        "--checkpoint_retention_frequency=null",
+        f"--checkpoint_retention_frequency={keep_interval or 'null'}",
+        "--save_final_optim=True",  # train_molmobot.py leaves the last checkpoint's optimizer state out
         *([] if use_wandb else ["--wandb=null"]),
         *trainer_options,
     ]
@@ -202,6 +221,7 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
         "cameras": cameras,
         "train_action_head": use_action_head,
         "tool_name": tool,
+        "metrics": str(save_dir / METRICS_FILE),
         "args": args,
     }
     spec_path = save_dir / "spec.json"
@@ -210,11 +230,35 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
     command = [str(TORCHRUN), "--standalone", "--nproc-per-node=1", str(TRAIN_SCRIPT), str(spec_path)]
     click.secho(f"Training {name}: {' '.join(command)}", fg="cyan")
     env = {**TRAINING_ENV, **os.environ}
-    completed = subprocess.run(command, env=env, cwd=MOLMOBOT_DIR)
-    if completed.returncode:
-        raise SystemExit(completed.returncode)
+    process = subprocess.Popen(command, env=env, cwd=MOLMOBOT_DIR)
+    try:
+        plotted = latest_step(save_dir / METRICS_FILE) // plot_interval if plot_interval else 0
+        while process.poll() is None:
+            try:
+                process.wait(timeout=PLOT_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            if plot_interval and (reached := latest_step(save_dir / METRICS_FILE) // plot_interval) > plotted:
+                plotted = reached
+                redraw(save_dir)
+    finally:  # also when it fails or Ctrl+C stops it (Ctrl+C reaches the trainer too: let it exit)
+        process.wait()
+        figure = redraw(save_dir)
+        if figure:
+            click.secho(f"Metrics: {figure}", fg="green")
+    if process.returncode:
+        raise SystemExit(process.returncode)
     final = save_dir / f"step{steps}-unsharded"
     click.secho(f"Done: {final}\n  load it with checkpoint.load_policy({str(final)!r})", fg="green")
+
+
+def redraw(save_dir: Path) -> Path | None:
+    """`plot_metrics`, without stopping training when drawing fails."""
+    try:
+        return plot_metrics(save_dir)
+    except Exception:
+        traceback.print_exc()
+        return None
 
 
 if __name__ == "__main__":

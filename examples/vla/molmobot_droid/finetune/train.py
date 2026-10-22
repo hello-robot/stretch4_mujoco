@@ -13,8 +13,10 @@ What it changes, all before `train_molmobot.main()` runs:
 - Stretch 4's joints (move groups) and cameras are presets, named PRESET.
 - The optimizer is bitsandbytes' 8-bit AdamW (`LocalShardAdamW8bit`) instead of torch's AdamW.
 - Without `train_action_head`, the action expert is frozen.
+- Every step's metrics the trainer logs, and every validation's, are appended to the spec's
+  `metrics` file (`plot_finetune.py` plots them): without W&B they would only reach the console.
 
-Spec (JSON): molmobot_dir, checkpoint, move_groups, cameras, train_action_head, and args,
+Spec (JSON): molmobot_dir, checkpoint, move_groups, cameras, train_action_head, metrics, and args,
 `train_molmobot.py`'s command line after the checkpoint.
 """
 
@@ -97,6 +99,43 @@ def freeze_action_expert() -> None:
     MolmoBotConfig.build_model = build_frozen
 
 
+def record_metrics(path: str) -> None:
+    """Append the metrics the trainer logs to `path`, one JSON line per step and per validation:
+    {"step", "kind": "train" or "val", "metrics": {name: value}}. Train steps carry the losses
+    (`train/...`), learning rates and gradient norms (`optim/...`), throughput and peak GPU memory;
+    validations, each evaluator's losses (`<label>/...`). A resumed run appends steps again from its
+    checkpoint, and the later lines win."""
+    from olmo.torch_util import get_global_rank
+    from olmo.train.trainer import Trainer
+
+    log_metrics_to_console = Trainer.log_metrics_to_console
+    loss_eval = Trainer.loss_eval
+
+    def write(step: int, kind: str, metrics: dict) -> None:
+        values = {}
+        for name, value in metrics.items():
+            try:
+                values[name] = float(value)
+            except (TypeError, ValueError):  # e.g. W&B media from inference evaluators
+                continue
+        with open(path, "a") as file:
+            file.write(json.dumps({"step": step, "kind": kind, "metrics": values}) + "\n")
+
+    def log_and_record(self, prefix, metrics):
+        if prefix.startswith("[step="):  # the train step's header; evaluators log under their label
+            write(self.global_step, "train", metrics)
+        log_metrics_to_console(self, prefix, metrics)
+
+    def eval_and_record(self):
+        metrics = loss_eval(self)
+        if get_global_rank() == 0:
+            write(self.global_step, "val", metrics)
+        return metrics
+
+    Trainer.log_metrics_to_console = log_and_record
+    Trainer.loss_eval = eval_and_record
+
+
 def checkpoint_model_config(checkpoint: str):
     from olmo.models.model_config import BaseModelConfig
 
@@ -137,6 +176,7 @@ def main() -> None:
     use_8bit_adamw()
     if not spec["train_action_head"]:
         freeze_action_expert()
+    record_metrics(spec["metrics"])
 
     checkpoint = spec["checkpoint"]
     sys.argv = [train_molmobot.__file__, checkpoint, *checkpoint_args(checkpoint), *spec["args"]]
