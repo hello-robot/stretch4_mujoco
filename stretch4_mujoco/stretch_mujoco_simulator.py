@@ -213,9 +213,13 @@ class StretchMujocoSimulator:
 
     def stop(self) -> None:
         """
-        This is called at exit to gracefully terminate the simulation and the Mujoco Process, and their many threads.
+        Stop the Mujoco process, release camera frame shared memory, and join threads.
 
+        Called at exit, and on SIGTERM and SIGINT, so it runs at most once.
         Fingers-crossed we get a SIGTERM, and not a SIGKILL..
+
+        Returns:
+            None.
         """
         if self.is_stop_called:
             return
@@ -234,6 +238,10 @@ class StretchMujocoSimulator:
         )
 
         self.stop_mujoco_process()
+
+        # The sim process has exited, so any camera frame segment still around
+        # was leaked by a crash.
+        self.data_proxies.close_camera_frames(unlink_leftovers=True)
 
         # We're going to try to wait for threads to end. They might not gracefully stop before hitting an exception. Race conditions are rampant.
         # For example, the main thread or a thread may not be checking `sim.is_running()` and is oblivious that it should stop. Nothing we can do to stop it except sigkill.
