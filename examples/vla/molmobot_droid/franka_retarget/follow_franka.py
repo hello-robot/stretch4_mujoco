@@ -125,7 +125,7 @@ def stretch_views(
 def follow_flags(params: RetargetParams, custom_franka_start_pose: bool) -> dict[str, object]:
     """The run's flags, for run names and reports: `params.flags()` without the ones for which of
     Stretch's cameras the policy sees, since it sees the Franka's."""
-    flags = {k: v for k, v in params.flags().items() if k not in ("exo_camera", "gripper_camera", "head-crop")}
+    flags = {k: v for k, v in params.flags().items() if k not in ("exo_camera", "gripper_camera", "head-crop", "head_follows_tool")}
     if custom_franka_start_pose:
         flags["custom_franka_start_pose"] = True
     return flags

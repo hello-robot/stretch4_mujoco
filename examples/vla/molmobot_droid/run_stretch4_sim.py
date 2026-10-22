@@ -10,7 +10,8 @@ thinks it is driving overlaid, and its wrist camera's view with and without Stre
 camera without Stretch in it, instead of Stretch's gripper camera.
 
 With --exo_camera left or right (the default), the policy's exo view is the head fisheye on the
-side the tool is toward, as on the real robot (see `head_camera_for_tool()`); with --rectify,
+side the tool is toward, as on the real robot (see `head_camera_for_tool()`), unless
+--no_head_follows_tool keeps it on --exo_camera's; with --rectify,
 redrawn as the DROID exo camera would see it (`FisheyeRectifier`) instead of only cropped to its
 aspect.
 
@@ -45,7 +46,6 @@ from examples.vla.molmobot_droid.franka_retarget.console import KEYS_HELP, Conso
 from examples.vla.molmobot_droid.franka_retarget.gripper_image_fix import reject_with_fix
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     CUSTOM_START_QPOS,
-    HEAD_SIDES,
     Stretch4SimEnv,
     franka_yaw_for_start,
     apply_overlay_grasp_offset,
@@ -233,9 +233,8 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
         if stretch_scene.backed_off:
             say(f"Moved {stretch_scene.backed_off:.2f} m back from the target so Stretch 4 clears what it "
                 f"rests on: --robot-pose {stretch_scene.robot_pose}", "yellow")
-        # As on the real robot, the exo view follows the tool between the side head fisheyes.
-        head_follows_tool = params.exo_camera in HEAD_SIDES
-        sim = spawn_stretch4(stretch_scene, params, both_head_sides=head_follows_tool)
+        # As on the real robot, the exo view follows the tool between the side head fisheyes (--head_follows_tool).
+        sim = spawn_stretch4(stretch_scene, params)
         if overlay_franka_gripper:
             sim.watch_bodies(with_nearby_free_bodies(stretch_scene, stretch_scene.watched_bodies))
         env = None
@@ -245,7 +244,6 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
             env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
             env.overlay_franka_gripper = overlay_franka_gripper
             env.use_franka_gripper_camera = use_franka_gripper_camera
-            env.head_follows_tool = head_follows_tool
             env.on_exo_side_change = lambda side, facing, tool_side: say(
                 f"◐ exo view from the {side} head camera (tool facing {facing}, on the {tool_side})"
             )
