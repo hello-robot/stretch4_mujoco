@@ -179,9 +179,8 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     sim.stop()
                 print_result(run.current, result, out_dir)
                 run.record(result)
-            successes = sum(r.success for r in run.results)
             saved = sum(bool(r.metrics.get("saved")) for r in run.results)
-            click.secho(f"{successes}/{len(run.results)} succeeded, {saved} trajectories saved. "
+            click.secho(f"{'; '.join(bench.score_lines(run.results))}; {saved} trajectories saved. "
                         f"Report: {out_dir / 'report.md'}", fg="green")
             click.secho(f"Grid videos: {(out_dir / bench.GRID_DIR).resolve().as_uri()}", fg="green")
             click.secho(f"Fine-tune on them with: python -m examples.vla.molmobot_droid.run_finetune --data {out_dir}"

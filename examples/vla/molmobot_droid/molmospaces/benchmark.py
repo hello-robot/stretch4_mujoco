@@ -176,6 +176,22 @@ def scene_record(index: int, setup: EpisodeSetup) -> dict:
     }
 
 
+STRETCH_MAST_HEIGHT = 1.2
+"""m. The top of Stretch 4's lift travel (`stretch4_retarget.LIFT_RANGE`). A target that starts
+higher than this is out of its reach, so reports also score the episodes without them."""
+
+
+def target_height(scene: dict) -> float | None:
+    """Where a `scene_record()`'s target starts, m above the floor (benchmark scenes' floor is z = 0)."""
+    return scene["target_start_pose"][2] if scene else None
+
+
+def above_mast(scene: dict) -> bool:
+    """Whether a `scene_record()`'s target starts above Stretch 4's mast, out of its reach."""
+    height = target_height(scene)
+    return height is not None and height > STRETCH_MAST_HEIGHT
+
+
 # ---------------------------------------------------------------------------
 # Success
 # ---------------------------------------------------------------------------
@@ -541,10 +557,6 @@ def write_report(
     episode a Ctrl+C or a crash (`stop_reason`) interrupted (not in `results`); the report says
     how to resume from it.
     """
-    results = sorted(results, key=lambda r: r.index)
-    finished = [r for r in results if r.error is None]
-    successes = sum(r.success for r in results)
-    rate = successes / len(results) if results else 0.0
     summary = {
         "robot": robot,
         "run_name": name,
@@ -554,26 +566,72 @@ def write_report(
         "checkpoint": f"{HF_REPO}@{HF_REVISION[:7]}",
         "molmobot_commit": MOLMOBOT_COMMIT[:7],
         "policy_dt_s": POLICY_DT,
-        "episodes": len(results),
-        "errors": len(results) - len(finished),
-        "successes": successes,
-        "success_rate": rate,
         "total_wall_seconds": time.time() - started,
         "stopped_at": stopped_at,
         "stop_reason": stop_reason,
+        "resume_command": resume_command,
         "command": episode_command(benchmark_dir),
         "results": [asdict(r) for r in results],
     }
+    return write_summary(out_dir, summary)
+
+
+def rewrite_report(run_dir: Path) -> Path:
+    """Write a run's `report.md` (and `results.json`) again from its `results.json`, e.g. after the report changes."""
+    return write_summary(run_dir, json.loads((run_dir / "results.json").read_text()))
+
+
+def score(results: list[EpisodeResult]) -> dict:
+    """The success rate over every episode, and over those whose target Stretch 4 can reach (`above_mast`)."""
+    reachable = [r for r in results if not above_mast(r.scene)]
+    successes = sum(r.success for r in results)
+    reachable_successes = sum(r.success for r in reachable)
+    return {
+        "episodes": len(results),
+        "errors": sum(r.error is not None for r in results),
+        "successes": successes,
+        "success_rate": successes / len(results) if results else 0.0,
+        "reachable_episodes": len(reachable),
+        "reachable_successes": reachable_successes,
+        "reachable_success_rate": reachable_successes / len(reachable) if reachable else 0.0,
+        "above_mast": [r.index for r in results if above_mast(r.scene)],
+    }
+
+
+def score_lines(results: list[EpisodeResult]) -> list[str]:
+    """e.g. ["98/200 succeeded (49%), 20 errored", "98/150 succeeded (65%) when objects are reachable"]."""
+    s = score(results)
+    return [
+        f"{s['successes']}/{s['episodes']} succeeded ({s['success_rate']:.0%})"
+        + (f", {s['errors']} errored" if s["errors"] else ""),
+        f"{s['reachable_successes']}/{s['reachable_episodes']} succeeded ({s['reachable_success_rate']:.0%}) "
+        "when objects are reachable",
+    ]
+
+
+def write_summary(out_dir: Path, summary: dict) -> Path:
+    """`results.json` and `report.md` from a run's summary, with its scores worked out from its results."""
+    results = sorted((EpisodeResult(**r) for r in summary["results"]), key=lambda r: r.index)
+    summary = {**{k: v for k, v in summary.items() if k != "results"}, **score(results),
+               "results": [asdict(r) for r in results]}
     (out_dir / "results.json").write_text(json.dumps(summary, indent=2, default=float))
 
+    robot, name, flags = summary["robot"], summary["run_name"], summary["flags"]
+    benchmark_dir, stopped_at, stop_reason = Path(summary["benchmark"]), summary["stopped_at"], summary["stop_reason"]
+    # Runs from before `resume_command` was recorded.
+    resume_command = summary.get("resume_command") or f"{summary['command']} --resume {stopped_at}"
+    total, reachable = score_lines(results)
+    variant = summary.get("scene_variant", "base")  # runs from before it was recorded used "base"
     metric_names = sorted({k for r in results for k in r.metrics})
     lines = [
         f"# MolmoBot-DROID benchmark: {robot}",
         "",
-        f"**Benchmark:** {benchmark_description(benchmark_dir)}, `{SCENE_VARIANT}` scenes",
+        f"**Benchmark:** {benchmark_description(benchmark_dir)}, `{variant}` scenes",
         "",
-        f"**{successes}/{len(results)} succeeded ({rate:.0%})**"
-        + (f", {summary['errors']} errored" if summary["errors"] else ""),
+        f"**{total}**",
+        "",
+        f"**{reachable}** (leaving out the {len(summary['above_mast'])} whose target starts above Stretch 4's "
+        f"{STRETCH_MAST_HEIGHT} m mast: {', '.join(episode_name(i) for i in summary['above_mast']) or 'none'})",
         "",
         *(
             [
@@ -601,15 +659,16 @@ def write_report(
         "",
         "## Episodes",
         "",
-        "| # | Episode | Scene | Instruction | Success | Video | Steps | Queries | s/query | Wall s | "
+        "| # | Episode | Scene | Instruction | Success | Reachable | Video | Steps | Queries | s/query | Wall s | "
         + " | ".join(metric_names)
         + " | Error |",
-        "|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
     ]
     for r in results:
         metrics = " | ".join(_format(r.metrics.get(m, "")) for m in metric_names)
         lines.append(
             f"| {r.index} | {episode_name(r.index)} | {r.scene_id} | {r.instruction} | {'yes' if r.success else 'no'} | "
+            f"{reachable_cell(r.scene)} | "
             f"{f'[grid]({r.grid_video})' if r.grid_video else ''} | {r.steps} | "
             f"{r.queries} | {r.mean_inference_seconds:.2f} | {r.wall_seconds:.0f} | {metrics} | {r.error or ''} |"
         )
@@ -620,7 +679,7 @@ def write_report(
         "",
         "## Scenes",
         "",
-        f"From benchmark build `{benchmark_dir}`, with molmospaces' `{SCENE_VARIANT}` scene files. "
+        f"From benchmark build `{benchmark_dir}`, with molmospaces' `{variant}` scene files. "
         "Poses are world-frame metres, quaternions in results.json as w, x, y, z. To rerun episodes "
         "(e.g. `--episodes 3,7`):",
         "",
@@ -632,6 +691,13 @@ def write_report(
     path = out_dir / "report.md"
     path.write_text("\n".join(lines))
     return path
+
+
+def reachable_cell(scene: dict) -> str:
+    """The report's Reachable cell: whether the target starts within Stretch 4's mast height."""
+    if not scene:
+        return ""
+    return f"**no**: {target_height(scene):.2f} m, above the mast" if above_mast(scene) else "yes"
 
 
 def episode_name(index: int) -> str:

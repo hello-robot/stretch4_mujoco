@@ -28,8 +28,11 @@ import numpy as np
 from examples.vla.molmobot_droid.checkpoint import POLICY_HZ
 from examples.vla.molmobot_droid.molmospaces.benchmark import (
     FLAG_ABBREVIATIONS,
+    STRETCH_MAST_HEIGHT,
+    above_mast,
     benchmark_description,
     episode_name,
+    reachable_cell,
     scene_table,
     video_path,
 )
@@ -143,9 +146,11 @@ def comparison_report(franka: dict, stretches: list[dict], common: list[int], vi
     def row(name: str, values) -> str:
         return f"| {name} | " + " | ".join(values) + " |"
 
-    def success(run: dict) -> str:
-        hits, rate = _rate(run, common)
-        return f"{hits}/{len(common)} ({rate:.0%})"
+    def success(run: dict, indices: list[int]) -> str:
+        hits, rate = _rate(run, indices)
+        return f"{hits}/{len(indices)} ({rate:.0%})"
+
+    reachable = [i for i in common if not above_mast(franka["by_index"][i].get("scene"))]
 
     per_stretch = lambda title: [f"{title}" if len(stretches) == 1 else f"{s['label']} {title[0].lower()}{title[1:]}"
                                  for s in stretches]
@@ -161,7 +166,9 @@ def comparison_report(franka: dict, stretches: list[dict], common: list[int], vi
         "",
         "| | " + " | ".join(run["label"] for run in runs) + " |",
         "|---" * (len(runs) + 1) + "|",
-        row("Success", [success(run) for run in runs]),
+        row("Success", [success(run, common) for run in runs]),
+        row(f"Success when reachable (target below Stretch 4's {STRETCH_MAST_HEIGHT} m mast)",
+            [success(run, reachable) for run in runs]),
         row("Run", [f"`{run['run_name']}`" for run in runs]),
         row("Benchmark", [f"`{run['benchmark']}`" for run in runs]),
         # Runs from before `scene_variant` was recorded used the "base" scenes.
@@ -176,15 +183,16 @@ def comparison_report(franka: dict, stretches: list[dict], common: list[int], vi
         "",
         "## Episodes",
         "",
-        "| # | Episode | Scene | Instruction | " + " | ".join(run["label"] for run in runs) + " | "
+        "| # | Episode | Scene | Instruction | Reachable | " + " | ".join(run["label"] for run in runs) + " | "
         + " | ".join(f"{run['label']} steps" for run in runs) + " | "
         + " | ".join(per_stretch("Stretch IK failures") + per_stretch("Stretch IK clamped")) + " | Videos |",
-        "|---" * (2 * len(runs) + 2 * len(stretches) + 5) + "|",
+        "|---" * (2 * len(runs) + 2 * len(stretches) + 6) + "|",
     ]
     for i in common:
         results = [run["by_index"][i] for run in runs]
         lines.append(
             f"| {i} | {episode_name(i)} | {results[0]['scene_id']} | {results[0]['instruction']} | "
+            f"{reachable_cell(results[0].get('scene'))} | "
             + " | ".join(_outcome(r) for r in results) + " | "
             + " | ".join(str(r["steps"]) for r in results) + " | "
             + " | ".join([_metric(r, "ik_failures") for r in results[1:]] + [_metric(r, "ik_clamped") for r in results[1:]])
@@ -287,6 +295,8 @@ def main(franka_dir, stretch_dirs, all_dir, out, videos):
             )
             stacked[i] = name
             click.echo(f"wrote {out_dir / name}")
+    else:  # link the ones an earlier --videos wrote
+        stacked = {i: name for i in common if (out_dir / (name := f"{episode_name(i)}_grid_stacked.mp4")).exists()}
 
     report = out_dir / "comparison_report.md"
     report.write_text(comparison_report(franka, stretches, common, stacked))

@@ -171,8 +171,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                 }
                 print_result(run.current, result, out_dir)
                 run.record(result)
-            successes = sum(r.success for r in run.results)
-            click.secho(f"{successes}/{len(run.results)} succeeded. Report: {out_dir / 'report.md'}", fg="green")
+            click.secho(f"{'; '.join(bench.score_lines(run.results))}. Report: {out_dir / 'report.md'}", fg="green")
             click.secho(f"Grid videos: {(out_dir / bench.GRID_DIR).resolve().as_uri()}", fg="green")
     finally:
         unload_policy()
