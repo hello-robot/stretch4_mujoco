@@ -261,10 +261,10 @@ class FollowFrankaEnv(Stretch4SimEnv):
             return "twisted"
         return "clamped" if targets.clamped else "reached"
 
-    def stats(self) -> dict[str, float]:
+    def stats(self) -> dict[str, float | int]:
         stats = super().stats()
         stats.pop("reverse_ik_failures")  # the policy's state is the Franka's own, never Stretch's mapped back
-        stats["ik_twisted"] = float(self.retargeter.ik_twisted)
+        stats["ik_twisted"] = self.retargeter.ik_twisted
         if self.tool_errors:
             stats["tool_error_mean_m"] = float(np.mean(self.tool_errors))
             stats["tool_error_max_m"] = float(np.max(self.tool_errors))

@@ -1645,13 +1645,13 @@ class Stretch4SimEnv:
         """Back to `start_q7`, the Franka's home pose unless set (Stretch's base stays where it is)."""
         self.move_to_franka_pose(self.start_q7)
 
-    def stats(self) -> dict[str, float]:
+    def stats(self) -> dict[str, float | int]:
         return {
-            "ik_failures": float(self.retargeter.ik_failures),
-            "ik_clamped": float(self.retargeter.ik_clamped),
-            "reverse_ik_failures": float(self.reverse_ik_failures),
-            "stale_observations": float(self.stale_observations),
-            "furniture_removed": float(len(self.stretch_scene.removed_bodies)),
+            "ik_failures": self.retargeter.ik_failures,
+            "ik_clamped": self.retargeter.ik_clamped,
+            "reverse_ik_failures": self.reverse_ik_failures,
+            "stale_observations": self.stale_observations,
+            "furniture_removed": len(self.stretch_scene.removed_bodies),
         }
 
     # -- scene state, for success checks ----------------------------------------
