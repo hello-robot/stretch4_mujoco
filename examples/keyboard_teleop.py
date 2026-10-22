@@ -47,7 +47,24 @@ def main(
     show_metrics: bool,
     use_stretch_3: bool,
     parallel_gripper: bool,
-):
+) -> None:
+    """
+    Drive the simulated robot from the keyboard, showing its cameras and lidar.
+
+    \f
+    Args:
+        scene_xml_path: Path to the scene XML, or None for the default scene.
+        select_env: Pick a robocasa environment interactively.
+        imagery: Render and show the cameras.
+        lidar: Show the lidar scan.
+        opencv: Show camera imagery in OpenCV windows instead of Rerun.
+        show_metrics: Show the physics and camera rates.
+        use_stretch_3: Simulate Stretch 3 instead of Stretch 4.
+        parallel_gripper: Use the parallel gripper (PG4) on Stretch 4.
+
+    Returns:
+        None.
+    """
     if parallel_gripper and use_stretch_3:
         raise click.UsageError("--parallel_gripper is only available on Stretch 4.")
 
@@ -150,6 +167,11 @@ def main(
 
     except KeyboardInterrupt:
         pass
+    except ConnectionError:
+        # Ctrl+C stops the sim from its signal handler, which can land between
+        # two pulls of one loop iteration.
+        if sim.is_running():
+            raise
     finally:
         rerun_logger.stop()
         if teleop is not None:

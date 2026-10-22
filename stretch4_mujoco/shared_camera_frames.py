@@ -15,7 +15,7 @@ the whole batch went through the Manager in one piece.
 
 import dataclasses
 from dataclasses import dataclass
-from multiprocessing import resource_tracker, shared_memory
+from multiprocessing import shared_memory
 from multiprocessing.managers import DictProxy
 from multiprocessing.synchronize import Lock
 import sys
@@ -65,11 +65,13 @@ def _frames_in(status: StatusStretchCameras) -> dict[str, np.ndarray]:
 
 def _attach_untracked(segment_name: str) -> shared_memory.SharedMemory:
     """
-    Attach to an existing segment without Python's resource tracker owning it.
+    Attach to an existing segment without registering it with the resource tracker.
 
-    Before Python 3.13 attaching registers the segment with the resource
-    tracker, which unlinks it, and warns that it leaked, when the attaching
-    process exits, even though the sim process created it and still uses it.
+    Before Python 3.13 attaching always registers the segment. That is
+    harmless here: a spawned process shares its parent's tracker, which keeps
+    one entry per name, and the sim's own entry is cleared when it unlinks.
+    Unregistering after attaching would be wrong, as it would clear the sim's
+    entry and make the tracker fail when the sim unlinks the segment.
 
     Args:
         segment_name: The name of the segment to attach to.
@@ -79,10 +81,7 @@ def _attach_untracked(segment_name: str) -> shared_memory.SharedMemory:
     """
     if sys.version_info >= (3, 13):
         return shared_memory.SharedMemory(name=segment_name, track=False)  # type: ignore[call-arg]
-
-    segment = shared_memory.SharedMemory(name=segment_name)
-    resource_tracker.unregister(segment._name, "shared_memory")  # type: ignore[attr-defined]
-    return segment
+    return shared_memory.SharedMemory(name=segment_name)
 
 
 class SharedCameraFrameWriter:
@@ -306,8 +305,8 @@ class SharedCameraFrameReader:
             return
         for segment_name in self._seen_segment_names:
             try:
-                # Attach tracked, so that unlinking also clears the sim
-                # process's registration with the shared resource tracker.
+                # Unlinking also clears the sim process's registration with
+                # the resource tracker the two processes share.
                 leftover = shared_memory.SharedMemory(name=segment_name)
             except FileNotFoundError:
                 continue
