@@ -229,9 +229,40 @@ class FisheyeRenderer:
         """`(width, height)` the `mujoco.Renderer` handed to `render_views` needs."""
         return (self._atlas_rect.width, self._atlas_rect.height)
 
-    def render_views(self, renderer: mujoco.Renderer, data: mujoco.MjData, camera_name: str):
-        """Render the views. Reads `data`, so call it under the sim's lock."""
+    def update_scene(
+        self, renderer: mujoco.Renderer, data: mujoco.MjData, camera_name: str
+    ) -> None:
+        """
+        Copy the simulation state into the renderer's scene.
+
+        This is the only step that reads `data`, so it is the only one that
+        needs the sim's lock. `render_views` draws from the copied scene and can
+        run after the lock is released.
+
+        Args:
+            renderer: The renderer whose scene is updated, sized to `render_size`.
+            data: The simulation state to draw.
+            camera_name: Name of the fisheye camera in the MJCF.
+
+        Returns:
+            None.
+        """
         renderer.update_scene(data=data, camera=camera_name)
+
+    def render_views(self, renderer: mujoco.Renderer) -> None:
+        """
+        Render the views from the scene copied by the last `update_scene`.
+
+        Does not read the simulation state, so it can run without the sim's
+        lock. Overwrites the scene's camera and headlights, so call
+        `update_scene` again before every call.
+
+        Args:
+            renderer: The renderer passed to the last `update_scene`.
+
+        Returns:
+            None. The views are read back into the atlas `project` warps.
+        """
         scene = renderer.scene
 
         # A headlight is lit along whichever way the GL camera faces, so each
