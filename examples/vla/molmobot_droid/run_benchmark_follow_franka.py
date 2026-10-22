@@ -21,10 +21,18 @@ its exo view, one continuous video (`run_finetune.py --use_fisheye tool`). For e
 also writes `<run name>_ep<#>.h5`, Stretch's trajectory pointing at those videos
 (`finetune/dataset.py`): pass the run directory to `run_finetune.py --data`.
 
+Besides molmospaces' benchmarks, --benchmark takes the generated ones
+(`molmospaces/generated_benchmarks.py`, 3000 episodes each, written to `molmospaces/benchmarks/`
+the first time they are asked for): `random` (a random object), `one_object` (--object_type
+every time) and `five_objects` (an apple, a salt shaker, a bowl, a tennis ball and a pen, one of
+them the target), on random surfaces in random rooms of random houses.
+
 Usage:
     python -m examples.vla.molmobot_droid.run_benchmark_follow_franka --use_parallel_gripper
     python -m examples.vla.molmobot_droid.run_benchmark_follow_franka --use_parallel_gripper \\
         --custom_franka_start_pose --no-wait-for-arrival --max-episodes 200 --no-rerun
+    python -m examples.vla.molmobot_droid.run_benchmark_follow_franka --use_parallel_gripper \
+        --benchmark one_object --object_type potato --max-episodes 3000 --no-rerun
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     retarget_options,
 )
 from examples.vla.molmobot_droid.molmospaces import benchmark as bench
+from examples.vla.molmobot_droid.molmospaces import generated_benchmarks
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     STRETCH_ROOT_BODY,
     SceneMirror,
@@ -72,16 +81,24 @@ ROBOT = "follow_franka"
 @benchmark_options
 @retarget_options(camera_options=False)
 @custom_start_option
+@click.option("--object_type", default=generated_benchmarks.DEFAULT_OBJECT_TYPE, show_default=True,
+              help="With --benchmark one_object: the object every episode has to pick up (a THOR category or "
+              "prefab, or tennis_ball).")
 @click.option("--rerun/--no-rerun", default=True, show_default=True)
 @click.option("--viewer", is_flag=True, help="Show stretch4_mujoco's viewer (default: headless).")
 def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, resume, list_only,
-         custom_franka_start_pose, rerun, viewer, **kwargs):
+         custom_franka_start_pose, object_type, rerun, viewer, **kwargs):
     if list_only:
-        click.echo("\n".join(bench.list_benchmarks()))
+        click.echo("\n".join([*bench.list_benchmarks(), *generated_benchmarks.KINDS]))
         return
     params = params_from_kwargs(kwargs)
-    benchmark_dir, selected = bench.load_episodes(benchmark, parse_episodes(episodes), max_episodes)
     flags = follow_flags(params, custom_franka_start_pose)
+    if benchmark in generated_benchmarks.KINDS:
+        benchmark = str(generated_benchmarks.ensure_benchmark(benchmark, object_type))
+    benchmark_dir, selected = bench.load_episodes(benchmark, parse_episodes(episodes), max_episodes)
+    if benchmark_dir.resolve().parent == generated_benchmarks.BENCHMARKS_DIR.resolve():
+        # Its own run directory: run names otherwise do not say which benchmark they ran.
+        flags = {"benchmark": benchmark_dir.name, **flags}
     name = bench.run_name(ROBOT, flags)
     out_dir = Path(out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
