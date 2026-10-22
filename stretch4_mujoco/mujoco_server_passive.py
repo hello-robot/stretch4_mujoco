@@ -49,11 +49,19 @@ class MujocoServerPassive(MujocoServer):
     @override
     def _run_ui_simulation(self, show_viewer_ui: bool):
         """
-        Starts the mujoco viewer in Passive Mode. Also starts a physics thread for stepping the simulation.
+        Start the Mujoco viewer in passive mode, with a thread stepping physics.
 
-        On MacOS, this needs to be started with `mjpython`.
+        Cameras render on this thread at the camera rate until the viewer
+        window closes or a stop is requested. On macOS, this needs to be
+        started with `mjpython`.
 
         https://mujoco.readthedocs.io/en/stable/python.html#passive-viewer
+
+        Args:
+            show_viewer_ui: Whether to show the viewer's left and right panels.
+
+        Returns:
+            None.
         """
         self.viewer =  mujoco.viewer.launch_passive(
             model=self.mjmodel, data=self.mjdata, show_left_ui=show_viewer_ui, show_right_ui=show_viewer_ui
@@ -111,6 +119,12 @@ class MujocoServerPassive(MujocoServer):
                     last_warning = start_time
 
             self.close()
+
+            # The viewer's own render thread runs until the viewer is closed, so
+            # joining it first always waited out the full timeout. Stop physics
+            # first, since it steps under `viewer.lock()`.
+            physics_thread.join(timeout=5.0)
+            viewer.close()
 
             # Wait for any active threads to close, otherwise the mujoco window gets stuck:
             active_threads = threading.enumerate()
