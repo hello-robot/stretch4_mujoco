@@ -170,6 +170,10 @@ class RetargetParams:
     rectify: bool = False
     """--rectify: a head fisheye exo view is redrawn as the DROID exo camera would see it
     (`FisheyeRectifier`), instead of only cropped to its aspect."""
+    head_follows_tool: bool = True
+    """--head_follows_tool: with --exo_camera left or right, the exo view switches to the side head
+    fisheye the tool is toward (`head_camera_for_tool()`), as on the real robot; with
+    --no_head_follows_tool it stays on --exo_camera's."""
 
     def __post_init__(self):
         if not 1 <= self.execute_first_n <= self.execute_horizon <= ACTION_HORIZON:
@@ -187,6 +191,11 @@ class RetargetParams:
             raise ValueError("--rectify needs --head-crop droid: it frames the image as DROID's camera does")
         if self.rectify and self.exo_camera not in HEAD_SIDES:
             raise ValueError("--rectify is for the left and right head fisheyes: --exo_camera left or right")
+
+    @property
+    def follows_tool(self) -> bool:
+        """Whether the exo view follows the tool between the side head fisheyes (--head_follows_tool)."""
+        return self.head_follows_tool and self.exo_camera in HEAD_SIDES
 
     @property
     def tool_name(self) -> str:
@@ -224,6 +233,8 @@ class RetargetParams:
             flags["apply_franka_gripper_image_mismatch_fix"] = True
         if self.rectify:
             flags["rectify"] = True
+        if self.follows_tool:
+            flags["head_follows_tool"] = True
         return flags
 
 
@@ -314,6 +325,19 @@ def rectify_option(function):
     )(function)
 
 
+def head_follows_tool_option(function):
+    """--head_follows_tool/--no_head_follows_tool (see `RetargetParams.head_follows_tool`)."""
+    return click.option(
+        "--head_follows_tool/--no_head_follows_tool",
+        "--head-follows-tool/--no-head-follows-tool",
+        "head_follows_tool",
+        default=True,
+        show_default=True,
+        help="With --exo_camera left or right: the exo view comes from the side head fisheye the tool is "
+        "toward, switching as it turns, as on the real robot. Off, it stays on --exo_camera's.",
+    )(function)
+
+
 def custom_start_option(function):
     """--custom_franka_start_pose, for the Stretch 4 scripts (see `custom_start_link0_height()`)."""
     return click.option(
@@ -371,7 +395,7 @@ def retarget_options(function=None, *, gripper_option: bool = True, camera_optio
     no --use_parallel_gripper (the real robot reports its gripper). Without `camera_options`
     there are none of the flags for which of Stretch's cameras the policy sees and how
     (--head-crop, --exo_camera, --gripper_camera, --apply_franka_gripper_image_mismatch_fix,
-    --rectify): for the follow-the-Franka scripts, where it sees the Franka's.
+    --rectify, --head_follows_tool): for the follow-the-Franka scripts, where it sees the Franka's.
     """
     if function is None:
         return lambda f: retarget_options(f, gripper_option=gripper_option, camera_options=camera_options)
@@ -389,6 +413,7 @@ def retarget_options(function=None, *, gripper_option: bool = True, camera_optio
         ),
         gripper_image_fix_option,
         rectify_option,
+        head_follows_tool_option,
     ]
     options = [
         click.option("--slow", is_flag=True, help="Run every joint at 20% of its default speed."),
@@ -450,6 +475,7 @@ def params_from_kwargs(kwargs: dict) -> RetargetParams:
         use_parallel_gripper=kwargs.pop("use_parallel_gripper", False),
         fix_gripper_image_mismatch=kwargs.pop("fix_gripper_image_mismatch", False),
         rectify=kwargs.pop("rectify", False),
+        head_follows_tool=kwargs.pop("head_follows_tool", True),
     )
 
 
@@ -1255,12 +1281,12 @@ SPAWN_ARM_EXTENSION = 0.2
 """m. Stretch's arm goes this far out as it starts, nearer where the Franka's start poses need it."""
 
 
-def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool = False, cameras=None):
+def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool | None = None, cameras=None):
     """
     A `Stretch4MujocoSimulator` for a `custom_scene.Stretch4Scene` (not started), rendering only
-    the cameras `params` needs (with `both_head_sides`, both side head fisheyes, for
-    `Stretch4SimEnv.head_follows_tool`), or `cameras` if given, and publishing the robot's and
-    the target object's poses.
+    the cameras `params` needs (with `both_head_sides`, by default `params.follows_tool`, both side
+    head fisheyes, for `Stretch4SimEnv.head_follows_tool`), or `cameras` if given, and publishing
+    the robot's and the target object's poses.
 
     Stretch spawns with its lift SPAWN_LIFT_FRACTION up, and homes its arm SPAWN_ARM_EXTENSION out
     (see `spawn_with_arm_out()`): at the model's lift of 0 the gripper is often under a table,
@@ -1271,7 +1297,7 @@ def spawn_stretch4(stretch_scene, params: RetargetParams, both_head_sides: bool 
     spawn_with_arm_out(stretch_scene.model, SPAWN_LIFT_FRACTION, SPAWN_ARM_EXTENSION)
     if cameras is None:
         cameras = stretch_cameras_to_use(params)
-        if both_head_sides:
+        if params.follows_tool if both_head_sides is None else both_head_sides:
             cameras = [cameras[0], *(HEAD_CAMERAS[side] for side in HEAD_SIDES)]
     sim = Stretch4MujocoSimulator(model=stretch_scene.model, cameras_to_use=cameras, tool_name=params.tool_name)
     sim.watch_bodies(stretch_scene.watched_bodies)
@@ -1388,10 +1414,10 @@ class Stretch4SimEnv:
         self.use_franka_gripper_camera = False
         """Show the policy the ghost Franka's own wrist camera, with Stretch hidden, for its wrist
         view instead of Stretch's gripper camera (needs the ghost Franka, with its wrist camera)."""
-        self.head_follows_tool = False
+        self.head_follows_tool = params.follows_tool
         """The exo view from the side head fisheye the tool is toward (`head_camera_for_tool()`),
-        as on the real robot, rather than --exo_camera's. Needs the simulator rendering both
-        (`spawn_stretch4(both_head_sides=True)`)."""
+        as on the real robot, rather than --exo_camera's (--head_follows_tool). Needs the
+        simulator rendering both (`spawn_stretch4()` does when `params.follows_tool`)."""
         self.exo_camera = params.exo_camera
         """Where the exo view comes from now: --exo_camera, or with `head_follows_tool` the side
         `update_exo_side()` last picked."""
