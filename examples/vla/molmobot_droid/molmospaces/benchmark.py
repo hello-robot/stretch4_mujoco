@@ -658,6 +658,7 @@ def write_summary(out_dir: Path, summary: dict) -> Path:
         f"| Wall time | {summary['total_wall_seconds'] / 60:.1f} min |",
         "",
         *outcome_table(results),
+        *failure_table(results),
         "## Flags",
         "",
         "| Flag | Value |",
@@ -782,6 +783,92 @@ def outcome_table(results: list[EpisodeResult]) -> list[str]:
         means = [f"{np.mean([r.metrics[m] for r in group]):.1f}" if group else "" for m in names]
         lines.append(f"| {label} | {len(group)} | " + " | ".join(means) + " |")
     return [*lines, ""]
+
+
+SETUP_ERRORS = {
+    "cannot reach the Franka's start pose": "Stretch 4 cannot reach the Franka's start pose",
+    "still touches": "Stretch 4 cannot stand clear of the scene where it spawns",
+}
+"""Errors before a rollout that come from where Stretch 4 starts, by what their message contains."""
+
+IK_LIMITED_BINS = ((0.0, 0.0), (0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 1.0))
+"""Ranges (low, high] of the share of an episode's steps that were IK-limited; (0, 0] is none."""
+
+
+def error_cause(error: str) -> str:
+    for text, cause in SETUP_ERRORS.items():
+        if text in error:
+            return cause
+    return f"Other error: `{error.split(':')[0]}`"
+
+
+def failure_table(results: list[EpisodeResult]) -> list[str]:
+    """
+    The report's breakdown of the episodes that did not succeed: errors by cause (the start pose,
+    spawning clear of the scene, anything else), targets above the mast, and the reachable
+    failed rollouts by the share of their steps Stretch 4 could not reach exactly
+    (`ik_clamped` + `ik_failures`), next to the successes' for comparison.
+    """
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return []
+    lines = [
+        "## Failures by cause",
+        "",
+        "| Cause | Episodes | Share of all | Which |",
+        "|---|---|---|---|",
+    ]
+
+    def row(cause: str, group: list[EpisodeResult]) -> str:
+        names = ", ".join(episode_name(r.index) for r in group)
+        return f"| {cause} | {len(group)} | {len(group) / len(results):.0%} | {names} |"
+
+    causes: dict[str, list[EpisodeResult]] = {}
+    for r in failed:
+        if r.error is not None:
+            causes.setdefault(error_cause(r.error), []).append(r)
+    order = [*SETUP_ERRORS.values(), *sorted(c for c in causes if c not in SETUP_ERRORS.values())]
+    lines += [row(cause, causes[cause]) for cause in order if cause in causes]
+    rollouts = [r for r in failed if r.error is None]
+    above = [r for r in rollouts if above_mast(r.scene)]
+    reachable = [r for r in rollouts if not above_mast(r.scene)]
+    if above:
+        lines.append(row(f"Target above the {STRETCH_MAST_HEIGHT} m mast", above))
+    lines.append(row("Reachable target, rollout failed", reachable))
+    lines.append("")
+
+    if not any("ik_clamped" in r.metrics or "ik_failures" in r.metrics for r in results):
+        return lines
+
+    def ik_limited(r: EpisodeResult) -> float:
+        return (r.metrics.get("ik_clamped", 0) + r.metrics.get("ik_failures", 0)) / max(r.steps, 1)
+
+    succeeded = [r for r in results if r.success and r.error is None]
+    lines += [
+        "Reachable failed rollouts by the share of their steps that were IK-limited: Franka actions Stretch 4 "
+        "only reached clamped or twisted (`ik_clamped`) or not at all (`ik_failures`). The successes are there "
+        "to compare with; the counts say how often Stretch 4 missed the action, not whether a miss caused "
+        "the failure.",
+        "",
+        "| IK-limited steps | Failed | Succeeded | Failure rate |",
+        "|---|---|---|---|",
+    ]
+    for low, high in IK_LIMITED_BINS:
+        label = "none" if high == 0 else f"{low:.0%}-{high:.0%}" if low else f"under {high:.0%}"
+        in_bin = lambda r: ik_limited(r) == 0 if high == 0 else low < ik_limited(r) <= high
+        bin_failed = sum(in_bin(r) for r in reachable)
+        bin_succeeded = sum(in_bin(r) for r in succeeded)
+        rate = f"{bin_failed / (bin_failed + bin_succeeded):.0%}" if bin_failed + bin_succeeded else ""
+        lines.append(f"| {label} | {bin_failed} | {bin_succeeded} | {rate} |")
+    mean = lambda group, m: f"{np.mean([r.metrics.get(m, 0) / max(r.steps, 1) for r in group]):.1%}" if group else ""
+    lines += [
+        "",
+        f"Mean share of steps clamped: {mean(reachable, 'ik_clamped')} in failed rollouts, "
+        f"{mean(succeeded, 'ik_clamped')} in successes; unreachable (`ik_failures`): "
+        f"{mean(reachable, 'ik_failures')} and {mean(succeeded, 'ik_failures')}.",
+        "",
+    ]
+    return lines
 
 
 def column_descriptions(metric_names: list[str]) -> list[str]:

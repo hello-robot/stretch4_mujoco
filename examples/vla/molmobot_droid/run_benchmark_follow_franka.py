@@ -67,6 +67,7 @@ from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     scene_camera_pose,
 )
 from examples.vla.molmobot_droid.run_benchmark_franka import (
+    FINETUNING_DATA_OUT,
     benchmark_options,
     failed_result,
     parse_episodes,
@@ -78,7 +79,7 @@ ROBOT = "follow_franka"
 
 
 @click.command()
-@benchmark_options
+@benchmark_options(out=FINETUNING_DATA_OUT)
 @retarget_options(camera_options=False)
 @custom_start_option
 @click.option("--object_type", default=generated_benchmarks.DEFAULT_OBJECT_TYPE, show_default=True,

@@ -5,13 +5,13 @@ with the runs' flags, success rates, head-to-head differences and per-episode re
 
 Usage:
     python -m examples.vla.molmobot_droid.compare_benchmarks \\
-        --franka outputs/molmobot_droid/franka_exo-droid_eh-8_n-2 \\
-        --stretch4 outputs/molmobot_droid/stretch4_exo-left_grip-left_eh-8_n-2_...
+        --franka outputs/molmobot_droid/benchmarks/franka_exo-droid_eh-8_n-2 \\
+        --stretch4 outputs/molmobot_droid/benchmarks/stretch4_exo-left_grip-left_eh-8_n-2_...
     # Several Stretch 4 runs, e.g. with and without a fix, against the same Franka run:
     python -m examples.vla.molmobot_droid.compare_benchmarks --franka <run> \\
         --stretch4 <run> --stretch4 <run> --videos
     # Every run in a directory (one Franka run; pass --franka too if there are several):
-    python -m examples.vla.molmobot_droid.compare_benchmarks --all outputs/molmobot_droid
+    python -m examples.vla.molmobot_droid.compare_benchmarks --all outputs/molmobot_droid/benchmarks
 """
 
 from __future__ import annotations
