@@ -79,21 +79,35 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
     include_franka = include_franka or overlay_franka_gripper  # the Robotiq is the ghost's
     if overlay_franka_gripper:
         apply_overlay_grasp_offset(params)  # before the run name, which has the offset
-    benchmark_dir, selected = bench.load_episodes(benchmark, parse_episodes(episodes), max_episodes)
     flags = {**params.flags(), "include_franka": include_franka}
     # Only when given, so earlier runs keep their names for --resume.
     if custom_franka_start_pose:
         flags["custom_franka_start_pose"] = True
     if overlay_franka_gripper:
         flags["overlay_franka_gripper"] = True
-    name = bench.run_name("stretch4", flags)
+    run_benchmark(params, flags, "stretch4", benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, resume,
+                  include_franka, custom_franka_start_pose, overlay_franka_gripper, rerun, viewer)
+
+
+def run_benchmark(params, flags, name_prefix, benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, resume,
+                  include_franka=False, custom_franka_start_pose=False, overlay_franka_gripper=False, rerun=True,
+                  viewer=False, env_class=Stretch4SimEnv, title="MolmoBot-DROID Stretch 4 benchmark"):
+    """
+    The benchmark `main()` runs, as the run `name_prefix` with `flags` in its name, with the
+    policy at `checkpoint` driving an `env_class` (a `Stretch4SimEnv`, or
+    `finetune.stretch4_env.FinetunedStretch4SimEnv` for a fine-tuned policy), and Rerun's
+    recording called `title`. Its results say robot "stretch4" either way, so `compare_benchmarks.py
+    --all` compares it with the other Stretch 4 runs.
+    """
+    benchmark_dir, selected = bench.load_episodes(benchmark, parse_episodes(episodes), max_episodes)
+    name = bench.run_name(name_prefix, flags)
     out_dir = Path(out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
     run = bench.BenchmarkRun(out_dir, "stretch4", name, flags, benchmark_dir, selected, resume)
     click.secho(f"{len(run.selected)} episodes from {benchmark_dir} -> {out_dir}", fg="green")
 
     if rerun:
-        rerun_scene.init_rerun("MolmoBot-DROID Stretch 4 benchmark", RERUN_CAMERAS)
+        rerun_scene.init_rerun(title, RERUN_CAMERAS)
     step_count = 0
     policy = load_policy(checkpoint)
     try:
@@ -134,7 +148,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                 try:
                     sim.start(headless=not viewer, viewer_look_at_body="stretch4")
                     bench.allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator
-                    env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
+                    env = env_class(sim, stretch_scene, params, SceneMirror(stretch_scene))
                     env.overlay_franka_gripper = overlay_franka_gripper
                     try:
                         env.move_to_franka_pose(start_q7)

@@ -197,6 +197,18 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
     if overlay_franka_gripper:
         apply_overlay_grasp_offset(params)
         click.secho(f"Grasp offset {params.effective_grasp_offset_mm} mm", fg="green")
+    run_sim(params, scene_id, object_type, object_index, in_place_of, robot_pose, max_steps, checkpoint, rerun,
+            include_franka, custom_franka_start_pose, overlay_franka_gripper, use_franka_gripper_camera)
+
+
+def run_sim(params, scene_id, object_type, object_index, in_place_of, robot_pose, max_steps, checkpoint, rerun,
+            include_franka=False, custom_franka_start_pose=False, overlay_franka_gripper=False,
+            use_franka_gripper_camera=False, env_class=Stretch4SimEnv, title="MolmoBot-DROID Stretch 4"):
+    """
+    The session `main()` runs, with the policy at `checkpoint` driving an `env_class` (a
+    `Stretch4SimEnv`, or `finetune.stretch4_env.FinetunedStretch4SimEnv` for a fine-tuned
+    policy, whose start pose commands go to its `franka_controls`), and Rerun's recording called `title`.
+    """
     scene = load_custom_scene(scene_id, object_type, object_index, in_place_of=in_place_of)
     pose = resolve_pose(scene, robot_pose)
     console = None
@@ -241,7 +253,7 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
         try:
             sim.start(viewer_look_at_body=STRETCH_ROOT_BODY)
             allow_ctrl_c()  # start() takes Ctrl+C over to stop only the simulator, leaving this waiting on the console
-            env = Stretch4SimEnv(sim, stretch_scene, params, SceneMirror(stretch_scene))
+            env = env_class(sim, stretch_scene, params, SceneMirror(stretch_scene))
             env.overlay_franka_gripper = overlay_franka_gripper
             env.use_franka_gripper_camera = use_franka_gripper_camera
             env.on_exo_side_change = lambda side, facing, tool_side: say(
@@ -255,7 +267,7 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
                 else:
                     franka_cameras = list(FRANKA_WRIST_CAMERAS) if include_franka else []
                     rerun_scene.init_rerun(
-                        "MolmoBot-DROID Stretch 4", RERUN_CAMERAS + franka_cameras,
+                        title, RERUN_CAMERAS + franka_cameras,
                         main_cameras=["exo", "wrist", *franka_cameras], eye=eye,
                     )
                 rerun_scene.set_step(0)
@@ -298,8 +310,8 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
                 console = Console()
             say(f"The target's instruction: {build_instruction('pick', scene.object_category)}", "green")
             editor = StretchStartPoseEditor(
-                env, go_to=env.move_to_franka_pose, set_pedestal_height=stretch_scene.set_franka_pedestal_height,
-                keys=console.keys, say=console.event, on_move=log_pose,
+                getattr(env, "franka_controls", env), go_to=env.move_to_franka_pose,
+                set_pedestal_height=stretch_scene.set_franka_pedestal_height, keys=console.keys, say=console.event, on_move=log_pose,
                 extra_commands=lambda text: object_command(text, scene, console.event),
             )
             try:

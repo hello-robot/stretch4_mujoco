@@ -32,17 +32,19 @@ BENCHMARKS_OUT = "outputs/molmobot_droid/benchmarks"
 FINETUNING_DATA_OUT = "outputs/molmobot_droid/finetuning/data"  # runs that save trajectories for run_finetune.py
 
 
-def benchmark_options(function=None, *, out: str = BENCHMARKS_OUT):
-    """Options shared by the benchmark runners, with `out` as --out's default."""
+def benchmark_options(function=None, *, out: str = BENCHMARKS_OUT, checkpoint: bool = True):
+    """Options shared by the benchmark runners, with `out` as --out's default. Without `checkpoint`,
+    no --checkpoint (the fine-tuned runners have their own, `finetune.checkpoints.finetuned_checkpoint_options`)."""
     if function is None:
-        return lambda function: benchmark_options(function, out=out)
+        return lambda function: benchmark_options(function, out=out, checkpoint=checkpoint)
     options = [
         click.option("--benchmark", default=bench.DEFAULT_BENCHMARK, show_default=True,
                      help="<suite>/<dataset>/<Benchmark>, or a directory holding benchmark.json."),
         click.option("--episodes", default=None, help="Comma-separated episode indices, e.g. 0,3,7."),
         click.option("--max-episodes", type=int, default=5, show_default=True),
         click.option("--out", default=out, show_default=True, type=click.Path()),
-        click.option("--checkpoint", default=None, help="Checkpoint directory. Default: download from Hugging Face."),
+        *([click.option("--checkpoint", default=None, help="Checkpoint directory. Default: download from Hugging Face.")]
+          if checkpoint else []),
         click.option("--run-to-horizon", is_flag=True, help="Keep going after success, to the episode's time limit."),
         click.option("--resume", default=None, metavar="EPISODE",
                      help="Start from this episode (e.g. ep0003, as printed), keeping the results before it "
