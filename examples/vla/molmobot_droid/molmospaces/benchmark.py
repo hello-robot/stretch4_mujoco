@@ -1,0 +1,1067 @@
+"""
+Helpers for running the MolmoSpaces benchmarks with MolmoBot-DROID, on the Franka DROID
+(`droid.FrankaDroidEnv`) or on Stretch 4 (`stretch4_retarget.Stretch4SimEnv`). The runners
+are `run_benchmark_franka.py` and `run_benchmark_stretch4.py`.
+
+Episodes are molmospaces' own benchmark JSON (`EpisodeSpec`): the house, object poses, the
+robot's base pose and starting arm, and the instruction. Scenes are rebuilt from them with
+`custom_scene`, and success uses molmospaces' criteria (see `PickSuccess`), checked through
+`env.body_pose()` / `env.body_contacts()` so that it works for either robot.
+
+Every episode writes one video per camera, the scene camera, and a grid of all of them with
+the instruction on it (in `grid/`, linked from the report); the run writes `report.md` and
+`results.json`. File names start with `run_name()`: the robot
+and the flags, joined with underscores.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import shlex
+import signal
+import sys
+import time
+import traceback
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Protocol
+
+import cv2
+import numpy as np
+
+from examples.vla.molmobot_droid.checkpoint import HF_REPO, HF_REVISION, MOLMOBOT_COMMIT, POLICY_DT, POLICY_HZ
+from examples.vla.molmobot_droid.droid import FRANKA_PEDESTAL_HEIGHT, Observation, RobotPose, quat_to_mat
+from examples.vla.molmobot_droid.molmospaces.custom_scene import CustomScene, parse_scene_id, resolve_scene_xml
+from examples.vla.molmobot_droid.rollout import StepInfo, run_rollout
+
+DEFAULT_BENCHMARK = "molmospaces-bench-v2/procthor-10k/FrankaPickDroidMiniBench"
+SCENE_VARIANT = "ceiling"
+"""The house variant molmospaces builds and evaluates benchmarks on (its `house_variant`
+default). The "base" XMLs leave out objects episodes place, sometimes the target itself."""
+
+
+# ---------------------------------------------------------------------------
+# Benchmarks and episodes
+# ---------------------------------------------------------------------------
+
+
+def benchmarks_root() -> Path:
+    from molmo_spaces.molmo_spaces_constants import DATA_CACHE_DIR
+
+    return Path(DATA_CACHE_DIR) / "benchmarks"
+
+
+def resolve_benchmark_dir(benchmark: str) -> Path:
+    """
+    A benchmark directory (the one holding `benchmark.json`), from a path or a name of the form
+    "<suite>/<dataset>/<Benchmark>", e.g. "molmospaces-bench-v2/procthor-10k/FrankaPickDroidMiniBench".
+    The suite's newest installed version and the benchmark's newest build are used.
+    """
+    path = Path(benchmark).expanduser()
+    if (path / "benchmark.json").exists():
+        return path
+    suite, dataset, name = benchmark.split("/")
+    suite_dir = benchmarks_root() / suite
+    if not suite_dir.is_dir():
+        raise FileNotFoundError(f"{suite_dir} not found; install it with molmospaces' resource manager")
+    for version in sorted(suite_dir.iterdir(), reverse=True):
+        builds = sorted((version / dataset / name).glob("*/benchmark.json"), reverse=True)
+        if builds:
+            return builds[0].parent
+    raise FileNotFoundError(f"No {dataset}/{name} under {suite_dir}")
+
+
+def benchmark_description(benchmark_dir: Path | str) -> str:
+    """
+    e.g. "`FrankaPickDroidMiniBench_json_benchmark_20251231`, task `PickTask` (molmospaces-bench-v2
+    20260415, procthor-10k, 1000 episodes)": the build, its task and where it comes from.
+    """
+    benchmark_dir = Path(benchmark_dir)
+    details = []
+    if benchmark_dir.parts[-6:-5] == ("benchmarks",):  # benchmarks/<suite>/<version>/<dataset>/<name>/<build>
+        suite, version, dataset = benchmark_dir.parts[-5:-2]
+        details += [f"{suite} {version}", dataset]
+    task = ""
+    metadata = benchmark_dir / "benchmark_metadata.json"
+    if metadata.exists():
+        meta = json.loads(metadata.read_text())
+        tasks = [cls.rsplit(".", 1)[-1] for cls in meta.get("task_cls_counts", {})]
+        task = f", task {', '.join(f'`{t}`' for t in tasks)}" if tasks else ""
+        if meta.get("num_episodes"):
+            details.append(f"{meta['num_episodes']} episodes")
+    return f"`{benchmark_dir.name}`{task}" + (f" ({', '.join(details)})" if details else "")
+
+
+def list_benchmarks() -> list[str]:
+    names = set()
+    for found in benchmarks_root().glob("*/*/*/*/*/benchmark.json"):
+        suite, _, dataset, name = found.parts[-6:-2]
+        names.add(f"{suite}/{dataset}/{name}")
+    return sorted(names)
+
+
+def load_episodes(benchmark: str, episodes: list[int] | None = None, max_episodes: int | None = None):
+    """The benchmark's `EpisodeSpec`s, optionally only some indices or the first N."""
+    from molmo_spaces.evaluation.benchmark_schema import load_all_episodes
+
+    benchmark_dir = resolve_benchmark_dir(benchmark)
+    all_episodes = load_all_episodes(benchmark_dir)
+    indices = episodes if episodes is not None else list(range(len(all_episodes)))
+    if max_episodes is not None:
+        indices = indices[:max_episodes]
+    return benchmark_dir, [(i, all_episodes[i]) for i in indices]
+
+
+@dataclass
+class EpisodeSetup:
+    scene: CustomScene
+    robot_pose: RobotPose
+    link0_height: float
+    """`fr3_link0` z: the episode's mocap base z plus molmospaces' 0.58 m pedestal."""
+    franka_init_qpos: list[float]
+    instruction: str
+    task_type: str
+    task: dict
+    horizon_steps: int
+    source: dict = field(default_factory=dict)
+    """Where the benchmark's episode came from: its datagen `h5_file` and `traj_key`."""
+
+
+def episode_setup(episode) -> EpisodeSetup:
+    """Everything needed to rebuild an episode, from its `EpisodeSpec`."""
+    task = episode.task
+    base = task["robot_base_pose"]  # x, y, z, qw, qx, qy, qz
+    rotation = quat_to_mat(base[3:7])
+    object_name = task["pickup_obj_name"]
+    object_pose = episode.scene_modifications.object_poses.get(object_name) or task.get("pickup_obj_start_pose")
+    scene = CustomScene(
+        scene_id=f"{episode.scene_dataset}/{episode.data_split}/{episode.house_index}",
+        scene_xml=resolve_scene_xml(
+            f"{episode.scene_dataset}/{episode.data_split}/{episode.house_index}", SCENE_VARIANT
+        ),
+        object_name=object_name,
+        object_pos=np.asarray(object_pose[:3], dtype=float),
+        object_quat=np.asarray(object_pose[3:7], dtype=float),
+        object_poses=dict(episode.scene_modifications.object_poses),
+        added_objects=dict(episode.scene_modifications.added_objects),
+        removed_objects=list(episode.scene_modifications.removed_objects),
+    )
+    return EpisodeSetup(
+        scene=scene,
+        robot_pose=RobotPose(base[0], base[1], math.atan2(rotation[1, 0], rotation[0, 0])),
+        link0_height=base[2] + FRANKA_PEDESTAL_HEIGHT,
+        franka_init_qpos=list(episode.robot.init_qpos.get("arm", [])),
+        instruction=episode.language.task_description,
+        task_type=task.get("task_type", "pick"),
+        task=task,
+        horizon_steps=round(task.get("task_horizon_sec", 20) * POLICY_HZ),
+        # Generated benchmarks (`generated_benchmarks`) come from no datagen trajectory.
+        source={"h5_file": episode.source.h5_file, "traj_key": episode.source.traj_key} if episode.source else {},
+    )
+
+
+def scene_record(index: int, setup: EpisodeSetup) -> dict:
+    """What `results.json` keeps of an episode's scene: enough to find it and rebuild it."""
+    dataset, split, house = parse_scene_id(setup.scene.scene_id)
+    return {
+        "episode": episode_name(index),
+        "dataset": dataset,
+        "split": split,
+        "house": house,
+        "scene_xml": Path(setup.scene.scene_xml).name,
+        "target": setup.scene.object_name,
+        "target_start_pose": [*map(float, setup.scene.object_pos), *map(float, setup.scene.object_quat)],
+        "robot_base_pose": list(setup.task["robot_base_pose"]),  # x, y, z, qw, qx, qy, qz
+        "source": setup.source,
+    }
+
+
+STRETCH_MAST_HEIGHT = 1.2
+"""m. The top of Stretch 4's lift travel (`stretch4_retarget.LIFT_RANGE`). A target that starts
+higher than this is out of its reach, so reports also score the episodes without them."""
+
+
+def target_height(scene: dict) -> float | None:
+    """Where a `scene_record()`'s target starts, m above the floor (benchmark scenes' floor is z = 0)."""
+    return scene["target_start_pose"][2] if scene else None
+
+
+def above_mast(scene: dict) -> bool:
+    """Whether a `scene_record()`'s target starts above Stretch 4's mast, out of its reach."""
+    height = target_height(scene)
+    return height is not None and height > STRETCH_MAST_HEIGHT
+
+
+# ---------------------------------------------------------------------------
+# Success
+# ---------------------------------------------------------------------------
+
+
+class BenchmarkEnv(Protocol):
+    """What the benchmark needs from a robot env, on top of `rollout.RobotEnv`."""
+
+    robot_root: str
+    """Root body name of the robot, as contacts report it."""
+
+    def observe(self) -> Observation: ...
+
+    def step(self, action8: np.ndarray): ...
+
+    def render_scene(self) -> np.ndarray | None: ...
+
+    def body_pose(self, name: str) -> tuple[np.ndarray, np.ndarray]: ...
+
+    def body_contacts(self, name: str) -> list[str]: ...
+
+    def close(self) -> None: ...
+
+
+class SuccessJudge(Protocol):
+    bodies: list[str]
+    """Bodies whose poses and contacts it reads (what Stretch's simulator must watch)."""
+
+    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float | bool]]: ...
+
+
+@dataclass
+class PickSuccess:
+    """
+    molmospaces `PickTask.judge_success()`: lifted at least `threshold` above its start and
+    touching nothing but the robot.
+    """
+
+    object_name: str
+    start_z: float
+    threshold: float = 0.01
+
+    @property
+    def bodies(self) -> list[str]:
+        return [self.object_name]
+
+    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float | bool]]:
+        position, _ = env.body_pose(self.object_name)
+        lift = float(position[2] - self.start_z)
+        contacts = env.body_contacts(self.object_name)
+        touching_robot = env.robot_root in contacts
+        only_robot = touching_robot and all(c == env.robot_root for c in contacts)
+        return only_robot and lift >= self.threshold, {"lift_m": lift, "held": only_robot}
+
+
+@dataclass
+class PickAndPlaceSuccess:
+    """
+    molmospaces `PickAndPlaceTask`, simplified to what poses and contacts show: the object
+    rests on the receptacle, the robot has let go, and the receptacle moved at most
+    `max_receptacle_displacement`.
+    """
+
+    object_name: str
+    receptacle_name: str
+    receptacle_start: np.ndarray
+    max_receptacle_displacement: float = 0.15
+
+    @property
+    def bodies(self) -> list[str]:
+        return [self.object_name, self.receptacle_name]
+
+    def __call__(self, env: BenchmarkEnv) -> tuple[bool, dict[str, float | bool]]:
+        contacts = env.body_contacts(self.object_name)
+        receptacle_pos, _ = env.body_pose(self.receptacle_name)
+        displacement = float(np.linalg.norm(receptacle_pos - self.receptacle_start))
+        on_receptacle = self.receptacle_name in contacts
+        released = env.robot_root not in contacts
+        success = on_receptacle and released and displacement <= self.max_receptacle_displacement
+        return success, {"on_receptacle": on_receptacle, "receptacle_moved_m": displacement}
+
+
+def make_judge(setup: EpisodeSetup) -> SuccessJudge:
+    task = setup.task
+    task_type = setup.task_type
+    if task_type == "pick":
+        return PickSuccess(
+            setup.scene.object_name, float(setup.scene.object_pos[2]), task.get("succ_pos_threshold", 0.01)
+        )
+    # "next to" is judged on distance to the receptacle rather than resting on it.
+    if task_type in ("pick_and_place", "pick_and_place_color") and "place_receptacle_name" in task:
+        receptacle = task["place_receptacle_name"]
+        start = task.get("place_receptacle_start_pose") or setup.scene.object_poses[receptacle]
+        return PickAndPlaceSuccess(
+            setup.scene.object_name,
+            receptacle,
+            np.asarray(start[:3], dtype=float),
+            task.get("max_place_receptacle_pos_displacement", 0.15),
+        )
+    # Opening/closing is judged on an articulation's joint, which Stretch's simulator does
+    # not report. Add it here when needed.
+    raise NotImplementedError(f"No success check for task type '{task_type}' yet")
+
+
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
+
+
+GRID_DIR = "grid"
+"""Subfolder of a run directory holding the grid videos, so they are easy to find."""
+
+
+def video_path(out_dir: Path, prefix: str, camera: str) -> Path:
+    """Where `EpisodeRecorder` writes `camera`'s video: grids go in `GRID_DIR`."""
+    name = f"{prefix}_{camera}.mp4"
+    return out_dir / GRID_DIR / name if camera == "grid" else out_dir / name
+
+
+class EpisodeRecorder:
+    """
+    Streams one mp4 per camera, plus a grid of them, at the policy rate. Frames are written as
+    they come, so an episode never holds its video in memory. The grid puts the scene camera
+    large on the left, the other cameras but `grid_excluded` beside it, and `title` (the
+    instruction) across the top.
+    """
+
+    GRID_TILE_HEIGHT = 360
+    GRID_EXCLUDED = ("head_raw", "gripper_raw")
+    """Stretch's raw cameras: their own videos are enough, the grid shows the policy's views of them."""
+
+    def __init__(
+        self, out_dir: Path, prefix: str, fps: float = POLICY_HZ, title: str = "",
+        grid_excluded: tuple[str, ...] = GRID_EXCLUDED,
+    ):
+        self.out_dir = out_dir
+        self.prefix = prefix
+        self.fps = fps
+        self.title = title
+        self.grid_excluded = grid_excluded
+        self._writers: dict[str, object] = {}
+        self._grid_size: tuple[int, int] | None = None
+        (out_dir / GRID_DIR).mkdir(parents=True, exist_ok=True)
+
+    def path(self, camera: str) -> Path:
+        return video_path(self.out_dir, self.prefix, camera)
+
+    def _writer(self, camera: str):
+        import imageio.v2 as imageio
+
+        if camera not in self._writers:
+            self._writers[camera] = imageio.get_writer(
+                self.path(camera), fps=self.fps, codec="libx264", quality=7, macro_block_size=8
+            )
+        return self._writers[camera]
+
+    def add(self, frames: dict[str, np.ndarray]) -> None:
+        frames = {name: frame for name, frame in frames.items() if frame is not None}
+        for name, frame in frames.items():
+            self._writer(name).append_data(_pad_to_block(frame))
+        self._writer("grid").append_data(self._grid(frames))
+
+    def _grid(self, frames: dict[str, np.ndarray]) -> np.ndarray:
+        frames = {name: frame for name, frame in frames.items() if name not in self.grid_excluded}
+        scene = frames.pop("scene", None)
+        tiles = [_labelled_tile(frame, name, self.GRID_TILE_HEIGHT) for name, frame in frames.items()]
+        grid = None
+        if tiles:
+            # Beside the scene, the other cameras go in two rows, so the scene is two tiles tall.
+            columns = math.ceil(len(tiles) / 2) if scene is not None else math.ceil(math.sqrt(len(tiles)))
+            rows = [tiles[i : i + columns] for i in range(0, len(tiles), columns)]
+            width = max(sum(t.shape[1] for t in row) for row in rows)
+            grid = np.vstack([_pad_width(np.hstack(row), width) for row in rows])
+        if scene is not None:
+            big = _labelled_tile(scene, "scene", grid.shape[0] if grid is not None else 2 * self.GRID_TILE_HEIGHT)
+            grid = big if grid is None else np.hstack([big, grid])
+        if self.title:
+            grid = np.vstack([_text_banner(self.title, grid.shape[1]), grid])
+        # Every frame of a video must be the same size; the first one fixes it.
+        if self._grid_size is None:
+            self._grid_size = (grid.shape[1] - grid.shape[1] % 8, grid.shape[0] - grid.shape[0] % 8)
+        return cv2.resize(grid, self._grid_size)
+
+    def close(self) -> list[Path]:
+        paths = []
+        for camera, writer in self._writers.items():
+            writer.close()
+            paths.append(self.path(camera))
+        self._writers.clear()
+        return paths
+
+
+def _pad_to_block(frame: np.ndarray, block: int = 8) -> np.ndarray:
+    """Pad to a multiple of the encoder's macro block, rather than let it resize."""
+    pad_h, pad_w = -frame.shape[0] % block, -frame.shape[1] % block
+    return np.pad(frame, ((0, pad_h), (0, pad_w), (0, 0))) if pad_h or pad_w else frame
+
+
+def _pad_width(image: np.ndarray, width: int) -> np.ndarray:
+    return np.pad(image, ((0, 0), (0, width - image.shape[1]), (0, 0)))
+
+
+def _labelled_tile(frame: np.ndarray, name: str, height: int) -> np.ndarray:
+    tile = cv2.resize(frame, (max(2, round(frame.shape[1] * height / frame.shape[0])), height))
+    cv2.putText(tile, name, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return tile
+
+
+def _text_banner(text: str, width: int, scale: float = 0.9, thickness: int = 2) -> np.ndarray:
+    """White text on black, wrapped to `width`."""
+    font, margin = cv2.FONT_HERSHEY_SIMPLEX, 12
+    lines: list[str] = []
+    for word in text.split():
+        candidate = f"{lines[-1]} {word}" if lines else word
+        if lines and cv2.getTextSize(candidate, font, scale, thickness)[0][0] <= width - 2 * margin:
+            lines[-1] = candidate
+        else:
+            lines.append(word)
+    line_height = cv2.getTextSize("Ag", font, scale, thickness)[0][1] + 14
+    banner = np.zeros((line_height * len(lines) + margin, width, 3), dtype=np.uint8)
+    for i, line in enumerate(lines):
+        cv2.putText(banner, line, (margin, margin + line_height * (i + 1) - 10), font, scale, (255, 255, 255),
+                    thickness, cv2.LINE_AA)
+    return banner
+
+
+def recording_frames(observation: Observation, scene: np.ndarray | None) -> dict[str, np.ndarray]:
+    """The policy's two views, any raw camera images, and the scene camera."""
+    return {"exo": observation.exo_rgb, "wrist": observation.wrist_rgb, **observation.extra_cameras, "scene": scene}
+
+
+# ---------------------------------------------------------------------------
+# Running
+# ---------------------------------------------------------------------------
+
+FLAG_ABBREVIATIONS = {
+    "benchmark": "bench",
+    "exo_camera": "exo",
+    "gripper_camera": "grip",
+    "execute-horizon": "eh",
+    "execute-horizon-do-only-first-n-steps": "n",
+    "head-crop": "crop",
+    "slow": "slow",
+    "wait-for-arrival": "wait",
+    "grasp-offset-mm": "offmm",
+    "grasp-offset-deg": "offdeg",
+    "use_parallel_gripper": "pg",
+    "include_franka": "ghost",
+    "custom_franka_start_pose": "customstart",
+    "overlay_franka_gripper": "overlay",
+    "apply_franka_gripper_image_mismatch_fix": "imgfix",
+    "head_follows_tool": "headtool",
+    "finetuned_checkpoint": "ft",
+}
+"""Short names for run names. `flags` dicts are keyed by the flags' command-line spelling."""
+
+
+def run_name(robot: str, flags: dict[str, object]) -> str:
+    """e.g. "stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-0_wait-1_pg-0_offmm-0,0,0_offdeg-0,0,0"."""
+    parts = [robot]
+    for key, value in flags.items():
+        if isinstance(value, bool):
+            value = int(value)
+        parts.append(f"{FLAG_ABBREVIATIONS.get(key, key)}-{value}")
+    return "_".join(parts).replace("/", "-").replace(" ", "")
+
+
+@dataclass
+class EpisodeResult:
+    index: int
+    scene_id: str
+    object_name: str
+    instruction: str
+    success: bool = False
+    steps: int = 0
+    queries: int = 0
+    wall_seconds: float = 0.0
+    mean_inference_seconds: float = 0.0
+    metrics: dict = field(default_factory=dict)
+    videos: list[str] = field(default_factory=list)
+    """Relative to the run directory."""
+    error: str | None = None
+    scene: dict = field(default_factory=dict)
+    """`scene_record()`, plus what a runner changed about the scene (Stretch 4's footprint, removed furniture)."""
+
+    @property
+    def grid_video(self) -> str | None:
+        return next((v for v in self.videos if v.endswith("_grid.mp4")), None)
+
+
+def new_result(index: int, setup: EpisodeSetup, **fields) -> EpisodeResult:
+    return EpisodeResult(
+        index, setup.scene.scene_id, setup.scene.object_name, setup.instruction,
+        scene=scene_record(index, setup), **fields,
+    )
+
+
+def run_episode(
+    index: int,
+    setup: EpisodeSetup,
+    env: BenchmarkEnv,
+    policy,
+    execute_horizon: int,
+    execute_first_n: int,
+    out_dir: Path,
+    prefix: str,
+    end_on_success: bool = True,
+    on_step: Callable[[StepInfo, BenchmarkEnv], None] | None = None,
+    extra_metrics: Callable[[BenchmarkEnv], dict] | None = None,
+    grid_excluded: tuple[str, ...] = EpisodeRecorder.GRID_EXCLUDED,
+) -> EpisodeResult:
+    """Run one episode on an already built env, recording it (the cameras in `grid_excluded`
+    only in their own videos), and judge it."""
+    result = new_result(index, setup)
+    judge = make_judge(setup)
+    recorder = EpisodeRecorder(
+        out_dir, f"{prefix}_{episode_name(index)}", title=setup.instruction, grid_excluded=grid_excluded
+    )
+    latest: dict[str, object] = {"success": False, "metrics": {}}
+
+    def step_callback(info: StepInfo) -> bool:
+        recorder.add(recording_frames(info.observation, env.render_scene()))
+        success, metrics = judge(env)
+        latest["success"] = latest["success"] or success
+        latest["metrics"] = metrics
+        if on_step is not None:
+            on_step(info, env)
+        return end_on_success and success
+
+    try:
+        recorder.add(recording_frames(env.observe(), env.render_scene()))
+        rollout = run_rollout(
+            env, policy, setup.instruction, execute_horizon, execute_first_n, setup.horizon_steps, step_callback
+        )
+        result.steps = rollout.steps
+        result.queries = rollout.queries
+        result.wall_seconds = rollout.wall_seconds
+        result.mean_inference_seconds = float(np.mean(rollout.inference_seconds)) if rollout.inference_seconds else 0.0
+    except Exception as error:  # one bad episode should not end the run
+        result.error = f"{type(error).__name__}: {error}"
+        traceback.print_exc()
+    finally:
+        result.videos = [p.relative_to(out_dir).as_posix() for p in recorder.close()]
+
+    result.success = bool(latest["success"])
+    result.metrics = dict(latest["metrics"])
+    if extra_metrics is not None:
+        result.metrics.update(extra_metrics(env))
+    return result
+
+
+def write_report(
+    out_dir: Path,
+    robot: str,
+    name: str,
+    flags: dict[str, object],
+    benchmark_dir: Path,
+    results: list[EpisodeResult],
+    started: float,
+    stopped_at: str | None = None,
+    resume_command: str | None = None,
+    stop_reason: str | None = None,
+) -> Path:
+    """
+    `report.md` for people and `results.json` for `compare_benchmarks.py`. `stopped_at` is the
+    episode a Ctrl+C or a crash (`stop_reason`) interrupted (not in `results`); the report says
+    how to resume from it.
+    """
+    summary = {
+        "robot": robot,
+        "run_name": name,
+        "flags": flags,
+        "benchmark": str(benchmark_dir),
+        "scene_variant": SCENE_VARIANT,
+        "checkpoint": f"{HF_REPO}@{HF_REVISION[:7]}",
+        "molmobot_commit": MOLMOBOT_COMMIT[:7],
+        "policy_dt_s": POLICY_DT,
+        "total_wall_seconds": time.time() - started,
+        "stopped_at": stopped_at,
+        "stop_reason": stop_reason,
+        "resume_command": resume_command,
+        "command": episode_command(benchmark_dir),
+        "results": [asdict(r) for r in results],
+    }
+    return write_summary(out_dir, summary)
+
+
+def rewrite_report(run_dir: Path) -> Path:
+    """Write a run's `report.md` (and `results.json`) again from its `results.json`, e.g. after the report changes."""
+    return write_summary(run_dir, json.loads((run_dir / "results.json").read_text()))
+
+
+def score(results: list[EpisodeResult]) -> dict:
+    """The success rate over every episode, and over those whose target Stretch 4 can reach (`above_mast`)."""
+    reachable = [r for r in results if not above_mast(r.scene)]
+    successes = sum(r.success for r in results)
+    reachable_successes = sum(r.success for r in reachable)
+    return {
+        "episodes": len(results),
+        "errors": sum(r.error is not None for r in results),
+        "successes": successes,
+        "success_rate": successes / len(results) if results else 0.0,
+        "reachable_episodes": len(reachable),
+        "reachable_successes": reachable_successes,
+        "reachable_success_rate": reachable_successes / len(reachable) if reachable else 0.0,
+        "above_mast": [r.index for r in results if above_mast(r.scene)],
+    }
+
+
+def score_lines(results: list[EpisodeResult]) -> list[str]:
+    """e.g. ["98/200 succeeded (49%), 20 errored", "98/150 succeeded (65%) when objects are reachable"]."""
+    s = score(results)
+    return [
+        f"{s['successes']}/{s['episodes']} succeeded ({s['success_rate']:.0%})"
+        + (f", {s['errors']} errored" if s["errors"] else ""),
+        f"{s['reachable_successes']}/{s['reachable_episodes']} succeeded ({s['reachable_success_rate']:.0%}) "
+        "when objects are reachable",
+    ]
+
+
+def write_summary(out_dir: Path, summary: dict) -> Path:
+    """`results.json` and `report.md` from a run's summary, with its scores worked out from its results."""
+    results = sorted(
+        (EpisodeResult(**{**r, "metrics": typed_metrics(r["metrics"])}) for r in summary["results"]),
+        key=lambda r: r.index,
+    )
+    summary = {**{k: v for k, v in summary.items() if k != "results"}, **score(results),
+               "results": [asdict(r) for r in results]}
+    (out_dir / "results.json").write_text(json.dumps(summary, indent=2, default=float))
+
+    robot, name, flags = summary["robot"], summary["run_name"], summary["flags"]
+    benchmark_dir, stopped_at, stop_reason = Path(summary["benchmark"]), summary["stopped_at"], summary["stop_reason"]
+    # Runs from before `resume_command` was recorded.
+    resume_command = summary.get("resume_command") or f"{summary['command']} --resume {stopped_at}"
+    total, reachable = score_lines(results)
+    variant = summary.get("scene_variant", "base")  # runs from before it was recorded used "base"
+    metric_names = sorted({k for r in results for k in r.metrics})
+    lines = [
+        f"# MolmoBot-DROID benchmark: {robot}",
+        "",
+        f"**Benchmark:** {benchmark_description(benchmark_dir)}, `{variant}` scenes",
+        "",
+        f"**{total}**",
+        "",
+        f"**{reachable}** (leaving out the {len(summary['above_mast'])} whose target starts above Stretch 4's "
+        f"{STRETCH_MAST_HEIGHT} m mast: {', '.join(episode_name(i) for i in summary['above_mast']) or 'none'})",
+        "",
+        *(
+            [
+                f"> **Stopped early** ({stop_reason or 'Ctrl+C'}) during `{stopped_at}`, which is not counted. "
+                f"Resume with `--resume {stopped_at}`:",
+                ">",
+                f"> `{resume_command}`",
+                "",
+            ]
+            if stopped_at
+            else []
+        ),
+        "| | |",
+        "|---|---|",
+        f"| Run | `{name}` |",
+        f"| Benchmark | `{benchmark_dir}` |",
+        f"| Checkpoint | `{summary['checkpoint']}` (MolmoBot code `{summary['molmobot_commit']}`) |",
+        f"| Wall time | {summary['total_wall_seconds'] / 60:.1f} min |",
+        "",
+        *outcome_table(results),
+        *failure_table(results),
+        "## Flags",
+        "",
+        "| Flag | Value |",
+        "|---|---|",
+        *[f"| `--{k}` | `{v}` |" for k, v in flags.items()],
+        "",
+        "## Episodes",
+        "",
+        "| # | Episode | Scene | Instruction | Success | Reachable | Video | Steps | Queries | s/query | Wall s | "
+        + " | ".join(metric_names)
+        + " | Error |",
+        "|---|---|---|---|---|---|---|---|---|---|---|" + "---|" * len(metric_names) + "---|",
+    ]
+    for r in results:
+        metrics = " | ".join(_format(r.metrics.get(m, "")) for m in metric_names)
+        lines.append(
+            f"| {r.index} | {episode_name(r.index)} | {r.scene_id} | {r.instruction} | {'yes' if r.success else 'no'} | "
+            f"{reachable_cell(r.scene)} | "
+            f"{f'[grid]({r.grid_video})' if r.grid_video else ''} | {r.steps} | "
+            f"{r.queries} | {r.mean_inference_seconds:.2f} | {r.wall_seconds:.0f} | {metrics} | {r.error or ''} |"
+        )
+    lines += [
+        "",
+        f"Videos per episode: `<run>_ep<#>_<camera>.mp4`, plus `{GRID_DIR}/<run>_ep<#>_grid.mp4` with the "
+        "policy's views, the scene camera and the instruction.",
+        "",
+        "### Columns",
+        "",
+        *column_descriptions(metric_names),
+        "",
+        "## Scenes",
+        "",
+        f"From benchmark build `{benchmark_dir}`, with molmospaces' `{variant}` scene files. "
+        "Poses are world-frame metres, quaternions in results.json as w, x, y, z. To rerun episodes "
+        "(e.g. `--episodes 3,7`):",
+        "",
+        f"`{summary['command']} --episodes <#>`",
+        "",
+        *scene_table([asdict(r) for r in results]),
+        "",
+    ]
+    path = out_dir / "report.md"
+    path.write_text("\n".join(lines))
+    return path
+
+
+COLUMN_DESCRIPTIONS = {
+    "#": "The episode's index in the benchmark.",
+    "Episode": "The episode's name in file names and `--resume`/`--episodes`.",
+    "Scene": "The molmospaces scene the episode runs in (see Scenes below).",
+    "Instruction": "What the policy is told to do.",
+    "Success": "Whether the success check passed at any step of the episode.",
+    "Reachable": f"Whether the target starts below Stretch 4's {STRETCH_MAST_HEIGHT} m mast; "
+                 "episodes marked **no** are left out of the reachable score.",
+    "Video": "The episode's grid video: the policy's views, the scene camera and the instruction.",
+    "Steps": "Actions executed (one per policy period).",
+    "Queries": "Times the policy was asked for a new action chunk.",
+    "s/query": "Mean seconds per policy query (inference).",
+    "Wall s": "Seconds the rollout took, wall clock.",
+    "Error": "The exception that ended the episode, if one did.",
+}
+"""What the report's fixed Episodes columns mean."""
+
+METRIC_DESCRIPTIONS = {
+    "lift_m": "Pick tasks: how far the target is above where it started, in metres, at the last step judged "
+              "(the success step when the episode ended on success).",
+    "held": "Pick tasks: whether the target, at the last step judged, touches the robot and nothing else.",
+    "on_receptacle": "Pick-and-place tasks: whether the object, at the last step judged, touches the receptacle.",
+    "receptacle_moved_m": "Pick-and-place tasks: how far the receptacle has moved from its start, in metres.",
+    "ik_failures": "Franka actions Stretch 4 could not reach even approximately (no Stretch target for them); "
+                   "counted after Stretch reached the start pose.",
+    "ik_clamped": "Franka actions out of Stretch 4's reach, so it went to the closest pose it could (including "
+                  "the twisted ones); counted after Stretch reached the start pose.",
+    "ik_twisted": "Of `ik_clamped`, the actions Stretch 4 reached only by turning its tool less about its approach "
+                  "axis than the Franka's (its wrist roll cannot turn as far).",
+    "reverse_ik_failures": "Steps where Stretch 4's pose could not be mapped back to a Franka state for the policy.",
+    "stale_observations": "Steps whose camera frames or body poses did not catch up with the joints in time, so the "
+                          "policy saw older ones.",
+    "furniture_removed": "Furniture taken out of the scene to make room for Stretch 4's footprint.",
+    "tool_error_mean_m": "Mean distance, in metres, between Stretch 4's tool and where the Franka's action put it, "
+                         "over the episode's steps.",
+    "tool_error_max_m": "Largest distance, in metres, between Stretch 4's tool and where the Franka's action put it, "
+                        "over the episode's steps.",
+    "saved": "Whether the episode's trajectory was saved for fine-tuning (successful episodes only).",
+}
+"""What the Episodes columns runners add from their success checks and `extra_metrics` mean."""
+
+METRIC_TYPES = {
+    **dict.fromkeys(("held", "on_receptacle", "saved"), bool),
+    **dict.fromkeys(("ik_failures", "ik_clamped", "ik_twisted", "reverse_ik_failures", "stale_observations",
+                     "furniture_removed"), int),
+}
+"""Metrics that are not floats. Runs from before they were recorded as such stored them as floats."""
+
+
+def typed_metrics(metrics: dict) -> dict:
+    return {k: METRIC_TYPES[k](v) if k in METRIC_TYPES else v for k, v in metrics.items()}
+
+
+OUTCOME_METRICS = ("ik_clamped", "ik_failures")
+"""Metrics the report averages over successes and failures separately."""
+
+
+def outcome_table(results: list[EpisodeResult]) -> list[str]:
+    """
+    The report's table of OUTCOME_METRICS averaged over the successful and the failed episodes
+    that have them (not those that errored before a rollout), or nothing if no episode has them.
+    """
+    names = [m for m in OUTCOME_METRICS if any(m in r.metrics for r in results)]
+    if not names:
+        return []
+    lines = [
+        "## IK by outcome",
+        "",
+        "Mean per episode, over the episodes that have them (episodes that errored before a rollout have none).",
+        "",
+        "| Episodes | Count | " + " | ".join(f"Mean {m}" for m in names) + " |",
+        "|---|---|" + "---|" * len(names),
+    ]
+    for label, success in (("Succeeded", True), ("Failed", False)):
+        group = [r for r in results if r.success == success and all(m in r.metrics for m in names)]
+        means = [f"{np.mean([r.metrics[m] for r in group]):.1f}" if group else "" for m in names]
+        lines.append(f"| {label} | {len(group)} | " + " | ".join(means) + " |")
+    return [*lines, ""]
+
+
+SETUP_ERRORS = {
+    "cannot reach the Franka's start pose": "Stretch 4 cannot reach the Franka's start pose",
+    "still touches": "Stretch 4 cannot stand clear of the scene where it spawns",
+}
+"""Errors before a rollout that come from where Stretch 4 starts, by what their message contains."""
+
+IK_LIMITED_BINS = ((0.0, 0.0), (0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 1.0))
+"""Ranges (low, high] of the share of an episode's steps that were IK-limited; (0, 0] is none."""
+
+
+def error_cause(error: str) -> str:
+    for text, cause in SETUP_ERRORS.items():
+        if text in error:
+            return cause
+    return f"Other error: `{error.split(':')[0]}`"
+
+
+def failure_table(results: list[EpisodeResult]) -> list[str]:
+    """
+    The report's breakdown of the episodes that did not succeed: errors by cause (the start pose,
+    spawning clear of the scene, anything else), targets above the mast, and the reachable
+    failed rollouts by the share of their steps Stretch 4 could not reach exactly
+    (`ik_clamped` + `ik_failures`), next to the successes' for comparison.
+    """
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return []
+    lines = [
+        "## Failures by cause",
+        "",
+        "| Cause | Episodes | Share of all | Which |",
+        "|---|---|---|---|",
+    ]
+
+    def row(cause: str, group: list[EpisodeResult]) -> str:
+        names = ", ".join(episode_name(r.index) for r in group)
+        return f"| {cause} | {len(group)} | {len(group) / len(results):.0%} | {names} |"
+
+    causes: dict[str, list[EpisodeResult]] = {}
+    for r in failed:
+        if r.error is not None:
+            causes.setdefault(error_cause(r.error), []).append(r)
+    order = [*SETUP_ERRORS.values(), *sorted(c for c in causes if c not in SETUP_ERRORS.values())]
+    lines += [row(cause, causes[cause]) for cause in order if cause in causes]
+    rollouts = [r for r in failed if r.error is None]
+    above = [r for r in rollouts if above_mast(r.scene)]
+    reachable = [r for r in rollouts if not above_mast(r.scene)]
+    if above:
+        lines.append(row(f"Target above the {STRETCH_MAST_HEIGHT} m mast", above))
+    lines.append(row("Reachable target, rollout failed", reachable))
+    lines.append("")
+
+    if not any("ik_clamped" in r.metrics or "ik_failures" in r.metrics for r in results):
+        return lines
+
+    def ik_limited(r: EpisodeResult) -> float:
+        return (r.metrics.get("ik_clamped", 0) + r.metrics.get("ik_failures", 0)) / max(r.steps, 1)
+
+    succeeded = [r for r in results if r.success and r.error is None]
+    lines += [
+        "Reachable failed rollouts by the share of their steps that were IK-limited: Franka actions Stretch 4 "
+        "only reached clamped or twisted (`ik_clamped`) or not at all (`ik_failures`). The successes are there "
+        "to compare with; the counts say how often Stretch 4 missed the action, not whether a miss caused "
+        "the failure.",
+        "",
+        "| IK-limited steps | Failed | Succeeded | Failure rate |",
+        "|---|---|---|---|",
+    ]
+    for low, high in IK_LIMITED_BINS:
+        label = "none" if high == 0 else f"{low:.0%}-{high:.0%}" if low else f"under {high:.0%}"
+        in_bin = lambda r: ik_limited(r) == 0 if high == 0 else low < ik_limited(r) <= high
+        bin_failed = sum(in_bin(r) for r in reachable)
+        bin_succeeded = sum(in_bin(r) for r in succeeded)
+        rate = f"{bin_failed / (bin_failed + bin_succeeded):.0%}" if bin_failed + bin_succeeded else ""
+        lines.append(f"| {label} | {bin_failed} | {bin_succeeded} | {rate} |")
+    mean = lambda group, m: f"{np.mean([r.metrics.get(m, 0) / max(r.steps, 1) for r in group]):.1%}" if group else ""
+    lines += [
+        "",
+        f"Mean share of steps clamped: {mean(reachable, 'ik_clamped')} in failed rollouts, "
+        f"{mean(succeeded, 'ik_clamped')} in successes; unreachable (`ik_failures`): "
+        f"{mean(reachable, 'ik_failures')} and {mean(succeeded, 'ik_failures')}.",
+        "",
+    ]
+    return lines
+
+
+def column_descriptions(metric_names: list[str]) -> list[str]:
+    """The report's list of what each Episodes column means, the metric columns in `metric_names` included."""
+    descriptions = {**COLUMN_DESCRIPTIONS, **{m: METRIC_DESCRIPTIONS.get(m, "") for m in metric_names}}
+    order = [*list(COLUMN_DESCRIPTIONS)[:-1], *metric_names, "Error"]
+    return [f"- **{name}**: {descriptions[name]}" if descriptions[name] else f"- **{name}**" for name in order]
+
+
+def reachable_cell(scene: dict) -> str:
+    """The report's Reachable cell: whether the target starts within Stretch 4's mast height."""
+    if not scene:
+        return ""
+    return f"**no**: {target_height(scene):.2f} m, above the mast" if above_mast(scene) else "yes"
+
+
+def episode_name(index: int) -> str:
+    """How an episode is named in output, file names and `--resume`: its index in the benchmark."""
+    return f"ep{index:04d}"
+
+
+def parse_episode_name(name: str) -> int:
+    if not (name.startswith("ep") and name[2:].isdigit()):
+        raise ValueError(f"Episode names look like ep0003, got '{name}'")
+    return int(name[2:])
+
+
+class BenchmarkRun:
+    """
+    The bookkeeping both runners share: which episodes are left (`--resume`), the results so
+    far (carried over from the run directory's results.json when resuming), the report after
+    every episode, and stopping cleanly on Ctrl+C with a report and the command to resume.
+
+        run = BenchmarkRun(out_dir, "franka", name, flags, benchmark_dir, selected, resume)
+        with run:
+            for index, episode in run.episodes():
+                ...
+                run.record(result)
+    """
+
+    def __init__(self, out_dir: Path, robot: str, name: str, flags: dict, benchmark_dir: Path, selected, resume: str | None):
+        self.out_dir, self.robot, self.name, self.flags, self.benchmark_dir = out_dir, robot, name, flags, benchmark_dir
+        self.results: list[EpisodeResult] = []
+        self.current: str | None = None
+        self.started = time.time()
+        self._session_started = self.started  # for the ETA; `started` goes back by a resumed run's earlier time
+        self._session_done = 0
+        self.selected = list(selected)
+        if resume:
+            start = parse_episode_name(resume)
+            order = [index for index, _ in self.selected]
+            if start not in order:
+                raise ValueError(f"{resume} is not among this run's episodes ({episode_name(order[0])}..)")
+            done = set(order[: order.index(start)])
+            self.selected = self.selected[order.index(start) :]
+            previous = out_dir / "results.json"
+            if previous.exists():
+                summary = json.loads(previous.read_text())
+                self.results = [EpisodeResult(**r) for r in summary["results"] if r["index"] in done]
+                self.started -= summary.get("total_wall_seconds", 0.0)
+            missing = done - {r.index for r in self.results}
+            if missing:
+                print(f"No earlier results for {sorted(episode_name(i) for i in missing)}; the report leaves them out.")
+
+    def episodes(self):
+        self._session_started = time.time()  # not counting loading the policy
+        for index, episode in self.selected:
+            self.current = episode_name(index)
+            yield index, episode
+        self.current = None
+
+    def record(self, result: EpisodeResult) -> None:
+        self.results.append(result)
+        self.write()
+        self._session_done += 1
+        print(self.eta())
+
+    def eta(self) -> str:
+        """e.g. "    12/200 episodes this run, ETA 2h31m (14:05), at 48 s per episode": from this
+        run's episodes so far (not a resumed run's earlier ones)."""
+        done, total = self._session_done, len(self.selected)
+        per_episode = (time.time() - self._session_started) / done
+        remaining = per_episode * (total - done)
+        finish = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+        hours, minutes = divmod(round(remaining / 60), 60)
+        return (f"    {done}/{total} episodes this run, ETA {f'{hours}h' if hours else ''}{minutes:02d}m ({finish}), "
+                f"at {per_episode:.0f} s per episode")
+
+    def write(self, stopped_at: str | None = None, stop_reason: str | None = None) -> Path:
+        return write_report(
+            self.out_dir, self.robot, self.name, self.flags, self.benchmark_dir, self.results, self.started,
+            stopped_at=stopped_at, resume_command=resume_command(stopped_at) if stopped_at else None,
+            stop_reason=stop_reason,
+        )
+
+    def __enter__(self) -> "BenchmarkRun":
+        allow_ctrl_c()
+        return self
+
+    def __exit__(self, kind, error, traceback_) -> bool:
+        if kind is None:
+            self.write()
+            return False
+        # Ctrl+C or a crash: either way the report says where the run stopped.
+        reason = "Ctrl+C" if kind is KeyboardInterrupt else f"crashed: {kind.__name__}: {str(error)[:200]}"
+        report = self.write(stopped_at=self.current, stop_reason=reason)
+        print(f"\nStopped during {self.current} ({reason}). Report so far: {report}")
+        if self.current:
+            print(f"Resume with:\n  {resume_command(self.current)}")
+        return kind is KeyboardInterrupt  # handled: the runner returns normally; a crash still raises
+
+
+def allow_ctrl_c() -> None:
+    """
+    Make Ctrl+C raise KeyboardInterrupt again. `Stretch4MujocoSimulator.start()` replaces the
+    handler with one that only stops the simulator, so call this after starting one.
+    """
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+def command_line(options: dict[str, str | None]) -> str:
+    """This command line, with `options` ({"--resume": "ep0003"}; None drops one) in place of earlier ones."""
+    args, skip = [], False
+    for arg in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if arg in options:
+            skip = True  # its value
+            continue
+        if arg.split("=", 1)[0] in options:
+            continue
+        args.append(arg)
+    for option, value in options.items():
+        if value is not None:
+            args += [option, value]
+    main = sys.modules["__main__"]
+    module = getattr(getattr(main, "__spec__", None), "name", None)
+    program = f"python -m {module}" if module else f"python {sys.argv[0]}"
+    return f"{program} {shlex.join(args)}"
+
+
+def resume_command(episode: str) -> str:
+    """This command line, with `--resume <episode>` in place of any earlier one."""
+    return command_line({"--resume": episode})
+
+
+def episode_command(benchmark_dir: Path) -> str:
+    """This command line for this benchmark build; add `--episodes <#>` to rerun just those episodes."""
+    return command_line({"--resume": None, "--max-episodes": None, "--episodes": None, "--benchmark": str(benchmark_dir)})
+
+
+def scene_table(results: list[dict]) -> list[str]:
+    """
+    Each episode's scene, from `results.json` results: the house and scene file, the target
+    and where it starts, where the episode puts the Franka, and the benchmark's source
+    trajectory; with Stretch 4's footprint and the furniture removed for it when a run has them.
+    """
+    stretch = any("stretch_robot_pose" in r.get("scene", {}) for r in results)
+    columns = ["#", "Episode", "Dataset", "House", "Scene file", "Target", "Target start (x, y, z)",
+               "Franka base (x, y, z, yaw°)", "Source"]
+    if stretch:
+        columns += ["Stretch 4 footprint (x, y, yaw°)", "Removed furniture"]
+    lines = ["| " + " | ".join(columns) + " |", "|---" * len(columns) + "|"]
+    for r in results:
+        scene = r.get("scene") or {}
+        if not scene:  # a run from before scenes were recorded
+            lines.append(f"| {r['index']} | {episode_name(r['index'])} | {r['scene_id']} |" + " |" * (len(columns) - 3))
+            continue
+        base, source = scene["robot_base_pose"], scene.get("source", {})
+        rotation = quat_to_mat(base[3:7])
+        cells = [
+            str(r["index"]), scene["episode"], f"{scene['dataset']}/{scene['split']}", str(scene["house"]),
+            f"`{scene['scene_xml']}`", f"`{scene['target']}`", _numbers(scene["target_start_pose"][:3]),
+            _numbers([*base[:3], math.degrees(math.atan2(rotation[1, 0], rotation[0, 0]))]),
+            f"`{'/'.join(Path(source['h5_file']).parts[-2:])}:{source['traj_key']}`" if source else "",
+        ]
+        if stretch:
+            pose = scene.get("stretch_robot_pose")
+            cells += [
+                _numbers([pose[0], pose[1], math.degrees(pose[2])]) if pose else "",
+                ", ".join(f"`{b}`" for b in scene.get("removed_furniture", [])),
+            ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def _numbers(values) -> str:
+    return ", ".join(f"{v:.3f}" for v in values)
+
+
+def _format(value) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return f"{value:.3f}" if isinstance(value, float) else str(value)
