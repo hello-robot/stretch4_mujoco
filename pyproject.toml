@@ -21,10 +21,9 @@ dependencies = [
     "rerun-sdk>=0.23.1",
     "yourdfpy",
     "urdf2mjcf>=0.2.39",
-    "pin>=4.1.0",
-    "coal>=3.0.3",
     "pygame>=2.5.0",
-    "hello-robot-stretch4-flying-gripper>=2026.7.2",
+    # pinocchio, the package used by flying gripper to resolve IK does not have pypi wheels for Windows
+    "hello-robot-stretch4-flying-gripper>=2026.7.2; sys_platform != 'win32'",
 ]
 authors = [
     {name = "Hello Robot Inc.", email = "support@hello-robot.com"},
@@ -65,9 +64,13 @@ jupyter = [
     "ipykernel",
     "ipython",
 ]
+# Linux-only: MolmoSpaces pulls `eva-decord`, which ships no macOS wheel for
+# Python 3.12 and no source distribution.
 molmo = [
     "molmo-spaces[mujoco]",
 ]
+# Linux-only: the real robot's driver stack needs `evdev`, which is sdist-only
+# and builds against Linux input headers.
 digital-twin = [
     "hello-robot-stretch4-body",
 ]

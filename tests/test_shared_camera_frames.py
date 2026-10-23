@@ -1,6 +1,7 @@
 """Tests for passing camera frames between processes through shared memory."""
 
 import multiprocessing
+import time
 from multiprocessing import shared_memory
 from multiprocessing.managers import SyncManager
 
@@ -219,7 +220,11 @@ def test_falls_back_to_manager_without_shared_memory(manager: SyncManager, monke
 
 def _publish_batches(proxies: MujocoServerProxies, count: int) -> None:
     """
-    Publish `count` batches as fast as possible, as the sim process would.
+    Publish `count` batches back to back, as the sim process would.
+
+    Pauses briefly between batches, still far faster than any camera rate. The
+    lock is not fair, so on a slow machine a publisher that re-takes it at once
+    can starve the reader until the last batch.
 
     Args:
         proxies: The proxies passed to this process when it was spawned.
@@ -230,6 +235,7 @@ def _publish_batches(proxies: MujocoServerProxies, count: int) -> None:
     """
     for value in range(1, count + 1):
         proxies.set_cameras(_batch(value, sim_time=value * 0.01))
+        time.sleep(0.001)
     proxies.close_camera_frames()
 
 

@@ -347,12 +347,19 @@ def test_wrist_jammed_against_the_table_stalls_out(harness):
     assert peak_tilt < 5.0, f"robot tipped to {peak_tilt:.1f} deg"
 
 
-def test_full_range_wrist_motion_does_not_false_trip(harness):
-    """Big wrist sweeps at 4 N.m still track, and the stall guard stays out.
+def test_full_range_wrist_motion_does_not_false_trip(harness: Harness) -> None:
+    """
+    Check that big wrist sweeps at 4 N.m still track, and the stall guard stays out.
 
     Peak effort touches the limit on fast reversals, which is why the servo
     guard is gated on velocity as well: a joint that is moving is not stalled,
     however hard it is working.
+
+    Args:
+        harness: A settled headless server with guarded contact running.
+
+    Returns:
+        None.
     """
     server, guarded = harness.server, harness.guarded
     server._set_actuator_position("arm", 0.5)
@@ -360,8 +367,9 @@ def test_full_range_wrist_motion_does_not_false_trip(harness):
     harness.cycles(800)
 
     joints = ("wrist_yaw", "wrist_pitch", "wrist_roll")
-    # Inside the joint ranges: yaw/pitch -1.135..4.276, roll -4.276..1.135.
-    for targets in ((1.5, 1.0, -1.5), (-1.0, -1.0, 1.0), (0.0, 0.0, 0.0)):
+    # Inside the joint ranges, all -1.135..4.276. Roll's is the URDF's mirrored
+    # by FLIP_WRIST_ROLL_RANGE in mjcf_generator.py.
+    for targets in ((1.5, 1.0, -1.0), (-1.0, -1.0, 1.5), (0.0, 0.0, 0.0)):
         for joint, target in zip(joints, targets):
             server._set_actuator_position(joint, target)
         harness.cycles(900)
