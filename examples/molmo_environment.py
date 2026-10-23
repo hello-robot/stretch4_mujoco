@@ -18,6 +18,8 @@ stretch4_mujoco control/camera/lidar API drives the robot inside the house.
 `StretchRobot(Robot)` subclass if you later want to run Stretch through their
 datagen pipeline instead of through `Stretch4MujocoSimulator`.
 
+Requires the Linux-only `molmo` extra: `uv pip install -e ".[molmo]"`.
+
 Usage:
     # A scene from a MolmoSpaces house dataset (downloads assets on first use)
     python -m examples.molmo_environment --dataset procthor-10k --house-index 0

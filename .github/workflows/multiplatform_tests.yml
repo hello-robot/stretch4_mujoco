@@ -30,9 +30,18 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install dependencies
+      # The molmo and digital-twin extras are Linux-only, so the other runners
+      # install only what the test suite needs.
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           uv sync --all-extras
+          uv pip install -e .
+
+      - name: Install dependencies (Windows & macOS)
+        if: runner.os != 'Linux'
+        run: |
+          uv sync --extra dev
           uv pip install -e .
 
       - name: Install Linux Headless OpenGL / Mesa dependencies
