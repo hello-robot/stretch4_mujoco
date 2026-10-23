@@ -101,8 +101,11 @@ from examples.vla.molmobot_droid.molmospaces.custom_scene import (
 from examples.vla.molmobot_droid.rollout import StepInfo, interactive_session
 
 
-def scene_options(function):
-    """Options shared by the interactive simulation runners."""
+def scene_options(function=None, *, checkpoint: bool = True):
+    """Options shared by the interactive simulation runners. Without `checkpoint`, no --checkpoint
+    (the fine-tuned runners have their own, `finetune.checkpoints.finetuned_checkpoint_options`)."""
+    if function is None:
+        return lambda function: scene_options(function, checkpoint=checkpoint)
     options = [
         click.option("--scene-id", default="procthor-10k/val/0", show_default=True,
                      help="<dataset>/<split>/<house index>"),
@@ -118,7 +121,8 @@ def scene_options(function):
         click.option("--robot-pose", default=None,
                      help="x,y,yaw of the robot's footprint (yaw in rad). Default: a clear spot facing the object."),
         click.option("--max-steps", type=int, default=300, show_default=True, help="Steps per instruction (15/s)."),
-        click.option("--checkpoint", default=None, help="Checkpoint directory. Default: download from Hugging Face."),
+        *([click.option("--checkpoint", default=None, help="Checkpoint directory. Default: download from Hugging Face.")]
+          if checkpoint else []),
         click.option("--rerun/--no-rerun", default=True, show_default=True),
     ]
     for option in reversed(options):
