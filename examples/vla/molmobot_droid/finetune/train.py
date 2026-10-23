@@ -9,8 +9,9 @@ What it changes, all before `train_molmobot.main()` runs:
   `train_molmobot.get_model()` rebuilds from it, so everything MolmoBot-DROID was trained with
   carries over (2 frames 8 steps apart per camera, 4 images, its pooling, the action expert's
   shape, ...). Only the normalization becomes Stretch's, which `train_molmobot` computes from
-  the data into the stats file.
-- Stretch 4's joints (move groups) and cameras are presets, named PRESET.
+  the data into the stats file (unless the stats file is already there: for the Franka's joints,
+  `run_finetune.py` puts the checkpoint's there).
+- The move groups (Stretch 4's joints, or the Franka's) and Stretch's cameras are presets, named PRESET.
 - The optimizer is bitsandbytes' 8-bit AdamW (`LocalShardAdamW8bit`) instead of torch's AdamW.
 - Without `train_action_head`, the action expert is frozen.
 - Every step's metrics the trainer logs, and every validation's, are appended to the spec's

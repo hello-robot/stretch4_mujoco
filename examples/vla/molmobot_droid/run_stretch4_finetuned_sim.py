@@ -1,7 +1,9 @@
 """
-A fine-tuned MolmoBot-DROID (`run_finetune.py`) driving Stretch 4 directly in simulation, in any
-MolmoSpaces house: as `run_stretch4_sim.py`, except that the policy's state and actions are
-Stretch's joints, with no retargeting (`finetune/stretch4_env.py`).
+A fine-tuned MolmoBot-DROID (`run_finetune.py`) driving Stretch 4 in simulation, in any
+MolmoSpaces house: as `run_stretch4_sim.py`, except that when the policy's state and actions
+are Stretch's joints (its run's --action_space stretch4) they drive it directly, with no
+retargeting (`finetune/stretch4_env.py`). A policy of the Franka's joints (--action_space franka)
+is retargeted, as `run_stretch4_sim.py` retargets MolmoBot-DROID's.
 
 The checkpoint is the newest under `finetune.checkpoints.MODELS_DIR` unless --checkpoint names
 one (or a run, for its newest); with --interactive (-i), they are listed to pick from. The
@@ -32,6 +34,7 @@ from examples.vla.molmobot_droid.finetune.checkpoints import (
 )
 from examples.vla.molmobot_droid.finetune.stretch4_env import FinetunedStretch4SimEnv
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    Stretch4SimEnv,
     custom_start_option,
     params_from_kwargs,
     retarget_options,
@@ -51,8 +54,9 @@ def main(scene_id, object_type, object_index, in_place_of, robot_pose, max_steps
     finetuned = resolve_checkpoint(checkpoint, interactive)
     apply_to_params(finetuned, params)
     custom_franka_start_pose = apply_training_start(finetuned, params, custom_franka_start_pose)
+    env_class = FinetunedStretch4SimEnv if finetuned.action_space == "stretch4" else Stretch4SimEnv
     run_sim(params, scene_id, object_type, object_index, in_place_of, robot_pose, max_steps, finetuned.path, rerun,
-            custom_franka_start_pose=custom_franka_start_pose, env_class=FinetunedStretch4SimEnv,
+            custom_franka_start_pose=custom_franka_start_pose, env_class=env_class,
             title=f"Fine-tuned MolmoBot-DROID Stretch 4: {finetuned.name}")
 
 
