@@ -1,7 +1,9 @@
 """
 Run a MolmoSpaces benchmark with a fine-tuned MolmoBot-DROID (`run_finetune.py`) driving Stretch 4
-directly in simulation: as `run_benchmark_stretch4.py`, except that the policy's state and actions
-are Stretch's joints, with no retargeting (`finetune/stretch4_env.py`). Stretch's footprint goes
+in simulation: as `run_benchmark_stretch4.py`, except that when the policy's state and actions
+are Stretch's joints (its run's --action_space stretch4) they drive it directly, with no
+retargeting (`finetune/stretch4_env.py`); a policy of the Franka's joints (--action_space franka)
+is retargeted, as `run_benchmark_stretch4.py` retargets MolmoBot-DROID's. Stretch's footprint goes
 where the episode puts the Franka's base, and it starts where the Franka's start pose puts its
 tool, as when the training episodes were recorded.
 
@@ -33,6 +35,7 @@ from examples.vla.molmobot_droid.finetune.checkpoints import (
 from examples.vla.molmobot_droid.finetune.stretch4_env import FinetunedStretch4SimEnv
 from examples.vla.molmobot_droid.franka_retarget.follow_franka import follow_flags
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    Stretch4SimEnv,
     custom_start_option,
     params_from_kwargs,
     retarget_options,
@@ -64,7 +67,8 @@ def main(benchmark, episodes, max_episodes, out, run_to_horizon, resume, list_on
     flags.pop("rectify", None)
     run_benchmark(params, flags, "stretch4-finetuned", benchmark, episodes, max_episodes, out, finetuned.path,
                   run_to_horizon, resume, custom_franka_start_pose=custom_franka_start_pose, rerun=rerun,
-                  viewer=viewer, env_class=FinetunedStretch4SimEnv,
+                  viewer=viewer,
+                  env_class=FinetunedStretch4SimEnv if finetuned.action_space == "stretch4" else Stretch4SimEnv,
                   title=f"Fine-tuned MolmoBot-DROID Stretch 4 benchmark: {finetuned.name}")
 
 

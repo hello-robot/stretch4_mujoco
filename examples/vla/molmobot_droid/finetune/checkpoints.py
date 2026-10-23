@@ -4,10 +4,11 @@ Stretch 4 the way each was trained.
 
 A run directory (`<out>/<run name>/`) holds MolmoBot's checkpoints: `step<N>/` (sharded, with
 the optimizer state) and the final `step<N>-unsharded/`. Either loads with
-`checkpoint.load_policy()`; each one's `config.yaml` carries Stretch's normalization. The run's
+`checkpoint.load_policy()`; each one's `config.yaml` carries its normalization. The run's
 `spec.json` says which of Stretch's cameras it was trained on and with which gripper
-(`apply_to_params()`), and its `dataset/` which start pose its episodes began from
-(`training_start()`).
+(`apply_to_params()`), whether its state and actions are Stretch's joints or the Franka's
+(`action_space`: the runners drive Stretch directly or through retargeting), and its
+`dataset/` which start pose its episodes began from (`training_start()`).
 
 `--checkpoint` takes a step directory or a run directory (its newest checkpoint); without it the
 newest checkpoint under MODELS_DIR is used, and with --interactive the runner lists them all to
@@ -71,11 +72,17 @@ class FinetunedCheckpoint:
     def tool_name(self) -> str:
         return self.spec["tool_name"]
 
+    @property
+    def action_space(self) -> str:
+        """What its state and actions are: "stretch4" (Stretch's joints, driven directly) or
+        "franka" (the Franka's, retargeted to Stretch). Runs from before the choice are stretch4."""
+        return self.spec.get("action_space", "stretch4")
+
     def describe(self) -> str:
         """One line: the checkpoint, when it was saved, and what it was trained on."""
         saved = datetime.fromtimestamp(self.saved_at).strftime("%Y-%m-%d %H:%M")
-        return (f"{self.name}  ({saved}, exo {self.exo_camera}, wrist {self.wrist_camera}, "
-                f"{self.tool_name.rsplit('_', 1)[-1].upper()})")
+        return (f"{self.name}  ({saved}, {self.action_space} joints, exo {self.exo_camera}, "
+                f"wrist {self.wrist_camera}, {self.tool_name.rsplit('_', 1)[-1].upper()})")
 
 
 def _finished_at(path: Path, unsharded: bool) -> float | None:
