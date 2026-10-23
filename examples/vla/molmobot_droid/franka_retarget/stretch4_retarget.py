@@ -419,7 +419,7 @@ def retarget_options(function=None, *, gripper_option: bool = True, camera_optio
         click.option("--slow", is_flag=True, help="Run every joint at 20% of its default speed."),
         click.option(
             "--wait-for-arrival/--no-wait-for-arrival",
-            default=True,
+            default=False,
             show_default=True,
             help="Wait for Stretch to reach each action before executing the next.",
         ),
