@@ -86,6 +86,7 @@ from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
     SLOW_FACTOR,
     SPAWN_LIFT_FRACTION,
     STEP_ARRIVAL_TIMEOUT,
+    STRETCH_GRIPPER_TOOL,
     FrankaStretchRetargeter,
     ReachMiss,
     RetargetParams,
@@ -892,12 +893,28 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
     if not params.head_follows_tool and params.exo_camera not in HEAD_SIDES:
         raise click.BadParameter("with --no_head_follows_tool the exo view is a side head fisheye: left or right",
                                  param_hint="--exo_camera")
+    run_real(params, robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, custom_franka_start_pose,
+             overlay_franka_gripper)
 
+
+def run_real(params, robot_ip, object_height, max_steps, recover_after, checkpoint, rerun,
+             custom_franka_start_pose=False, overlay_franka_gripper=False, env_class=RealStretch4Env, tool_name=None,
+             title="MolmoBot-DROID Stretch 4 (real)"):
+    """
+    The session `main()` runs, with the policy at `checkpoint` driving an `env_class` (a
+    `RealStretch4Env`, or `run_stretch4_finetuned_real.FinetunedRealStretch4Env` for a fine-tuned
+    policy, whose start pose commands go to its `franka_controls`), and Rerun's recording called
+    `title`. With `tool_name`, the robot has to have that gripper; otherwise the one it has is used.
+    """
     click.secho(f"Connecting to Stretch 4 at {robot_ip}...", dim=True)
     robot, gripper = connect(robot_ip)
     if not robot.is_homed():
         robot.stop()
         raise click.ClickException("Home the robot first")
+    robot_tool = PARALLEL_GRIPPER_TOOL if gripper == "parallel_gripper" else STRETCH_GRIPPER_TOOL
+    if tool_name is not None and robot_tool != tool_name:
+        robot.stop()
+        raise click.ClickException(f"The robot has a {gripper.replace('_', ' ')} ({robot_tool}); this needs {tool_name}")
 
     # The gripper on the robot decides the tool, its kinematics and its default grasp offset.
     params.use_parallel_gripper = gripper == "parallel_gripper"
@@ -915,7 +932,7 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
     receiver = ImageAndJointReceiver(robot_ip)
     env = live = console = None
     try:
-        env = RealStretch4Env(robot, receiver, params, robot_model.franka)
+        env = env_class(robot, receiver, params, robot_model.franka)
         env.start_q7 = start_q7
         env.recover_after = recover_after
         if overlay_franka_gripper:
@@ -937,7 +954,7 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         )
         if rerun:
             rerun_scene.init_rerun(
-                "MolmoBot-DROID Stretch 4 (real)", ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True,
+                title, ["exo", "wrist", "head_raw", "gripper_raw"], text_log=True,
                 main_cameras=["exo", "wrist"],
             )
             live = LiveView(env, robot_model)
@@ -985,7 +1002,7 @@ def main(robot_ip, object_height, max_steps, recover_after, checkpoint, rerun, c
         click.echo("\n" + KEYS_HELP + "\n")
         console = Console()
         editor = StretchStartPoseEditor(
-            env,
+            getattr(env, "franka_controls", env),
             go_to=env.go_home,
             set_pedestal_height=robot_model.set_franka_pedestal_height,
             keys=console.keys,
