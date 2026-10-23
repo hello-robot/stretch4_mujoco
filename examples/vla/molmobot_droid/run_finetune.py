@@ -1,10 +1,17 @@
 """
-Fine-tune MolmoBot-DROID to drive Stretch 4 directly, on the Stretch 4 trajectories
+Fine-tune MolmoBot-DROID to drive Stretch 4, on the Stretch 4 trajectories
 `run_benchmark_follow_franka.py` saves, with MolmoBot's own trainer (`finetune/train.py`).
 
-The fine-tuned policy's state and actions are Stretch 4's joints, the ones retargeting moves
-(`finetune/stretch4_joints.py`): base heading, lift, arm, wrist yaw/pitch/roll, an unused slot
-and the gripper, in the Franka's 8 slots so the pretrained action head loads. Its exo view is a
+--action_space says what the fine-tuned policy's state and actions are:
+- stretch4 (default): Stretch 4's joints, the ones retargeting moves
+  (`finetune/stretch4_joints.py`): base heading, lift, arm, wrist yaw/pitch/roll, an unused slot
+  and the gripper, in the Franka's 8 slots so the pretrained action head loads. It drives Stretch
+  directly. Its normalization is computed from the trajectories.
+- franka: the Franka's 7 joints and gripper, as MolmoBot-DROID's, from what the Franka did in the
+  same trajectories; only what the policy sees is Stretch's. It drives Stretch through
+  retargeting, as MolmoBot-DROID itself does. Its normalization is the checkpoint's, so the
+  pretrained action head's outputs keep their meaning.
+The `*_finetuned_*` runners read which from the run's `spec.json`. Its exo view is a
 head fisheye, DROID-framed (--use_fisheye: left, right, or `tool`, the one on the tool's side each
 step, as `run_stretch4_sim.py` and the real robot pick it; with --use_rectified_fisheye, redrawn
 as the DROID exo camera instead, as --rectify does), and its wrist view a gripper camera
@@ -34,8 +41,10 @@ Python 3.11, git-ignored with the clone). To set it up:
 5090; the cu128 one does.)
 
 Writes to <out>/<run name>/:
-- `dataset/`: links to the episodes' run directories, split into train and val;
-- `norm_stats.yaml`: Stretch's state and action normalization, computed on the first run;
+- `dataset/`: links to the episodes' run directories, split into train and val (with
+  --action_space franka, the episodes' Franka copies and links to their videos);
+- `norm_stats.yaml`: the state and action normalization, computed (or with --action_space franka,
+  copied from the checkpoint) on the first run;
 - `spec.json`: what `finetune/train.py` was given;
 - `metrics.jsonl`: every step's metrics and every validation's, and `metrics.png`, all of them
   across steps in one figure (losses, learning rates, gradient norms, throughput, GPU memory),
@@ -54,6 +63,8 @@ Usage:
     python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool
     python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool \
         --use_rectified_fisheye
+    # The Franka's joints out, Stretch's cameras in: run through retargeting.
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --action_space franka
     # Check the whole pipeline in a few minutes: a tiny randomly initialized model, 20 steps.
     python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --debug --steps 20
     # Any of MolmoBot's TrainConfig options after --, e.g. the action expert's learning rate:
@@ -71,8 +82,7 @@ from pathlib import Path
 import click
 
 from examples.vla.molmobot_droid.checkpoint import MOLMOBOT_LOCAL_DIR, download_checkpoint
-from examples.vla.molmobot_droid.finetune.dataset import build_dataset, find_episodes
-from examples.vla.molmobot_droid.finetune.stretch4_joints import MOVE_GROUPS
+from examples.vla.molmobot_droid.finetune.dataset import ACTION_SPACES, build_dataset, find_episodes
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import PARALLEL_GRIPPER_TOOL, STRETCH_GRIPPER_TOOL
 from examples.vla.molmobot_droid.plot_finetune import METRICS_FILE, latest_step, plot_metrics
 
@@ -99,10 +109,10 @@ TRAINING_ENV = {
 }
 
 
-def run_name(fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool, action_head: bool, vit: bool,
-             steps: int, debug: bool) -> str:
+def run_name(action_space: str, fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool, action_head: bool,
+             vit: bool, steps: int, debug: bool) -> str:
     return (
-        f"stretch4_fish-{fisheye}{'-rect' if rectified else ''}_grip-{gripper}_pg-{int(parallel_gripper)}_ah-{int(action_head)}_vit-{int(vit)}"
+        f"{action_space}_fish-{fisheye}{'-rect' if rectified else ''}_grip-{gripper}_pg-{int(parallel_gripper)}_ah-{int(action_head)}_vit-{int(vit)}"
         f"_steps-{steps}" + ("_debug" if debug else "")
     )
 
@@ -111,6 +121,11 @@ def run_name(fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool
 @click.option("--data", multiple=True, required=True, type=click.Path(exists=True, path_type=Path),
               help="A run directory of run_benchmark_follow_franka.py, or a directory holding several: every "
               "trajectory saved under it is used (that matches the gripper and has the cameras). Repeatable.")
+@click.option("--action_space", "--action-space", "action_space", type=click.Choice(list(ACTION_SPACES)),
+              default="stretch4", show_default=True,
+              help="The policy's state and actions: Stretch 4's joints, driving it directly, or the Franka's "
+              "(what the Franka did in the same trajectories), driving Stretch through retargeting. Its "
+              "cameras are Stretch's either way.")
 @click.option("--use_fisheye", "--use-fisheye", "use_fisheye", type=click.Choice(["left", "right", "tool"]),
               default="left", show_default=True,
               help="The head fisheye, DROID-framed, that is the policy's exo view: tool is the one on the tool's "
@@ -149,7 +164,7 @@ def run_name(fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool
 @click.option("--debug", is_flag=True, help="A tiny randomly initialized model instead of the checkpoint's "
               "weights (its config still), batch 1 and no validation: to check the pipeline end to end.")
 @click.argument("trainer_options", nargs=-1, type=click.UNPROCESSED)
-def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps,
+def main(data, action_space, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps,
          global_batch_size, device_batch_size, val_fraction, val_interval, save_interval, keep_interval, plot_interval, num_workers, out,
          checkpoint, use_wandb, debug, trainer_options):
     """Fine-tune MolmoBot-DROID on Stretch 4 trajectories (see the module docstring). Options after
@@ -178,12 +193,17 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
         fg="green",
     )
 
-    name = run_name(use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head,
-                    use_vision_transformer, steps, debug)
+    name = run_name(action_space, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper,
+                    use_action_head, use_vision_transformer, steps, debug)
     save_dir = out.resolve() / name
-    counts = build_dataset(usable, save_dir / "dataset", val_fraction)
-    click.secho(f"Dataset: {save_dir / 'dataset'} ({counts['train']} train, {counts['val']} val)", fg="green")
+    counts = build_dataset(usable, save_dir / "dataset", val_fraction, action_space=action_space)
+    click.secho(f"Dataset: {save_dir / 'dataset'} ({counts['train']} train, {counts['val']} val, "
+                f"{action_space} state and actions)", fg="green")
     checkpoint_dir = Path(checkpoint).resolve() if checkpoint else download_checkpoint()
+    stats_path = save_dir / "norm_stats.yaml"
+    if action_space == "franka" and not stats_path.exists():
+        write_checkpoint_normalization(checkpoint_dir, stats_path)
+        click.secho(f"Normalization: the checkpoint's ({stats_path})", fg="green")
 
     validation = (
         ["--no_val"] if counts["val"] == 0
@@ -196,7 +216,7 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
         # --debug makes the global batch the world size: 1.
         "--device_batch_size", str(1 if debug else device_batch_size),
         "--global_batch_size", str(global_batch_size),
-        "--stats_path", str(save_dir / "norm_stats.yaml"),
+        "--stats_path", str(stats_path),
         "--num_workers", str(num_workers),
         "--exp_name", name,
         *validation,
@@ -217,7 +237,8 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
     spec = {
         "molmobot_dir": str(MOLMOBOT_DIR),
         "checkpoint": str(checkpoint_dir),
-        "move_groups": MOVE_GROUPS,
+        "action_space": action_space,
+        "move_groups": ACTION_SPACES[action_space],
         "cameras": cameras,
         "train_action_head": use_action_head,
         "tool_name": tool,
@@ -250,6 +271,17 @@ def main(data, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gri
         raise SystemExit(process.returncode)
     final = save_dir / f"step{steps}-unsharded"
     click.secho(f"Done: {final}\n  load it with checkpoint.load_policy({str(final)!r})", fg="green")
+
+
+def write_checkpoint_normalization(checkpoint_dir: Path, stats_path: Path) -> None:
+    """The checkpoint's own state and action normalization (its `config.yaml`'s
+    `model.robot_preprocessor`) as the stats file, which MolmoBot's trainer then loads instead of
+    computing one from the data."""
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.load(checkpoint_dir / "config.yaml")
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config.model.robot_preprocessor, stats_path)
 
 
 def redraw(save_dir: Path) -> Path | None:

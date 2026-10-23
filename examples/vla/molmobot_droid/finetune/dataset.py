@@ -19,7 +19,10 @@ to that episode's videos, laid out as molmospaces' own trajectories are, for Mol
 
 `build_dataset()` puts the chosen episodes in a directory MolmoBot reads,
 `{train,val}/<run>/<episode>.h5` with each split's `valid_trajectory_index.json`, by linking to
-the run directories instead of copying them.
+the run directories instead of copying them. For a policy whose state and actions stay the
+Franka's (ACTION_SPACES), each `<run>/` is a directory of its own instead: copies of the h5 files
+with `obs/agent/qpos` and `actions/joint_pos` the Franka's (`stretch4/franka_*8`), beside links to
+their videos.
 """
 
 from __future__ import annotations
@@ -36,6 +39,16 @@ from examples.vla.molmobot_droid.finetune.stretch4_joints import JOINTS, MOVE_GR
 
 FORMAT = "stretch4_follow_franka/1"
 """The h5 files' `format` attribute: how `find_episodes()` tells them from other h5 files."""
+
+FRANKA_FORMAT = "stretch4_follow_franka_as_franka/1"
+"""The `format` of `build_dataset()`'s Franka copies, which `find_episodes()` leaves out."""
+
+FRANKA_MOVE_GROUPS: dict[str, int] = {"arm": 7, "gripper": 1}
+"""The Franka's move groups, as molmospaces stores them (MolmoBot's `franka_joint` preset)."""
+
+ACTION_SPACES: dict[str, dict[str, int]] = {"stretch4": MOVE_GROUPS, "franka": FRANKA_MOVE_GROUPS}
+"""What a fine-tuned policy's state and actions are: Stretch's joints (`stretch4_joints`), or
+the Franka's 7 joints and gripper the episode's policy drove, as MolmoBot-DROID's are."""
 
 INDEX_FILE = "valid_trajectory_index.json"
 SPLITS = ("train", "val")
@@ -169,7 +182,7 @@ def find_episodes(paths) -> list[SavedEpisode]:
             if resolved in found:
                 continue
             with h5py.File(path, "r") as f:
-                if f.attrs.get("format") != FORMAT:
+                if f.attrs.get("format") != FORMAT:  # also leaves out `build_dataset()`'s Franka copies
                     continue
                 found[resolved] = SavedEpisode(
                     resolved, int(f.attrs["steps"]), str(f.attrs.get("tool_name", "")),
@@ -178,14 +191,46 @@ def find_episodes(paths) -> list[SavedEpisode]:
     return sorted(found.values(), key=lambda e: e.path)
 
 
-def build_dataset(episodes: list[SavedEpisode], out_dir: Path, val_fraction: float, seed: int = 0) -> dict[str, int]:
+def write_franka_episode(source: Path, house_dir: Path) -> None:
+    """
+    `source`'s episode in `house_dir` with the Franka's state and actions (FRANKA_MOVE_GROUPS)
+    in place of Stretch's: a copy of the h5, and links to its videos (MolmoBot looks for them
+    beside it). Its `stretch4/` group is left as it was.
+    """
+    import h5py
+
+    path = house_dir / source.name
+    partial = path.with_name(path.name + ".partial")
+    shutil.copyfile(source, partial)
+    with h5py.File(partial, "r+") as f:
+        traj = f["traj_0"]
+        states = [to_move_groups(s, FRANKA_MOVE_GROUPS) for s in traj["stretch4/franka_state8"][:]]
+        actions = [to_move_groups(a, FRANKA_MOVE_GROUPS) for a in traj["stretch4/franka_action8"][:]]
+        del traj["obs/agent/qpos"], traj["actions/joint_pos"]
+        traj["obs/agent/qpos"] = _json_rows(states)
+        traj["actions/joint_pos"] = _json_rows([{}] + actions + [actions[-1]])
+        f.attrs["format"] = FRANKA_FORMAT
+        f.attrs["move_groups"] = json.dumps(FRANKA_MOVE_GROUPS)
+        videos = [bytes(traj["obs/sensor_data"][camera][:]).decode() for camera in traj["obs/sensor_data"]]
+    partial.replace(path)
+    for video in videos:
+        link = house_dir / video
+        if not link.is_symlink():
+            link.symlink_to(source.parent / video)
+
+
+def build_dataset(episodes: list[SavedEpisode], out_dir: Path, val_fraction: float, seed: int = 0,
+                  action_space: str = "stretch4") -> dict[str, int]:
     """
     Lay `episodes` out under `out_dir` as MolmoBot's `SynthmanipDataset` reads them: each split
     holds a link per run directory (its videos are found beside the h5) and an index of the
-    split's episodes in it. `val_fraction` of them (at least one, if there are two or more and
-    it is not 0), picked at random with `seed`, are the val split. Replaces whatever splits
-    `out_dir` had. Returns the episodes per split.
+    split's episodes in it. With `action_space` "franka", a directory per run instead, of the
+    episodes' Franka copies (`write_franka_episode()`). `val_fraction` of them (at least one, if
+    there are two or more and it is not 0), picked at random with `seed`, are the val split.
+    Replaces whatever splits `out_dir` had. Returns the episodes per split.
     """
+    if action_space not in ACTION_SPACES:
+        raise ValueError(f"Unknown action space {action_space!r}: one of {list(ACTION_SPACES)}")
     order = list(episodes)
     random.Random(seed).shuffle(order)
     n_val = round(len(order) * val_fraction)
@@ -208,13 +253,17 @@ def build_dataset(episodes: list[SavedEpisode], out_dir: Path, val_fraction: flo
     for split in SPLITS:
         split_dir = out_dir / split
         if split_dir.exists():
-            shutil.rmtree(split_dir)  # links and the index only: rmtree removes links, never follows them
+            # Links, the index and Franka copies only: rmtree removes links, never follows them.
+            shutil.rmtree(split_dir)
         split_dir.mkdir(parents=True)
         index: dict[str, dict] = {}
         for episode in chosen[split]:
             house = houses[episode.path.parent]
             link = split_dir / house
-            if not link.exists():
+            if action_space == "franka":
+                link.mkdir(exist_ok=True)
+                write_franka_episode(episode.path, link)
+            elif not link.exists():
                 link.symlink_to(episode.path.parent, target_is_directory=True)
             # Rows of actions/joint_pos: the padding frame, one per step, the done frame.
             index.setdefault(house, {})[f"{house}/{episode.path.name}"] = {"traj_0": episode.steps + 2}

@@ -50,11 +50,11 @@ def action8(base_yaw: float, lift: float, arm: float, wrist_yaw: float, wrist_pi
     return np.array([base_yaw, lift, arm, wrist_yaw, wrist_pitch, wrist_roll, 0.0, gripper])
 
 
-def to_move_groups(values8) -> dict[str, list[float]]:
-    """`values8` split into MOVE_GROUPS, as the h5 files store them."""
+def to_move_groups(values8, move_groups: dict[str, int] = MOVE_GROUPS) -> dict[str, list[float]]:
+    """`values8` split into `move_groups`, as the h5 files store them."""
     values = [float(v) for v in values8]
     groups, start = {}, 0
-    for name, size in MOVE_GROUPS.items():
+    for name, size in move_groups.items():
         groups[name] = values[start : start + size]
         start += size
     return groups
