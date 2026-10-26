@@ -20,6 +20,10 @@ import click
 
 from examples.vla.molmobot_droid.checkpoint import FRANKA_HOME_QPOS, load_policy, unload_policy
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    CUSTOM_START_QPOS,
+    RetargetParams,
+    custom_start_link0_height,
+    custom_start_option,
     execution_flags,
     execution_options,
     exo_camera_option,
@@ -69,8 +73,33 @@ def failed_result(index: int, setup, error: Exception) -> bench.EpisodeResult:
 @benchmark_options
 @exo_camera_option("droid")
 @execution_options
+@custom_start_option
 def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, resume, list_only, exo_camera,
-         execute_horizon, execute_first_n):
+         execute_horizon, execute_first_n, custom_franka_start_pose):
+    """
+    Run the benchmark on the Franka DROID. With --custom_franka_start_pose, every episode starts
+    from CUSTOM_START_QPOS on the pedestal height `run_benchmark_stretch4.py` gives the virtual
+    Franka for it with the parallel jaw gripper, the gripper the Stretch 4 runs compared against
+    it use; otherwise from the episode's own start pose and height.
+    \f
+
+    Args:
+        benchmark: The benchmark to run (see `bench.load_episodes()`).
+        episodes: Comma-separated episode indices, or None for all of them.
+        max_episodes: How many episodes to run at most.
+        out: The directory the run directory goes in.
+        checkpoint: MolmoBot-DROID's checkpoint directory, or None to download it.
+        run_to_horizon: Whether to keep going after success, to the episode's time limit.
+        resume: The episode to resume from (e.g. ep0003), or None to start over.
+        list_only: Whether to only list the installed benchmarks.
+        exo_camera: The camera the policy's exo view comes from.
+        execute_horizon: How many steps of each predicted action chunk to keep.
+        execute_first_n: How many of those to execute before predicting again.
+        custom_franka_start_pose: Whether to start from CUSTOM_START_QPOS (see above).
+
+    Returns:
+        None.
+    """
     if list_only:
         click.echo("\n".join(bench.list_benchmarks()))
         return
@@ -79,6 +108,8 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
 
     benchmark_dir, selected = bench.load_episodes(benchmark, parse_episodes(episodes), max_episodes)
     flags = {"exo_camera": exo_camera, **execution_flags(execute_horizon, execute_first_n)}
+    if custom_franka_start_pose:
+        flags["custom_franka_start_pose"] = True
     name = bench.run_name("franka", flags)
     out_dir = Path(out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -91,12 +122,18 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
             for index, episode in run.episodes():
                 setup = bench.episode_setup(episode)
                 click.secho(f"[{run.current}] {setup.scene.scene_id}: {setup.instruction}", fg="cyan")
+                if custom_franka_start_pose:
+                    link0_height = custom_start_link0_height(RetargetParams(use_parallel_gripper=True), setup.scene.floor_z)
+                    start_q7 = CUSTOM_START_QPOS
+                else:
+                    link0_height = setup.link0_height
+                    start_q7 = setup.franka_init_qpos or FRANKA_HOME_QPOS
                 try:
                     env = load_custom_scene_franka_droid(
                         setup.scene,
                         setup.robot_pose,
                         exo_camera=exo_camera,
-                        link0_height=setup.link0_height,
+                        link0_height=link0_height,
                         standing_on_floor=False,  # the benchmark's floating 0.58 m pedestal
                     )
                 except Exception as error:  # e.g. the scene lacks a body the episode names
@@ -105,7 +142,7 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     run.record(result)
                     continue
                 try:
-                    env.reset(setup.franka_init_qpos or FRANKA_HOME_QPOS)
+                    env.reset(start_q7)
                     result = bench.run_episode(
                         index, setup, env, policy, execute_horizon, execute_first_n, out_dir, name,
                         end_on_success=not run_to_horizon,

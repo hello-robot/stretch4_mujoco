@@ -10,7 +10,7 @@ Usage:
     # Several Stretch 4 runs, e.g. with and without a fix, against the same Franka run:
     python -m examples.vla.molmobot_droid.compare_benchmarks --franka <run> \\
         --stretch4 <run> --stretch4 <run> --videos
-    # Every run in a directory (one Franka run; pass --franka too if there are several):
+    # Every Stretch 4 run in a directory against each of its Franka runs (one comparison per Franka run):
     python -m examples.vla.molmobot_droid.compare_benchmarks --all outputs/molmobot_droid/benchmarks
 """
 
@@ -251,37 +251,71 @@ def find_runs(directory: Path) -> dict[str, list[Path]]:
 @click.option("--stretch4", "stretch_dirs", multiple=True, type=click.Path(exists=True, file_okay=False),
               help="A Stretch 4 run. Give it more than once to compare several.")
 @click.option("--all", "all_dir", default=None, type=click.Path(exists=True, file_okay=False),
-              help="Compare every run in this directory's subfolders, in place of --stretch4 (and of --franka, "
-              "unless there are several Franka runs).")
-@click.option("--out", default=None, type=click.Path(), help="Default: next to the runs.")
+              help="Compare every Stretch 4 run in this directory's subfolders, in place of --stretch4, against "
+              "each Franka run there (or only --franka's), one comparison per Franka run.")
+@click.option("--out", default=None, type=click.Path(),
+              help="Default: next to the runs. With several Franka runs, each comparison goes in its own "
+              "subfolder of it.")
 @click.option("--videos", is_flag=True, help="Also stack each episode's grid videos, one run above the other.")
 def main(franka_dir, stretch_dirs, all_dir, out, videos):
+    """
+    Compare Franka DROID benchmark runs with Stretch 4 ones (see the module docstring).
+    \f
+
+    Args:
+        franka_dir: The Franka run to compare against, or None for each of --all's.
+        stretch_dirs: The Stretch 4 runs to compare; --all finds them instead.
+        all_dir: The directory whose runs --all compares, or None.
+        out: Where the comparison goes, or None for next to the runs.
+        videos: Whether to also stack each episode's grid videos.
+
+    Returns:
+        None.
+    """
+    franka_dirs = [Path(franka_dir)] if franka_dir is not None else []
     if all_dir:
         if stretch_dirs:
             raise click.UsageError("--all finds the Stretch 4 runs itself; leave out --stretch4")
         found = find_runs(Path(all_dir))
         stretch_dirs = found.get("stretch4", [])
-        if franka_dir is None:
-            frankas = found.get("franka", [])
-            if len(frankas) != 1:
-                raise click.UsageError(
-                    f"--all needs exactly one Franka run in {all_dir}, found {len(frankas)}"
-                    + (f": {[f.name for f in frankas]}. Pick one with --franka." if frankas else ".")
-                )
-            franka_dir = frankas[0]
-        click.echo(f"Franka: {Path(franka_dir).name}\n" + "\n".join(f"Stretch 4: {Path(d).name}" for d in stretch_dirs))
-    if franka_dir is None or not stretch_dirs:
-        raise click.UsageError("Need --franka and at least one --stretch4, or --all")
-    franka = load_run(Path(franka_dir), "Franka")
-    stretch_flags = [json.loads((Path(d) / "results.json").read_text())["flags"]
-                     if (Path(d) / "results.json").exists() else {} for d in stretch_dirs]
-    stretches = [load_run(Path(d), label) for d, label in zip(stretch_dirs, stretch_labels(stretch_flags))]
+        if not franka_dirs:
+            franka_dirs = found.get("franka", [])
+        click.echo("\n".join([*(f"Franka: {d.name}" for d in franka_dirs),
+                               *(f"Stretch 4: {Path(d).name}" for d in stretch_dirs)]))
+    if not franka_dirs or not stretch_dirs:
+        raise click.UsageError("Need --franka and at least one --stretch4, or --all with both in its directory")
+    for franka_run in franka_dirs:
+        compare(franka_run, [Path(d) for d in stretch_dirs], out, videos, own_subfolder=len(franka_dirs) > 1)
+
+
+def compare(franka_dir: Path, stretch_dirs: list[Path], out: str | None, videos: bool, own_subfolder: bool) -> None:
+    """
+    Write `comparison_report.md` (and with `videos`, the stacked grid videos) comparing one
+    Franka run with the Stretch 4 runs, over the episodes they all ran.
+
+    Args:
+        franka_dir: The Franka run to compare against.
+        stretch_dirs: The Stretch 4 runs to compare with it.
+        out: Where the comparison goes, or None for next to the runs (`default_out_dir()`).
+        videos: Whether to also stack each episode's grid videos.
+        own_subfolder: Whether `out` holds several comparisons, each in a subfolder named as
+            `default_out_dir()` names it.
+
+    Returns:
+        None.
+    """
+    franka = load_run(franka_dir, "Franka")
+    stretch_flags = [json.loads((d / "results.json").read_text())["flags"]
+                     if (d / "results.json").exists() else {} for d in stretch_dirs]
+    stretches = [load_run(d, label) for d, label in zip(stretch_dirs, stretch_labels(stretch_flags))]
     runs = [franka, *stretches]
-    out_dir = Path(out) if out else default_out_dir(franka, stretches)
+    out_dir = default_out_dir(franka, stretches)
+    if out:
+        out_dir = Path(out) / out_dir.name if own_subfolder else Path(out)
     out_dir.mkdir(parents=True, exist_ok=True)
     common = sorted(set.intersection(*(set(run["by_index"]) for run in runs)))
     if not common:
-        raise click.ClickException("The runs have no episodes in common")
+        raise click.ClickException(f"{franka_dir.name} and the Stretch 4 runs have no episodes in common")
 
     stacked: dict[int, str] = {}
     if videos:
@@ -301,7 +335,6 @@ def main(franka_dir, stretch_dirs, all_dir, out, videos):
     report = out_dir / "comparison_report.md"
     report.write_text(comparison_report(franka, stretches, common, stacked))
     click.secho(f"Report: {report}", fg="green")
-
 
 if __name__ == "__main__":
     main()
