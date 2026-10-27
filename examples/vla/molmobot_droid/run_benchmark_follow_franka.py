@@ -48,6 +48,7 @@ from examples.vla.molmobot_droid.franka_retarget.follow_franka import (
     GRID_EXCLUDED,
     FollowFrankaEnv,
     follow_flags,
+    save_step_log,
     save_trajectory,
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
@@ -173,8 +174,16 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                             extra_metrics=lambda e: e.stats(), grid_excluded=GRID_EXCLUDED,
                         )
                         result.metrics["saved"] = False
+                        prefix = f"{name}_{bench.episode_name(index)}"
+                        # Every episode, failed ones too: what retargeting was asked and did, step by step.
+                        save_step_log(env, out_dir, prefix, {
+                            "episode": index,
+                            "scene_id": setup.scene.scene_id,
+                            "instruction": setup.instruction,
+                            "success": result.success,
+                            "metrics": result.metrics,
+                        })
                         if result.success and result.error is None:
-                            prefix = f"{name}_{bench.episode_name(index)}"
                             try:
                                 saved = save_trajectory(env, out_dir, prefix, setup.instruction, setup.task_type, {
                                     "run_name": name,
