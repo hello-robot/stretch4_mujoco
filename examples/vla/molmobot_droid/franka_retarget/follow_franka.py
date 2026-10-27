@@ -170,6 +170,8 @@ class FollowFrankaEnv(Stretch4SimEnv):
         """Stretch's heading at `reset()`: its state's base_yaw is from there."""
         self.tool_errors: list[float] = []
         """m. After each step, how far Stretch's tool is from where the Franka's action put it."""
+        self.step_log: list[dict] = []
+        """One row per step of what retargeting was asked and did (`_log_step()`), for `save_step_log()`."""
         # `exo_camera` follows the tool, for TOOL_FISHEYE: the policy's views are the Franka's either way.
         self.head_follows_tool = True
 
@@ -196,6 +198,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         self.start_yaw = float(self.base_pose(self.world_from_footprint())[2])
         self.trajectory = StretchTrajectory()
         self.tool_errors = []
+        self.step_log = []
 
     def observe(self) -> Observation:
         camera_data = self.fresh_camera_data()
@@ -223,8 +226,19 @@ class FollowFrankaEnv(Stretch4SimEnv):
         return Observation(exo_rgb=exo, wrist_rgb=wrist, state8=state8, extra_cameras=stretch_views(images, self.params.rectify, self.exo_camera))
 
     def step(self, action8: np.ndarray) -> StretchTargets | None:
+        """
+        Retarget one Franka action onto Stretch, send it, step the Franka alone by it, and wait one
+        policy period (or for arrival with --wait-for-arrival).
+
+        Args:
+            action8: The policy's Franka action: 7 joint positions (rad) and the gripper command.
+
+        Returns:
+            The Stretch targets sent, or None if Stretch could not follow and held still.
+        """
         joints = self.joints()
         footprint = self.world_from_footprint()
+        franka_q7 = np.array(self.franka.state8[:7], dtype=float)
         targets = self.retargeter.franka_to_stretch(action8, footprint, joints)
         closed = bool(action8[7] >= GRIPPER_CLOSED / 2)
         start = self.sim.pull_status().time
@@ -251,7 +265,60 @@ class FollowFrankaEnv(Stretch4SimEnv):
         error = self.tool_error_m()
         if error is not None:
             self.tool_errors.append(error)
+        self._log_step(action8, franka_q7, joints, footprint, targets, error)
         return targets
+
+    def _log_step(
+        self,
+        action8: np.ndarray,
+        franka_q7: np.ndarray,
+        joints,
+        footprint: np.ndarray,
+        targets: StretchTargets | None,
+        tool_error: float | None,
+    ) -> None:
+        """
+        Append one row to `step_log`: the Franka action and where the Franka was, Stretch's joints
+        and footprint before the step, the tool target retargeting worked out, how it was reached
+        (with `ReachMiss`'s details when it was twisted or unreachable), the targets sent, and how
+        far the tool was from its target after the step.
+
+        Args:
+            action8: The policy's Franka action for this step.
+            franka_q7: The Franka's joints before the step (rad).
+            joints: Stretch's `StretchJoints` before the step.
+            footprint: world_from_footprint before the step.
+            targets: What retargeting sent Stretch, or None if it held still.
+            tool_error: m from Stretch's tool to its target after the step, or None if unknown.
+
+        Returns:
+            None.
+        """
+        miss = self.retargeter.last_miss
+        target_world = self.retargeter.last_target_tool_world
+        self.step_log.append({
+            "franka_action8": [float(v) for v in action8],
+            "franka_q7": [float(v) for v in franka_q7],
+            "stretch_joints": [joints.lift, joints.arm, joints.wrist_yaw, joints.wrist_pitch, joints.wrist_roll],
+            "footprint": [float(v) for v in self.base_pose(footprint)],
+            "target_tool_world": None if target_world is None else target_world.tolist(),
+            "reach": self._reach(targets),
+            "miss": None if miss is None else {
+                "kind": miss.kind,
+                "position_error_m": miss.position_error_m,
+                "rotation_error_rad": miss.rotation_error_rad,
+                "twist_rad": miss.twist_rad,
+                "at_limits": miss.at_limits,
+                "arm_out_of_range": miss.arm_out_of_range,
+            },
+            "targets": None if targets is None else {
+                "base_rotate_by": targets.base_rotate_by,
+                "joints": [targets.lift, targets.arm, targets.wrist_yaw, targets.wrist_pitch, targets.wrist_roll],
+                "clamped": targets.clamped,
+                "ik_error_m": targets.tool_error_m,
+            },
+            "tool_error_m": tool_error,
+        })
 
     def _reach(self, targets: StretchTargets | None) -> str:
         if targets is None:
@@ -273,6 +340,37 @@ class FollowFrankaEnv(Stretch4SimEnv):
     def close(self) -> None:
         super().close()
         self.franka.close()
+
+
+def save_step_log(env: FollowFrankaEnv, out_dir: Path, prefix: str, attrs: dict) -> Path:
+    """
+    Write `env.step_log` as `<prefix>_steps.json` in `out_dir`, with what is needed to replay it
+    through `FrankaStretchRetargeter` offline: the virtual Franka's `world_from_link0`, the start
+    pose, the tool and the grasp offset. Written for every episode, failed ones included, which
+    `save_trajectory()` does not keep.
+
+    Args:
+        env: The env the episode ran in.
+        out_dir: The run directory.
+        prefix: The episode's file prefix (`<run name>_ep<#>`).
+        attrs: Anything else to keep with it, e.g. the episode's index and whether it succeeded.
+
+    Returns:
+        The path written.
+    """
+    import json
+
+    path = out_dir / f"{prefix}_steps.json"
+    path.write_text(json.dumps({
+        "world_from_link0": env.stretch_scene.franka.world_from_link0.tolist(),
+        "start_q7": [float(q) for q in env.start_q7],
+        "tool_name": env.params.tool_name,
+        "grasp_offset_mm": list(env.params.effective_grasp_offset_mm),
+        "grasp_offset_deg": list(env.params.grasp_offset_deg),
+        **attrs,
+        "steps": env.step_log,
+    }, default=lambda value: value.item() if hasattr(value, "item") else str(value)))  # numpy scalars
+    return path
 
 
 def save_trajectory(env: FollowFrankaEnv, out_dir: Path, prefix: str, instruction: str, task_type: str,
