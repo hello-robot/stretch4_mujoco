@@ -11,6 +11,9 @@ screws holding the fin-ray into the base block, and a thin black grip strip
 skinned over the fin-ray's inner face and around its tip.
 `split_parallel_gripper_finger` sorts those shells into a blue, a black and a
 steel mesh so each can carry its own colour.
+
+The SG4 fingertip is one STL holding two shells: the black pad and the white
+holder the ArUco tag sits on. `split_standard_gripper_fingertip` separates them.
 """
 
 from __future__ import annotations
@@ -313,3 +316,43 @@ def split_parallel_gripper_finger(stl_path: str | Path) -> FingerParts:
     )
     screws = trimesh.util.concatenate(steel) if steel else None
     return FingerParts(fin_ray, black, screws)
+
+
+def split_standard_gripper_fingertip(
+    stl_path: str | Path, tag_position: np.ndarray
+) -> tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    """
+    Split an SG4 fingertip mesh into its ArUco tag holder and its pad.
+
+    The holder is the shell whose bounding box lies nearest the tag; every
+    other shell is the pad.
+
+    Args:
+        stl_path: The SG4 gripper_fingertip_{left,right}_link visual mesh.
+        tag_position: The tag link's origin in the fingertip frame, in metres.
+
+    Returns:
+        The holder mesh and the pad mesh, in the fingertip frame.
+    """
+    mesh = trimesh.load(stl_path, process=True)
+    parts = mesh.split(only_watertight=False)
+    if len(parts) < 2:
+        raise ValueError(f"{stl_path} does not split into a tag holder and a pad.")
+
+    def box_distance(part: trimesh.Trimesh) -> float:
+        """
+        Distance from the tag to a shell's bounding box, zero inside it.
+
+        Args:
+            part: One shell of the fingertip mesh.
+
+        Returns:
+            The distance in metres.
+        """
+        low, high = part.bounds
+        outside = np.maximum(low - tag_position, tag_position - high)
+        return float(np.linalg.norm(np.maximum(0.0, outside)))
+
+    holder = min(parts, key=box_distance)
+    pad = trimesh.util.concatenate([p for p in parts if p is not holder])
+    return holder, pad
