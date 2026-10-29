@@ -54,8 +54,11 @@ PARALLEL_GRIPPER_SCREW_MATERIAL = {
     "specular": "1",
     "shininess": "0.8",
 }
+<<<<<<< HEAD
 # The SG4 fingertip's ArUco tag holder, printed in the body's off-white.
 STANDARD_GRIPPER_TAG_HOLDER_RGBA = "0.9 0.9 0.88 1"
+=======
+>>>>>>> 002fabe9 (PJG and SG4 now have ArUco tags. PJG looks more like the real gripper)
 
 
 def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):

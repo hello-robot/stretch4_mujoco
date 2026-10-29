@@ -11,9 +11,6 @@ screws holding the fin-ray into the base block, and a thin black grip strip
 skinned over the fin-ray's inner face and around its tip.
 `split_parallel_gripper_finger` sorts those shells into a blue, a black and a
 steel mesh so each can carry its own colour.
-
-The SG4 fingertip is one STL holding two shells: the black pad and the white
-holder the ArUco tag sits on. `split_standard_gripper_fingertip` separates them.
 """
 
 from __future__ import annotations
