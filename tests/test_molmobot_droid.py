@@ -28,6 +28,8 @@ from examples.vla.molmobot_droid.droid import (  # noqa: E402
     stretch4_camera_poses,
 )
 from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (  # noqa: E402
+    END_STOP_MARGIN,
+    LIFT_RANGE,
     STRETCH_TCP,
     TCP_ALIGN,
     FrankaStretchRetargeter,
@@ -257,13 +259,13 @@ def test_grasp_offset_moves_stretch_but_not_the_franka_state():
 
 def test_unreachable_target_is_clamped_or_refused():
     """The Franka's home pose over a tall counter is above Stretch's lift; it goes as close as it can."""
-    # fr3_link0 at 0.75 m: the Franka's downward TCP at 1.185 m, just over what Stretch reaches.
-    pose, retargeter = make_retargeter(link0_height=0.75)
+    # fr3_link0 at 0.66 m: the Franka's downward TCP at ~1.095 m, ~2 cm over what Stretch reaches.
+    pose, retargeter = make_retargeter(link0_height=0.66)
     targets = retargeter.franka_to_stretch(
         np.append(checkpoint.FRANKA_HOME_QPOS, 0), pose.matrix(), StretchJoints(0.6, 0.1, 0, 0, 0, 1)
     )
     assert targets is not None and targets.clamped
-    assert targets.lift == pytest.approx(1.2 - 0.005, abs=1e-3), "at the top of its travel, short of the end stop"
+    assert targets.lift == pytest.approx(LIFT_RANGE[1] - END_STOP_MARGIN, abs=1e-3), "at the top of its travel, short of the end stop"
     assert 0 < targets.tool_error_m < 0.05
 
     far = np.array(checkpoint.FRANKA_HOME_QPOS)
@@ -327,7 +329,7 @@ def test_run_name_joins_flags_with_underscores():
     flags = RetargetParams(grasp_offset_mm=(0, 5, 0), slow=True).flags()
     name = run_name("stretch4", {**flags, "include_franka": False})
     assert name == (
-        "stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-1_wait-1_pg-0_offmm-0,5,0_offdeg-0,0,0_ghost-0"
+        "stretch4_exo-left_grip-left_eh-8_n-2_crop-droid_slow-1_wait-1_pg-0_offmm-0,5,0_offdeg-0,0,0_headtool-1_ghost-0"
     )
 
 
