@@ -404,58 +404,6 @@ class StretchMujocoSimulator:
             return False
         return True
 
-    def _has_unacknowledged_command(self) -> bool:
-        """Whether the server still has a queued command it has not applied.
-
-        Commands reach the server through a proxy it drains once per control tick,
-        so for a moment after `move_by()` returns there is nothing to observe: the
-        joint has not left its start position and the base's `active_*` flags are
-        still clear. The server clears each command's `trigger` as it applies it
-        and writes the command back, which is the acknowledgement this reads.
-        """
-        try:
-            command = self.data_proxies.get_command()
-        except Exception:
-            # No connection to read an acknowledgement over; the caller's own
-            # liveness checks are what should decide what happens next.
-            return False
-
-        if any(move.trigger for move in command.move_to.values()):
-            return True
-        if any(move.trigger for move in command.move_by.values()):
-            return True
-        if command.base_velocity is not None and command.base_velocity.trigger:
-            return True
-        return command.keyframe is not None and command.keyframe.trigger
-
-    def _wait_for_command_acknowledgement(
-        self, timeout: float, check_interval: float = 0.01
-    ) -> bool:
-        """Blocks until the server has applied every queued command and published
-        a status that reports it.
-
-        The deadline is in wall-clock seconds rather than sim seconds: how long a
-        pickup takes is set by how often the server process gets to run, not by
-        how fast sim time is advancing.
-        """
-        deadline = time.time() + timeout
-
-        while self._has_unacknowledged_command():
-            if not self.is_running() or time.time() > deadline:
-                return False
-            time.sleep(check_interval)
-
-        # The server publishes status *before* it drains commands, so the status
-        # on hand was taken a tick before the move started. Wait for the next one,
-        # which is the first to carry the `active_*` and in-motion flags for it.
-        acknowledged_at = self.pull_status().time
-        while self.pull_status().time <= acknowledged_at:
-            if not self.is_running() or time.time() > deadline:
-                return False
-            time.sleep(check_interval)
-
-        return True
-
     def wait_command(self, timeout: float = 15.0, check_interval: float = 0.1, position_tolerance: float = 0.001) -> bool:
         """
         Pause program execution until all motion is complete.
@@ -499,13 +447,6 @@ class StretchMujocoSimulator:
                 else:
                     positions[act] = act.get_position(status)
             return positions
-
-        # A command that has not reached the server yet has moved nothing and set
-        # no `active_*` flag, so the stability loop below would read "not started"
-        # as "already finished" and return straight away. Wait for the server to
-        # acknowledge what is queued first.
-        if not self._wait_for_command_acknowledgement(timeout):
-            return False
 
         try:
             start_time = self.pull_status().time
