@@ -22,6 +22,7 @@ from stretch4_mujoco.enums.actuators import Actuators
 from stretch4_mujoco.enums.stretch_cameras import StretchCameras
 import stretch4_mujoco.config as config
 from stretch4_mujoco.enums.stretch_sensors import StretchSensors
+from stretch4_mujoco.safe_motions.safe_motion_manager import SafeMotionManager
 from stretch4_mujoco.mujoco_server_camera_manager import (
     MujocoServerCameraManagerThreaded,
     MujocoServerCameraManagerSync,
@@ -605,6 +606,19 @@ class MujocoServer:
 
         self.joint_profiles = self._build_joint_profiles()
 
+        # Bumped every time a caller commands an actuator. A safe motion that
+        # has stopped a joint needs to tell "the caller has said nothing since"
+        # from "the caller has asked for something new", and it cannot read
+        # that off the profile: an override parks a joint on a zero-velocity
+        # goal, which is byte for byte what an explicit stop command leaves.
+        self.actuator_command_seq: dict[str, int] = {
+            name: 0 for name in self.joint_profiles
+        }
+
+        # Needs the profiles and the base controller it overrides, so it is
+        # built last.
+        self.safe_motion_manager = SafeMotionManager(self)
+
         signal.signal(signal.SIGTERM, lambda num, h: self.request_to_stop())
         signal.signal(signal.SIGINT, lambda num, h: self.request_to_stop())
 
@@ -686,6 +700,8 @@ class MujocoServer:
                 self.mjmodel, mujoco._enums.mjtObj.mjOBJ_ACTUATOR, i
             )
             profile = self.joint_profiles.get(actuator_name) if actuator_name else None
+            if actuator_name:
+                self._note_command(actuator_name)
             if profile is None:
                 self.mjdata.ctrl[i] = float(ctrl[i])
             else:
@@ -698,6 +714,11 @@ class MujocoServer:
     def _measured_position(self, actuator_name: str) -> float:
         return float(self.mjdata.actuator(actuator_name).length[0])
 
+    def _note_command(self, actuator_name: str) -> None:
+        """Record that a caller has just commanded this actuator."""
+        if actuator_name in self.actuator_command_seq:
+            self.actuator_command_seq[actuator_name] += 1
+
     def _set_actuator_position(
         self,
         actuator_name: str,
@@ -706,6 +727,7 @@ class MujocoServer:
         max_accel: float | None = None,
     ) -> None:
         """Command an absolute position, rate limited if the actuator has limits."""
+        self._note_command(actuator_name)
         profile = self.joint_profiles.get(actuator_name)
         if profile is None:
             self.mjdata.actuator(actuator_name).ctrl = pos
@@ -721,6 +743,7 @@ class MujocoServer:
         max_accel: float | None = None,
     ) -> None:
         """Jog an actuator, rate limited if the actuator has limits."""
+        self._note_command(actuator_name)
         profile = self.joint_profiles.get(actuator_name)
         if profile is None:
             current = float(self.mjdata.actuator(actuator_name).ctrl[0])
@@ -981,6 +1004,9 @@ class MujocoServer:
         self.physics_fps_counter.tick(sim_time=data.time)
         self.pull_status()
         self.push_command(self.data_proxies.get_command())
+        # Last, so a safe motion overrides the setpoints `push_command()` just
+        # wrote rather than being overwritten by them. See `SafeMotion`.
+        self.safe_motion_manager.step()
 
     def pull_status(self):
         """
@@ -1097,6 +1123,18 @@ class MujocoServer:
                 # A lot of geoms might technically intersect by design depending on limits, but ncon tracks active contacts.
                 new_status.is_self_colliding = True
                 break
+
+        # From the previous control cycle: `pull_status()` runs ahead of the
+        # safe motions, so this is the tilt they last acted on.
+        overtilt = self.safe_motion_manager.controllers.get("safe_motion_overtilt_avoid")
+        if overtilt is not None:
+            new_status.gravity_tilt = overtilt.status["gravity_tilt"]
+            new_status.in_overtilt = overtilt.status["in_overtilt"]
+
+        guarded = self.safe_motion_manager.controllers.get("safe_motion_guarded_contact")
+        if guarded is not None:
+            new_status.guarded_events = guarded.status["guarded_events"]
+            new_status.in_guarded_event = dict(guarded.status["in_guarded_event"])
 
         self.data_proxies.set_status(new_status)
 
