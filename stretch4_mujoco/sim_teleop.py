@@ -230,9 +230,15 @@ class KeyboardTeleop:
             self._thread.join(timeout=1.0)
             self._thread = None
 
-    def _loop(self):
+    def _loop(self) -> None:
+        """
+        Re-apply held movement keys at the teleop rate until stopped or the sim stops.
+
+        Returns:
+            None.
+        """
         period = 1.0 / self._rate_hz
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and self.sim.is_running():
             start = time.perf_counter()
             if self.is_keyboard_control_active:
                 for key in list(self.key_buffer):
@@ -250,19 +256,40 @@ class KeyboardTeleop:
         self.is_keyboard_control_active = False
         print("Keyboard control disabled")
 
-    def on_press(self, key):
+    def on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        """
+        Track a pressed key so the teleop loop can act on it while it is held.
+
+        Args:
+            key: The key pynput reports as pressed.
+
+        Returns:
+            None.
+        """
         if key == keyboard.Key.ctrl:
             self.ctrl_pressed = True
 
         if key not in self.key_buffer and len(self.key_buffer) <= 3:
             self.key_buffer.append(key)
 
-    def on_release(self, key):
+    def on_release(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
+        """
+        Stop whatever a released key was driving.
+
+        The keyboard listener outlives the sim until `stop()` is called, so a
+        key released after the sim stopped is ignored rather than commanded.
+
+        Args:
+            key: The key pynput reports as released.
+
+        Returns:
+            None.
+        """
         if key == keyboard.Key.ctrl:
             self.ctrl_pressed = False
         if key in self.key_buffer:
             self.key_buffer.remove(key)
-        if isinstance(key, keyboard.KeyCode):
+        if isinstance(key, keyboard.KeyCode) and self.sim.is_running():
             self.keyboard_control_release(key.char)
 
     def _release_held_keys(self):

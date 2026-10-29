@@ -608,6 +608,50 @@ def block_until_check_succeeds(
     return False
 
 
+def release_gl_context(renderer: mujoco.Renderer) -> None:
+    """
+    Release the renderer's GL context from the calling thread.
+
+    A context can only be current on one thread. EGL refuses to make a context
+    current while another thread still holds it, and CGL's `make_current` locks
+    the context until it is released, so another thread waits forever. Call
+    this on the thread that last rendered, before rendering from another one.
+    `Renderer.render()` makes the context current again.
+
+    Args:
+        renderer: The renderer whose context was last made current on this
+            thread.
+
+    Returns:
+        None.
+    """
+    gl_context = renderer._gl_context
+    if gl_context is None:
+        return
+
+    backend = type(gl_context).__module__
+    if backend == "mujoco.egl":
+        import mujoco.egl
+        from mujoco.egl import egl_ext
+
+        egl_ext.eglMakeCurrent(
+            mujoco.egl.EGL_DISPLAY, egl_ext.EGL_NO_SURFACE, egl_ext.EGL_NO_SURFACE, egl_ext.EGL_NO_CONTEXT
+        )
+    elif backend == "mujoco.osmesa":
+        from OpenGL import GL, osmesa
+
+        osmesa.OSMesaMakeCurrent(None, None, GL.GL_FLOAT, 0, 0)
+    elif backend == "mujoco.cgl":
+        from mujoco.cgl import cgl
+
+        cgl.CGLUnlockContext(gl_context._context)
+        cgl.CGLSetCurrentContext(None)
+    elif backend == "mujoco.glfw":
+        import glfw
+
+        glfw.make_context_current(None)
+
+
 def switch_to_glfw_renderer(mjmodel: MjModel, renderer: mujoco.Renderer):
     """
     On Darwin, the default renderer in `mujoco/gl_context.py` is CGL, which is not compatible with offscreen rendering.

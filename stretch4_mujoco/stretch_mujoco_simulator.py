@@ -146,6 +146,10 @@ class StretchMujocoSimulator:
                 problem, but the camera then stays where the mouse leaves it
                 instead of following the body -- panning included, which a
                 tracking camera overrides. Ignored if viewer_track_body is set.
+
+        Returns:
+            None. Returns once the first status and camera frame arrive and the
+            robot is homed, or early if the Mujoco process exits.
         """
         self.is_stop_called = False
 
@@ -185,14 +189,19 @@ class StretchMujocoSimulator:
         self._server_process.start()
 
         # Handle stopping, in all its various ways:
-        signal.signal(signal.SIGTERM, lambda num, sig: self.stop())
-        signal.signal(signal.SIGINT, lambda num, sig: self.stop())
+        signal.signal(signal.SIGTERM, lambda num, sig: self._stop_from_signal())
+        signal.signal(signal.SIGINT, lambda num, sig: self._stop_from_signal())
         atexit.register(self.stop)
 
         click.secho("Starting Stretch Mujoco Simulator...", fg="green")
+        # Poll often so start() returns soon after the first camera frame, but
+        # only report the wait once a second.
+        last_waiting_message = time.perf_counter()
         while self.pull_status().time == 0 or self.pull_camera_data().time == 0:
-            time.sleep(1)
-            click.secho("Still waiting to connect to the Mujoco Simulator.", fg="yellow")
+            time.sleep(0.05)
+            if time.perf_counter() - last_waiting_message >= 1.0:
+                last_waiting_message = time.perf_counter()
+                click.secho("Still waiting to connect to the Mujoco Simulator.", fg="yellow")
 
             if not self.is_running():
                 click.secho("The simulator is not running anymore, quitting..", fg="yellow")
@@ -202,11 +211,31 @@ class StretchMujocoSimulator:
 
         self.home()
 
+    def _stop_from_signal(self) -> None:
+        """
+        Stop the simulator from a signal handler, without blocking the main thread.
+
+        A signal handler runs on the main thread between two of its bytecodes,
+        possibly halfway through a call to the Manager. Manager proxies keep
+        one connection per thread, so calls made from the handler could take
+        the reply the interrupted call is waiting for. On its own thread,
+        `stop()` gets its own connection. The thread is not a daemon, so the
+        interpreter waits for it before exiting.
+
+        Returns:
+            None.
+        """
+        threading.Thread(target=self.stop, name="StretchMujocoStop").start()
+
     def stop(self) -> None:
         """
-        This is called at exit to gracefully terminate the simulation and the Mujoco Process, and their many threads.
+        Stop the Mujoco process, release camera frame shared memory, and join non-daemon threads.
 
+        Called at exit, and on SIGTERM and SIGINT, so it runs at most once.
         Fingers-crossed we get a SIGTERM, and not a SIGKILL..
+
+        Returns:
+            None.
         """
         if self.is_stop_called:
             return
@@ -226,13 +255,21 @@ class StretchMujocoSimulator:
 
         self.stop_mujoco_process()
 
+        # The sim process has exited, so any camera frame segment still around
+        # was leaked by a crash.
+        self.data_proxies.close_camera_frames(unlink_leftovers=True)
+
         # We're going to try to wait for threads to end. They might not gracefully stop before hitting an exception. Race conditions are rampant.
         # For example, the main thread or a thread may not be checking `sim.is_running()` and is oblivious that it should stop. Nothing we can do to stop it except sigkill.
+        # Daemon threads are skipped: they never hold up the interpreter's exit,
+        # and they are often stopped by the caller's own cleanup, which only
+        # runs once this returns -- a Rerun logger or keyboard listener, say.
         active_threads = threading.enumerate()
         for index, thread in enumerate(active_threads):
             if (
                 thread != threading.current_thread()
                 and thread != threading.main_thread()
+                and not thread.daemon
                 and not isinstance(thread, threading._DummyThread)
             ):
                 click.secho(
