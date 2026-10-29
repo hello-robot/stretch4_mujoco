@@ -360,8 +360,11 @@ def test_full_range_wrist_motion_does_not_false_trip(harness):
     harness.cycles(800)
 
     joints = ("wrist_yaw", "wrist_pitch", "wrist_roll")
-    # Inside the joint ranges: yaw/pitch -1.135..4.276, roll -4.276..1.135.
-    for targets in ((1.5, 1.0, -1.5), (-1.0, -1.0, 1.0), (0.0, 0.0, 0.0)):
+    # Inside the joint ranges: -1.135..4.276 for all three, as the generator
+    # mirrors the URDF's roll range (see FLIP_WRIST_ROLL_RANGE). Roll stays
+    # positive while yaw and pitch are at -1.0: rolling negative there drives
+    # the gripper into arm_l4_link, a real contact the guard rightly trips on.
+    for targets in ((1.5, 1.0, -1.0), (-1.0, -1.0, 1.5), (0.0, 0.0, 0.0)):
         for joint, target in zip(joints, targets):
             server._set_actuator_position(joint, target)
         harness.cycles(900)
