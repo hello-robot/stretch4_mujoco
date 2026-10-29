@@ -4,6 +4,8 @@ from functools import cache
 import mujoco
 import mujoco._structs
 
+from stretch4_mujoco.enums.line_sensor import line_sensor_site_name
+
 
 class StretchSensors(Enum):
     """
@@ -19,6 +21,7 @@ class StretchSensors(Enum):
     The sim's counterpart to the robot IMU's `qw`..`qz`, and the input to
     `StatusStretchSensors.gravity_tilt`.
     """
+    line_sensors = 4
 
     @staticmethod
     def all() -> list["StretchSensors"]:
@@ -64,6 +67,10 @@ class StretchSensors(Enum):
                 if site_name and "lidar" in site_name:
                     sensors.add(StretchSensors.base_lidar)
                     break
+
+        if StretchSensors.line_sensors in remaining_sensors:
+            if mujoco.mj_name2id(mjmodel, mujoco.mjtObj.mjOBJ_SITE, line_sensor_site_name(0)) != -1:
+                sensors.add(StretchSensors.line_sensors)
 
         return list(sensors)
 
