@@ -1053,9 +1053,25 @@ class GamepadTeleop:
         return self.gamepad_controller
 
 
-def _build_flying_gripper_controller(sim: StretchMujocoSimulator):
-    """Builds the same `KinematicController` the robot uses, from a planar-IK URDF
-    generated for the simulated robot model."""
+def _build_flying_gripper_controller(sim: StretchMujocoSimulator) -> object:
+    """
+    Build the same KinematicController the robot uses, from a planar-IK URDF
+    generated for the simulated robot model.
+
+    Writes the generated URDF to a new temporary directory and prints its path.
+
+    Args:
+        sim: The simulator whose robot model the IK controller is built for.
+
+    Returns:
+        A stretch4_flying_gripper KinematicController for the simulated robot.
+
+    Raises:
+        NotImplementedError: If the simulator is not a Stretch 4, or if
+            stretch4_flying_gripper is not installed, which is the case on
+            Windows because pinocchio has no Windows wheels.
+    """
+    import sys
     import tempfile
 
     if not isinstance(sim, Stretch4MujocoSimulator):
@@ -1064,7 +1080,13 @@ def _build_flying_gripper_controller(sim: StretchMujocoSimulator):
             f"for {type(sim).__name__}."
         )
 
-    from stretch4_flying_gripper.kinematic_controller import KinematicController
+    try:
+        from stretch4_flying_gripper.kinematic_controller import KinematicController
+    except ImportError as e:
+        raise NotImplementedError(
+            f"FLYING_GRIPPER_IK is not supported on this platform ({sys.platform}): "
+            "hello-robot-stretch4-flying-gripper is not installed."
+        ) from e
     from stretch4_urdf import make_planar_ik_urdf
     from yourdfpy import urdf as ud
 

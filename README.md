@@ -86,6 +86,8 @@ Mirror motion between the sim and a real Stretch 4 over the network. Commands is
 forwarded to the robot as the same `RobotClient` command, and the robot's joint status is followed
 back into the sim, so moving either side moves the other.
 
+The `digital-twin` extra is Linux-only.
+
 ```
 uv pip install -e ".[digital-twin]"
 uv run examples/digital_twin.py --robot_ip 192.168.1.10
@@ -119,6 +121,17 @@ uv run examples/robocasa_environment.py
 ```
 
 Ignore any warnings.
+
+[MolmoSpaces environments](./examples/molmo_environment.py)
+
+Spawn Stretch into a [MolmoSpaces](https://github.com/allenai/molmospaces) house. The `molmo`
+extra is Linux-only: one of its dependencies, `eva-decord`, has no macOS wheel or source
+distribution.
+
+```
+uv pip install -e ".[molmo]"
+uv run python -m examples.molmo_environment --dataset procthor-10k --house-index 0
+```
 
 ## Writing Code
 
