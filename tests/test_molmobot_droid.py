@@ -333,6 +333,26 @@ def test_run_name_joins_flags_with_underscores():
     )
 
 
+def test_failures_split_into_out_of_reach_and_stuck_on_ik():
+    from examples.vla.molmobot_droid.molmospaces.benchmark import EpisodeResult, failure_table
+
+    def result(index, distance, height=0.8, ik_failures=0, steps=100):
+        scene = {"episode": f"ep{index:04d}", "target_start_pose": [distance, 0.0, height, 1, 0, 0, 0],
+                 "stretch_robot_pose": [0.0, 0.0, 0.0]}
+        return EpisodeResult(index, "", "", "", steps=steps, metrics={"ik_failures": ik_failures}, scene=scene)
+
+    rows = {
+        line.split(" | ")[0].lstrip("| "): line.split(" | ")[3].rstrip(" |")
+        for line in failure_table([
+            result(0, 0.70), result(1, 0.50, height=1.15), result(2, 0.50, ik_failures=25), result(3, 0.50, ik_failures=24),
+        ])
+        if line.startswith("| ") and "Episodes" not in line
+    }
+    assert next(v for k, v in rows.items() if k.startswith("Target out of reach")) == "ep0000, ep0001"
+    assert next(v for k, v in rows.items() if k.startswith("Reachable target, stuck")) == "ep0002"
+    assert rows["Reachable target, rollout failed"] == "ep0003"
+
+
 @pytest.mark.parametrize("use_parallel_gripper", [False, True])
 def test_default_grasp_offset_per_tool(use_parallel_gripper):
     from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import DEFAULT_GRASP_OFFSET_MM

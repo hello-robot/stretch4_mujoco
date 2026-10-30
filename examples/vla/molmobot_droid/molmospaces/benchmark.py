@@ -193,6 +193,31 @@ def above_mast(scene: dict) -> bool:
     return height is not None and height > STRETCH_MAST_HEIGHT
 
 
+STRETCH_REACH = 0.64
+"""m. How far, horizontally, from Stretch 4's footprint (where the virtual Franka's `fr3_link0`
+stands) a target can start for Stretch to follow the Franka's grasps of it. Offline, the
+retargeting IK from the custom start pose (parallel gripper, no wrist flips mid-rollout) reached
+top-down grasps at every heading out to 0.64 m, 80% of them at 0.68-0.72 m, and none at 0.80 m."""
+
+STRETCH_MAX_TARGET_HEIGHT = 1.10
+"""m. Pointing straight down at the top of its lift, Stretch 4's parallel gripper reaches 1.15 m;
+a target (whose origin is about its centre) higher than this less 5 cm is out of reach."""
+
+
+def stretch_target_distance(scene: dict) -> float | None:
+    """How far, horizontally, a `scene_record()`'s target starts from Stretch 4's footprint (m),
+    or None in a run without Stretch 4 (or from before its footprint was recorded)."""
+    pose = scene.get("stretch_robot_pose") if scene else None
+    return math.dist(pose[:2], scene["target_start_pose"][:2]) if pose else None
+
+
+def out_of_reach(scene: dict) -> bool:
+    """Whether, in a run with Stretch 4, a `scene_record()`'s target starts further than
+    STRETCH_REACH from its footprint or higher than STRETCH_MAX_TARGET_HEIGHT."""
+    distance = stretch_target_distance(scene)
+    return distance is not None and (distance > STRETCH_REACH or target_height(scene) > STRETCH_MAX_TARGET_HEIGHT)
+
+
 # ---------------------------------------------------------------------------
 # Success
 # ---------------------------------------------------------------------------
@@ -795,6 +820,14 @@ SETUP_ERRORS = {
 IK_LIMITED_BINS = ((0.0, 0.0), (0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 1.0))
 """Ranges (low, high] of the share of an episode's steps that were IK-limited; (0, 0] is none."""
 
+STUCK_IK_SHARE = 0.25
+"""A failed rollout is stuck on IK when Stretch 4 could not follow (`ik_failures`) at least this
+share of its steps: it held still for them."""
+
+
+def stuck_on_ik(result: EpisodeResult) -> bool:
+    return result.steps > 0 and result.metrics.get("ik_failures", 0) >= STUCK_IK_SHARE * result.steps
+
 
 def error_cause(error: str) -> str:
     for text, cause in SETUP_ERRORS.items():
@@ -806,9 +839,10 @@ def error_cause(error: str) -> str:
 def failure_table(results: list[EpisodeResult]) -> list[str]:
     """
     The report's breakdown of the episodes that did not succeed: errors by cause (the start pose,
-    spawning clear of the scene, anything else), targets above the mast, and the reachable
-    failed rollouts by the share of their steps Stretch 4 could not reach exactly
-    (`ik_clamped` + `ik_failures`), next to the successes' for comparison.
+    spawning clear of the scene, anything else), targets above the mast, targets out of Stretch
+    4's reach (`out_of_reach()`), reachable ones Stretch 4 got stuck on (`stuck_on_ik()`), the
+    rest; and the reachable failed rollouts by the share of their steps Stretch 4 could not reach
+    exactly (`ik_clamped` + `ik_failures`), next to the successes' for comparison.
     """
     failed = [r for r in results if not r.success]
     if not failed:
@@ -832,10 +866,17 @@ def failure_table(results: list[EpisodeResult]) -> list[str]:
     lines += [row(cause, causes[cause]) for cause in order if cause in causes]
     rollouts = [r for r in failed if r.error is None]
     above = [r for r in rollouts if above_mast(r.scene)]
-    reachable = [r for r in rollouts if not above_mast(r.scene)]
+    beyond = [r for r in rollouts if not above_mast(r.scene) and out_of_reach(r.scene)]
+    reachable = [r for r in rollouts if not above_mast(r.scene) and not out_of_reach(r.scene)]
     if above:
         lines.append(row(f"Target above the {STRETCH_MAST_HEIGHT} m mast", above))
-    lines.append(row("Reachable target, rollout failed", reachable))
+    if any(stretch_target_distance(r.scene) is not None for r in results):
+        lines.append(row(f"Target out of reach (over {STRETCH_REACH} m from Stretch 4's footprint, or above "
+                         f"{STRETCH_MAX_TARGET_HEIGHT} m)", beyond))
+    if any("ik_failures" in r.metrics for r in results):
+        lines.append(row(f"Reachable target, stuck because of IK (Stretch 4 could not follow {STUCK_IK_SHARE:.0%} "
+                         "or more of the steps)", [r for r in reachable if stuck_on_ik(r)]))
+    lines.append(row("Reachable target, rollout failed", [r for r in reachable if not stuck_on_ik(r)]))
     lines.append("")
 
     if not any("ik_clamped" in r.metrics or "ik_failures" in r.metrics for r in results):
