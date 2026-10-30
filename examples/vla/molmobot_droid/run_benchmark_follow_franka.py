@@ -204,6 +204,11 @@ def main(benchmark, episodes, max_episodes, out, checkpoint, run_to_horizon, res
                     result = failed_result(index, setup, error)
                 finally:
                     sim.stop()
+                pose = stretch_scene.robot_pose
+                result.scene |= {
+                    "stretch_robot_pose": [pose.x, pose.y, pose.yaw],
+                    "removed_furniture": list(stretch_scene.removed_bodies),
+                }
                 print_result(run.current, result, out_dir)
                 run.record(result)
             saved = sum(bool(r.metrics.get("saved")) for r in run.results)
