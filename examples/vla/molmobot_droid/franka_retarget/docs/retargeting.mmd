@@ -1,0 +1,78 @@
+---
+config:
+  flowchart:
+    wrappingWidth: 420
+    nodeSpacing: 30
+    rankSpacing: 40
+---
+flowchart LR
+    POLICY(["MolmoBot-DROID<br/>believes it drives a Franka FR3 + Robotiq"])
+    ROBOT[["Stretch 4 — simulator or real robot<br/>moves, then reports its joints and base pose"]]
+    NEXT(["the policy's next observation:<br/>state8 + exo and wrist images"])
+
+    subgraph FWD["① Franka action → Stretch targets · franka_to_stretch()"]
+        direction TB
+        A["<b>action8</b>: 7 FR3 joint positions (rad) + gripper 0–255<br/>limited to ≤ 0.2 rad per joint from the last state8 (rollout.py)"]
+        FK["<b>Franka FK</b> (droid.FrankaKinematics) → grasp_site pose in fr3_link0"]
+        MOUNT["<b>× world_from_link0</b>: the virtual Franka stands over Stretch's starting footprint,<br/>at the training height for the object, turned by franka_yaw_for_start()"]
+        ALIGN["<b>× TCP_ALIGN × grasp offset</b>: Franka TCP (+z approach) → Stretch grasp_center_link<br/>(+x approach), camera-aligned; then --grasp-offset-mm / --grasp-offset-deg"]
+        LOCAL["<b>into Stretch's current base_footprint</b><br/>× tool_correction⁻¹ (PG4 TCP → SG4 TCP; identity for SG4)"]
+        IK["<b>solve_stretch_ik()</b> — stretch4_kinematics, pinocchio CLIK, 6 DOF:<br/>base rotation, lift, arm, wrist yaw / pitch / roll<br/>roll limits −65°…245° and the 40.75 mm arm offset corrected<br/>multi-start: current joints + 8 canonical wrist poses"]
+        PICK{"exact?<br/>1 mm, 0.5°"}
+        PREF["<b>pick among exact solutions</b>: 0.15 rad clear of wrist limits first;<br/>start pose → least base turn, most wrist room;<br/>afterwards → least change, no base/wrist jump > 45°"]
+        CLOSE{"closest pose<br/>≤ 5 cm and ≤ 20°?"}
+        TWIST{"&gt; 20° off: twist_to_reach()<br/>target turned ≤ 60° about the<br/>approach axis reachable?"}
+        CLAMPED["<b>clamped</b> → ik_clamped"]
+        TWISTED["<b>twisted</b> → ik_twisted + ik_clamped<br/>position kept, grasp turned less"]
+        FAIL["<b>None</b> → ik_failures, last_miss<br/>Stretch holds; only the gripper is sent<br/>(real robot: --recover-after in a row → start pose)"]
+        T["<b>StretchTargets</b>: base_rotate_by (relative), lift, arm,<br/>wrist yaw / pitch / roll, gripper closed?<br/>lift and arm held 2 mm inside their end stops"]
+        A --> FK --> MOUNT --> ALIGN --> LOCAL --> IK --> PICK
+        PICK -- yes --> PREF --> T
+        PICK -- no --> CLOSE
+        CLOSE -- yes --> CLAMPED --> T
+        CLOSE -- no --> TWIST
+        TWIST -- yes --> TWISTED --> T
+        TWIST -- no --> FAIL
+    end
+
+    subgraph REV["② Stretch joints → Franka state · stretch_to_franka()"]
+        direction TB
+        J["<b>StretchJoints + world_from_footprint</b><br/>lift, arm, wrist yaw / pitch / roll, gripper open fraction"]
+        SFK["<b>Stretch FK</b> (stretch4_kinematics, arm offset corrected)<br/>× tool_correction → the real tool's grasp_center_link in the world"]
+        UNDO["<b>× grasp offset⁻¹</b>, into fr3_link0, <b>× TCP_ALIGNᵀ</b><br/>→ the Franka grasp_site pose that matches"]
+        FIK["<b>Franka damped-least-squares IK</b> (droid.FrankaKinematics)<br/>seeded with the last action, then the last state, then home,<br/>so the redundant elbow does not flip"]
+        GRIP["<b>gripper</b>: open fraction → Robotiq driver angle<br/>0.003 open … 0.824 closed"]
+        S8["<b>state8</b>: 7 FR3 joints + driver angle"]
+        J --> SFK --> UNDO --> FIK --> S8
+        J --> GRIP --> S8
+    end
+
+    subgraph IMGS["③ Stretch's cameras → the policy's views · observe()"]
+        direction TB
+        HEADRAW["<b>head fisheye</b> (exo): sim 1920×1200, real 1280×800 MJPEG (the publisher's default)<br/>turned upright: 1200×1920, 800×1280"]
+        RECTQ{"--rectify?"}
+        CROP["<b>to_droid_frame()</b>: centre crop to 640:368 (1200×690, 800×460), 136° × 77°,<br/>squeezed toward the edges; INTER_AREA → 640×368"]
+        RECT["<b>FisheyeRectifier</b>: redrawn as the DROID exo pinhole (102° × 71°) on the lens axis;<br/>remap → 1280×736, INTER_AREA → 640×368"]
+        GRIPRAW["<b>gripper camera</b> (wrist): 640×400 (sim; real at --wrist_resolution 400)"]
+        WRIST["<b>wrist_view()</b>: centre crop → 640×368<br/>(--apply_franka_gripper_image_mismatch_fix: remapped to 640×368)"]
+        MODEL["<b>MolmoBot's preprocessor</b>: each 640×368 view squashed to 378×378 (bilinear),<br/>27×27 SigLIP patches of 14 px, pooled 2×2; now and 8 steps back"]
+        HEADRAW --> RECTQ
+        RECTQ -- no --> CROP --> MODEL
+        RECTQ -- yes --> RECT --> MODEL
+        GRIPRAW --> WRIST --> MODEL
+    end
+
+    POLICY --> FWD
+    FWD --> ROBOT
+    ROBOT --> REV
+    REV --> NEXT
+    ROBOT --> IMGS
+    IMGS --> NEXT
+
+    classDef miss fill:#fde2e1,stroke:#c0392b,color:#000
+    classDef warn fill:#fff4d6,stroke:#c79100,color:#000
+    classDef ok fill:#e3f4e8,stroke:#2e7d4f,color:#000
+    class FAIL miss
+    class CLAMPED,TWISTED warn
+    class T,S8 ok
+    class NEXT,POLICY ok

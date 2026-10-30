@@ -1,0 +1,297 @@
+"""
+Fine-tune MolmoBot-DROID to drive Stretch 4, on the Stretch 4 trajectories
+`run_benchmark_follow_franka.py` saves, with MolmoBot's own trainer (`finetune/train.py`).
+
+--action_space says what the fine-tuned policy's state and actions are:
+- stretch4 (default): Stretch 4's joints, the ones retargeting moves
+  (`finetune/stretch4_joints.py`): base heading, lift, arm, wrist yaw/pitch/roll, an unused slot
+  and the gripper, in the Franka's 8 slots so the pretrained action head loads. It drives Stretch
+  directly. Its normalization is computed from the trajectories.
+- franka: the Franka's 7 joints and gripper, as MolmoBot-DROID's, from what the Franka did in the
+  same trajectories; only what the policy sees is Stretch's. It drives Stretch through
+  retargeting, as MolmoBot-DROID itself does. Its normalization is the checkpoint's, so the
+  pretrained action head's outputs keep their meaning.
+The `*_finetuned_*` runners read which from the run's `spec.json`. Its exo view is a
+head fisheye, DROID-framed (--use_fisheye: left, right, or `tool`, the one on the tool's side each
+step, as `run_stretch4_sim.py` and the real robot pick it; with --use_rectified_fisheye, redrawn
+as the DROID exo camera instead, as --rectify does), and its wrist view a gripper camera
+(--use_gripper), 2 frames 8 steps apart each, as MolmoBot-DROID's are. Everything else about the
+model is the checkpoint's.
+
+What is trained. The LLM stays frozen: on 32 GB, its weights and gradients alone would not fit.
+- --use_action_head (default): the flow-matching action expert, which turns the LLM's features
+  into actions. --no-use_action_head freezes it.
+- --use_vision_transformer: the SigLIP2 vision encoder and its connector into the LLM, to adapt
+  them to Stretch's cameras. Off by default: it backpropagates through the whole LLM, so each
+  step costs several times as much.
+The optimizer is 8-bit AdamW (bitsandbytes).
+
+Training runs on one GPU under torchrun, in MolmoBot's own venv (`molmobot/MolmoBot/.venv`,
+Python 3.11, git-ignored with the clone). To set it up:
+
+    git clone https://github.com/allenai/MolmoBot.git examples/vla/molmobot_droid/molmobot
+    cd examples/vla/molmobot_droid/molmobot/MolmoBot
+    uv sync --extra train --python 3.11
+    uv pip install --python .venv/bin/python --reinstall-package torch --reinstall-package torchvision \\
+        --reinstall-package torchaudio torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \\
+        --index-url https://download.pytorch.org/whl/cu128
+    uv pip install --python .venv/bin/python bitsandbytes
+
+(The lock's torch is the CUDA 12.6 build, which has no kernels for Blackwell GPUs like the RTX
+5090; the cu128 one does.)
+
+Writes to <out>/<run name>/:
+- `dataset/`: links to the episodes' run directories, split into train and val (with
+  --action_space franka, the episodes' Franka copies and links to their videos);
+- `norm_stats.yaml`: the state and action normalization, computed (or with --action_space franka,
+  copied from the checkpoint) on the first run;
+- `spec.json`: what `finetune/train.py` was given;
+- `metrics.jsonl`: every step's metrics and every validation's, and `metrics.png`, all of them
+  across steps in one figure (losses, learning rates, gradient norms, throughput, GPU memory),
+  redrawn every --plot-interval steps and when training ends or stops (`plot_finetune.py` draws
+  it any time);
+- MolmoBot's checkpoints: `step<N>/` every --save-interval steps, sharded, with the optimizer
+  state: the latest, for resuming (run the same command again; Ctrl+C does not save one first),
+  and every --keep-interval steps'. And the final `step<steps>-unsharded/` (the model alone),
+  which `checkpoint.load_policy()` loads.
+
+Usage:
+    python -m examples.vla.molmobot_droid.run_finetune --use_parallel_gripper \\
+        --data outputs/molmobot_droid/finetuning/data/follow_franka_eh-8_n-8_slow-0_wait-0_pg-1_offmm-4,0,0_offdeg-0,0,0
+    python -m examples.vla.molmobot_droid.run_finetune --data outputs/molmobot_droid/finetuning/data --use_parallel_gripper \\
+        --use_fisheye right --use_gripper right --use_vision_transformer --no-use_action_head
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --use_fisheye tool \
+        --use_rectified_fisheye
+    # The Franka's joints out, Stretch's cameras in: run through retargeting.
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --action_space franka
+    # Check the whole pipeline in a few minutes: a tiny randomly initialized model, 20 steps.
+    python -m examples.vla.molmobot_droid.run_finetune --data ... --use_parallel_gripper --debug --steps 20
+    # Any of MolmoBot's TrainConfig options after --, e.g. the action expert's learning rate:
+    python -m examples.vla.molmobot_droid.run_finetune --data ... -- --optimizer.action_expert_learning_rate=3e-5
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import traceback
+from pathlib import Path
+
+import click
+
+from examples.vla.molmobot_droid.checkpoint import MOLMOBOT_LOCAL_DIR, download_checkpoint
+from examples.vla.molmobot_droid.finetune.dataset import ACTION_SPACES, build_dataset, find_episodes
+from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import PARALLEL_GRIPPER_TOOL, STRETCH_GRIPPER_TOOL
+from examples.vla.molmobot_droid.plot_finetune import METRICS_FILE, latest_step, plot_metrics
+
+MOLMOBOT_DIR = MOLMOBOT_LOCAL_DIR / "MolmoBot"
+TORCHRUN = MOLMOBOT_DIR / ".venv" / "bin" / "torchrun"
+TRAIN_SCRIPT = Path(__file__).parent / "finetune" / "train.py"
+PRESET = "stretch4"
+"""The action and camera preset `finetune/train.py` registers (its PRESET)."""
+
+PLOT_POLL_SECONDS = 15
+"""How often, while training, the metrics are checked for --plot-interval more steps."""
+
+VAL_MAX_EXAMPLES = 256
+"""Val examples per evaluation: a few minutes at most, every --val-interval steps."""
+
+TRAINING_ENV = {
+    # As MolmoBot's README sets them for training.
+    "OLMO_SHARED_FS": "1",
+    "OMP_NUM_THREADS": "8",
+    "LOG_FILTER_TYPE": "rank0_only",
+    "OLMO_NUM_THREADS_ENV_VAR": "8",
+    "NCCL_TIMEOUT_MINUTES": "60",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
+
+
+def run_name(action_space: str, fisheye: str, rectified: bool, gripper: str, parallel_gripper: bool, action_head: bool,
+             vit: bool, steps: int, debug: bool) -> str:
+    return (
+        f"{action_space}_fish-{fisheye}{'-rect' if rectified else ''}_grip-{gripper}_pg-{int(parallel_gripper)}_ah-{int(action_head)}_vit-{int(vit)}"
+        f"_steps-{steps}" + ("_debug" if debug else "")
+    )
+
+
+@click.command(context_settings={"ignore_unknown_options": True})
+@click.option("--data", multiple=True, required=True, type=click.Path(exists=True, path_type=Path),
+              help="A run directory of run_benchmark_follow_franka.py, or a directory holding several: every "
+              "trajectory saved under it is used (that matches the gripper and has the cameras). Repeatable.")
+@click.option("--action_space", "--action-space", "action_space", type=click.Choice(list(ACTION_SPACES)),
+              default="stretch4", show_default=True,
+              help="The policy's state and actions: Stretch 4's joints, driving it directly, or the Franka's "
+              "(what the Franka did in the same trajectories), driving Stretch through retargeting. Its "
+              "cameras are Stretch's either way.")
+@click.option("--use_fisheye", "--use-fisheye", "use_fisheye", type=click.Choice(["left", "right", "tool"]),
+              default="left", show_default=True,
+              help="The head fisheye, DROID-framed, that is the policy's exo view: tool is the one on the tool's "
+              "side each step (fisheye_tool), as run_stretch4_sim.py and the real robot pick it.")
+@click.option("--use_rectified_fisheye", "--use-rectified-fisheye", "use_rectified_fisheye", is_flag=True,
+              help="The --use_fisheye fisheye redrawn as the DROID exo camera (its _rectified video, as --rectify "
+              "draws it) instead of only cropped to its aspect.")
+@click.option("--use_gripper", "--use-gripper", "use_gripper", type=click.Choice(["left", "right"]), default="left",
+              show_default=True, help="The gripper camera that is the policy's wrist view.")
+@click.option("--use_parallel_gripper", "--use-parallel-gripper", "use_parallel_gripper", is_flag=True,
+              help="Train on the trajectories recorded with the parallel jaw gripper (PG4) instead of the "
+              "Stretch gripper (SG4).")
+@click.option("--use_action_head/--no-use_action_head", "--use-action-head/--no-use-action-head", "use_action_head",
+              default=True, show_default=True, help="Train the action expert (the action head).")
+@click.option("--use_vision_transformer/--no-use_vision_transformer",
+              "--use-vision-transformer/--no-use-vision-transformer", "use_vision_transformer", default=False,
+              show_default=True, help="Train the vision transformer and its connector into the LLM.")
+@click.option("--steps", type=int, default=50_000, show_default=True, help="Optimizer steps.")
+@click.option("--global-batch-size", type=int, default=32, show_default=True, help="Examples per optimizer step.")
+@click.option("--device-batch-size", type=int, default=8, show_default=True,
+              help="Examples per forward pass; the rest of a step's are gradient accumulation.")
+@click.option("--val-fraction", type=float, default=0.1, show_default=True,
+              help="Of the episodes, how many are held out for validation loss.")
+@click.option("--val-interval", type=int, default=1000, show_default=True)
+@click.option("--save-interval", type=int, default=2000, show_default=True,
+              help="Steps between (sharded) checkpoints, for resuming.")
+@click.option("--keep-interval", type=int, default=10_000, show_default=True,
+              help="Keep the sharded checkpoints (model and optimizer state) at multiples of this many steps, "
+              "not only the latest. A multiple of --save-interval; 0 keeps only the latest.")
+@click.option("--plot-interval", type=int, default=50, show_default=True,
+              help="Redraw metrics.png every this many steps while training (0: only at the end).")
+@click.option("--num-workers", type=int, default=4, show_default=True, help="Data loader workers.")
+@click.option("--out", default="outputs/molmobot_droid/finetuning/models", show_default=True, type=click.Path(path_type=Path))
+@click.option("--checkpoint", default=None, help="Checkpoint to start from. Default: MolmoBot-DROID from Hugging Face.")
+@click.option("--wandb", "use_wandb", is_flag=True, help="Log to Weights & Biases (needs WANDB_PROJECT and WANDB_ENTITY).")
+@click.option("--debug", is_flag=True, help="A tiny randomly initialized model instead of the checkpoint's "
+              "weights (its config still), batch 1 and no validation: to check the pipeline end to end.")
+@click.argument("trainer_options", nargs=-1, type=click.UNPROCESSED)
+def main(data, action_space, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper, use_action_head, use_vision_transformer, steps,
+         global_batch_size, device_batch_size, val_fraction, val_interval, save_interval, keep_interval, plot_interval, num_workers, out,
+         checkpoint, use_wandb, debug, trainer_options):
+    """Fine-tune MolmoBot-DROID on Stretch 4 trajectories (see the module docstring). Options after
+    the ones here go to MolmoBot's TrainConfig, e.g. --optimizer.action_expert_learning_rate=3e-5."""
+    if not (use_action_head or use_vision_transformer):
+        raise click.UsageError("Nothing to train: give --use_action_head or --use_vision_transformer (the LLM stays frozen)")
+    if keep_interval and keep_interval % save_interval:
+        raise click.UsageError(f"--keep-interval {keep_interval} is not a multiple of --save-interval {save_interval}: "
+                               "no checkpoint would be saved at its steps")
+    if not TORCHRUN.exists():
+        raise click.ClickException(f"No MolmoBot training venv at {TORCHRUN.parent.parent}: set it up as "
+                                   "`python -m examples.vla.molmobot_droid.run_finetune --help`'s module docstring says")
+
+    tool = PARALLEL_GRIPPER_TOOL if use_parallel_gripper else STRETCH_GRIPPER_TOOL
+    exo = f"fisheye_{use_fisheye}" + ("_rectified" if use_rectified_fisheye else "")
+    cameras = [exo, f"gripper_{use_gripper}"]  # exo then wrist, as MolmoBot-DROID's
+    episodes = find_episodes(data)
+    usable = [e for e in episodes if e.tool_name == tool and set(cameras) <= set(e.cameras)]
+    other_tool = sum(e.tool_name != tool for e in episodes)
+    if not usable:
+        hint = f" ({other_tool} with the other gripper: {'drop' if use_parallel_gripper else 'add'} --use_parallel_gripper?)" if other_tool else ""
+        raise click.ClickException(f"No {tool} trajectories with {cameras} under {', '.join(map(str, data))}{hint}")
+    click.secho(
+        f"{len(usable)} trajectories, {sum(e.steps for e in usable)} steps"
+        + (f" ({len(episodes) - len(usable)} others left out)" if len(usable) < len(episodes) else ""),
+        fg="green",
+    )
+
+    name = run_name(action_space, use_fisheye, use_rectified_fisheye, use_gripper, use_parallel_gripper,
+                    use_action_head, use_vision_transformer, steps, debug)
+    save_dir = out.resolve() / name
+    counts = build_dataset(usable, save_dir / "dataset", val_fraction, action_space=action_space)
+    click.secho(f"Dataset: {save_dir / 'dataset'} ({counts['train']} train, {counts['val']} val, "
+                f"{action_space} state and actions)", fg="green")
+    checkpoint_dir = Path(checkpoint).resolve() if checkpoint else download_checkpoint()
+    stats_path = save_dir / "norm_stats.yaml"
+    if action_space == "franka" and not stats_path.exists():
+        write_checkpoint_normalization(checkpoint_dir, stats_path)
+        click.secho(f"Normalization: the checkpoint's ({stats_path})", fg="green")
+
+    validation = (
+        ["--no_val"] if counts["val"] == 0
+        else ["--val_interval", str(val_interval), "--val_max_examples", str(VAL_MAX_EXAMPLES)]
+    )
+    args = [
+        "--data_paths", str(save_dir / "dataset"),
+        "--action_preset", PRESET,
+        "--camera_preset", PRESET,
+        # --debug makes the global batch the world size: 1.
+        "--device_batch_size", str(1 if debug else device_batch_size),
+        "--global_batch_size", str(global_batch_size),
+        "--stats_path", str(stats_path),
+        "--num_workers", str(num_workers),
+        "--exp_name", name,
+        *validation,
+        *(["--debug"] if debug else []),
+        # MolmoBot's TrainConfig, as OmegaConf overrides.
+        f"--save_folder={save_dir}",
+        f"--max_duration={steps}",
+        "--ft_llm=False",
+        f"--ft_vit={use_vision_transformer}",
+        f"--ft_connector={use_vision_transformer}",
+        f"--save_interval={save_interval}",
+        "--save_final_unsharded_checkpoint=True",
+        f"--checkpoint_retention_frequency={keep_interval or 'null'}",
+        "--save_final_optim=True",  # train_molmobot.py leaves the last checkpoint's optimizer state out
+        *([] if use_wandb else ["--wandb=null"]),
+        *trainer_options,
+    ]
+    spec = {
+        "molmobot_dir": str(MOLMOBOT_DIR),
+        "checkpoint": str(checkpoint_dir),
+        "action_space": action_space,
+        "move_groups": ACTION_SPACES[action_space],
+        "cameras": cameras,
+        "train_action_head": use_action_head,
+        "tool_name": tool,
+        "metrics": str(save_dir / METRICS_FILE),
+        "args": args,
+    }
+    spec_path = save_dir / "spec.json"
+    spec_path.write_text(json.dumps(spec, indent=2))
+
+    command = [str(TORCHRUN), "--standalone", "--nproc-per-node=1", str(TRAIN_SCRIPT), str(spec_path)]
+    click.secho(f"Training {name}: {' '.join(command)}", fg="cyan")
+    env = {**TRAINING_ENV, **os.environ}
+    process = subprocess.Popen(command, env=env, cwd=MOLMOBOT_DIR)
+    try:
+        plotted = latest_step(save_dir / METRICS_FILE) // plot_interval if plot_interval else 0
+        while process.poll() is None:
+            try:
+                process.wait(timeout=PLOT_POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            if plot_interval and (reached := latest_step(save_dir / METRICS_FILE) // plot_interval) > plotted:
+                plotted = reached
+                redraw(save_dir)
+    finally:  # also when it fails or Ctrl+C stops it (Ctrl+C reaches the trainer too: let it exit)
+        process.wait()
+        figure = redraw(save_dir)
+        if figure:
+            click.secho(f"Metrics: {figure}", fg="green")
+    if process.returncode:
+        raise SystemExit(process.returncode)
+    final = save_dir / f"step{steps}-unsharded"
+    click.secho(f"Done: {final}\n  load it with checkpoint.load_policy({str(final)!r})", fg="green")
+
+
+def write_checkpoint_normalization(checkpoint_dir: Path, stats_path: Path) -> None:
+    """The checkpoint's own state and action normalization (its `config.yaml`'s
+    `model.robot_preprocessor`) as the stats file, which MolmoBot's trainer then loads instead of
+    computing one from the data."""
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.load(checkpoint_dir / "config.yaml")
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config.model.robot_preprocessor, stats_path)
+
+
+def redraw(save_dir: Path) -> Path | None:
+    """`plot_metrics`, without stopping training when drawing fails."""
+    try:
+        return plot_metrics(save_dir)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+if __name__ == "__main__":
+    main()
