@@ -12,8 +12,11 @@ of a random procthor-10k house, at random spots and headings, and lets them sett
 own objects of the same kinds are taken out, so the instruction names only one. The Franka is
 placed as molmospaces' pick datagen places it (`PickTaskSamplerConfig`, and as the
 FrankaPickDroidMiniBench episodes are): 0.35-0.7 m from the target, facing it to within 15
-degrees, its base ROBOT_OBJECT_Z_OFFSET below it, its arm at home with up to 0.05 rad of noise.
-Targets start between MIN_TARGET_HEIGHT and Stretch 4's mast, so every episode is reachable.
+degrees, its base ROBOT_OBJECT_Z_OFFSET below it, its arm at home with up to 0.05 rad of noise;
+but no further than Stretch 4 reaches: where Stretch 4 ends up standing under it (moved back to
+clear what the target rests on, `load_custom_scene_stretch4()`) is within `STRETCH_REACH` of the
+target. Targets start between MIN_TARGET_HEIGHT and `STRETCH_MAX_TARGET_HEIGHT`, so every
+episode is reachable.
 
 A benchmark is a molmospaces benchmark directory (`benchmark.json`, a list of `EpisodeSpec`s,
 and `benchmark_metadata.json`) under BENCHMARKS_DIR: written the first time it is asked for
@@ -31,7 +34,9 @@ import functools
 import io
 import json
 import math
+import shutil
 import sys
+import tempfile
 import time
 import zlib
 from collections import Counter
@@ -44,14 +49,22 @@ import click
 import mujoco
 import numpy as np
 
-from examples.vla.molmobot_droid.droid import FRANKA_HOME_QPOS, ROBOT_OBJECT_Z_OFFSET, contacts_of_subtree
-from examples.vla.molmobot_droid.molmospaces.benchmark import SCENE_VARIANT, STRETCH_MAST_HEIGHT
+from examples.vla.molmobot_droid.droid import FRANKA_HOME_QPOS, ROBOT_OBJECT_Z_OFFSET, RobotPose, contacts_of_subtree
+from examples.vla.molmobot_droid.franka_retarget.stretch4_retarget import (
+    CUSTOM_START_QPOS,
+    PARALLEL_GRIPPER_TOOL,
+    RetargetParams,
+    custom_start_link0_height,
+    franka_yaw_for_start,
+)
+from examples.vla.molmobot_droid.molmospaces.benchmark import SCENE_VARIANT, STRETCH_MAX_TARGET_HEIGHT, STRETCH_REACH
 from examples.vla.molmobot_droid.molmospaces.custom_scene import (
     INSERT_DROP_HEIGHT,
     Asset,
     CustomScene,
     added_object_name,
     find_asset,
+    load_custom_scene_stretch4,
     resolve_scene_xml,
     robot_footprint_clear,
     thor_prefabs,
@@ -98,6 +111,9 @@ MIN_TARGET_HEIGHT = 0.6
 """m. About the MiniBench's lowest targets (its 5th percentile, 0.65 m; median 0.95 m): no sofa seats."""
 MAX_ATTEMPTS = 200
 """Houses tried for one episode before giving up."""
+STRETCH_PLACEMENT_TRIES = 10
+"""Franka placements on clear floor checked for where Stretch 4 would stand (seconds each) before
+the surface is given up on."""
 
 
 class Rejected(Exception):
@@ -137,7 +153,13 @@ def generate_benchmark(kind: str, object_type: str, episodes: int, workers: int 
     started = time.time()
     jobs = [(kind, object_type, index) for index in range(episodes)]
     specs = []
-    with ProcessPoolExecutor(workers, mp_context=get_context("spawn")) as pool:
+    with (
+        tempfile.TemporaryDirectory() as stretch_dir,
+        ProcessPoolExecutor(
+            workers, mp_context=get_context("spawn"), initializer=_use_stretch_xml,
+            initargs=(freeze_stretch_xml(Path(stretch_dir)),),
+        ) as pool,
+    ):
         for spec in pool.map(_generate_episode_job, jobs, chunksize=4):
             specs.append(EpisodeSpec.model_validate(spec).model_dump())
             if len(specs) % 50 == 0 or len(specs) == episodes:
@@ -169,6 +191,35 @@ def metadata(kind: str, object_type: str, specs: list[dict]) -> dict:
 
 def _generate_episode_job(job: tuple[str, str, int]) -> dict:
     return generate_episode(*job)
+
+
+_stretch_xml: str | None = None
+"""The Stretch 4 MJCF `stretch_distance()` builds scenes with: `freeze_stretch_xml()`'s."""
+
+
+def _use_stretch_xml(path: str) -> None:
+    global _stretch_xml
+    _stretch_xml = path
+
+
+def freeze_stretch_xml(directory: Path) -> str:
+    """
+    Generate the parallel-gripper Stretch 4 MJCF and copy it, with the generated files it
+    includes, into `directory`; returns the copy's path. Every scene built from it reads the
+    same files: generating it per scene rewrites one set of files in stretch4_mujoco's models
+    directory, which other processes generating at the same time read half-written.
+    """
+    from stretch4_mujoco import utils
+    from stretch4_mujoco.stretch4_mujoco_simulator import Stretch4MujocoSimulator
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        generated = Path(Stretch4MujocoSimulator.get_robot_xml_path(PARALLEL_GRIPPER_TOOL))
+    # It includes the files it was generated with by absolute path: point those at the copies.
+    models, copy = Path(utils.models_path) / "stretch_4", directory / "stretch_4"
+    shutil.copytree(models, copy, dirs_exist_ok=True)
+    frozen = directory / generated.name
+    frozen.write_text(generated.read_text().replace(f'"{models.as_posix()}/', f'"{copy.as_posix()}/'))
+    return str(frozen)
 
 
 def generate_episode(kind: str, object_type: str, index: int) -> dict:
@@ -260,9 +311,12 @@ def episode_in_house(house: int, assets: list[Asset], target: int, rng: np.rando
     )
     model, data, settled = settle(scene, surface)
     target_pose = settled[names[target]]
-    if not MIN_TARGET_HEIGHT <= target_pose[2] <= STRETCH_MAST_HEIGHT:
+    if not MIN_TARGET_HEIGHT <= target_pose[2] <= STRETCH_MAX_TARGET_HEIGHT:
         raise Rejected(f"{surface} puts the target at {target_pose[2]:.2f} m")
-    robot_base_pose = place_franka(model, data, names[target], target_pose, rng)
+    settled_scene = replace(
+        scene, object_pos=np.array(target_pose[:3]), object_quat=np.array(target_pose[3:]), object_poses=settled
+    )
+    robot_base_pose = place_franka(model, data, settled_scene, target_pose, rng)
 
     label = assets[target].label
     arm = np.asarray(FRANKA_HOME_QPOS) + rng.uniform(-ARM_QPOS_NOISE, ARM_QPOS_NOISE, len(FRANKA_HOME_QPOS))
@@ -396,21 +450,55 @@ def settle(scene: CustomScene, surface: str) -> tuple[mujoco.MjModel, mujoco.MjD
 
 
 def place_franka(
-    model: mujoco.MjModel, data: mujoco.MjData, target: str, target_pose: list[float], rng: np.random.Generator,
+    model: mujoco.MjModel, data: mujoco.MjData, scene: CustomScene, target_pose: list[float], rng: np.random.Generator,
     tries: int = 100,
 ) -> list[float]:
     """The Franka's `robot_base_pose` (x, y, z, qw, qx, qy, qz): ROBOT_DISTANCE from the target,
-    on clear floor, the target in sight, facing it to within ROBOT_YAW_NOISE."""
-    target_id = model.body(target).id
+    on clear floor, the target in sight, facing it to within ROBOT_YAW_NOISE, and Stretch 4
+    standing under it within STRETCH_REACH of the target (`stretch_distance()`)."""
+    target_id = model.body(scene.object_name).id
     low, high = world_aabb(model, data, target_id)
     sight = (low + high) / 2  # its body's origin can be at its bottom, level with the surface
+    stretch_tries = 0
     for _ in range(tries):
-        angle, distance = rng.uniform(0, 2 * math.pi), rng.uniform(*ROBOT_DISTANCE)
+        angle, distance = rng.uniform(0, 2 * math.pi), rng.uniform(ROBOT_DISTANCE[0], min(ROBOT_DISTANCE[1], STRETCH_REACH))
         x, y = target_pose[0] - distance * math.cos(angle), target_pose[1] - distance * math.sin(angle)
         if robot_footprint_clear(model, data, target_id, sight, x, y, floor_z=0.0):
             yaw = angle + rng.uniform(-ROBOT_YAW_NOISE, ROBOT_YAW_NOISE)
-            return [x, y, target_pose[2] + ROBOT_OBJECT_Z_OFFSET, math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
-    raise Rejected(f"No clear floor for the Franka near {target}")
+            if stretch_distance(scene, RobotPose(x, y, yaw)) <= STRETCH_REACH:
+                return [x, y, target_pose[2] + ROBOT_OBJECT_Z_OFFSET, math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
+            stretch_tries += 1
+            if stretch_tries == STRETCH_PLACEMENT_TRIES:
+                raise Rejected(f"Stretch 4 stands out of reach of {scene.object_name} wherever the Franka goes")
+    raise Rejected(f"No clear floor for the Franka near {scene.object_name}")
+
+
+@functools.cache
+def _stretch_start() -> tuple[float, float]:
+    """(fr3_link0 height above the floor, the Franka's yaw from Stretch 4's) the runners use with
+    the parallel gripper and --custom_franka_start_pose."""
+    params = RetargetParams(use_parallel_gripper=True)
+    height = custom_start_link0_height(params, 0.0)
+    return height, franka_yaw_for_start(params, height, CUSTOM_START_QPOS)
+
+
+def stretch_distance(scene: CustomScene, pose: RobotPose) -> float:
+    """
+    How far, horizontally, Stretch 4 stands from the target (m) when the Franka is put at `pose`:
+    `load_custom_scene_stretch4()` moves both back until Stretch clears what the target rests on,
+    as the runners do (with the parallel gripper and --custom_franka_start_pose: other tools and
+    start poses turn Stretch a few degrees differently). Infinite where Stretch cannot stand.
+    """
+    link0_height, franka_yaw = _stretch_start()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            stretch_scene = load_custom_scene_stretch4(
+                scene, pose, tool_name=PARALLEL_GRIPPER_TOOL, link0_height=link0_height, stretch_yaw=-franka_yaw,
+                robot_xml_path=_stretch_xml,
+            )
+    except RuntimeError:  # still collides with the scene
+        return math.inf
+    return math.dist((stretch_scene.robot_pose.x, stretch_scene.robot_pose.y), scene.object_pos[:2])
 
 
 @click.command()

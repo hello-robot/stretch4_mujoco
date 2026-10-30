@@ -729,11 +729,16 @@ def load_custom_scene_stretch4(
     clear_footprint: bool = True,
     stretch_yaw: float = 0.0,
     keep_removed_for_franka: bool = False,
+    robot_xml_path: str | None = None,
 ) -> Stretch4Scene:
     """
     The scene with Stretch 4 standing at `robot_pose`, compiled for
     `Stretch4MujocoSimulator(model=...)`. Stretch faces `stretch_yaw` (rad) to the left of
     `robot_pose`'s heading, the Franka along it: see `franka_yaw_for_start()`.
+
+    `robot_xml_path` is the Stretch MJCF to put in; by default it is generated again, with
+    `tool_name`, into stretch4_mujoco's models directory (which processes building scenes at
+    the same time would overwrite under each other).
 
     `keep_removed_for_franka` keeps the furniture `clear_footprint` removes for the Franka's own
     views (`keep_for_franka_views()`, drawn by `SceneMirror.render_with_franka()`'s
@@ -755,7 +760,8 @@ def load_custom_scene_stretch4(
     pose, backed_off = robot_pose, 0.0
     for _ in range(4):
         stretch_scene = _build_stretch4_scene(
-            scene, pose, include_franka, tool_name, link0_height, removed, stretch_yaw, keep_removed_for_franka
+            scene, pose, include_franka, tool_name, link0_height, removed, stretch_yaw, keep_removed_for_franka,
+            robot_xml_path,
         )
         if not clear_footprint:
             return stretch_scene
@@ -845,6 +851,7 @@ def _build_stretch4_scene(
     removed: list[str],
     stretch_yaw: float = 0.0,
     keep_removed_for_franka: bool = False,
+    robot_xml_path: str | None = None,
 ) -> "Stretch4Scene":
     from examples.molmo_environment import add_stretch_to_scene
 
@@ -856,7 +863,8 @@ def _build_stretch4_scene(
         remove_objects(spec, removed)
     stretch_pose = RobotPose(robot_pose.x, robot_pose.y, robot_pose.yaw + stretch_yaw)
     add_stretch_to_scene(
-        spec, pos=[robot_pose.x, robot_pose.y, scene.floor_z], quat=stretch_pose.quat_wxyz, tool_name=tool_name
+        spec, pos=[robot_pose.x, robot_pose.y, scene.floor_z], quat=stretch_pose.quat_wxyz, tool_name=tool_name,
+        robot_xml_path=robot_xml_path,
     )
     height = link0_height if link0_height is not None else virtual_franka_link0_height(scene)
     if include_franka:
