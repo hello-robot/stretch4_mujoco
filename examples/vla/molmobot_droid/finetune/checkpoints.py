@@ -231,8 +231,21 @@ def apply_training_start(checkpoint: FinetunedCheckpoint, params: RetargetParams
     """
     Start Stretch where `checkpoint`'s training episodes did, for each of --custom_franka_start_pose,
     --grasp-offset-mm and --grasp-offset-deg not given on the command line; says what it took and
-    warns when a given one differs. Returns --custom_franka_start_pose.
+    warns when a given one differs. A run copied without its `dataset/` has no record of that start
+    pose, so it warns and keeps the command line's.
+
+    Args:
+        checkpoint: The checkpoint whose run's training episodes give the start pose.
+        params: The retargeting parameters; their grasp offsets are set to training's when not given.
+        custom_franka_start_pose: --custom_franka_start_pose as given (or defaulted) on the command line.
+
+    Returns:
+        --custom_franka_start_pose to use: training's unless it was given on the command line.
     """
+    if not (checkpoint.run_dir / "dataset" / "train" / "valid_trajectory_index.json").exists():
+        click.secho(f"{checkpoint.run_dir} has no dataset/ to read training's start pose from: "
+                    "the command line's is used", fg="yellow")
+        return custom_franka_start_pose
     start = training_start(checkpoint)
     if start is None:
         click.secho("The training episodes began from different start poses: the command line's is used", fg="yellow")
