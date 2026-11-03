@@ -12,7 +12,7 @@ dependencies = [
     "inputs>=0.5",
     "matplotlib>=3.10.1",
     "mujoco~=3.5.0",
-    "numpy==2.2.6",
+    "numpy>=2.2.6",
     "opencv-python",
     # Used by models/stretch_4/head_texture.py to unwrap and paint the head mesh.
     "pillow>=10.0",
@@ -81,7 +81,8 @@ molmo = [
 # Linux-only: the real robot's driver stack needs `evdev`, which is sdist-only
 # and builds against Linux input headers.
 digital-twin = [
-    "hello-robot-stretch4-body",
+    "hello-robot-stretch4-body>=2026.10.21",
+    "numpy>=2.3.4",
 ]
 # examples/vla/molmobot_droid: MolmoBot-DROID retargeted onto Stretch 4. MolmoBot's own code
 # is cloned at runtime (see examples/vla/molmobot_droid/checkpoint.py) because it pins
@@ -89,7 +90,8 @@ digital-twin = [
 molmobot-droid = [
     "molmo-spaces[mujoco]",
     "hello-robot-stretch4-kinematics>=2026.9.15",
-    "hello-robot-stretch4-body",
+    "hello-robot-stretch4-body>=2026.10.21",
+    "numpy>=2.3.4",
     "pyzmq",
     "imageio[ffmpeg]",
     "huggingface_hub",
