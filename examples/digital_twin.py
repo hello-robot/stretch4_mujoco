@@ -1244,7 +1244,7 @@ def _parallel_gripper_fingers(hand: dict, limits: tuple[float, float] | None) ->
     _, params = RobotParams.get_params()
     range_mm = float(params.get("parallel_gripper", {}).get("range_mm", 80.0)) or 80.0
     lower, upper = limits
-    value = upper + (float(pos_mm) / range_mm) * (lower - upper)
+    value = lower + (float(pos_mm) / range_mm) * (upper - lower)  # lower = closed, upper = open
     return {"finger_left_joint": value, "finger_right_joint": value}
 
 
