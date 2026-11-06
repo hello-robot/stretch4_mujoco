@@ -61,6 +61,27 @@ export XLA_FLAGS=--xla_gpu_triton_gemm_any=true
 
 These variables ensure that MuJoCo and any associated rendering libraries utilize hardware acceleration, which is highly recommended for performance when working with cameras or complex scenes.
 
+## Grippers
+
+Stretch 4 can be simulated with either of its grippers. Both carry the ArUco tags of the real fingertips (`DICT_6X6_250`, ID 200 on the left finger and 201 on the right), so marker detection on the gripper camera works in simulation.
+
+| Standard gripper (SG4), the default | Parallel jaw gripper (PG4) |
+| :---: | :---: |
+| ![The SG4 gripper in simulation](./docs/images/gripper_sg4.png) | ![The PG4 gripper in simulation](./docs/images/gripper_pg4.png) |
+
+Pass `--parallel_gripper` to run an example with the PG4:
+
+```
+uv run examples/gamepad_teleop.py --parallel_gripper
+uv run python -m examples.molmo_environment --parallel_gripper
+```
+
+In your own code, pick the gripper with `tool_name`:
+
+```python
+sim = Stretch4MujocoSimulator(tool_name=Stretch4MujocoSimulator.PARALLEL_GRIPPER_TOOL_NAME)
+```
+
 ## Example Scripts
 
 [Keyboard teleop](./examples/keyboard_teleop.py)
