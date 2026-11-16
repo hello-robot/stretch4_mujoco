@@ -50,6 +50,7 @@ from examples.vla.molmobot_droid.droid import (
     mat_to_quat,
     pose_to_transform,
     resize_franka_pedestal,
+    robotiq_joint_positions,
     spawn_franka_droid,
     subtree_geoms,
 )
@@ -946,9 +947,26 @@ class SceneMirror:
         mujoco.mj_kinematics(self.model, data)
         mujoco.mj_camlight(self.model, data)
 
-    def set_ghost(self, arm_qpos) -> None:
+    def set_ghost(self, arm_qpos, driver_angle: float | None = None) -> None:
+        """
+        Pose the ghost Franka's arm, and its Robotiq when a driver angle is given, then update
+        the mirror's kinematics and cameras.
+
+        The ghost has no actuators and the mirror is never stepped, so its Robotiq's joints stay
+        at `qpos0` (open) unless set here. Callers pass the Franka state's gripper value so the
+        ghost shown on the scene camera and in Rerun opens and closes with the policy's state.
+
+        Args:
+            arm_qpos: The 7 FR3 joint positions in radians.
+            driver_angle: The Robotiq driver joint angle (the Franka state's last value), or
+                None to leave the fingers where they are.
+        """
         for joint, value in zip(self._ghost_joints, arm_qpos):
             self.data.joint(joint).qpos = value
+        if self._ghost_joints and driver_angle is not None:
+            prefix = self.stretch_scene.franka.prefix
+            for name, value in robotiq_joint_positions(driver_angle).items():
+                self.data.joint(prefix + name).qpos = value
         mujoco.mj_kinematics(self.model, self.data)
         mujoco.mj_camlight(self.model, self.data)
 

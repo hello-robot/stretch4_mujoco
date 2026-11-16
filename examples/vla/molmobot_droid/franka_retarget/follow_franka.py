@@ -213,7 +213,7 @@ class FollowFrankaEnv(Stretch4SimEnv):
         q7 = self.franka.state8[:7]
         driver = robotiq_driver_angle(joints.gripper_open_fraction)
         state8 = np.append(q7, driver)
-        self.mirror.set_ghost(q7)
+        self.mirror.set_ghost(q7, driver)
         # The Franka's own cameras, with the Franka in its own look and none of Stretch.
         exo = self.mirror.render_with_franka(DROID_EXO_IN_STRETCH_SCENE, driver, "franka_alone")
         wrist = self.mirror.render_with_franka(self.stretch_scene.franka.wrist_camera_name, driver, "franka_alone")

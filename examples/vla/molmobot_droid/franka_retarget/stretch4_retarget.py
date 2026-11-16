@@ -1509,7 +1509,7 @@ class Stretch4SimEnv:
         state8, self.ik_converged = self.retargeter.stretch_to_franka(footprint, joints)
         self.reverse_ik_failures += not self.ik_converged
         self.mirror.update(status, poses)
-        self.mirror.set_ghost(state8[:7])
+        self.mirror.set_ghost(state8[:7], state8[7])
         self.update_exo_side(joints)
 
         head, gripper = self.camera_images(cameras)
