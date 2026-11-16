@@ -8,9 +8,10 @@ instruction runs, the policy's views and the ghost Franka it is retargeted from.
 
 On the robot, run the image + joint-state publisher from stretch4_compliant_gripper first:
 
-    python send_gripper_and_head_images_with_joint_states.py -r --head_camera left,right --wrist_camera left --wrist_resolution 400
+    python send_gripper_and_head_images_with_joint_states.py -r --head_camera left,right --head_resolution 1200 --wrist_camera left --wrist_resolution 400
 
-with both head fisheyes, and its wrist camera side matching --gripper_camera. The policy's exo
+with both head fisheyes at the sensor's full 1920x1200 (as the simulator renders them), and its
+wrist camera side matching --gripper_camera. The policy's exo
 view is the head fisheye on the side the tool is toward (see `head_camera_for_tool()`), so
 --exo_camera is not used; with --no_head_follows_tool it is --exo_camera's (left or right). Commands go
 through stretch4_body's `RobotClient`; with --wait-for-arrival (the default) each action waits
