@@ -22,7 +22,7 @@ The `mjcf_generator.py` applies the following changes to the raw `urdf2mjcf` out
 
 ## SG4 compliant fingers
 
-`sg4_tool/compliant_fingers.py` rebuilds the SG4's fingers so the fingertips follow the robot's measured path and the fingers give under load:
+`sg4_tool/compliant_fingers.py` rebuilds the SG4's fingers so the fingertips follow the robot's measured path and the fingers give under load (step by step in [sg4_tool/README.md](sg4_tool/README.md)):
 
 - `gripper_finger_{left,right}_joint` keep their names, classes and actuators. Their range is `-0.16..0.5`: 0 is closed (the cups meet), 0.5 fully open, and below 0 squeezes. The servo maps as `pos_pct = 600 * q`.
 - Each fingertip rides x, y and yaw joints tied to a follower joint by the fingertip calibration's cubics (`stretch4_compliant_gripper`'s `latest_model_planar.yaml` for robot 4026, embedded in `sg4_tool/calibration_4026.py`). The motor pulls the follower through a spring tendon (`FLEX_K`), so blocked fingertips stop while the motor still reaches its command; the spring's stretch is the grip force.

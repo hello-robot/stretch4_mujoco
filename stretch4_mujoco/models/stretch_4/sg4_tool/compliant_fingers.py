@@ -15,8 +15,8 @@ Per finger, in the generated MJCF:
   on the robot. The spring's stretch is the grip force.
 - Each fingertip gains a third compliance hinge about z at the cup's rim, so the cups turn flat onto
   each other or onto an object.
-- The two steel strips per finger are drawn as hinge chains whose shape follows sg4_<side>_band, for
-  looks only. Each strip's end is pinned to the fingertip.
+- The two steel strips per finger are hinge chains whose shape follows sg4_<side>_band. Each strip's
+  end is pinned to the fingertip. They collide with the world but not the gripper body or fingertips.
 - The cups' collision meshes stay excluded from each other; a flat pad on each rim and one contact
   pair between the pads stop the cups on each other.
 """

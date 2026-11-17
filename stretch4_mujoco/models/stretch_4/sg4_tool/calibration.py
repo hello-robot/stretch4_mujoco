@@ -10,7 +10,7 @@ rotation = R(theta about the plane normal) @ base_frame, with u, v and theta sin
 the servo's pos_pct. The camera frame is carried into the gripper frame by the URDF's camera mount.
 
 The spring shapes (sg4_spring_shapes.json) are exported from the commercial render rig, sampled over
-the stroke. They only set how the steel strips are drawn; the strips carry no force.
+the stroke. They set the steel strips' shape; the grip force comes from compliant_fingers.FLEX_K.
 """
 
 import hashlib
@@ -181,7 +181,8 @@ def tip_polys(calibration: dict = DEFAULT_CALIBRATION) -> dict[str, dict[str, An
     """
     Cubic fits of each fingertip's planar pose over the calibrated stroke.
 
-    The fits are exact up to float error, as the calibration's splines are single cubics.
+    The calibration's u, v and theta are single cubics, but the cup-base offset and the projection
+    into the gripper plane are not polynomial, so the fits are within about 0.1 mm and 0.01 mrad.
 
     Args:
         calibration: The fingertip calibration, as in calibration_4026.CALIBRATION.
