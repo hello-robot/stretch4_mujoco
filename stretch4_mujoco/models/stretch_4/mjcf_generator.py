@@ -135,7 +135,7 @@ def generate_mjcf(urdf_path: str, out_mjcf_path: str=None):
             elif mesh_name.startswith("finger_"):
                 # PG4 fin-ray fingers. SG4's are "gripper_finger_*", caught below.
                 geom.set("rgba", PARALLEL_GRIPPER_FINGER_RGBA)
-            elif "arm_l4" in mesh_name or "finger_" in mesh_name:
+            elif "finger_" in mesh_name:
                 geom.set("rgba", "0.9 0.9 0.88 1")  # Off-white / Cream
             elif any(
                 part in mesh_name
