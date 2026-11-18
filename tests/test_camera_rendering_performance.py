@@ -39,7 +39,8 @@ BASELINE_SERVER_CAMERA_FPS = 30.0
 BASELINE_DELIVERED_FPS = {
     "cam_nav_rgb_se4_left": 30.0,
     "cam_nav_rgb_se4_right": 30.0,
-    "cam_nav_rgb_se4_center_low_rez": 10.0,
+    # Rendered at low resolution, but `pull_camera_data()` reports it as the centre camera.
+    "cam_nav_rgb_se4_center": 10.0,
     "cam_gripper_se4_left_rgb": 30.0,
     "cam_gripper_se4_right_rgb": 30.0,
     "cam_gripper_se4_stereo_depth": 30.0,
