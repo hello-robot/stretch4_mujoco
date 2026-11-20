@@ -281,17 +281,72 @@ def test_status_reports_guarded_state_to_clients(harness):
 
 
 # ---------------------------------------------------------------------------
-# Servo joints (wrist, gripper) -- the stall guard
+# Servo joints (wrist) -- the stall guard
 # ---------------------------------------------------------------------------
 
 
 def test_servo_joints_are_watched(harness):
-    """The wrist and gripper are guarded too, by the servos' stall model."""
+    """The wrist is guarded too, by the servos' stall model; the fingers are not."""
     guarded = harness.guarded
     for joint in ("wrist_yaw", "wrist_pitch", "wrist_roll"):
         assert joint in guarded.status["in_guarded_event"], f"{joint} is unguarded"
         # SE4_wrist_*_DW4: stall_max_effort 20.0.
         assert guarded.threshold_pct(joint) == pytest.approx(20.0)
+    for joint in ("gripper_left_finger", "gripper_right_finger"):
+        assert joint not in guarded.status["in_guarded_event"], f"{joint} is guarded"
+
+
+def test_a_grasp_is_not_a_stall(harness):
+    """Fingers closed on the tennis ball keep squeezing, as the robot's do.
+
+    A grasp stops the fingers while they push, which is a stall by the servo
+    guard's definition. Guarding the fingers tripped every grasp a second
+    after it closed and parked them where they stopped, which on the PG4 left
+    under 2 N of grip.
+    """
+    server, guarded = harness.server, harness.guarded
+    model, data = server.mjmodel, server.mjdata
+    fingers = ("gripper_left_finger", "gripper_right_finger")
+
+    def finger_range(name):
+        return model.jnt_range[model.actuator_trnid[data.actuator(name).id][0]]
+
+    # Gripper up off the table, fingers open (the bottom of their range).
+    server._set_actuator_position("lift", 0.9)
+    server._set_actuator_position("arm", 0.15)
+    for name in fingers:
+        server._set_actuator_position(name, finger_range(name)[0])
+    harness.cycles(800)
+
+    # Hold the ball between the fingertips until they close on it.
+    ball = model.body("tennis_ball")
+    qadr = model.jnt_qposadr[ball.jntadr[0]]
+    vadr = model.jnt_dofadr[ball.jntadr[0]]
+    pads = [
+        model.geom(f"gripper_fingertip_{side}_link_collision").id for side in ("left", "right")
+    ]
+    for name in fingers:
+        server._set_actuator_position(name, finger_range(name)[1])
+    start = data.time
+    while data.time - start < 0.6:
+        with harness.lock:
+            data.qpos[qadr : qadr + 3] = data.geom_xpos[pads].mean(axis=0)
+            data.qpos[qadr + 3 : qadr + 7] = [1, 0, 0, 0]
+            data.qvel[vadr : vadr + 6] = 0
+            mujoco.mj_forward(model, data)
+        harness.cycles(1)
+
+    # Well past the servos' stall_max_time_s of 1 s, then lift.
+    harness.cycles(300)
+    server._set_actuator_position("lift", 1.05)
+    harness.cycles(300)
+
+    assert guarded.status["guarded_events"] == 0
+    for name in fingers:
+        limit = model.actuator_forcerange[data.actuator(name).id][1]
+        assert abs(data.actuator(name).force[0]) > 0.5 * limit, f"{name} let go"
+    gap = data.xpos[ball.id] - data.geom_xpos[pads].mean(axis=0)
+    assert (gap**2).sum() ** 0.5 < 0.01, "the ball slipped out of the grasp"
 
 
 def test_wrist_actuators_carry_servo_torque_not_a_shaft_force(harness):
