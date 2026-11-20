@@ -193,10 +193,21 @@ class KeyboardTeleop:
     until released, mirroring the pattern in `examples/keyboard_teleop.py`.
     """
 
-    def __init__(self, sim: StretchMujocoSimulator, rate_hz: float = 30.0):
+    def __init__(
+        self, sim: StretchMujocoSimulator, rate_hz: float = 30.0, motion_profile: str = "default"
+    ):
         self.sim = sim
         self._rate_hz = rate_hz
         self.base_velocity = _KeyboardBaseVelocity()
+
+        # The lift and arm jog at the speed profile's rate, as the gamepad's
+        # D-pad does (`gamepad_joints.CommandLift` / `CommandArm`, the arm at
+        # 75%). They were a fixed 0.10 and 0.08 m/s, slower than even the slow
+        # profile.
+        lift = gamepad_joints.ROBOT_PARAMS["lift"]["motion"][motion_profile]
+        arm = gamepad_joints.ROBOT_PARAMS["arm"]["motion"][motion_profile]
+        self.lift_velocity, self.lift_accel = lift["vel_m"], lift["accel_m"]
+        self.arm_velocity, self.arm_accel = 0.75 * arm["vel_m"], arm["accel_m"]
 
         # Allow multiple key-presses, references https://stackoverflow.com/a/74910695
         self.key_buffer: list = []
@@ -403,13 +414,13 @@ class KeyboardTeleop:
         self.base_velocity.apply(self.sim)
 
         if key == "u":
-            self.sim.lift.set_velocity(0.10)
+            self.sim.lift.set_velocity(self.lift_velocity, a_m=self.lift_accel)
         elif key == "j":
-            self.sim.lift.set_velocity(-0.10)
+            self.sim.lift.set_velocity(-self.lift_velocity, a_m=self.lift_accel)
         elif key == "h":
-            self.sim.arm.set_velocity(-0.08)
+            self.sim.arm.set_velocity(-self.arm_velocity, a_m=self.arm_accel)
         elif key == "k":
-            self.sim.arm.set_velocity(0.08)
+            self.sim.arm.set_velocity(self.arm_velocity, a_m=self.arm_accel)
         elif key == "o":
             self.sim.end_of_arm.wrist_yaw.set_velocity(-0.3)
         elif key == "p":

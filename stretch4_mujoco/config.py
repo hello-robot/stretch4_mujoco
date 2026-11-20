@@ -122,7 +122,16 @@ robot_settings_se4 = {
         # guards them a different way: `feetech_SM_hello._unpack_status` calls
         # a stall once the joint has sat under `stall_min_vel` while over
         # `stall_max_effort` percent for longer than `stall_max_time`. Values
-        # from `SE4_wrist_*_DW4` / `SE4_stretch_gripper_DW4`.
+        # from `SE4_wrist_*_DW4`.
+        #
+        # Not the gripper's fingers. A grasp is a stall by this definition --
+        # the fingers stop on the object and keep pushing -- so guarding them
+        # trips on every grasp a second after it closes, and holding a finger
+        # where it stopped takes the squeeze away: the PG4's grip falls from
+        # 27 N to 1.3 N and what it holds slides out. The robot does not do
+        # that: stretch4_body only reports the gripper's `stall_overload`, its
+        # back-off sentry is disabled, and the PG4's contact guard keeps
+        # squeezing past the point of contact rather than stopping at it.
         # NOTE: the thresholds below are a percentage of the actuator's
         # `forcerange`, which for the wrist is 400 N.m in defaults.xml. That is
         # servo-implausible, and it puts the 20% trip point at 80 N.m -- above
@@ -132,8 +141,7 @@ robot_settings_se4 = {
             name: {'stall_max_effort_pct': 20.0,
                    'stall_min_vel': 0.1,
                    'stall_max_time_s': 1.0}
-            for name in ('wrist_yaw', 'wrist_pitch', 'wrist_roll',
-                         'gripper_left_finger', 'gripper_right_finger')
+            for name in ('wrist_yaw', 'wrist_pitch', 'wrist_roll')
         },
         # How far the setpoint must lead the measured position before the joint
         # counts as driving into something rather than holding station. Any
